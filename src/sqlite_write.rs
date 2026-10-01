@@ -980,8 +980,7 @@ impl<'a> SqliteWriteTransaction<'a> {
                 Ok(())
             }
             Err(error) => {
-                let deadline_error =
-                    is_sqlite_busy_error(&error) && Instant::now() >= self.deadline_at;
+                let deadline_error = is_commit_deadline_error(&error, self.deadline_at);
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 if deadline_error {
                     self.log_transaction_end(
@@ -1045,7 +1044,15 @@ impl<'a> SqliteWriteTransaction<'a> {
 
     fn log_transaction_end(&self, error_kind: &'static str, message: &'static str) {
         let transaction_ms = self.transaction_started.elapsed().as_millis();
-        if transaction_ms >= self.slow_threshold_ms as u128 || error_kind != "ok" {
+        let completed_at = Instant::now();
+        let completed_after_deadline = completed_at >= self.deadline_at;
+        let deadline_overrun_ms = completed_at
+            .saturating_duration_since(self.deadline_at)
+            .as_millis();
+        if completed_after_deadline
+            || transaction_ms >= self.slow_threshold_ms as u128
+            || error_kind != "ok"
+        {
             warn!(
                 event = "sqlite.write",
                 operation = self.lane,
@@ -1055,6 +1062,8 @@ impl<'a> SqliteWriteTransaction<'a> {
                 begin_ms = self.begin_elapsed.as_millis(),
                 transaction_ms,
                 deadline_ms = self.deadline.as_millis(),
+                completed_after_deadline,
+                deadline_overrun_ms,
                 error_kind,
                 "{message}"
             );
@@ -1068,6 +1077,8 @@ impl<'a> SqliteWriteTransaction<'a> {
                 begin_ms = self.begin_elapsed.as_millis(),
                 transaction_ms,
                 deadline_ms = self.deadline.as_millis(),
+                completed_after_deadline,
+                deadline_overrun_ms,
                 "{message}"
             );
         }
@@ -1184,6 +1195,10 @@ pub fn is_sqlite_busy_error(err: &(dyn std::error::Error + 'static)) -> bool {
         current = err.source();
     }
     false
+}
+
+fn is_commit_deadline_error(error: &sqlx::Error, deadline_at: Instant) -> bool {
+    is_sqlite_busy_error(error) && Instant::now() >= deadline_at
 }
 
 fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
@@ -1676,6 +1691,22 @@ mod tests {
     }
 
     #[test]
+    fn non_busy_commit_errors_are_not_reclassified_after_deadline() {
+        let deadline_at = Instant::now() - Duration::from_millis(1);
+        let constraint_error = sqlx::Error::Database(Box::new(TestDatabaseError {
+            code: "19",
+            message: "constraint failed",
+        }));
+        let busy_error = sqlx::Error::Database(Box::new(TestDatabaseError {
+            code: "5",
+            message: "database is locked",
+        }));
+
+        assert!(!is_commit_deadline_error(&constraint_error, deadline_at));
+        assert!(is_commit_deadline_error(&busy_error, deadline_at));
+    }
+
+    #[test]
     fn busy_detection_matches_sqlx_primary_and_extended_codes() {
         for code in ["5", "6", "261", "262", "517", "19"] {
             let error = sqlx::Error::Database(Box::new(TestDatabaseError {
@@ -1921,7 +1952,7 @@ mod tests {
         remove_test_database(read_pool, &database_path).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn commit_dispatched_before_deadline_can_succeed_after_reader_releases() {
         let database_path = test_database_path();
         let options = SqliteConnectOptions::new()
@@ -1951,9 +1982,14 @@ mod tests {
             .expect("hold a shared read lock");
 
         let deadline = Duration::from_millis(40);
+        let coordinator_deadline = Duration::from_secs(5);
         let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
             Some(writer_pool.clone()),
-            test_deadlines(deadline, deadline, Duration::from_millis(20)),
+            test_deadlines(
+                coordinator_deadline,
+                coordinator_deadline,
+                Duration::from_millis(20),
+            ),
         );
         let (permit, mut tx) = coordinator
             .begin_immediate(&read_pool, "commit_reader_contention")
@@ -1963,6 +1999,18 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("write before commit deadline");
+        tx.deadline_at = Instant::now() + deadline;
+        tx.deadline = deadline;
+
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
         let release_reader = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(90)).await;
             reader.rollback().await.expect("release reader transaction");
@@ -1975,6 +2023,22 @@ mod tests {
         drop(permit);
         release_reader.await.expect("join reader release");
         assert!(commit_elapsed >= deadline);
+        let events = buffer.json_events();
+        assert!(
+            events.iter().any(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event.get("operation")
+                        == Some(&Value::String("commit_reader_contention".to_owned()))
+                    && event.get("error_kind") == Some(&Value::String("ok".to_owned()))
+                    && event.get("completed_after_deadline") == Some(&Value::Bool(true))
+                    && event
+                        .get("deadline_overrun_ms")
+                        .and_then(Value::as_str)
+                        .and_then(|overrun| overrun.parse::<u64>().ok())
+                        .is_some_and(|overrun| overrun > 0)
+            }),
+            "late commit telemetry was not captured: {events:?}"
+        );
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_deadline_probe")
             .fetch_one(&read_pool)
@@ -1991,6 +2055,96 @@ mod tests {
             .await
             .expect("write after late successful commit");
         next_tx.commit().await.expect("commit after late success");
+
+        remove_test_database(writer_pool, &database_path).await;
+        remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn non_busy_commit_error_preserves_sqlite_error() {
+        let database_path = test_database_path();
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Delete)
+            .busy_timeout(Duration::from_millis(250));
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .expect("create rollback-journal reader pool");
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("create rollback-journal writer pool");
+        sqlx::query("CREATE TABLE commit_error_parent (id INTEGER PRIMARY KEY)")
+            .execute(&read_pool)
+            .await
+            .expect("create deferred foreign-key parent");
+        sqlx::query(
+            "CREATE TABLE commit_error_child (parent_id INTEGER NOT NULL REFERENCES commit_error_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        )
+        .execute(&read_pool)
+        .await
+        .expect("create deferred foreign-key child");
+
+        let mut reader = read_pool.begin().await.expect("begin reader transaction");
+        sqlx::query("SELECT COUNT(*) FROM commit_error_child")
+            .fetch_one(&mut *reader)
+            .await
+            .expect("hold a shared read lock");
+
+        let coordinator_deadline = Duration::from_secs(5);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(writer_pool.clone()),
+            test_deadlines(
+                coordinator_deadline,
+                coordinator_deadline,
+                Duration::from_millis(20),
+            ),
+        );
+        let (permit, mut tx) = coordinator
+            .begin_immediate(&read_pool, "commit_deferred_constraint")
+            .await
+            .expect("begin write transaction while reader is active");
+        sqlx::query("INSERT INTO commit_error_child (parent_id) VALUES (99)")
+            .execute(&mut *tx)
+            .await
+            .expect("deferred foreign-key constraint allows the insert");
+
+        reader.rollback().await.expect("release reader transaction");
+        let error = tx
+            .commit()
+            .await
+            .expect_err("deferred foreign-key violation should fail COMMIT");
+        drop(permit);
+
+        assert!(!is_sqlite_busy_error(error.as_ref()));
+        assert!(!is_sqlite_write_deadline_error(error.as_ref()));
+        let child_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_error_child")
+            .fetch_one(&read_pool)
+            .await
+            .expect("count after failed deferred constraint commit");
+        assert_eq!(child_count, 0);
+
+        let (_permit, mut next_tx) = coordinator
+            .begin_immediate(&read_pool, "commit_after_constraint_error")
+            .await
+            .expect("writer connection is reusable after failed commit");
+        sqlx::query("INSERT INTO commit_error_parent (id) VALUES (2)")
+            .execute(&mut *next_tx)
+            .await
+            .expect("insert parent on reusable writer connection");
+        sqlx::query("INSERT INTO commit_error_child (parent_id) VALUES (2)")
+            .execute(&mut *next_tx)
+            .await
+            .expect("insert valid child on reusable writer connection");
+        next_tx
+            .commit()
+            .await
+            .expect("commit after constraint error");
 
         remove_test_database(writer_pool, &database_path).await;
         remove_test_database(read_pool, &database_path).await;
