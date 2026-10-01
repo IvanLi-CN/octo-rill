@@ -4,16 +4,18 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；all-features 测试、source-quality 质量门通过，fresh review 与 PR merge 待完成
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；当前候选仍待 fresh review、CI 与 PR merge
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
 ## Coverage / rollout summary
 
 - 新增 `src/sqlite_write.rs`，提供 `SqliteWriteCoordinator`、单 writer permit、foreground/background/best-effort priority、`BEGIN IMMEDIATE` 事务入口、busy/locked 分类、bounded retry 与 tracing telemetry。
-- PR3.9 为生产文件型 SQLite 配置独立单连接 writer pool，读池保留原容量；foreground/background 共用单调 deadline，best-effort 立即尝试且不排队，取得 permit 后最多使用 2500 ms 启动预算；SQLite busy timeout 为 100 ms，最多 4 次尝试并按 25/50/100 ms 退避。
+- PR3.9 为生产文件型 SQLite 配置独立单连接 writer pool，读池保留原容量；foreground/background 共用单调 deadline，best-effort 立即尝试且不排队，取得 permit 后最多使用 2500 ms 启动预算；SQLite busy timeout 为 100 ms，普通 callback 最多 4 次尝试，`BEGIN IMMEDIATE` 在同一总 deadline 内按 25/50/100 ms 退避，避免连接驱逐后的短暂文件锁提前终止恢复。
 - 普通 coordinator callback 的 SQL 查询显式使用专用 writer pool；`BEGIN IMMEDIATE` 入口也会选择专用池，未配置独立池的内存数据库继续使用传入池。
 - deadline 限制 writer queue、write-pool acquisition、事务启动、callback 启动和重试启动；callback 一旦启动就持有 permit 直到真实结果返回，并记录 deadline overrun。Webhook receiver 将同一个绝对阶段 deadline 传入 delivery claim、release enqueue、queued-state update 和恢复写入的 coordinator，因此队列、连接池与 `BEGIN IMMEDIATE` 到期后不会再启动新事务；queued-state 与恢复写入均通过 deadline-aware `BEGIN IMMEDIATE` transaction 执行，保留 COMMIT 派发前的 deadline 检查。短 enqueue 阶段跳过独立的批量 deadline 清扫，避免将多行清理纳入 750 ms admission budget。已启动阶段仍等待实际结果，并把 coordinator deadline 映射为 retryable 响应。SQLite progress handler 只约束事务语句与 COMMIT 派发前的阶段；COMMIT 派发前过期会在 150 ms cleanup budget 内尝试回滚，COMMIT 派发后关闭 progress handler 并等待 SQLite 的实际结果，late completion telemetry 记录完成状态与超期毫秒。退避无法在剩余 deadline 内开始时记录为 deadline，而非 retry。已知 busy 在预算外返回时按 deadline 结束且不再重试；其他提交错误保留实际错误。前台 deadline 映射为 retryable 503，后台 job 持久化延迟重试，未启动的 best-effort 写入跳过。
+- 异步取消事务现在使用独立的 progress-handler interrupt 标志：正常 commit/rollback 会移除 handler，事务 future 被取消时会中断活动 SQLite 语句。专用 writer pool 的 `after_release` hook 会在 transaction depth 非零时立即返回错误并让 SQLx hard-close/evict 不确定连接；普通读池/内存 fallback 在同一个 150 ms budget 内完成 queued rollback，失败仍 hard-close/evict；depth 已清零时移除旧 handler并确认可复用。回归覆盖 101 次取消后写入、内存 fallback 取消后的 schema 保留、强制清理失败驱逐和真实长 SQL 清理超时后的连接重建。
+- content processing recovery/claim、已领取任务的数据库执行、job task claim 与 repo release claim loop 共用 `worker_backoff`，连续失败的基础等待为 1/2/4/8/16/30 秒并加入不提前的抖动；content claim 成功后立即复位 claim 退避，执行阶段的数据库失败使用独立退避，其他 worker 在成功 DB 尝试后复位；每个 worker 只有一笔同类 claim 在途，日志记录 lane、错误类别、失败计数和 retry wait。
 - deadline telemetry 区分 writer queue、write-pool acquisition、`BEGIN IMMEDIATE` 与 transaction 阶段，并记录 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 和 `deadline_ms`。
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
@@ -49,7 +51,7 @@
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（990 passed, 2 ignored）
+- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（当前候选必须重新运行；结果绑定到本次验收 evidence card，不复用基线数字）
 - `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
 
 ## Remaining Gaps
@@ -60,6 +62,7 @@
 
 - `docs/solutions/backend/sqlite-wal-write-transactions.md` 更新为 writer coordinator + `BEGIN IMMEDIATE` 的复用方案。
 - `src/sqlite_write.rs` 覆盖 WAL + 多连接并发写入、foreground 优先级、独立 writer pool callback、内存库 fallback、callback deadline overrun 与 permit 保持、调用方绝对 deadline 限制 writer 队列、late `BEGIN IMMEDIATE` busy 分类、COMMIT 跨过 deadline 后的真实成功/非 busy 错误、提交前过期回滚与 writer 连接复用、busy 重试耗尽，以及队列、连接池、重试和提交阶段的 busy/deadline telemetry 分类；`src/webhook_push.rs` 覆盖已启动 receiver 阶段在 deadline 后等待实际结果。
+- `src/sqlite_write.rs` 另外覆盖活动长 SQL 被取消后的 101 轮连续写入、清理失败驱逐、清理超时驱逐与重建；`src/worker_backoff.rs` 覆盖 1/2/4/8/16/30 秒基础等待、抖动不提前和成功复位。
 - `src/translations.rs` 新增 batch 启动写段在 writer 压力下串行化回归，以及结果聚合在 writer 背压下直接复用 pending 快照的回归。
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。

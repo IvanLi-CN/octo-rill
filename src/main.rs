@@ -30,6 +30,7 @@ mod sync;
 mod translations;
 mod version;
 mod webhook_push;
+mod worker_backoff;
 
 use anyhow::Result;
 use dotenvy::{dotenv, from_filename};
