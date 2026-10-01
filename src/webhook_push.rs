@@ -3188,7 +3188,11 @@ async fn reset_delivery_to_pending(
     let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
     let write = state
         .sqlite_writer
-        .write_foreground("webhook_receiver_delivery_rollback", |_| {
+        .write_with_priority_until(
+            "webhook_receiver_delivery_rollback",
+            SqliteWritePriority::Foreground,
+            deadline,
+            |_| {
             let delivery = delivery.clone();
             let pool = pool.clone();
             async move {
@@ -3206,7 +3210,8 @@ async fn reset_delivery_to_pending(
                     .context("commit GitHub release delivery rollback")?;
                 Ok(())
             }
-        });
+        },
+        );
     run_receiver_stage("webhook_receiver_delivery_rollback", deadline, write).await
 }
 
@@ -3345,10 +3350,11 @@ pub async fn receive(
     let claim = async move {
         let (permit, mut transaction) = state_for_claim
             .sqlite_writer
-            .begin_immediate_with_priority(
+            .begin_immediate_with_priority_until(
                 &state_for_claim.pool,
                 "webhook_receiver_delivery_claim",
                 SqliteWritePriority::Foreground,
+                write_deadline,
             )
             .await?;
         sqlx::query(
@@ -3409,8 +3415,13 @@ pub async fn receive(
         ));
     }
     let repo = repo.expect("repo checked above");
-    let enqueue =
-        sync::enqueue_user_repo_release_sync(state.as_ref(), &row.0, repo.id, &repo.full_name);
+    let enqueue = sync::enqueue_user_repo_release_sync_until(
+        state.as_ref(),
+        &row.0,
+        repo.id,
+        &repo.full_name,
+        write_deadline,
+    );
     let reused_fresh =
         match run_receiver_stage("webhook_receiver_release_enqueue", write_deadline, enqueue).await
         {
@@ -3439,7 +3450,11 @@ pub async fn receive(
     let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
     let queued_update = state
         .sqlite_writer
-        .write_foreground("webhook_receiver_delivery_queued", |_| {
+        .write_with_priority_until(
+            "webhook_receiver_delivery_queued",
+            SqliteWritePriority::Foreground,
+            write_deadline,
+            |_| {
             let delivery = delivery.clone();
             let queued_task_id = queued_task_id.clone();
             let pool = pool.clone();
@@ -3457,7 +3472,8 @@ pub async fn receive(
                     .context("commit GitHub release delivery queued state")?;
                 Ok(())
             }
-        });
+        },
+        );
     if let Err(error) = run_receiver_stage(
         "webhook_receiver_delivery_queued",
         write_deadline,

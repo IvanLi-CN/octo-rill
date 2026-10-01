@@ -5090,6 +5090,7 @@ async fn attach_and_wait_for_user_release_demand_with_freshness(
         &snapshots,
         false,
         None,
+        None,
     )
     .await?;
 
@@ -5194,6 +5195,7 @@ pub async fn refresh_public_repo_release_if_stale(
         &HashMap::new(),
         false,
         Some(PUBLIC_RELEASE_READ_FRESHNESS_WINDOW),
+        None,
     )
     .await?;
     let snapshot = load_public_repo_release_refresh_snapshot(state, repo_id)
@@ -5253,11 +5255,12 @@ async fn load_public_repo_release_refresh_snapshot(
     Ok(snapshot)
 }
 
-pub async fn enqueue_user_repo_release_sync(
+pub async fn enqueue_user_repo_release_sync_until(
     state: &AppState,
     user_id: &str,
     repo_id: i64,
     full_name: &str,
+    stage_deadline_at: tokio::time::Instant,
 ) -> Result<bool> {
     let repos = [ReleaseDemandRepo {
         repo_id,
@@ -5275,6 +5278,7 @@ pub async fn enqueue_user_repo_release_sync(
         &HashMap::new(),
         true,
         None,
+        Some(stage_deadline_at),
     )
     .await?;
     Ok(attached.reused_fresh > 0)
@@ -5299,6 +5303,7 @@ async fn attach_release_demand(
         &HashMap::new(),
         false,
         None,
+        None,
     )
     .await
 }
@@ -5315,6 +5320,7 @@ async fn attach_release_demand_with_freshness(
     snapshots: &HashMap<i64, usize>,
     force_refresh: bool,
     freshness_window: Option<Duration>,
+    stage_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -5324,7 +5330,10 @@ async fn attach_release_demand_with_freshness(
         return Ok(result);
     }
 
-    expire_repo_release_deadlines(state).await?;
+    // Keep the webhook's short admission budget bounded by skipping this separate sweep.
+    if stage_deadline_at.is_none() {
+        expire_repo_release_deadlines(state).await?;
+    }
 
     let now = Utc::now();
     let now_rfc3339 = now.to_rfc3339();
@@ -5335,11 +5344,23 @@ async fn attach_release_demand_with_freshness(
     let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
-        let (_sqlite_write, mut tx) = state
-            .sqlite_writer
-            .begin_immediate(&state.pool, "repo_release_attach")
-            .await
-            .context("begin repo release attach tx")?;
+        let (_sqlite_write, mut tx) = if let Some(stage_deadline_at) = stage_deadline_at {
+            state
+                .sqlite_writer
+                .begin_immediate_with_priority_until(
+                    &state.pool,
+                    "repo_release_attach",
+                    SqliteWritePriority::Foreground,
+                    stage_deadline_at,
+                )
+                .await
+        } else {
+            state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "repo_release_attach")
+                .await
+        }
+        .context("begin repo release attach tx")?;
         let existing = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
             r#"
             SELECT
@@ -22830,6 +22851,7 @@ mod tests {
             Some(&mut policy),
             &snapshots,
             false,
+            None,
             None,
         )
         .await

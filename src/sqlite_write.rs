@@ -237,7 +237,7 @@ impl SqliteWriteCoordinator {
         &self,
         lane: &'static str,
         priority: SqliteWritePriority,
-        mut operation: Op,
+        operation: Op,
     ) -> Result<T>
     where
         Op: FnMut(usize) -> Fut,
@@ -245,6 +245,38 @@ impl SqliteWriteCoordinator {
     {
         let deadline = self.deadline_for(priority);
         let deadline_at = Instant::now() + deadline;
+        self.write_with_deadline(lane, priority, deadline_at, deadline, operation)
+            .await
+    }
+
+    pub async fn write_with_priority_until<T, Fut, Op>(
+        &self,
+        lane: &'static str,
+        priority: SqliteWritePriority,
+        deadline_at: Instant,
+        operation: Op,
+    ) -> Result<T>
+    where
+        Op: FnMut(usize) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let deadline = deadline_at.saturating_duration_since(Instant::now());
+        self.write_with_deadline(lane, priority, deadline_at, deadline, operation)
+            .await
+    }
+
+    async fn write_with_deadline<T, Fut, Op>(
+        &self,
+        lane: &'static str,
+        priority: SqliteWritePriority,
+        deadline_at: Instant,
+        deadline: Duration,
+        mut operation: Op,
+    ) -> Result<T>
+    where
+        Op: FnMut(usize) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         let mut attempt = 1usize;
         loop {
             let permit = self
@@ -634,6 +666,25 @@ impl SqliteWriteCoordinator {
         ))
     }
 
+    fn classify_begin_error(
+        &self,
+        lane: &'static str,
+        priority: SqliteWritePriority,
+        deadline_at: Instant,
+        deadline: Duration,
+        completed_at: Instant,
+        error: anyhow::Error,
+    ) -> (anyhow::Error, bool) {
+        let expired_busy = is_sqlite_busy_error(error.as_ref()) && completed_at >= deadline_at;
+        let deadline_error = is_sqlite_write_deadline_error(error.as_ref()) || expired_busy;
+        let error = if expired_busy {
+            self.deadline_error(lane, priority, "begin_immediate", deadline)
+        } else {
+            error
+        };
+        (error, deadline_error)
+    }
+
     pub async fn begin_immediate<'a>(
         &self,
         pool: &'a SqlitePool,
@@ -651,12 +702,56 @@ impl SqliteWriteCoordinator {
     ) -> Result<(SqliteWritePermit, SqliteWriteTransaction<'a>)> {
         let deadline = self.deadline_for(priority);
         let deadline_at = Instant::now() + deadline;
+        self.begin_immediate_with_priority_until(pool, lane, priority, deadline_at)
+            .await
+    }
+
+    pub async fn begin_immediate_with_priority_until<'a>(
+        &self,
+        pool: &'a SqlitePool,
+        lane: &'static str,
+        priority: SqliteWritePriority,
+        deadline_at: Instant,
+    ) -> Result<(SqliteWritePermit, SqliteWriteTransaction<'a>)> {
+        let deadline = deadline_at.saturating_duration_since(Instant::now());
         let write_pool = self.write_pool_or(pool);
         let mut attempt = 1usize;
         loop {
+            if Instant::now() >= deadline_at {
+                warn!(
+                    event = "sqlite.write",
+                    operation = lane,
+                    priority = priority.as_str(),
+                    writer_wait_ms = 0_u128,
+                    pool_wait_ms = 0_u128,
+                    begin_ms = 0_u128,
+                    transaction_ms = 0_u128,
+                    deadline_ms = deadline.as_millis(),
+                    error_kind = "writer_queue_timeout",
+                    "sqlite writer deadline expired before permit acquisition"
+                );
+                return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+            }
             let permit = self
                 .acquire_until(lane, priority, deadline_at, deadline)
                 .await?;
+            if Instant::now() >= deadline_at {
+                let writer_wait_ms = permit.writer_wait_ms();
+                drop(permit);
+                warn!(
+                    event = "sqlite.write",
+                    operation = lane,
+                    priority = priority.as_str(),
+                    writer_wait_ms,
+                    pool_wait_ms = 0_u128,
+                    begin_ms = 0_u128,
+                    transaction_ms = 0_u128,
+                    deadline_ms = deadline.as_millis(),
+                    error_kind = "writer_queue_timeout",
+                    "sqlite writer permit arrived after deadline"
+                );
+                return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+            }
             let pool_wait_started = Instant::now();
             let connection = tokio::time::timeout_at(deadline_at, write_pool.acquire()).await;
             let pool_wait = pool_wait_started.elapsed();
@@ -685,22 +780,67 @@ impl SqliteWriteCoordinator {
                     return Err(self.deadline_error(lane, priority, "write_pool", deadline));
                 }
             };
+            if Instant::now() >= deadline_at {
+                let writer_wait_ms = permit.writer_wait_ms();
+                drop(connection);
+                drop(permit);
+                warn!(
+                    event = "sqlite.write",
+                    operation = lane,
+                    priority = priority.as_str(),
+                    writer_wait_ms,
+                    pool_wait_ms = pool_wait.as_millis(),
+                    begin_ms = 0_u128,
+                    transaction_ms = 0_u128,
+                    deadline_ms = deadline.as_millis(),
+                    error_kind = "write_pool_timeout",
+                    "sqlite write connection arrived after deadline"
+                );
+                return Err(self.deadline_error(lane, priority, "write_pool", deadline));
+            }
             let begin_started = Instant::now();
-            let result = match tokio::time::timeout_at(
-                deadline_at,
-                Transaction::begin(connection, Some(Cow::Borrowed("BEGIN IMMEDIATE"))),
-            )
+            let result = match tokio::time::timeout_at(deadline_at, async move {
+                if Instant::now() >= deadline_at {
+                    return None;
+                }
+                Some(Transaction::begin(connection, Some(Cow::Borrowed("BEGIN IMMEDIATE"))).await)
+            })
             .await
             {
-                Ok(Ok(tx)) => Ok(tx),
-                Ok(Err(error)) => Err(anyhow::Error::new(error))
+                Ok(Some(Ok(tx))) => Ok(tx),
+                Ok(Some(Err(error))) => Err(anyhow::Error::new(error))
                     .with_context(|| format!("begin sqlite write tx ({lane})")),
-                Err(_) => Err(self.deadline_error(lane, priority, "begin_immediate", deadline)),
+                Ok(None) | Err(_) => {
+                    Err(self.deadline_error(lane, priority, "begin_immediate", deadline))
+                }
             };
             let mut begin_elapsed = begin_started.elapsed();
 
             match result {
                 Ok(mut tx) => {
+                    if Instant::now() >= deadline_at {
+                        let begin_elapsed = begin_started.elapsed();
+                        cleanup_sqlite_write_transaction(tx, lane).await;
+                        warn!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = priority.as_str(),
+                            writer_wait_ms,
+                            pool_wait_ms = pool_wait.as_millis(),
+                            begin_ms = begin_elapsed.as_millis(),
+                            transaction_ms = 0_u128,
+                            deadline_ms = deadline.as_millis(),
+                            error_kind = "write_deadline",
+                            "sqlite write transaction began after deadline"
+                        );
+                        drop(permit);
+                        return Err(self.deadline_error(
+                            lane,
+                            priority,
+                            "begin_immediate",
+                            deadline,
+                        ));
+                    }
                     let deadline_std = deadline_at.into_std();
                     let progress_handler_active = Arc::new(AtomicBool::new(true));
                     let handler_active = Arc::clone(&progress_handler_active);
@@ -713,7 +853,31 @@ impl SqliteWriteCoordinator {
                         Ok::<_, sqlx::Error>(())
                     };
                     match tokio::time::timeout_at(deadline_at, setup_handler).await {
-                        Ok(Ok(handle)) => handle,
+                        Ok(Ok(handle)) if Instant::now() < deadline_at => handle,
+                        Ok(Ok(_)) => {
+                            let begin_elapsed = begin_started.elapsed();
+                            progress_handler_active.store(false, Ordering::Relaxed);
+                            cleanup_sqlite_write_transaction(tx, lane).await;
+                            warn!(
+                                event = "sqlite.write",
+                                operation = lane,
+                                priority = priority.as_str(),
+                                writer_wait_ms,
+                                pool_wait_ms = pool_wait.as_millis(),
+                                begin_ms = begin_elapsed.as_millis(),
+                                transaction_ms = 0_u128,
+                                deadline_ms = deadline.as_millis(),
+                                error_kind = "write_deadline",
+                                "sqlite writer deadline expired after transaction setup"
+                            );
+                            drop(permit);
+                            return Err(self.deadline_error(
+                                lane,
+                                priority,
+                                "transaction_setup",
+                                deadline,
+                            ));
+                        }
                         Ok(Err(error)) => {
                             let begin_elapsed = begin_started.elapsed();
                             progress_handler_active.store(false, Ordering::Relaxed);
@@ -833,7 +997,14 @@ impl SqliteWriteCoordinator {
                 Err(err) => {
                     let writer_wait_ms = permit.writer_wait_ms();
                     drop(permit);
-                    let deadline_error = is_sqlite_write_deadline_error(err.as_ref());
+                    let (err, deadline_error) = self.classify_begin_error(
+                        lane,
+                        priority,
+                        deadline_at,
+                        deadline,
+                        Instant::now(),
+                        err,
+                    );
                     if is_sqlite_busy_error(err.as_ref()) || deadline_error {
                         warn!(
                             event = "sqlite.write",
@@ -2419,6 +2590,152 @@ mod tests {
 
         remove_test_database(writer_pool, &database_path).await;
         remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn begin_busy_completion_after_deadline_is_classified_as_deadline() {
+        let database_path = test_database_path();
+        let read_pool = open_test_pool(&database_path, 1, Duration::from_millis(5)).await;
+        let writer_pool = open_test_pool(&database_path, 1, Duration::from_millis(5)).await;
+        sqlx::query("CREATE TABLE final_begin_busy_probe (value INTEGER NOT NULL)")
+            .execute(&read_pool)
+            .await
+            .expect("create final begin busy probe");
+        let holder = read_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external writer lock");
+        let busy_error = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&writer_pool)
+            .await
+            .expect_err("external lock should produce SQLite busy");
+        assert!(is_sqlite_busy_error(&busy_error));
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(writer_pool.clone()),
+            test_deadlines(
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            ),
+        );
+        let deadline_at = Instant::now();
+        let (error, deadline_error) = coordinator.classify_begin_error(
+            "final_begin_busy",
+            SqliteWritePriority::Foreground,
+            deadline_at,
+            Duration::from_millis(30),
+            deadline_at + Duration::from_millis(1),
+            anyhow::Error::new(busy_error),
+        );
+
+        assert!(deadline_error);
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+
+        holder
+            .rollback()
+            .await
+            .expect("release external writer lock");
+        remove_test_database(writer_pool, &database_path).await;
+        remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_begin_deadline_bounds_writer_queue_wait() {
+        let database_path = test_database_path();
+        let read_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        let writer_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(writer_pool.clone()),
+            test_deadlines(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        );
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let holder = {
+            let coordinator = coordinator.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                coordinator
+                    .write_foreground("hold_writer_for_deadline_test", move |_| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("writer holder should start");
+        let deadline_at = Instant::now() + Duration::from_millis(40);
+
+        let error = match coordinator
+            .begin_immediate_with_priority_until(
+                &read_pool,
+                "explicit_begin_deadline",
+                SqliteWritePriority::Foreground,
+                deadline_at,
+            )
+            .await
+        {
+            Ok(_) => panic!("explicit deadline should bound writer queue wait"),
+            Err(error) => error,
+        };
+
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+        release.notify_one();
+        holder
+            .await
+            .expect("join writer holder")
+            .expect("writer holder succeeds");
+        remove_test_database(writer_pool, &database_path).await;
+        remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn expired_explicit_begin_deadline_does_not_start_transaction() {
+        let database_path = test_database_path();
+        let pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(pool.clone()),
+            test_deadlines(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        );
+
+        let error = match coordinator
+            .begin_immediate_with_priority_until(
+                &pool,
+                "expired_explicit_begin",
+                SqliteWritePriority::Foreground,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .await
+        {
+            Ok((permit, transaction)) => {
+                transaction
+                    .rollback()
+                    .await
+                    .expect("clean up transaction unexpectedly started");
+                drop(permit);
+                panic!("expired deadline must not start a transaction");
+            }
+            Err(error) => error,
+        };
+
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+        assert!(!coordinator.runtime_status().active);
+        remove_test_database(pool, &database_path).await;
     }
 
     #[tokio::test]
