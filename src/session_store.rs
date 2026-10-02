@@ -280,9 +280,6 @@ impl SessionStore for CoordinatedSqliteSessionStore {
         let activity_only = previous
             .as_ref()
             .is_some_and(|previous| session_record_changed_only_by_activity(previous, record));
-        let desired_encoded = rmp_serde::to_vec(record)
-            .map_err(|error| session_store::Error::Encode(error.to_string()))?;
-
         loop {
             let (permit, mut transaction) = self
                 .sqlite_writer
@@ -356,7 +353,23 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                         }
                     }
                 }
-                Ok(None) => (desired_encoded.clone(), record.clone()),
+                Ok(None) => {
+                    let error = anyhow::anyhow!(
+                        "retryable sqlite session conflict: session row disappeared"
+                    );
+                    if let Err(rollback_error) = transaction.rollback().await {
+                        warn!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            error_kind = "rollback_error",
+                            error_chain = %rollback_error,
+                            "sqlite session write rollback failed; preserving the original error"
+                        );
+                    }
+                    drop(permit);
+                    return Err(self.map_write_error(lane, activity_only, deadline, error));
+                }
                 Err(error) => {
                     let busy = is_sqlite_busy_error(&error);
                     let error =
@@ -662,6 +675,7 @@ fn is_retryable_session_text(message: &str) -> bool {
         || normalized.contains("database is locked")
         || normalized.contains("database table is locked")
         || normalized.contains("sqlite_busy")
+        || normalized.contains("retryable sqlite session conflict")
         || (normalized.contains("code: 9") && normalized.contains("interrupted"))
         || (normalized.contains("code: \"9\"") && normalized.contains("interrupted"))
 }
@@ -1317,6 +1331,48 @@ mod tests {
                 Some(&json!(true))
             );
         }
+
+        let mut deleted_record = Record {
+            id: Id::default(),
+            data: HashMap::from([(String::from("user_id"), json!("deleted-user"))]),
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+        shared_store
+            .create(&mut deleted_record)
+            .await
+            .expect("create deleted-session race record");
+        let deleted_baseline = SESSION_BASELINE
+            .scope(RefCell::new(None), shared_store.load(&deleted_record.id))
+            .await
+            .expect("load deleted-session race record")
+            .expect("deleted-session race baseline exists");
+        SESSION_BASELINE
+            .scope(RefCell::new(None), second_store.delete(&deleted_record.id))
+            .await
+            .expect("delete session during stale save");
+        let mut stale_deleted_update = deleted_baseline.clone();
+        stale_deleted_update
+            .data
+            .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(999_i64));
+        let stale_deleted_result = SESSION_BASELINE
+            .scope(
+                RefCell::new(Some(deleted_baseline)),
+                shared_store.save(&stale_deleted_update),
+            )
+            .await;
+        match stale_deleted_result {
+            Err(session_store::Error::Backend(message)) => {
+                assert!(message.contains("retryable sqlite session conflict"));
+            }
+            other => panic!("stale save resurrected deleted session: {other:?}"),
+        }
+        assert!(
+            shared_store
+                .load(&deleted_record.id)
+                .await
+                .expect("reload deleted session")
+                .is_none()
+        );
 
         drop(first_store);
         drop(second_store);
