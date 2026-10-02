@@ -40,13 +40,14 @@ const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
 const SESSION_RECORD_CACHE_MAX: usize = 4096;
+const SESSION_RECORD_HISTORY_MAX: usize = 4;
 
 #[derive(Clone)]
 pub struct CoordinatedSqliteSessionStore {
     inner: SqliteStore,
     reader_pool: SqlitePool,
     sqlite_writer: SqliteWriteCoordinator,
-    loaded_records: Arc<Mutex<HashMap<Id, Record>>>,
+    loaded_records: Arc<Mutex<HashMap<Id, Vec<Record>>>>,
 }
 
 impl CoordinatedSqliteSessionStore {
@@ -67,11 +68,13 @@ impl CoordinatedSqliteSessionStore {
         self.inner.migrate().await
     }
 
-    fn previous_record(&self, session_id: &Id) -> Option<Record> {
-        self.loaded_records
-            .lock()
-            .ok()
-            .and_then(|records| records.get(session_id).cloned())
+    fn previous_record(&self, desired: &Record) -> Option<Record> {
+        let records = self.loaded_records.lock().ok()?;
+        let history = records.get(&desired.id)?;
+        history
+            .iter()
+            .min_by_key(|previous| session_record_difference_score(previous, desired))
+            .cloned()
     }
 
     fn remember_record(&self, record: &Record) {
@@ -82,7 +85,16 @@ impl CoordinatedSqliteSessionStore {
             {
                 records.remove(&evicted_id);
             }
-            records.insert(record.id, record.clone());
+            let history = records.entry(record.id).or_default();
+            if let Some(existing_index) = history.iter().position(|existing| {
+                existing.data == record.data && existing.expiry_date == record.expiry_date
+            }) {
+                history.remove(existing_index);
+            }
+            history.push(record.clone());
+            if history.len() > SESSION_RECORD_HISTORY_MAX {
+                history.remove(0);
+            }
         }
     }
 
@@ -279,7 +291,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
         let deadline_at = Instant::now() + deadline;
         let started = Instant::now();
         let mut attempt = 1usize;
-        let previous = self.previous_record(&record.id);
+        let previous = self.previous_record(record);
         let activity_only = previous
             .as_ref()
             .is_some_and(|previous| session_record_changed_only_by_activity(previous, record));
@@ -304,7 +316,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
             .bind(record.id.to_string())
             .fetch_optional(&mut *transaction)
             .await;
-            let encoded = match current_result {
+            let (encoded, committed_record) = match current_result {
                 Ok(Some((data,))) => {
                     let current = match rmp_serde::from_slice::<Record>(&data) {
                         Ok(current) => current,
@@ -325,7 +337,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                     };
                     let merged = merge_session_record_changes(previous.as_ref(), &current, record);
                     match rmp_serde::to_vec(&merged) {
-                        Ok(encoded) => encoded,
+                        Ok(encoded) => (encoded, merged),
                         Err(error) => {
                             if let Err(rollback_error) = transaction.rollback().await {
                                 warn!(
@@ -342,7 +354,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                         }
                     }
                 }
-                Ok(None) => desired_encoded.clone(),
+                Ok(None) => (desired_encoded.clone(), record.clone()),
                 Err(error) => {
                     let busy = is_sqlite_busy_error(&error);
                     let error =
@@ -377,9 +389,9 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 "INSERT INTO {SESSION_TABLE_NAME} (id, data, expiry_date) VALUES (?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET data = excluded.data, expiry_date = excluded.expiry_date"
             ))
-            .bind(record.id.to_string())
+            .bind(committed_record.id.to_string())
             .bind(encoded.clone())
-            .bind(record.expiry_date)
+            .bind(committed_record.expiry_date)
             .execute(&mut *transaction)
             .await;
 
@@ -387,7 +399,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 Ok(_) => match transaction.commit().await {
                     Ok(()) => {
                         drop(permit);
-                        self.remember_record(record);
+                        self.remember_record(&committed_record);
                         self.log_success(lane, started, attempt);
                         return Ok(());
                     }
@@ -620,13 +632,34 @@ fn session_record_changed_only_by_activity(previous: &Record, next: &Record) -> 
     changed
 }
 
+fn session_record_difference_score(previous: &Record, desired: &Record) -> usize {
+    previous
+        .data
+        .iter()
+        .filter(|(key, value)| desired.data.get(*key) != Some(*value))
+        .count()
+        + desired
+            .data
+            .keys()
+            .filter(|key| !previous.data.contains_key(*key))
+            .count()
+}
+
 fn merge_session_record_changes(
     previous: Option<&Record>,
     current: &Record,
     desired: &Record,
 ) -> Record {
     let Some(previous) = previous else {
-        return desired.clone();
+        let mut merged = current.clone();
+        // Without a local baseline, retain unknown current fields rather than
+        // replacing the whole row with a potentially stale snapshot.
+        for (key, value) in &desired.data {
+            merged.data.insert(key.clone(), value.clone());
+        }
+        merged.id = desired.id;
+        merged.expiry_date = current.expiry_date.max(desired.expiry_date);
+        return merged;
     };
 
     let mut merged = current.clone();
@@ -648,7 +681,7 @@ fn merge_session_record_changes(
         }
     }
     merged.id = desired.id;
-    merged.expiry_date = desired.expiry_date;
+    merged.expiry_date = current.expiry_date.max(desired.expiry_date);
     merged
 }
 
@@ -1124,6 +1157,20 @@ mod tests {
             merged.data.get(SESSION_ACTIVITY_TOUCH_KEY),
             Some(&json!(123_i64))
         );
+        assert_eq!(merged.expiry_date, activity.expiry_date);
+
+        let mut stale_expiry = activity.clone();
+        stale_expiry.expiry_date = previous.expiry_date + time::Duration::minutes(5);
+        let merged_stale_expiry =
+            merge_session_record_changes(Some(&previous), &activity, &stale_expiry);
+        assert_eq!(merged_stale_expiry.expiry_date, activity.expiry_date);
+
+        let without_baseline = merge_session_record_changes(None, &current, &activity);
+        assert_eq!(without_baseline.data.get("critical"), Some(&json!(true)));
+        assert_eq!(
+            without_baseline.data.get(SESSION_ACTIVITY_TOUCH_KEY),
+            Some(&json!(123_i64))
+        );
     }
 
     #[tokio::test]
@@ -1158,6 +1205,7 @@ mod tests {
             reader_pool.clone(),
             coordinator.clone(),
         );
+        let shared_store = first_store.clone();
         first_store.migrate().await.expect("migrate session store");
 
         let mut record = Record {
@@ -1203,6 +1251,38 @@ mod tests {
         assert_eq!(
             saved.data.get(SESSION_ACTIVITY_TOUCH_KEY),
             Some(&json!(123_i64))
+        );
+
+        let mut shared_base = shared_store
+            .load(&record.id)
+            .await
+            .expect("load shared session snapshot")
+            .expect("shared session snapshot exists");
+        let mut shared_stale = shared_base.clone();
+        shared_base
+            .data
+            .insert("critical_two".to_owned(), json!(true));
+        shared_store
+            .save(&shared_base)
+            .await
+            .expect("save shared critical session update");
+        shared_stale
+            .data
+            .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(456_i64));
+        shared_store
+            .save(&shared_stale)
+            .await
+            .expect("save shared stale activity update");
+
+        let shared_saved = shared_store
+            .load(&record.id)
+            .await
+            .expect("reload shared merged session")
+            .expect("shared merged session exists");
+        assert_eq!(shared_saved.data.get("critical_two"), Some(&json!(true)));
+        assert_eq!(
+            shared_saved.data.get(SESSION_ACTIVITY_TOUCH_KEY),
+            Some(&json!(456_i64))
         );
 
         drop(first_store);
