@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; candidate `674a5e69` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; candidate `54e504ba` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -53,12 +53,12 @@
 
 - `cargo fmt --all --check`
 - `cargo build --release --locked`
-- `cargo test --offline --all-targets --all-features`（candidate `674a5e69`: 1006 passed, 0 failed, 2 ignored）
+- `cargo test --offline --all-targets --all-features`（candidate `54e504ba`: 1006 passed, 0 failed, 2 ignored）
 - `cargo check --offline --all-targets --all-features`
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
-- `bash scripts/check-rust-source-quality.sh`（candidate `674a5e69`: source quality scan passed）
-- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（candidate `674a5e69`: baseline, competition, external lock, recovery and sustained phases passed with no unexpected failures; task persistence/idempotence and background recovery checks passed）
-- 真实 `tower_sessions` statement-interruption probe（candidate `674a5e69`: retryable `503` with `Retry-After: 1`, unchanged session during interruption, then `/api/me` `200` after connection recovery）
+- `bash scripts/check-rust-source-quality.sh`（candidate `54e504ba`: source quality scan passed）
+- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（candidate `54e504ba`: baseline, competition, external lock, recovery and sustained phases passed with no unexpected failures; task persistence/idempotence and background recovery checks passed）
+- 真实 `tower_sessions` statement-interruption probe（candidate `54e504ba`: retryable `503` with `Retry-After: 1`, unchanged session during interruption, connection eviction observed, then `/api/me` `200` after recovery）
 
 ## Remaining Gaps
 
