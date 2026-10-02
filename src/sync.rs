@@ -20152,7 +20152,7 @@ mod tests {
             .migrate()
             .await
             .expect("migrate production shape session store");
-        let session = Session::new(None, session_store, None);
+        let session = Session::new(None, session_store.clone(), None);
         session
             .insert("user_id", user_id.clone())
             .await
@@ -20161,10 +20161,7 @@ mod tests {
             .save()
             .await
             .expect("create persisted session before concurrent save");
-        session
-            .insert("load_probe", "ready".to_owned())
-            .await
-            .expect("update persisted session before concurrent save");
+        let persisted_session_id = session.id().expect("persisted session has an id");
 
         let dashboard_state = state.clone();
         let dashboard_task = tokio::spawn(async move {
@@ -20189,14 +20186,28 @@ mod tests {
             started.elapsed()
         });
 
+        let session_store_for_save = session_store.clone();
         let session_save_task = tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            let result = session.save().await;
-            assert!(
-                result.is_ok(),
-                "coordinated session save should not return a busy error: {result:?}"
-            );
-            started.elapsed()
+            crate::session_store::with_session_baseline_scope(async move {
+                let started = std::time::Instant::now();
+                let session =
+                    Session::new(Some(persisted_session_id), session_store_for_save, None);
+                session
+                    .load()
+                    .await
+                    .expect("load persisted session before concurrent save");
+                session
+                    .insert("load_probe", "ready".to_owned())
+                    .await
+                    .expect("update persisted session before concurrent save");
+                let result = session.save().await;
+                assert!(
+                    result.is_ok(),
+                    "coordinated session save should not return a busy error: {result:?}"
+                );
+                started.elapsed()
+            })
+            .await
         });
 
         let enqueue_state = state.clone();

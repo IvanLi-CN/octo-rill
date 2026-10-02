@@ -1,10 +1,10 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    cell::RefCell,
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -39,15 +39,16 @@ const SESSION_TABLE_NAME: &str = "tower_sessions";
 const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
-const SESSION_RECORD_CACHE_MAX: usize = 4096;
-const SESSION_RECORD_HISTORY_MAX: usize = 4;
+
+tokio::task_local! {
+    static SESSION_BASELINE: RefCell<Option<Record>>;
+}
 
 #[derive(Clone)]
 pub struct CoordinatedSqliteSessionStore {
     inner: SqliteStore,
     reader_pool: SqlitePool,
     sqlite_writer: SqliteWriteCoordinator,
-    loaded_records: Arc<Mutex<HashMap<Id, Vec<Record>>>>,
 }
 
 impl CoordinatedSqliteSessionStore {
@@ -60,48 +61,11 @@ impl CoordinatedSqliteSessionStore {
             inner,
             reader_pool,
             sqlite_writer,
-            loaded_records: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn migrate(&self) -> sqlx::Result<()> {
         self.inner.migrate().await
-    }
-
-    fn previous_record(&self, desired: &Record) -> Option<Record> {
-        let records = self.loaded_records.lock().ok()?;
-        let history = records.get(&desired.id)?;
-        history
-            .iter()
-            .min_by_key(|previous| session_record_difference_score(previous, desired))
-            .cloned()
-    }
-
-    fn remember_record(&self, record: &Record) {
-        if let Ok(mut records) = self.loaded_records.lock() {
-            if !records.contains_key(&record.id)
-                && records.len() >= SESSION_RECORD_CACHE_MAX
-                && let Some(evicted_id) = records.keys().next().copied()
-            {
-                records.remove(&evicted_id);
-            }
-            let history = records.entry(record.id).or_default();
-            if let Some(existing_index) = history.iter().position(|existing| {
-                existing.data == record.data && existing.expiry_date == record.expiry_date
-            }) {
-                history.remove(existing_index);
-            }
-            history.push(record.clone());
-            if history.len() > SESSION_RECORD_HISTORY_MAX {
-                history.remove(0);
-            }
-        }
-    }
-
-    fn forget_record(&self, session_id: &Id) {
-        if let Ok(mut records) = self.loaded_records.lock() {
-            records.remove(session_id);
-        }
     }
 
     fn map_write_error(
@@ -172,6 +136,27 @@ impl CoordinatedSqliteSessionStore {
     }
 }
 
+fn task_session_baseline_for(session_id: &Id) -> Option<Record> {
+    SESSION_BASELINE
+        .try_with(|baseline| baseline.borrow().clone())
+        .ok()
+        .flatten()
+        .filter(|record| &record.id == session_id)
+}
+
+fn set_task_session_baseline(record: Option<&Record>) {
+    let _ = SESSION_BASELINE.try_with(|baseline| {
+        *baseline.borrow_mut() = record.cloned();
+    });
+}
+
+pub(crate) async fn with_session_baseline_scope<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    SESSION_BASELINE.scope(RefCell::new(None), future).await
+}
+
 impl fmt::Debug for CoordinatedSqliteSessionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoordinatedSqliteSessionStore")
@@ -218,7 +203,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 Ok(_) => match transaction.commit().await {
                     Ok(()) => {
                         drop(permit);
-                        self.remember_record(record);
+                        set_task_session_baseline(Some(record));
                         self.log_success(lane, started, attempt);
                         return Ok(());
                     }
@@ -291,7 +276,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
         let deadline_at = Instant::now() + deadline;
         let started = Instant::now();
         let mut attempt = 1usize;
-        let previous = self.previous_record(record);
+        let previous = task_session_baseline_for(&record.id);
         let activity_only = previous
             .as_ref()
             .is_some_and(|previous| session_record_changed_only_by_activity(previous, record));
@@ -335,7 +320,24 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                             return Err(session_store::Error::Decode(error.to_string()));
                         }
                     };
-                    let merged = merge_session_record_changes(previous.as_ref(), &current, record);
+                    let Some(previous) = previous.as_ref() else {
+                        let error = anyhow::anyhow!(
+                            "retryable sqlite session conflict: request baseline unavailable"
+                        );
+                        if let Err(rollback_error) = transaction.rollback().await {
+                            warn!(
+                                event = "sqlite.write",
+                                operation = lane,
+                                priority = SqliteWritePriority::Foreground.as_str(),
+                                error_kind = "rollback_error",
+                                error_chain = %rollback_error,
+                                "sqlite session write rollback failed; preserving the original error"
+                            );
+                        }
+                        drop(permit);
+                        return Err(self.map_write_error(lane, false, deadline, error));
+                    };
+                    let merged = merge_session_record_changes(previous, &current, record);
                     match rmp_serde::to_vec(&merged) {
                         Ok(encoded) => (encoded, merged),
                         Err(error) => {
@@ -399,7 +401,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 Ok(_) => match transaction.commit().await {
                     Ok(()) => {
                         drop(permit);
-                        self.remember_record(&committed_record);
+                        set_task_session_baseline(Some(&committed_record));
                         self.log_success(lane, started, attempt);
                         return Ok(());
                     }
@@ -451,10 +453,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
 
     async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
         let record = self.inner.load(session_id).await?;
-        match &record {
-            Some(record) => self.remember_record(record),
-            None => self.forget_record(session_id),
-        }
+        set_task_session_baseline(record.as_ref());
         Ok(record)
     }
 
@@ -487,7 +486,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 Ok(_) => match transaction.commit().await {
                     Ok(()) => {
                         drop(permit);
-                        self.forget_record(session_id);
+                        set_task_session_baseline(None);
                         self.log_success(lane, started, attempt);
                         return Ok(());
                     }
@@ -632,36 +631,7 @@ fn session_record_changed_only_by_activity(previous: &Record, next: &Record) -> 
     changed
 }
 
-fn session_record_difference_score(previous: &Record, desired: &Record) -> usize {
-    previous
-        .data
-        .iter()
-        .filter(|(key, value)| desired.data.get(*key) != Some(*value))
-        .count()
-        + desired
-            .data
-            .keys()
-            .filter(|key| !previous.data.contains_key(*key))
-            .count()
-}
-
-fn merge_session_record_changes(
-    previous: Option<&Record>,
-    current: &Record,
-    desired: &Record,
-) -> Record {
-    let Some(previous) = previous else {
-        let mut merged = current.clone();
-        // Without a local baseline, retain unknown current fields rather than
-        // replacing the whole row with a potentially stale snapshot.
-        for (key, value) in &desired.data {
-            merged.data.insert(key.clone(), value.clone());
-        }
-        merged.id = desired.id;
-        merged.expiry_date = current.expiry_date.max(desired.expiry_date);
-        return merged;
-    };
-
+fn merge_session_record_changes(previous: &Record, current: &Record, desired: &Record) -> Record {
     let mut merged = current.clone();
     for key in previous.data.keys() {
         if previous.data.get(key) != desired.data.get(key) {
@@ -835,7 +805,7 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        Box::pin(async move {
+        Box::pin(with_session_baseline_scope(async move {
             let Some(cookies) = req.extensions().get::<Cookies>().cloned() else {
                 return Ok(ApiError::internal("missing cookies request extension").into_response());
             };
@@ -887,7 +857,7 @@ where
                 }
                 _ => Ok(response),
             }
-        })
+        }))
     }
 }
 
@@ -898,7 +868,11 @@ mod tests {
     use serde_json::json;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::{
-        sync::atomic::{AtomicU8, Ordering},
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU8, Ordering},
+        },
         time::Duration as StdDuration,
     };
     use tower::ServiceExt;
@@ -1151,7 +1125,7 @@ mod tests {
 
         let mut current = previous.clone();
         current.data.insert("critical".to_owned(), json!(true));
-        let merged = merge_session_record_changes(Some(&previous), &current, &activity);
+        let merged = merge_session_record_changes(&previous, &current, &activity);
         assert_eq!(merged.data.get("critical"), Some(&json!(true)));
         assert_eq!(
             merged.data.get(SESSION_ACTIVITY_TOUCH_KEY),
@@ -1161,16 +1135,8 @@ mod tests {
 
         let mut stale_expiry = activity.clone();
         stale_expiry.expiry_date = previous.expiry_date + time::Duration::minutes(5);
-        let merged_stale_expiry =
-            merge_session_record_changes(Some(&previous), &activity, &stale_expiry);
+        let merged_stale_expiry = merge_session_record_changes(&previous, &activity, &stale_expiry);
         assert_eq!(merged_stale_expiry.expiry_date, activity.expiry_date);
-
-        let without_baseline = merge_session_record_changes(None, &current, &activity);
-        assert_eq!(without_baseline.data.get("critical"), Some(&json!(true)));
-        assert_eq!(
-            without_baseline.data.get(SESSION_ACTIVITY_TOUCH_KEY),
-            Some(&json!(123_i64))
-        );
     }
 
     #[tokio::test]
@@ -1218,29 +1184,47 @@ mod tests {
             .await
             .expect("create session record");
 
-        let mut first_update = first_store
-            .load(&record.id)
-            .await
-            .expect("load first session snapshot")
-            .expect("first session snapshot exists");
-        let mut stale_activity_update = second_store
-            .load(&record.id)
-            .await
-            .expect("load stale session snapshot")
-            .expect("stale session snapshot exists");
-        first_update.data.insert("critical".to_owned(), json!(true));
-        first_store
-            .save(&first_update)
-            .await
-            .expect("save critical session update");
+        let baseline_conflict = SESSION_BASELINE
+            .scope(RefCell::new(None), first_store.save(&record))
+            .await;
+        match baseline_conflict {
+            Err(session_store::Error::Backend(message)) => {
+                assert!(message.contains("retryable sqlite session conflict"));
+            }
+            other => panic!("missing request baseline returned {other:?}"),
+        }
 
-        stale_activity_update
-            .data
-            .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(123_i64));
-        second_store
-            .save(&stale_activity_update)
-            .await
-            .expect("save stale activity update");
+        SESSION_BASELINE
+            .scope(RefCell::new(None), async {
+                let mut first_update = first_store
+                    .load(&record.id)
+                    .await
+                    .expect("load first session snapshot")
+                    .expect("first session snapshot exists");
+                first_update.data.insert("critical".to_owned(), json!(true));
+                first_store
+                    .save(&first_update)
+                    .await
+                    .expect("save critical session update");
+            })
+            .await;
+
+        SESSION_BASELINE
+            .scope(RefCell::new(None), async {
+                let mut stale_activity_update = second_store
+                    .load(&record.id)
+                    .await
+                    .expect("load stale session snapshot")
+                    .expect("stale session snapshot exists");
+                stale_activity_update
+                    .data
+                    .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(123_i64));
+                second_store
+                    .save(&stale_activity_update)
+                    .await
+                    .expect("save stale activity update");
+            })
+            .await;
 
         let saved = first_store
             .load(&record.id)
@@ -1253,24 +1237,29 @@ mod tests {
             Some(&json!(123_i64))
         );
 
-        let mut shared_base = shared_store
-            .load(&record.id)
+        let shared_base = SESSION_BASELINE
+            .scope(RefCell::new(None), shared_store.load(&record.id))
             .await
             .expect("load shared session snapshot")
             .expect("shared session snapshot exists");
-        let mut shared_stale = shared_base.clone();
-        shared_base
+        let mut shared_update = shared_base.clone();
+        shared_update
             .data
             .insert("critical_two".to_owned(), json!(true));
-        shared_store
-            .save(&shared_base)
+        SESSION_BASELINE
+            .scope(RefCell::new(Some(shared_base.clone())), async {
+                shared_store.save(&shared_update).await
+            })
             .await
             .expect("save shared critical session update");
+        let mut shared_stale = shared_base.clone();
         shared_stale
             .data
             .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(456_i64));
-        shared_store
-            .save(&shared_stale)
+        SESSION_BASELINE
+            .scope(RefCell::new(Some(shared_base)), async {
+                shared_store.save(&shared_stale).await
+            })
             .await
             .expect("save shared stale activity update");
 
@@ -1284,6 +1273,50 @@ mod tests {
             shared_saved.data.get(SESSION_ACTIVITY_TOUCH_KEY),
             Some(&json!(456_i64))
         );
+
+        let stale_before_follow_up_updates = shared_saved.clone();
+        for index in 0..6 {
+            SESSION_BASELINE
+                .scope(RefCell::new(None), async {
+                    let mut update = shared_store
+                        .load(&record.id)
+                        .await
+                        .expect("load follow-up session snapshot")
+                        .expect("follow-up session snapshot exists");
+                    update
+                        .data
+                        .insert(format!("critical_follow_up_{index}"), json!(true));
+                    shared_store
+                        .save(&update)
+                        .await
+                        .expect("save follow-up session update");
+                })
+                .await;
+        }
+        let mut stale_after_follow_up_updates = stale_before_follow_up_updates.clone();
+        stale_after_follow_up_updates
+            .data
+            .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(789_i64));
+        SESSION_BASELINE
+            .scope(
+                RefCell::new(Some(stale_before_follow_up_updates)),
+                shared_store.save(&stale_after_follow_up_updates),
+            )
+            .await
+            .expect("save stale activity after follow-up updates");
+        let saved_after_follow_up = shared_store
+            .load(&record.id)
+            .await
+            .expect("reload follow-up merged session")
+            .expect("follow-up merged session exists");
+        for index in 0..6 {
+            assert_eq!(
+                saved_after_follow_up
+                    .data
+                    .get(&format!("critical_follow_up_{index}")),
+                Some(&json!(true))
+            );
+        }
 
         drop(first_store);
         drop(second_store);
@@ -1333,11 +1366,12 @@ mod tests {
             .create(&mut record)
             .await
             .expect("create session record");
-        let mut updated = store
-            .load(&record.id)
+        let mut updated = SESSION_BASELINE
+            .scope(RefCell::new(None), store.load(&record.id))
             .await
             .expect("load session record")
             .expect("session record exists");
+        let save_baseline = updated.clone();
         updated.data.insert("critical".to_owned(), json!(true));
 
         let permit = coordinator
@@ -1353,7 +1387,11 @@ mod tests {
         assert_eq!(loaded_while_writer_held.id, record.id);
 
         let save_store = store.clone();
-        let save_task = tokio::spawn(async move { save_store.save(&updated).await });
+        let save_task = tokio::spawn(async move {
+            SESSION_BASELINE
+                .scope(RefCell::new(Some(save_baseline)), save_store.save(&updated))
+                .await
+        });
         tokio::time::timeout(StdDuration::from_millis(200), async {
             loop {
                 if coordinator.runtime_status().waiting_foreground > 0 {
