@@ -79,7 +79,11 @@ impl ApiError {
             || ((error_chain_lower.contains("code: \"9\"")
                 || error_chain_lower.contains("code: 9"))
                 && error_chain_lower.contains("interrupted"));
-        if is_write_deadline {
+        let is_write_busy = error_chain_lower.contains("database is locked")
+            || error_chain_lower.contains("database table is locked")
+            || error_chain_lower.contains("sqlite_busy")
+            || error_chain_lower.contains("sqlite busy");
+        if is_write_deadline || is_write_busy {
             return Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "sqlite_write_retryable",
@@ -164,5 +168,16 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn sqlite_busy_maps_to_retryable_service_unavailable() {
+        let response = ApiError::internal(anyhow::anyhow!(
+            "failed to insert job task: error returned from database: (code: 5) database is locked"
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 }
