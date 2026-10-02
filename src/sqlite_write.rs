@@ -210,7 +210,7 @@ impl SqliteWriteCoordinator {
         self.write_pool.as_ref().unwrap_or(fallback)
     }
 
-    fn deadline_for(&self, priority: SqliteWritePriority) -> Duration {
+    pub(crate) fn deadline_for_priority(&self, priority: SqliteWritePriority) -> Duration {
         match priority {
             SqliteWritePriority::Foreground => self.deadlines.foreground,
             SqliteWritePriority::Background => self.deadlines.background,
@@ -256,7 +256,7 @@ impl SqliteWriteCoordinator {
         Op: FnMut(usize) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let deadline = self.deadline_for(priority);
+        let deadline = self.deadline_for_priority(priority);
         let deadline_at = Instant::now() + deadline;
         self.write_with_deadline(lane, priority, deadline_at, deadline, operation)
             .await
@@ -438,7 +438,7 @@ impl SqliteWriteCoordinator {
         Op: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let deadline = self.deadline_for(SqliteWritePriority::BestEffort);
+        let deadline = self.deadline_for_priority(SqliteWritePriority::BestEffort);
         let deadline_at = Instant::now() + deadline;
         let permit = match self.try_acquire(lane, SqliteWritePriority::BestEffort) {
             Some(permit) => permit,
@@ -559,16 +559,13 @@ impl SqliteWriteCoordinator {
         }
     }
 
-    pub fn try_acquire_best_effort(&self, lane: &'static str) -> Option<SqliteWritePermit> {
-        self.try_acquire(lane, SqliteWritePriority::BestEffort)
-    }
-
+    #[cfg(test)]
     pub async fn acquire_with_priority(
         &self,
         lane: &'static str,
         priority: SqliteWritePriority,
     ) -> Result<SqliteWritePermit> {
-        let deadline = self.deadline_for(priority);
+        let deadline = self.deadline_for_priority(priority);
         let deadline_at = Instant::now() + deadline;
         self.acquire_until(lane, priority, deadline_at, deadline)
             .await
@@ -663,6 +660,16 @@ impl SqliteWriteCoordinator {
         ))
     }
 
+    pub(crate) fn deadline_error_for(
+        &self,
+        lane: &'static str,
+        priority: SqliteWritePriority,
+        phase: &'static str,
+        deadline: Duration,
+    ) -> anyhow::Error {
+        self.deadline_error(lane, priority, phase, deadline)
+    }
+
     fn classify_begin_error(
         &self,
         lane: &'static str,
@@ -697,7 +704,7 @@ impl SqliteWriteCoordinator {
         lane: &'static str,
         priority: SqliteWritePriority,
     ) -> Result<(SqliteWritePermit, SqliteWriteTransaction<'a>)> {
-        let deadline = self.deadline_for(priority);
+        let deadline = self.deadline_for_priority(priority);
         let deadline_at = Instant::now() + deadline;
         self.begin_immediate_with_priority_until(pool, lane, priority, deadline_at)
             .await
@@ -1052,6 +1059,10 @@ impl SqliteWriteCoordinator {
             .base_delay
             .saturating_mul(multiplier)
             .min(self.retry.max_delay)
+    }
+
+    pub(crate) fn retry_delay_for_attempt(&self, attempt: usize) -> Duration {
+        self.retry_delay(attempt)
     }
 
     fn try_acquire(

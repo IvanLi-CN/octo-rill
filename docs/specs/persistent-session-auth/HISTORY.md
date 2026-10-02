@@ -4,12 +4,13 @@
 
 - Lifecycle: active
 - Created: 2026-04-21
-- Last: 2026-04-21
+- Last: 2026-10-02
 
 ## 历史摘要
 
 - 2026-04-21: 建立该主题规格并冻结基础范围。
 - 2026-04-21: 已交付；fast-track / 30d sliding session + stable cookie-name config / PR #110
+- 2026-10-02: PR3.9.2 candidate 将 session load 与 session write 分离到 reader/writer pool；session critical write 共享单调 foreground deadline，activity-only refresh 在 writer pressure 下保持原业务响应并禁止虚假续期 cookie。代码候选 `12c8ea90` 改用请求任务局部、按 session ID 绑定的 baseline，移除跨请求有限 snapshot cache/history，并在无同请求 baseline 或当前行已被删除时返回 retryable session conflict；stale field 按 baseline diff 合并，expiry 单调前进。候选通过 fresh HTTP acceptance、真实语句中断恢复与质量门禁；review、CI 与 merge 仍待完成。
 
 ## 交付记录
 

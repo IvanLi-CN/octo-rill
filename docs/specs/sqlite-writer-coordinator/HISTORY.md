@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-02：PR3.9.2 将 session load 保留在 reader pool，并把 create/save/delete 改为独立 writer pool 上的 direct SQL；session save 共享单调 foreground deadline，activity-only refresh 在 writer pressure 下保留原业务响应并禁止虚假续期 cookie，critical/mixed 写入继续返回可识别的 retryable 503。代码候选 `12c8ea90` 改为请求任务局部、按 session ID 绑定的 baseline，不再依赖跨请求的有限 snapshot cache/history；existing-row save 无同请求 baseline 或当前行已被删除时返回 retryable session conflict，并按 baseline diff 合并并发字段、单调合并 expiry，避免复活已删除 session。该候选通过 fresh HTTP acceptance、真实语句中断恢复与质量门禁；review、CI 与 merge 仍待完成。
 - 2026-10-02：复核连接归还的失败边界后，确认专用 writer 连接的事务深度仍非零时不能再取得第二个清理预算；`after_release` 立即返回错误让 SQLx hard-close/evict，普通读池/内存 fallback 则在同一个 150 ms budget 内完成 queued rollback，只有清理确认成功的连接才允许复用。
 - 2026-10-01：PR3.9.1 复现确认，事务 future 取消时原 progress handler 把 `active=false` 解释为“继续执行”，长 SQL 因此继续占用 SQLite worker，连接归还无法在 cleanup budget 内完成；改为独立 interrupt 标志，归还时显式清理 handler/事务，清理不确定则 hard-evict 连接并允许 pool 重建。
 - 2026-10-01：PR3.9.1 将 content processing recovery/claim、job claim 与 repo release claim 的失败重试统一为 1/2/4/8/16/30 秒有界退避，抖动只增加等待，成功 DB 尝试后复位；保留持久化 task/work/lease 状态，不在数据库不可用时立即自旋。

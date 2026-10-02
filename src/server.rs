@@ -31,14 +31,14 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use tower_sessions::Expiry;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::session_store::ExpiredDeletion;
-use tower_sessions::{Expiry, SessionManagerLayer};
 use tracing::{info, warn};
 use url::Url;
 
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
-use crate::session_store::CoordinatedSqliteSessionStore;
+use crate::session_store::{CoordinatedSessionLayer, CoordinatedSqliteSessionStore};
 use crate::state::AppState;
 use crate::{
     admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_identity_upgrade,
@@ -134,6 +134,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     ));
     let session_store = CoordinatedSqliteSessionStore::new(
         tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
+        pool.clone(),
         sqlite_writer.clone(),
     );
     session_store
@@ -204,7 +205,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
-    let session_layer = SessionManagerLayer::new(session_store)
+    let session_layer = CoordinatedSessionLayer::new(session_store)
         .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
         .with_same_site(SameSite::Lax)
