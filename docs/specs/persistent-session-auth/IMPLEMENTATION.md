@@ -3,10 +3,10 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: 已交付
+- Implementation: PR3.9.2 session writer isolation and pressure semantics implemented; code candidate `12c8ea90` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
 - Created: 2026-04-21
-- Last: 2026-04-21
-- Summary: 已交付；fast-track / 30d sliding session + stable cookie-name config / PR #110
+- Last: 2026-10-02
+- Summary: 30d sliding session + stable cookie-name config retained; coordinated reader/writer session persistence and pressure-aware middleware added in the PR3.9.2 candidate
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -15,4 +15,11 @@
 - [x] M1: 创建并冻结持久 session 规格与文档入口。
 - [x] M2: 后端 session layer 支持 30 天不活跃滑动过期与固定 cookie 名。
 - [x] M3: 前端 startup cache 语义与公开配置文档同步收口。
-- [x] M4: 验证、review-loop、PR 合并与 cleanup 完成。
+- [ ] M4: 验证、review-loop、PR 合并与 cleanup 完成。
+
+## Current implementation coverage
+
+- Session loads use the reader pool; create/save/delete use direct SQL on the coordinator's dedicated writer pool and preserve the existing `tower_sessions` MessagePack/table contract.
+- Foreground session writes share the coordinator's monotonic deadline, bounded busy retry, and commit-result contract. Expired-session cleanup remains best-effort.
+- Activity-only refresh failures preserve the original successful HTTP response and omit a refreshed cookie; critical or mixed session changes retain retryable `503` behavior with `Retry-After: 1`.
+- Unit coverage includes cookie persistence, activity-only classification, critical failure mapping, stale concurrent session-field merging, request-scoped baseline enforcement, no-baseline and deleted-row retryable conflict mapping, monotonic expiry merging, and a file-backed WAL reader/writer contention path. Code candidate `12c8ea90` passed the fresh acceptance matrix with no unexpected failures: 21,600 HTTP records were valid, baseline/competition/recovery/sustained traffic succeeded, 60 external-lock task writes returned the documented retryable `503`, and the real statement-interruption probe returned `503` before a successful `/api/me` recovery.
