@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; pre-repair candidate acceptance passed, while the stale-session merge repair batch still awaits final acceptance, review, CI and merge
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; candidate `674a5e69` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -51,11 +51,14 @@
 
 ## Validation
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（当前候选必须重新运行；结果绑定到本次验收 evidence card，不复用基线数字）
-- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（当前候选必须重新运行；结果绑定到当前 candidate SHA）
-- `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
+- `cargo fmt --all --check`
+- `cargo build --release --locked`
+- `cargo test --offline --all-targets --all-features`（candidate `674a5e69`: 1006 passed, 0 failed, 2 ignored）
+- `cargo check --offline --all-targets --all-features`
+- `cargo clippy --offline --all-targets --all-features -- -D warnings`
+- `bash scripts/check-rust-source-quality.sh`（candidate `674a5e69`: source quality scan passed）
+- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（candidate `674a5e69`: baseline, competition, external lock, recovery and sustained phases passed with no unexpected failures; task persistence/idempotence and background recovery checks passed）
+- 真实 `tower_sessions` statement-interruption probe（candidate `674a5e69`: retryable `503` with `Retry-After: 1`, unchanged session during interruption, then `/api/me` `200` after connection recovery）
 
 ## Remaining Gaps
 
