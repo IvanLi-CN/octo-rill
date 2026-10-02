@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; current candidate still awaits fresh acceptance, review, CI and merge
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; pre-repair candidate acceptance passed, while the stale-session merge repair batch still awaits final acceptance, review, CI and merge
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 

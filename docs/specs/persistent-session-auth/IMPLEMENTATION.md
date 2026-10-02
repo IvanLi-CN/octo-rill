@@ -3,7 +3,7 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: PR3.9.2 session writer isolation and pressure semantics implemented; fresh review, CI and merge pending
+- Implementation: PR3.9.2 session writer isolation and pressure semantics implemented; pre-repair candidate acceptance passed, while the stale-session merge repair batch still needs final acceptance, review, CI and merge
 - Created: 2026-04-21
 - Last: 2026-10-02
 - Summary: 30d sliding session + stable cookie-name config retained; coordinated reader/writer session persistence and pressure-aware middleware added in the PR3.9.2 candidate
@@ -22,4 +22,4 @@
 - Session loads use the reader pool; create/save/delete use direct SQL on the coordinator's dedicated writer pool and preserve the existing `tower_sessions` MessagePack/table contract.
 - Foreground session writes share the coordinator's monotonic deadline, bounded busy retry, and commit-result contract. Expired-session cleanup remains best-effort.
 - Activity-only refresh failures preserve the original successful HTTP response and omit a refreshed cookie; critical or mixed session changes retain retryable `503` behavior with `Retry-After: 1`.
-- Unit coverage includes cookie persistence, activity-only classification, critical failure mapping, and a file-backed WAL reader/writer contention path. The fresh HTTP acceptance run remains required for this candidate.
+- Unit coverage includes cookie persistence, activity-only classification, critical failure mapping, stale concurrent session-field merging, and a file-backed WAL reader/writer contention path. The pre-repair candidate passed fresh HTTP acceptance; this repair batch requires a final candidate rerun.

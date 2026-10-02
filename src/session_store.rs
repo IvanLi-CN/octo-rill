@@ -279,10 +279,11 @@ impl SessionStore for CoordinatedSqliteSessionStore {
         let deadline_at = Instant::now() + deadline;
         let started = Instant::now();
         let mut attempt = 1usize;
-        let activity_only = self
-            .previous_record(&record.id)
-            .is_some_and(|previous| session_record_changed_only_by_activity(&previous, record));
-        let encoded = rmp_serde::to_vec(record)
+        let previous = self.previous_record(&record.id);
+        let activity_only = previous
+            .as_ref()
+            .is_some_and(|previous| session_record_changed_only_by_activity(previous, record));
+        let desired_encoded = rmp_serde::to_vec(record)
             .map_err(|error| session_store::Error::Encode(error.to_string()))?;
 
         loop {
@@ -296,6 +297,81 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                 )
                 .await
                 .map_err(|error| self.map_write_error(lane, activity_only, deadline, error))?;
+
+            let current_result = sqlx::query_as::<_, (Vec<u8>,)>(&format!(
+                "SELECT data FROM {SESSION_TABLE_NAME} WHERE id = ?"
+            ))
+            .bind(record.id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await;
+            let encoded = match current_result {
+                Ok(Some((data,))) => {
+                    let current = match rmp_serde::from_slice::<Record>(&data) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            if let Err(rollback_error) = transaction.rollback().await {
+                                warn!(
+                                    event = "sqlite.write",
+                                    operation = lane,
+                                    priority = SqliteWritePriority::Foreground.as_str(),
+                                    error_kind = "rollback_error",
+                                    error_chain = %rollback_error,
+                                    "sqlite session write rollback failed; preserving the original error"
+                                );
+                            }
+                            drop(permit);
+                            return Err(session_store::Error::Decode(error.to_string()));
+                        }
+                    };
+                    let merged = merge_session_record_changes(previous.as_ref(), &current, record);
+                    match rmp_serde::to_vec(&merged) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            if let Err(rollback_error) = transaction.rollback().await {
+                                warn!(
+                                    event = "sqlite.write",
+                                    operation = lane,
+                                    priority = SqliteWritePriority::Foreground.as_str(),
+                                    error_kind = "rollback_error",
+                                    error_chain = %rollback_error,
+                                    "sqlite session write rollback failed; preserving the original error"
+                                );
+                            }
+                            drop(permit);
+                            return Err(session_store::Error::Encode(error.to_string()));
+                        }
+                    }
+                }
+                Ok(None) => desired_encoded.clone(),
+                Err(error) => {
+                    let busy = is_sqlite_busy_error(&error);
+                    let error =
+                        anyhow::Error::new(error).context("load sqlite session before upsert");
+                    if let Err(rollback_error) = transaction.rollback().await {
+                        warn!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            error_kind = "rollback_error",
+                            error_chain = %rollback_error,
+                            "sqlite session write rollback failed; preserving the original error"
+                        );
+                    }
+                    if busy {
+                        drop(permit);
+                        if self
+                            .retry_after_busy(lane, attempt, deadline_at, &error)
+                            .await
+                        {
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(self.map_write_error(lane, activity_only, deadline, error));
+                    }
+                    drop(permit);
+                    return Err(self.map_write_error(lane, activity_only, deadline, error));
+                }
+            };
 
             let result = sqlx::query(&format!(
                 "INSERT INTO {SESSION_TABLE_NAME} (id, data, expiry_date) VALUES (?, ?, ?) \
@@ -542,6 +618,38 @@ fn session_record_changed_only_by_activity(previous: &Record, next: &Record) -> 
         }
     }
     changed
+}
+
+fn merge_session_record_changes(
+    previous: Option<&Record>,
+    current: &Record,
+    desired: &Record,
+) -> Record {
+    let Some(previous) = previous else {
+        return desired.clone();
+    };
+
+    let mut merged = current.clone();
+    for key in previous.data.keys() {
+        if previous.data.get(key) != desired.data.get(key) {
+            match desired.data.get(key) {
+                Some(value) => {
+                    merged.data.insert(key.clone(), value.clone());
+                }
+                None => {
+                    merged.data.remove(key);
+                }
+            }
+        }
+    }
+    for (key, value) in &desired.data {
+        if !previous.data.contains_key(key) {
+            merged.data.insert(key.clone(), value.clone());
+        }
+    }
+    merged.id = desired.id;
+    merged.expiry_date = desired.expiry_date;
+    merged
 }
 
 fn is_retryable_session_text(message: &str) -> bool {
@@ -1007,6 +1115,104 @@ mod tests {
         assert!(!session_record_changed_only_by_activity(
             &previous, &critical
         ));
+
+        let mut current = previous.clone();
+        current.data.insert("critical".to_owned(), json!(true));
+        let merged = merge_session_record_changes(Some(&previous), &current, &activity);
+        assert_eq!(merged.data.get("critical"), Some(&json!(true)));
+        assert_eq!(
+            merged.data.get(SESSION_ACTIVITY_TOUCH_KEY),
+            Some(&json!(123_i64))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_activity_save_preserves_concurrent_session_fields() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-session-merge-{}.db",
+            crate::local_id::generate_local_id()
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(StdDuration::from_millis(100));
+        let reader_pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options.clone())
+            .await
+            .expect("create reader pool");
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("create writer pool");
+        let coordinator = SqliteWriteCoordinator::with_write_pool(writer_pool.clone());
+        let first_store = CoordinatedSqliteSessionStore::new(
+            SqliteStore::new(reader_pool.clone()),
+            reader_pool.clone(),
+            coordinator.clone(),
+        );
+        let second_store = CoordinatedSqliteSessionStore::new(
+            SqliteStore::new(reader_pool.clone()),
+            reader_pool.clone(),
+            coordinator.clone(),
+        );
+        first_store.migrate().await.expect("migrate session store");
+
+        let mut record = Record {
+            id: Id::default(),
+            data: HashMap::from([(String::from("user_id"), json!("user"))]),
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+        first_store
+            .create(&mut record)
+            .await
+            .expect("create session record");
+
+        let mut first_update = first_store
+            .load(&record.id)
+            .await
+            .expect("load first session snapshot")
+            .expect("first session snapshot exists");
+        let mut stale_activity_update = second_store
+            .load(&record.id)
+            .await
+            .expect("load stale session snapshot")
+            .expect("stale session snapshot exists");
+        first_update.data.insert("critical".to_owned(), json!(true));
+        first_store
+            .save(&first_update)
+            .await
+            .expect("save critical session update");
+
+        stale_activity_update
+            .data
+            .insert(SESSION_ACTIVITY_TOUCH_KEY.to_owned(), json!(123_i64));
+        second_store
+            .save(&stale_activity_update)
+            .await
+            .expect("save stale activity update");
+
+        let saved = first_store
+            .load(&record.id)
+            .await
+            .expect("reload merged session")
+            .expect("merged session exists");
+        assert_eq!(saved.data.get("critical"), Some(&json!(true)));
+        assert_eq!(
+            saved.data.get(SESSION_ACTIVITY_TOUCH_KEY),
+            Some(&json!(123_i64))
+        );
+
+        drop(first_store);
+        drop(second_store);
+        drop(coordinator);
+        reader_pool.close().await;
+        writer_pool.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
     }
 
     #[tokio::test]
