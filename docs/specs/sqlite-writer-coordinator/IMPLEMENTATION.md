@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；当前候选仍待 fresh review、CI 与 PR merge
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; current candidate still awaits fresh acceptance, review, CI and merge
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -20,7 +20,7 @@
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
 - `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel 使用 foreground lane。
-- session create/save/delete 使用 foreground lane 与短 busy retry；过期 session 清理使用 best-effort lane。
+- session load 使用 reader pool；create/save/delete 使用独立 writer pool 上的 direct SQL、foreground lane 与统一单调 deadline/短 busy retry；过期 session 清理使用 best-effort lane。Session middleware 对 activity-only refresh pressure 保留原业务响应并省略新 cookie，对 critical/mixed save failure 返回可识别的 retryable 503。
 - repo release attach/claim/finalize/watchers/heartbeat/fail/upsert/sync-state 已接入 writer coordinator。
 - social activity snapshot 与 feed activity event 持久化已接入 writer coordinator；social snapshot 先在 permit 外读取 current-member、history、stale association 与 stale repo/member 候选，再按固定 64 行 chunk 分阶段执行 `BEGIN IMMEDIATE`，chunk 之间释放 permit。current-member/history materialization、baseline、stale cleanup 与 association source 清理保持幂等和可中断恢复，并记录候选读取、writer wait、query elapsed、chunk elapsed 与 chunk count。
 - translation request/batch claim/finalize/recovery/heartbeat 已接入 writer coordinator。
@@ -46,12 +46,15 @@
 - reaction PAT state、dashboard daily rollup、scheduled slot patch 与 public release usage metadata refresh 均进入明确的 foreground/background writer lane，补齐 API 与高频 sync metadata 的遗漏写路径。
 - `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool write、pool accessor、未协调的 pool transaction、`SqliteConnection` 别名与 raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围保持显式边界；已由 coordinator 提供的通用 `Executor` helper 与 Transaction helper 保持可复用，subscription prune facade 只有在 marker、直接 callback 转发与 coordinator 调用同时通过 AST 验证时才作为结构化安全边界处理。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
+- `src/session_store.rs` 增加协调式 session layer：读路径调用 reader-backed store，写路径在 writer transaction 内直接执行 `tower_sessions` schema 的 MessagePack SQL；bounded record snapshots 用于区分 activity-only 与 mixed critical changes，避免 writer pressure 下误发刷新 cookie。
+- `src/session_store.rs` 回归覆盖 activity-only refresh 保留原响应、critical retryable failure 的 `503`/`Retry-After`、expiry-only refresh 分类，以及真实文件型 WAL reader/writer contention。
 
 ## Validation
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（当前候选必须重新运行；结果绑定到本次验收 evidence card，不复用基线数字）
+- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（当前候选必须重新运行；结果绑定到当前 candidate SHA）
 - `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
 
 ## Remaining Gaps

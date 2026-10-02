@@ -2477,6 +2477,7 @@ mod tests {
 
         let session_store = crate::session_store::CoordinatedSqliteSessionStore::new(
             tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
+            pool.clone(),
             state.sqlite_writer.clone(),
         );
         session_store

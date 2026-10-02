@@ -113,6 +113,13 @@
 - content processing recovery/claim、普通 job claim 与 repo release claim worker 在数据库尝试失败时必须使用有界内存退避，基础等待依次为 1/2/4/8/16/30 秒并封顶 30 秒；抖动只能增加当次等待。每个 worker 同时最多执行一笔同类 claim，成功完成对应 recovery/claim DB 尝试后复位退避；等待期间不得由 tick、notify 或其他循环信号提前绕过。
 - 结构化 `sqlite.write` telemetry 必须包含 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms`，并可区分 `writer_queue_timeout`、`write_pool_timeout` 与 `sqlite_busy`。
 
+### REQ-SQLITE-WRITER-013
+
+- session `load` 必须继续使用 reader pool；session `create`、`save`、`delete` 与过期清理必须通过共享 writer coordinator，生产文件型 SQLite 必须使用独立单连接 writer pool。
+- session store 在取得 writer permit 后必须直接在 writer transaction 上执行 session SQL，不得在持有 writer permit 时调用底层 store 的写入 API，避免重新占用 reader pool 或绕过统一 deadline。
+- session `create`、`save`、`delete` 的 foreground deadline 从首次排队开始贯穿 writer acquisition、`BEGIN IMMEDIATE`、SQL、busy retry 与 COMMIT；activity-only save 可以在 writer pressure 下安全跳过，但包含其他字段变更的 save 不得跳过。
+- session middleware 必须把关键写入的 retryable deadline/busy/locked 失败映射为 `503`、`Retry-After: 1` 与 `sqlite_write_retryable`；activity-only refresh 失败必须保留原业务响应并省略 refreshed cookie；constraint、decode 与其他 backend 错误必须保留真实错误类别。
+
 ### SHOULD
 
 - 事务仍应尽量短小；小批量写可以在单次 permit 内完成，生产量级全量重建必须拆成多个短 permit。
@@ -249,6 +256,12 @@
 - Method: coordinator contention tests with independent reader and writer pools, held writer permits, an exhausted reader pool, external `BEGIN IMMEDIATE`, delayed transaction callbacks, a rollback-journal reader that releases after COMMIT dispatch, captured tracing events, and repeated deadline expiry followed by a successful write.
 - covers: REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012
 - Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; callbacks are not started after queue expiry and started callbacks retain the permit until returning; COMMIT dispatched before expiry may succeed after the deadline and reports its actual result; transactions expired before COMMIT roll back and return a reusable connection or hard-evict an unconfirmed connection; telemetry separates writer queue, pool acquisition, SQLite busy time, connection recovery, and late completion. Fake-clock worker tests prove the required bounded backoff floors without early retry.
+
+### VER-SQLITE-WRITER-005
+
+- Method: file-backed SQLite WAL HTTP acceptance using `tmp/sqlite_acceptance.py`, with seeded persistent sessions, normal baseline traffic, an external `BEGIN IMMEDIATE` lock, recovery traffic, and post-run integrity checks.
+- covers: REQ-SQLITE-WRITER-003, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013
+- Pass condition: reader-backed dashboard reads remain valid while the dedicated writer is pressured; session save, task enqueue and cancellation expose only contract-approved retryable responses; activity-only refresh never produces a false refreshed cookie; recovery returns to successful traffic without integrity errors, and the evidence is tied to the current candidate SHA.
 
 ## 验收清单（Acceptance checklist）
 

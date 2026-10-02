@@ -20145,6 +20145,7 @@ mod tests {
         };
         let session_store = Arc::new(CoordinatedSqliteSessionStore::new(
             SqliteStore::new(pool.clone()),
+            pool.clone(),
             state.sqlite_writer.clone(),
         ));
         session_store
