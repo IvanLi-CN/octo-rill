@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; code candidate `6c672f77` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; code candidate `12c8ea90` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -46,19 +46,19 @@
 - reaction PAT state、dashboard daily rollup、scheduled slot patch 与 public release usage metadata refresh 均进入明确的 foreground/background writer lane，补齐 API 与高频 sync metadata 的遗漏写路径。
 - `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool write、pool accessor、未协调的 pool transaction、`SqliteConnection` 别名与 raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围保持显式边界；已由 coordinator 提供的通用 `Executor` helper 与 Transaction helper 保持可复用，subscription prune facade 只有在 marker、直接 callback 转发与 coordinator 调用同时通过 AST 验证时才作为结构化安全边界处理。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
-- `src/session_store.rs` 增加协调式 session layer：读路径调用 reader-backed store，写路径在 writer transaction 内直接执行 `tower_sessions` schema 的 MessagePack SQL；每个请求在 task-local scope 内保存与 session ID 绑定的 request baseline，用 baseline diff 区分 activity-only 与 mixed critical changes，避免 writer pressure 下误发刷新 cookie。取消了跨请求共享的有限 session snapshot cache/history；existing-row save 若没有同请求 baseline 会返回 retryable session conflict，避免 stale caller 覆盖未知字段。并发字段按 baseline diff 合并，expiry 只单调前进。
+- `src/session_store.rs` 增加协调式 session layer：读路径调用 reader-backed store，写路径在 writer transaction 内直接执行 `tower_sessions` schema 的 MessagePack SQL；每个请求在 task-local scope 内保存与 session ID 绑定的 request baseline，用 baseline diff 区分 activity-only 与 mixed critical changes，避免 writer pressure 下误发刷新 cookie。取消了跨请求共享的有限 session snapshot cache/history；existing-row save 若没有同请求 baseline，或 request baseline 存在但当前行已消失，会返回 retryable session conflict，避免 stale caller 覆盖未知字段或复活已删除 session。并发字段按 baseline diff 合并，expiry 只单调前进。
 - `src/session_store.rs` 回归覆盖 activity-only refresh 保留原响应、critical retryable failure 的 `503`/`Retry-After`、expiry-only refresh 分类，以及真实文件型 WAL reader/writer contention。
 
 ## Validation
 
 - `cargo fmt --all --check`
 - `cargo build --release --locked`
-- `cargo test --offline --all-targets --all-features`（code candidate `6c672f77`: 1007 passed, 0 failed, 2 ignored）
+- `cargo test --offline --all-targets --all-features`（code candidate `12c8ea90`: 1007 passed, 0 failed, 2 ignored）
 - `cargo check --offline --all-targets --all-features`
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
-- `bash scripts/check-rust-source-quality.sh`（code candidate `6c672f77`: source quality scan passed）
-- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `6c672f77`: 21,328 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
-- 真实 `tower_sessions` statement-interruption probe（code candidate `6c672f77`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
+- `bash scripts/check-rust-source-quality.sh`（code candidate `12c8ea90`: source quality scan passed）
+- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
+- 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 
 ## Remaining Gaps
 

@@ -111,11 +111,15 @@
   When session middleware 完成保存
   Then 返回 `503`、`Retry-After: 1` 与 `sqlite_write_retryable`，且不得把 retryable failure 伪装成普通 `500`。
 
+- Given 请求已经加载了一个已有 session，而过期清理或并发操作在保存前删除了该行
+  When 该请求继续保存原 session ID
+  Then 返回 retryable session conflict，不能用 stale record 重新创建已删除的 session；真正的新 session 或 `cycle_id` 仍通过 `create` 使用新 ID。
+
 ## Verification
 
 ### VER-PERSISTENT-SESSION-001
 
-- Method: Rust session-layer tests and HTTP middleware assertions for cookie attributes, expiry refresh, activity-only classification, and critical failure mapping.
+- Method: Rust session-layer tests and HTTP middleware assertions for cookie attributes, expiry refresh, activity-only classification, critical failure mapping, and stale save after concurrent deletion.
 - covers: REQ-PERSISTENT-SESSION-001, REQ-PERSISTENT-SESSION-002, REQ-PERSISTENT-SESSION-004, REQ-PERSISTENT-SESSION-005
 - Pass condition: cookie and sliding-expiry contracts remain intact; activity-only pressure preserves the original response without a refreshed cookie; mixed/critical pressure returns the documented retryable response.
 
