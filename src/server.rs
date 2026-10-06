@@ -42,8 +42,8 @@ use crate::session_store::{CoordinatedSessionLayer, CoordinatedSqliteSessionStor
 use crate::state::AppState;
 use crate::{
     admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_identity_upgrade,
-    content_processing, jobs, observability, runtime, search_index, state, sync, translations,
-    version, webhook_push,
+    content_processing, jobs, observability, online_migrations, runtime, search_index, state, sync,
+    translations, version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -387,6 +387,19 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/jobs/translations/runtime-config",
             patch(translations::admin_patch_translation_runtime_config),
         )
+        .route("/admin/jobs/migrations", get(online_migrations::admin_list))
+        .route(
+            "/admin/jobs/migrations/{migration_id}",
+            get(online_migrations::admin_detail),
+        )
+        .route(
+            "/admin/jobs/migrations/{migration_id}/pause",
+            post(online_migrations::admin_pause),
+        )
+        .route(
+            "/admin/jobs/migrations/{migration_id}/resume",
+            post(online_migrations::admin_resume),
+        )
         .route(
             "/admin/jobs/content-processing/cutover",
             post(content_processing::admin_cutover),
@@ -613,6 +626,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         let public_metrics_refresh_abort_handle =
             crate::public_metrics::spawn_refresh_worker(public_metrics_service.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
+        let online_migration_abort_handle = online_migrations::spawn_operator(app_state.clone());
         translations::spawn_translation_scheduler(app_state.clone()).await;
         let global_content_processing_abort_handle =
             content_processing::spawn_global_scheduler(app_state.clone());
@@ -635,6 +649,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             global_content_processing_abort_handle,
             content_identity_upgrade_abort_handle,
             search_index_abort_handle,
+            online_migration_abort_handle,
         ];
         if let Some(handle) = model_catalog_abort_handle {
             abort_handles.push(handle);

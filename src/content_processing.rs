@@ -152,6 +152,25 @@ pub async fn ensure_legacy_writer(pool: &SqlitePool) -> Result<(), ApiError> {
     })))
 }
 
+pub(crate) async fn legacy_writer_route(
+    state: &AppState,
+) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, ApiError> {
+    let guard = state.sqlite_writer.acquire_content_mode_read().await;
+    match current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        ContentProcessingMode::Legacy => Ok(Some(guard)),
+        ContentProcessingMode::RollbackFreeze | ContentProcessingMode::Global => Ok(None),
+    }
+}
+
+pub(crate) async fn acquire_content_mode_transition_guard(
+    state: &AppState,
+) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    state.sqlite_writer.acquire_content_mode_write().await
+}
+
 pub async fn ensure_legacy_writer_runtime(pool: &SqlitePool) -> Result<bool> {
     Ok(current_mode(pool).await? == ContentProcessingMode::Legacy)
 }
@@ -219,6 +238,16 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
 async fn ensure_global_mode_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), ApiError> {
+    let repaired = sqlx::query(
+        "UPDATE content_processing_control SET mode = 'global', switch_token = 'online-admission-repair', updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode IN ('legacy', 'rollback_freeze')",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
+    if repaired == 1 {
+        return Ok(());
+    }
     let mode =
         sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
             .fetch_optional(&mut **tx)
@@ -227,11 +256,9 @@ async fn ensure_global_mode_in_transaction(
     if mode.as_deref() == Some(ContentProcessingMode::Global.as_str()) {
         return Ok(());
     }
-    Err(ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "content_processing_transition",
-        "content processing is not in global mode; poll the request status before retrying",
-    ))
+    Err(ApiError::internal(anyhow!(
+        "content processing mode cannot be admitted as global: {mode:?}"
+    )))
 }
 
 #[allow(dead_code)]
@@ -248,6 +275,7 @@ pub async fn transition_to_global(pool: &SqlitePool, switch_token: &str) -> Resu
 }
 
 pub async fn transition_to_global_state(state: &AppState, switch_token: &str) -> Result<bool> {
+    let _content_mode_guard = acquire_content_mode_transition_guard(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_cutover")
@@ -265,6 +293,7 @@ pub async fn transition_to_rollback_freeze_state(
     state: &AppState,
     switch_token: &str,
 ) -> Result<bool> {
+    let _content_mode_guard = acquire_content_mode_transition_guard(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_freeze")
@@ -364,6 +393,7 @@ async fn transition_to_global_in_transaction(
 }
 
 async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    crate::online_migrations::ensure_legacy_observation_identity_schema(tx).await?;
     let has_ai_translations = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ai_translations'",
     )
@@ -372,7 +402,7 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
         > 0;
     if has_ai_translations {
         sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (NULLIF(trim(title), '') IS NOT NULL OR NULLIF(trim(summary), '') IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id || '-' || source_hash, 'ai_translations', id, source_hash, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (NULLIF(trim(title), '') IS NOT NULL OR NULLIF(trim(summary), '') IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
         )
         .execute(&mut **tx)
         .await?;
@@ -386,9 +416,9 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
         > 0;
     if has_translation_work_items {
         let query = if has_ai_translations {
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (NULLIF(trim(c.title), '') IS NOT NULL OR NULLIF(trim(c.summary), '') IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id || '-' || w.source_hash, 'translation_work_items', w.id, w.source_hash, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (NULLIF(trim(c.title), '') IS NOT NULL OR NULLIF(trim(c.summary), '') IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
         } else {
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, 'legacy_conflict', '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id || '-' || w.source_hash, 'translation_work_items', w.id, w.source_hash, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, 'legacy_conflict', '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
         };
         sqlx::query(query).execute(&mut **tx).await?;
     }
@@ -998,59 +1028,6 @@ pub async fn submit_item(
     // This is the scheduler admission transaction. API adapters only provide
     // an already-authorized immutable request; provider calls, attempts and
     // terminal projections remain scheduler-worker responsibilities.
-    let processing_mode = current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    match processing_mode {
-        ContentProcessingMode::Global => {}
-        ContentProcessingMode::RollbackFreeze => {
-            let (resource_type, pipeline) = canonical_identity(item);
-            let hash = source_hash(item).map_err(ApiError::internal)?;
-            let details = sqlx::query(
-                "SELECT w.id AS work_item_id, w.status, l.request_id FROM content_work_items w LEFT JOIN content_request_links l ON l.work_item_id = w.id AND l.requester_id = ? WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(w.updated_at) DESC, w.id DESC, datetime(l.created_at) DESC LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(resource_type)
-            .bind(&item.entity_id)
-            .bind(pipeline)
-            .bind(&item.variant)
-            .bind(&item.target_lang)
-            .bind(&hash)
-            .bind(GLOBAL_PROTOCOL_VERSION)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-            .map(|row| {
-                let request_id = row.get::<Option<String>, _>("request_id");
-                json!({
-                    "mode": ContentProcessingMode::RollbackFreeze.as_str(),
-                    "work_item_id": row.get::<String, _>("work_item_id"),
-                    "status": row.get::<String, _>("status"),
-                    "request_id": request_id,
-                    "poll_url": request_id.map(|id| format!("/api/translate/requests/{id}")),
-                })
-            })
-            .unwrap_or_else(|| json!({
-                "mode": ContentProcessingMode::RollbackFreeze.as_str(),
-                "request_id": Value::Null,
-                "work_item_id": Value::Null,
-                "poll_url": Value::Null,
-            }));
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "content_processing_transition",
-                "content processing is temporarily frozen; poll the request status before retrying",
-            )
-            .with_details(details));
-        }
-        ContentProcessingMode::Legacy => {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "content_processing_legacy",
-                "global content processing is not active",
-            ));
-        }
-    }
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
     let snapshot = serde_json::to_string(&json!({
@@ -1062,6 +1039,7 @@ pub async fn submit_item(
     let now = Utc::now().to_rfc3339();
     let request_id = local_id::generate_local_id().to_string();
     let work_id = local_id::generate_local_id().to_string();
+    let _content_mode_guard = state.sqlite_writer.acquire_content_mode_write().await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -5221,6 +5199,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_route_guard_serializes_mode_transition() {
+        let pool = pool("legacy").await;
+        let state = global_state(pool.clone());
+        let route = legacy_writer_route(state.as_ref())
+            .await
+            .unwrap()
+            .expect("legacy mode should expose the legacy route");
+
+        let transition_state = state.clone();
+        let transition = tokio::spawn(async move {
+            transition_to_rollback_freeze_state(transition_state.as_ref(), "freeze-guard")
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!transition.is_finished());
+
+        drop(route);
+        assert!(transition.await.unwrap());
+        assert_eq!(
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::RollbackFreeze
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_mode_can_enter_the_controlled_freeze_window() {
         let pool = pool("legacy").await;
         let mut tx = pool.begin().await.unwrap();
@@ -5687,6 +5691,70 @@ mod tests {
         assert_eq!(status, "ready");
         assert_eq!(payload["title_zh"], "保留标题");
         assert_eq!(payload["body_md"], "保留摘要");
+    }
+
+    #[tokio::test]
+    async fn submission_repairs_historical_modes_without_changing_admission_status() {
+        for mode in ["legacy", "rollback_freeze"] {
+            let pool = global_pool().await;
+            sqlx::query("UPDATE content_processing_control SET mode = ? WHERE id = 1")
+                .bind(mode)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let state = global_state(pool.clone());
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: "feed.auto_translate:release:repair-1".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "summary".to_owned(),
+                entity_id: "repair-1".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: vec![translations::TranslationSourceBlock {
+                    slot: "title".to_owned(),
+                    text: "A repairable release title".to_owned(),
+                }],
+                target_slots: vec!["title_zh".to_owned()],
+            };
+
+            let (status, response) = submit_item(&state, "user-1", "async", &item).await.unwrap();
+            assert_eq!(status, StatusCode::ACCEPTED, "mode={mode}");
+            assert_eq!(response.status, "queued", "mode={mode}");
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT mode FROM content_processing_control WHERE id = 1",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                "global",
+                "mode={mode}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT switch_token FROM content_processing_control WHERE id = 1",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                "online-admission-repair",
+                "mode={mode}"
+            );
+
+            let mut duplicate = item.clone();
+            duplicate.producer_ref = "feed.manual:release:repair-1".to_owned();
+            let (duplicate_status, duplicate_response) =
+                submit_item(&state, "user-1", "async", &duplicate)
+                    .await
+                    .unwrap();
+            assert_eq!(duplicate_status, StatusCode::CONFLICT, "mode={mode}");
+            assert_eq!(duplicate_response.work_item_id, response.work_item_id);
+            assert_eq!(
+                duplicate_response.error.as_ref().unwrap()["code"],
+                "content_processing_active",
+                "mode={mode}"
+            );
+        }
     }
 
     #[tokio::test]

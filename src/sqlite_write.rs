@@ -15,7 +15,10 @@ use sqlx::{
     Sqlite, SqliteConnection, SqlitePool, Transaction, TransactionManager,
     sqlite::SqliteTransactionManager,
 };
-use tokio::{sync::Notify, time::Instant};
+use tokio::{
+    sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
+    time::Instant,
+};
 use tracing::{debug, warn};
 
 use crate::observability;
@@ -31,6 +34,7 @@ const BACKGROUND_WRITER_QUEUE_LIMIT: usize = 1;
 pub struct SqliteWriteCoordinator {
     state: Arc<Mutex<SqliteWriteState>>,
     notify: Arc<Notify>,
+    content_mode_gate: Arc<RwLock<()>>,
     write_pool: Option<SqlitePool>,
     deadlines: SqliteWriteDeadlines,
     retry: SqliteWriteRetryConfig,
@@ -249,6 +253,7 @@ impl SqliteWriteCoordinator {
         Self {
             state: Arc::new(Mutex::new(SqliteWriteState::default())),
             notify: Arc::new(Notify::new()),
+            content_mode_gate: Arc::new(RwLock::new(())),
             write_pool,
             deadlines,
             retry: SqliteWriteRetryConfig {
@@ -273,6 +278,14 @@ impl SqliteWriteCoordinator {
 
     pub(crate) fn write_pool_or<'a>(&'a self, fallback: &'a SqlitePool) -> &'a SqlitePool {
         self.write_pool.as_ref().unwrap_or(fallback)
+    }
+
+    pub(crate) async fn acquire_content_mode_read(&self) -> OwnedRwLockReadGuard<()> {
+        self.content_mode_gate.clone().read_owned().await
+    }
+
+    pub(crate) async fn acquire_content_mode_write(&self) -> OwnedRwLockWriteGuard<()> {
+        self.content_mode_gate.clone().write_owned().await
     }
 
     pub(crate) fn deadline_for_priority(&self, priority: SqliteWritePriority) -> Duration {
@@ -1814,6 +1827,12 @@ pub fn is_sqlite_background_admission_error(err: &(dyn std::error::Error + 'stat
         current = err.source();
     }
     false
+}
+
+pub fn is_sqlite_retryable_write_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    is_sqlite_background_admission_error(err)
+        || is_sqlite_busy_error(err)
+        || is_sqlite_write_deadline_error(err)
 }
 
 pub struct SqliteWritePermit {
