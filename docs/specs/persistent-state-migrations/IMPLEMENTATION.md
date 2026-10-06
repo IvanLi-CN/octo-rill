@@ -10,6 +10,8 @@ The DDL operation upgrades `content_legacy_observations` to include source-hash 
 
 Each step renews the lease and runtime-owner heartbeat in a serialized SQLite transaction. The operator uses the background writer lane. Foreground admission has priority, and transient background admission, busy, and deadline errors defer the step without changing the durable run to `failed`. Deterministic checksum or schema errors are persisted as redacted failure state. Pause takes effect between committed operation batches.
 
+A failed operation remains idle until an administrator resumes the migration; resume clears the failed operation's transient owner/error fields and returns it to `pending`. A malformed persisted backfill phase or rowid cursor is rejected instead of being interpreted as another legacy table.
+
 ## Content Admission
 
 `content_processing::submit_item` opens the foreground writer transaction and repairs `legacy` or `rollback_freeze` to `global` before the unique content identity and request link are read or created. The response keeps the existing queued `202` and active-work `409` semantics. Public adapters that support global work route `rollback_freeze` through this boundary instead of the legacy writer's transition response; the compatibility `legacy` path remains available until the normal operator repair or an explicit global adapter is selected.

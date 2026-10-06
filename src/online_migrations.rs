@@ -150,7 +150,7 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1) AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')) AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))",
+        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status IN ('pending', 'running', 'paused') ORDER BY operation_order LIMIT 1) AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')) AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))",
     )
     .bind(&safe_error)
     .bind(&now)
@@ -528,7 +528,7 @@ fn redact_error_summary(error: &str) -> String {
 
 async fn load_next_operation(state: &AppState) -> Result<Option<Operation>> {
     sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT operation_id, operation_kind, status, cursor FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1",
+        "SELECT operation_id, operation_kind, status, cursor FROM online_migration_operations WHERE migration_id = ? AND status IN ('pending', 'running', 'paused') ORDER BY operation_order LIMIT 1",
     )
     .bind(MIGRATION_ID)
     .fetch_optional(&state.pool)
@@ -630,11 +630,20 @@ async fn backfill_batch(
     let (phase, last_rowid) = cursor
         .split_once('|')
         .unwrap_or(("translation_work_items", ""));
+    if !matches!(phase, "translation_work_items" | "ai_translations") {
+        anyhow::bail!("unknown online migration backfill cursor phase: {phase}");
+    }
     // Legacy primary keys are nanoid/text values and do not provide a stable
     // ordering. The cursor records the last observed SQLite rowid for
     // operators, but observation absence is the completion/re-entry predicate:
     // SQLite may reuse a deleted rowid and such a row must still be observed.
-    let last_rowid = last_rowid.parse::<i64>().unwrap_or(0);
+    let last_rowid = if last_rowid.is_empty() {
+        0
+    } else {
+        last_rowid
+            .parse::<i64>()
+            .with_context(|| format!("invalid online migration backfill cursor: {cursor}"))?
+    };
     let table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
     )
@@ -907,6 +916,11 @@ pub async fn admin_resume(
         .execute(&mut *tx)
         .await
         .map_err(crate::error::ApiError::internal)?;
+    sqlx::query("UPDATE online_migration_operations SET status = 'pending', last_error = NULL, owner_id = NULL, lease_heartbeat_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE migration_id = ? AND status = 'failed'")
+        .bind(MIGRATION_ID)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::error::ApiError::internal)?;
     tx.commit()
         .await
         .map_err(crate::error::ApiError::internal)?;
@@ -1036,6 +1050,30 @@ mod tests {
                 .await
                 .expect("count observations"),
             105
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_rejects_unknown_cursor_phase() {
+        let pool = pool().await;
+        let mut tx = pool.begin().await.expect("begin malformed cursor batch");
+        let error = backfill_batch(&mut tx, "unexpected_phase|0")
+            .await
+            .expect_err("unknown cursor phase must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown online migration backfill cursor phase")
+        );
+        tx.rollback()
+            .await
+            .expect("rollback malformed cursor batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
+                .fetch_one(&pool)
+                .await
+                .expect("count observations after malformed cursor"),
+            0
         );
     }
 
@@ -1707,7 +1745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_pause_bootstraps_control_tables_before_updating_request() {
+    async fn admin_pause_and_resume_control_operation_state() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1738,7 +1776,11 @@ mod tests {
                 "/admin/jobs/migrations/{migration_id}/pause",
                 post(admin_pause),
             )
-            .with_state(state)
+            .route(
+                "/admin/jobs/migrations/{migration_id}/resume",
+                post(admin_resume),
+            )
+            .with_state(state.clone())
             .layer(SessionManagerLayer::new(MemoryStore::default()).with_name("sid"));
 
         let login = app
@@ -1759,11 +1801,12 @@ mod tests {
             .expect("session cookie")
             .to_owned();
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/admin/jobs/migrations/{MIGRATION_ID}/pause"))
-                    .header(header::COOKIE, cookie)
+                    .header(header::COOKIE, cookie.clone())
                     .body(Body::empty())
                     .expect("build pause request"),
             )
@@ -1779,6 +1822,80 @@ mod tests {
             .await
             .expect("read pause request"),
             1
+        );
+
+        sqlx::query("UPDATE online_migration_operations SET status = 'completed' WHERE migration_id = ? AND operation_id != 'ddl-001'")
+            .bind(MIGRATION_ID)
+            .execute(&pool)
+            .await
+            .expect("complete unrelated operations");
+        sqlx::query("UPDATE online_migration_runs SET status = 'failed', last_error = 'persisted failure' WHERE migration_id = ?")
+            .bind(MIGRATION_ID)
+            .execute(&pool)
+            .await
+            .expect("mark migration failed");
+        sqlx::query("UPDATE online_migration_operations SET status = 'failed', last_error = 'persisted failure' WHERE migration_id = ? AND operation_id = 'ddl-001'")
+            .bind(MIGRATION_ID)
+            .execute(&pool)
+            .await
+            .expect("mark operation failed");
+        assert!(
+            load_next_operation(&state)
+                .await
+                .expect("load failed operation")
+                .is_none(),
+            "failed operations remain idle until an administrator resumes them"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/jobs/migrations/{MIGRATION_ID}/resume"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("build resume request"),
+            )
+            .await
+            .expect("resume response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT pause_requested FROM online_migration_runs WHERE migration_id = ?",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read cleared pause request"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_runs WHERE migration_id = ?",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read resumed migration status"),
+            "running"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'ddl-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read resumed operation status"),
+            "pending"
+        );
+        assert_eq!(
+            load_next_operation(&state)
+                .await
+                .expect("load resumed operation")
+                .expect("resumed operation")
+                .operation_id,
+            "ddl-001"
         );
     }
 }
