@@ -1016,6 +1016,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_once_executes_ordered_operator_and_persists_cursor() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('operator-runtime', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert runtime owner");
+        sqlx::query(
+            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('operator-work', 'release_summary', 'release-operator', 'operator-hash', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert operator fixture row");
+        let state = test_state(pool.clone(), "operator-runtime");
+
+        run_once(&state).await.expect("execute DDL operation");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'ddl-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read DDL status"),
+            "completed"
+        );
+
+        run_once(&state).await.expect("execute DML operation");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'dml-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read DML status"),
+            "completed"
+        );
+
+        run_once(&state)
+            .await
+            .expect("execute first backfill batch");
+        let first_cursor = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT status, cursor, rows_processed FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'backfill-001'",
+        )
+        .bind(MIGRATION_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("read first backfill state");
+        assert_eq!(first_cursor.0, "running");
+        assert_eq!(first_cursor.1, "translation_work_items|1");
+        assert_eq!(first_cursor.2, 1);
+
+        run_once(&state)
+            .await
+            .expect("advance backfill phase cursor");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT cursor FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'backfill-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read phase cursor"),
+            "ai_translations|"
+        );
+
+        run_once(&state).await.expect("complete backfill operation");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_runs WHERE migration_id = ?",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read completed migration status"),
+            "completed"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_primary_key = 'operator-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count operator observations"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn backfill_is_bounded_and_resumes_from_cursor() {
         let pool = pool().await;
         for index in 0..105 {

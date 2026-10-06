@@ -21,6 +21,9 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     let Some(applied) = load_applied_migrations(pool).await? else {
         return apply_migrations(pool).await;
     };
+    if applied.is_empty() {
+        return apply_migrations(pool).await;
+    }
     validate_history(Some(&applied), &MIGRATOR)?;
     ensure_no_pending_migrations(&applied, &MIGRATOR)?;
     Ok(())
@@ -250,6 +253,31 @@ mod tests {
         .await
         .expect("read webhook PAT scope column");
         assert_eq!(scope_column, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_migration_history_restarts_initialization() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create empty SQLx history");
+
+        run(&pool)
+            .await
+            .expect("restart incomplete database initialization");
+        let applied =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("read recovered migration history");
+        assert!(applied > 0);
     }
 
     #[tokio::test]

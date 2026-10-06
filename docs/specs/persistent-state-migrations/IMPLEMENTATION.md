@@ -2,7 +2,7 @@
 
 ## Runtime Lifecycle
 
-`database_migrations::run` executes before the listener is bound. A fresh database applies the checked-in SQLx set before listen. A database that already has `_sqlx_migrations` is validation-only: applied rows are checked for version, checksum, and dirty state, and pending SQLx migrations are not applied in place.
+`database_migrations::run` executes before the listener is bound. A fresh database applies the checked-in SQLx set before listen. A database that already has non-empty `_sqlx_migrations` history is validation-only: applied rows are checked for version, checksum, and dirty state, and pending SQLx migrations are not applied in place. An empty SQLx history table is treated as incomplete initialization and is safely restarted.
 
 After `runtime::register_runtime_owner`, the server starts the online operator. The named `online-migration-operator` lease creates the control tables and registers `content-processing-online-v2` with three ordered operations: `ddl-001`, `dml-001`, and `backfill-001`. The previous `content-processing-online-v1` identity and checksums remain historical and are validated read-only.
 
@@ -24,4 +24,4 @@ The topology remains one Compose service with SQLite. There is no second databas
 
 ## Current Validation
 
-The focused migration suite covers bounded backfill, cursor re-entry, source-hash incarnations, checksum identity, stale-owner protection, redaction, and admin pause/read behavior. Content admission tests cover repair from both historical modes and preserve `202`/active `409` results. Current-head coordinator pressure tests cover foreground session writes while background work contends for SQLite.
+The focused migration suite covers bounded backfill, cursor re-entry, source-hash incarnations, checksum identity, stale-owner protection, redaction, admin pause/read behavior, and the ordered `run_once` operator path through durable cursor completion. Content admission tests cover repair from both historical modes and preserve `202`/active `409` results. Current-head coordinator pressure tests cover foreground session writes while background work contends for SQLite.
