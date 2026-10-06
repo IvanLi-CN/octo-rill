@@ -76,6 +76,16 @@ struct Operation {
     cursor: String,
 }
 
+struct ObservationInput<'a> {
+    table: &'a str,
+    id: &'a str,
+    kind: &'a str,
+    entity_id: &'a str,
+    source_hash: &'a str,
+    status: &'a str,
+    displayable_cache: bool,
+}
+
 pub fn spawn_operator(state: Arc<AppState>) -> AbortHandle {
     tokio::spawn(async move {
         loop {
@@ -646,13 +656,15 @@ async fn backfill_batch(
             let status: String = row.get("status");
             insert_observation(
                 tx,
-                "translation_work_items",
-                &id,
-                &kind,
-                &entity_id,
-                &source_hash,
-                &status,
-                false,
+                ObservationInput {
+                    table: "translation_work_items",
+                    id: &id,
+                    kind: &kind,
+                    entity_id: &entity_id,
+                    source_hash: &source_hash,
+                    status: &status,
+                    displayable_cache: false,
+                },
             )
             .await?;
             next = rowid;
@@ -688,13 +700,15 @@ async fn backfill_batch(
                 .any(|value| !value.trim().is_empty());
         insert_observation(
             tx,
-            "ai_translations",
-            &id,
-            &kind,
-            &entity_id,
-            &source_hash,
-            &status,
-            displayable,
+            ObservationInput {
+                table: "ai_translations",
+                id: &id,
+                kind: &kind,
+                entity_id: &entity_id,
+                source_hash: &source_hash,
+                status: &status,
+                displayable_cache: displayable,
+            },
         )
         .await?;
         next = rowid;
@@ -702,39 +716,32 @@ async fn backfill_batch(
     Ok((format!("ai_translations|{next}"), rows.len() as i64, false))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn insert_observation(
     tx: &mut Transaction<'_, Sqlite>,
-    table: &str,
-    id: &str,
-    kind: &str,
-    entity_id: &str,
-    source_hash: &str,
-    status: &str,
-    displayable_cache: bool,
+    input: ObservationInput<'_>,
 ) -> Result<()> {
     let resource_type = ["release", "announcement", "notification"]
         .iter()
-        .find(|value| kind.contains(**value))
+        .find(|value| input.kind.contains(**value))
         .copied();
-    let pipeline = if kind.contains("smart") {
+    let pipeline = if input.kind.contains("smart") {
         "polishing"
     } else {
         "translation"
     };
-    let classification = if table == "ai_translations" && displayable_cache {
+    let classification = if input.table == "ai_translations" && input.displayable_cache {
         "legacy_cached"
     } else {
         "legacy_conflict"
     };
-    let basis = json!({"kind": kind, "source_hash": source_hash, "status": status, "classification": classification}).to_string();
+    let basis = json!({"kind": input.kind, "source_hash": input.source_hash, "status": input.status, "classification": classification}).to_string();
     sqlx::query("INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
         .bind(local_id::generate_local_id().to_string())
-        .bind(table)
-        .bind(id)
-        .bind(source_hash)
+        .bind(input.table)
+        .bind(input.id)
+        .bind(input.source_hash)
         .bind(resource_type)
-        .bind(entity_id)
+        .bind(input.entity_id)
         .bind(pipeline)
         .bind(classification)
         .bind(basis)
