@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented; code candidate `12c8ea90` passed fresh WAL HTTP acceptance, statement-interruption recovery, quality gates and persistence checks; fresh review, CI and merge remain
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 当前工作树已补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；fresh review, CI and merge remain
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -17,6 +17,8 @@
 - 异步取消事务现在使用独立的 progress-handler interrupt 标志：正常 commit/rollback 会移除 handler，事务 future 被取消时会中断活动 SQLite 语句。专用 writer pool 的 `after_release` hook 会在 transaction depth 非零时立即返回错误并让 SQLx hard-close/evict 不确定连接；普通读池/内存 fallback 在同一个 150 ms budget 内完成 queued rollback，失败仍 hard-close/evict；depth 已清零时移除旧 handler并确认可复用。回归覆盖 101 次取消后写入、内存 fallback 取消后的 schema 保留、强制清理失败驱逐和真实长 SQL 清理超时后的连接重建。
 - content processing recovery/claim、已领取任务的数据库执行、job task claim 与 repo release claim loop 共用 `worker_backoff`，连续失败的基础等待为 1/2/4/8/16/30 秒并加入不提前的抖动；content claim 成功后立即复位 claim 退避，执行阶段的数据库失败使用独立退避，其他 worker 在成功 DB 尝试后复位；每个 worker 只有一笔同类 claim 在途，日志记录 lane、错误类别、失败计数和 retry wait。
 - deadline telemetry 区分 writer queue、write-pool acquisition、`BEGIN IMMEDIATE` 与 transaction 阶段，并记录 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 和 `deadline_ms`。
+- PR3.9.3 为 background writer 增加共享有界等待预算（最多一个 waiting background，foreground waiter 出现后拒绝新的 background admission），并暴露 waiting/admitted/rejected/coalesced runtime counters；content processing recovery 通过 coordinator 的 1 秒 per-lane cadence admission 合并重复 worker pass，admission denial 进入已有 worker backoff。
+- HTTP access middleware 现在为正常成功请求也写入 `http.access`，并在 task-local request context 中保留 request ID、method、route；SQLite transaction-end、session write 与 background admission telemetry 复用这些字段完成 request-to-writer correlation。
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
 - `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel 使用 foreground lane。
@@ -48,6 +50,8 @@
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
 - `src/session_store.rs` 增加协调式 session layer：读路径调用 reader-backed store，写路径在 writer transaction 内直接执行 `tower_sessions` schema 的 MessagePack SQL；每个请求在 task-local scope 内保存与 session ID 绑定的 request baseline，用 baseline diff 区分 activity-only 与 mixed critical changes，避免 writer pressure 下误发刷新 cookie。取消了跨请求共享的有限 session snapshot cache/history；existing-row save 若没有同请求 baseline，或 request baseline 存在但当前行已消失，会返回 retryable session conflict，避免 stale caller 覆盖未知字段或复活已删除 session。并发字段按 baseline diff 合并，expiry 只单调前进。
 - `src/session_store.rs` 回归覆盖 activity-only refresh 保留原响应、critical retryable failure 的 `503`/`Retry-After`、expiry-only refresh 分类，以及真实文件型 WAL reader/writer contention。
+- `src/sqlite_write.rs` 新增 background admission bounded-queue 回归；`src/content_processing.rs` 新增跨 worker recovery coalescing 与文件型 WAL 下 scheduler pressure/session foreground write 生产形回归，覆盖 waiter cleanup、foreground success、recovery amplification 与后续 writer reuse。
+- `src/server.rs` 更新正常成功请求的 access-log 回归，锁定 request ID、route、status、latency/slow 字段和敏感 query/cookie 不泄漏。
 
 ## Validation
 

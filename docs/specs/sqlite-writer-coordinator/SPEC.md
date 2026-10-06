@@ -120,6 +120,13 @@
 - session `create`、`save`、`delete` 的 foreground deadline 从首次排队开始贯穿 writer acquisition、`BEGIN IMMEDIATE`、SQL、busy retry 与 COMMIT；activity-only save 可以在 writer pressure 下安全跳过，但包含其他字段变更的 save 不得跳过。
 - session middleware 必须把关键写入的 retryable deadline/busy/locked 失败映射为 `503`、`Retry-After: 1` 与 `sqlite_write_retryable`；activity-only refresh 失败必须保留原业务响应并省略 refreshed cookie；constraint、decode 与其他 backend 错误必须保留真实错误类别。
 
+### REQ-SQLITE-WRITER-014
+
+- background writer admission 必须有共享的有界等待预算；默认最多保留一个等待中的 background writer。已有 background waiter 不得被新的 background 请求无限堆积，超出预算时必须返回 typed admission error 并记录 `waiting_foreground`、`waiting_background`、`queue_limit` 与 `request_id`。
+- foreground waiter 出现后不得再接纳新的 background waiter；已经取得 permit 或已经进入有界等待的 background 写可以完成，但后续 background 尝试必须结束本轮并由 worker backoff 处理，不得立即自旋。
+- per-lane background work 可以通过共享 coordinator 的 cadence admission 合并同一时间窗口内的重复执行。content processing recovery 的所有 worker 必须共享 cadence 状态，重复 tick 只增加 coalesced telemetry，不得重复开始 recovery transaction。
+- HTTP access telemetry 必须覆盖正常成功请求以及慢请求和错误请求，并至少包含 `request_id`、method、route、status、latency 与 slow 标记；同一请求上下文内的 `sqlite.write` telemetry 必须带 request correlation 字段。
+
 ### SHOULD
 
 - 事务仍应尽量短小；小批量写可以在单次 permit 内完成，生产量级全量重建必须拆成多个短 permit。
@@ -146,6 +153,8 @@
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 - foreground 与 background 使用各自有界总 deadline；deadline 限制 writer permit、专用 write pool 获取、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试开始。已经启动的 callback 可以完成在 deadline 之后；COMMIT 一旦派发，deadline 不再中断它。
 - 专用 write pool 只供协调写入使用，普通读请求继续共享多连接 reader pool；因 reader pool 耗尽不应阻塞 writer pool 获取。
+- background recovery/claim 使用共享 coordinator admission：recovery lane 以 cadence 合并同一窗口内的重复 worker pass，普通 background writer 遵循有界等待预算；admission denial 由 worker backoff 消化，不改变前台 session、enqueue 或其他用户可见写入的 foreground lane。
+- HTTP middleware 在 task-local request context 中保留 request ID、method 和 route；正常请求也写入 `http.access`，writer transaction end、session writer 与 admission telemetry 复用这些字段完成前后台关联。
 
 ### Edge cases / errors
 
@@ -231,6 +240,18 @@
   When worker 进入下一次 claim loop
   Then 同类 claim 使用 1/2/4/8/16/30 秒基础退避和不提前的抖动等待；成功 DB 尝试后退避复位，故障解除后任务继续领取且 lease/幂等状态保持正确。
 
+- Given 多个 global content worker 在同一 recovery window 内同时 tick
+  When worker 执行 recovery/claim loop
+  Then recovery transaction 只由共享 cadence admission 启动一次，重复 worker pass 被 coalesce 或按有界 background admission 拒绝，且 worker 通过 backoff 结束本轮而不自旋。
+
+- Given foreground session HTTP 写入与后台 recovery/claim 同时竞争文件型 SQLite WAL writer
+  When writer permit、reader pool 和专用 writer pool 都处于竞争状态
+  Then background 等待位不超过一个，foreground 请求不返回 retryable 5xx/deadline failure，所有 waiter 和 permit 在负载结束后清零，并可执行下一笔 foreground write 验证连接清理完成。
+
+- Given 一个正常成功的 HTTP 请求
+  When access middleware 完成请求
+  Then `http.access` 仍记录 request ID、method、route、status、latency 和 slow 字段；请求内的 SQLite writer telemetry 使用同一个 request correlation。
+
 ## Verification
 
 ### VER-SQLITE-WRITER-001
@@ -263,6 +284,12 @@
 - covers: REQ-SQLITE-WRITER-003, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013
 - Pass condition: reader-backed dashboard reads remain valid while the dedicated writer is pressured; session save, task enqueue and cancellation expose only contract-approved retryable responses; activity-only refresh never produces a false refreshed cookie; recovery returns to successful traffic without integrity errors, and the evidence is tied to the current candidate SHA.
 
+### VER-SQLITE-WRITER-006
+
+- Method: `sqlite_write::tests::background_writer_admission_is_bounded`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
+- covers: REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013, REQ-SQLITE-WRITER-014
+- Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under a real external SQLite writer lock, writer state is reusable after the run, and a request's `http.access` and `sqlite.write` events carry matching request ID, method, and route fields; fast 4xx access logs carry the complete field set at `warn` level.
+
 ## 验收清单（Acceptance checklist）
 
 - 核心路径的长期行为已被明确描述。
@@ -275,7 +302,7 @@
 ### Testing
 
 - Unit tests: `SqliteWriteCoordinator` 并发串行化、foreground 优先级与 busy 分类。
-- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator。
+- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator；background queue/admission 有界，content recovery 跨 worker coalesce，HTTP session foreground write 与 scheduler pressure 的 file-backed regression 保持成功。
 - E2E tests: None。
 
 ### UI / Storybook (if applicable)
@@ -288,6 +315,7 @@
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --locked --all-features`
 - `bash scripts/check-rust-source-quality.sh`
+- `cargo test content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`
 
 ## Visual Evidence
 

@@ -1,6 +1,6 @@
-use std::fmt;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
+use std::{cell::RefCell, fmt, future::Future};
 
 use axum::{
     extract::MatchedPath, extract::Request, http::StatusCode, middleware::Next, response::Response,
@@ -13,6 +13,17 @@ const DEFAULT_UPSTREAM_SLOW_MS: usize = 2_000;
 const DEFAULT_SQLITE_WRITE_SLOW_MS: usize = 250;
 
 static LOGGING_THRESHOLDS: OnceLock<RwLock<LoggingThresholds>> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+pub(crate) struct RequestContext {
+    pub request_id: String,
+    pub method: String,
+    pub route: String,
+}
+
+tokio::task_local! {
+    static REQUEST_CONTEXT: RefCell<Option<RequestContext>>;
+}
 
 #[derive(Clone, Debug)]
 pub struct LoggingThresholds {
@@ -81,6 +92,40 @@ pub fn request_id_from_headers(headers: &axum::http::HeaderMap) -> String {
         .to_owned()
 }
 
+pub(crate) fn current_request_context() -> Option<RequestContext> {
+    REQUEST_CONTEXT
+        .try_with(|context| context.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn current_request_id() -> String {
+    current_request_context()
+        .map(|context| context.request_id)
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+pub(crate) fn current_request_method() -> String {
+    current_request_context()
+        .map(|context| context.method)
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+pub(crate) fn current_request_route() -> String {
+    current_request_context()
+        .map(|context| context.route)
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+pub(crate) async fn with_request_context<F>(context: RequestContext, future: F) -> F::Output
+where
+    F: Future,
+{
+    REQUEST_CONTEXT
+        .scope(RefCell::new(Some(context)), future)
+        .await
+}
+
 pub fn request_trace_span(request: &Request) -> Span {
     let request_id = request_id_from_headers(request.headers());
     let route = request_route(request);
@@ -96,35 +141,46 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     let request_id = request_id_from_headers(request.headers());
     let method = request.method().to_string();
     let route = request_route(&request);
+    let request_context = RequestContext {
+        request_id: request_id.clone(),
+        method: method.clone(),
+        route: route.clone(),
+    };
     let thresholds = logging_thresholds();
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+    let response = with_request_context(request_context, next.run(request)).await;
     let latency = started.elapsed();
     let status = response.status();
-    if is_slow_or_error(status, latency, thresholds.http_slow_ms) {
-        let latency_ms = latency.as_millis();
-        if status.is_client_error() || status.is_server_error() {
-            tracing::warn!(
-                event = "http.access",
-                request_id = %request_id,
-                method = %method,
-                route = %route,
-                status = status.as_u16(),
-                latency_ms,
-                "http request finished with error"
-            );
-        } else {
-            tracing::info!(
-                event = "http.access",
-                request_id = %request_id,
-                method = %method,
-                route = %route,
-                status = status.as_u16(),
-                latency_ms,
-                threshold_ms = thresholds.http_slow_ms,
-                "http request finished slowly"
-            );
-        }
+    let latency_ms = latency.as_millis();
+    let slow = if status.is_client_error() || status.is_server_error() {
+        false
+    } else {
+        is_slow_or_error(status, latency, thresholds.http_slow_ms)
+    };
+    if status.is_client_error() || status.is_server_error() {
+        tracing::warn!(
+            event = "http.access",
+            request_id = %request_id,
+            method = %method,
+            route = %route,
+            status = status.as_u16(),
+            latency_ms,
+            slow,
+            threshold_ms = thresholds.http_slow_ms,
+            "http request finished"
+        );
+    } else {
+        tracing::info!(
+            event = "http.access",
+            request_id = %request_id,
+            method = %method,
+            route = %route,
+            status = status.as_u16(),
+            latency_ms,
+            slow,
+            threshold_ms = thresholds.http_slow_ms,
+            "http request finished"
+        );
     }
     response
 }
