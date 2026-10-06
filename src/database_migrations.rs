@@ -216,6 +216,28 @@ mod tests {
         assert!(validate_history(Some(&dirty), &MIGRATOR).is_err());
     }
 
+    #[test]
+    fn internal_history_gap_is_rejected() {
+        let missing_version = 84;
+        let mut history = MIGRATOR
+            .iter()
+            .map(|migration| AppliedMigration {
+                version: migration.version,
+                checksum: migration.checksum.to_vec(),
+                success: 1,
+            })
+            .collect::<Vec<_>>();
+        history.retain(|migration| migration.version != missing_version);
+
+        let error = validate_history(Some(&history), &MIGRATOR)
+            .expect_err("an internal migration history gap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("database migration 84 is missing from history")
+        );
+    }
+
     #[tokio::test]
     async fn fresh_database_skips_legacy_sql() {
         let pool = SqlitePoolOptions::new()

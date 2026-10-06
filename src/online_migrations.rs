@@ -689,9 +689,9 @@ async fn backfill_batch(
         anyhow::bail!("unknown online migration backfill cursor phase: {phase}");
     }
     // Legacy primary keys are nanoid/text values and do not provide a stable
-    // ordering. The cursor records the last observed SQLite rowid for
-    // operators, but observation absence is the completion/re-entry predicate:
-    // SQLite may reuse a deleted rowid and such a row must still be observed.
+    // ordering. Use rowid for the normal forward scan, then do an absence sweep
+    // from the beginning when the cursor reaches the end so SQLite row reuse is
+    // still observed. Observation absence remains the completion predicate.
     let last_rowid = if last_rowid.is_empty() {
         0
     } else {
@@ -714,10 +714,26 @@ async fn backfill_batch(
     }
 
     if phase == "translation_work_items" {
-        let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
-            .bind(OP_BATCH_SIZE)
-            .fetch_all(&mut **tx)
-            .await?;
+        let rows = if last_rowid > 0 {
+            let forward_rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+                .bind(last_rowid)
+                .bind(OP_BATCH_SIZE)
+                .fetch_all(&mut **tx)
+                .await?;
+            if forward_rows.is_empty() {
+                sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+                    .bind(OP_BATCH_SIZE)
+                    .fetch_all(&mut **tx)
+                    .await?
+            } else {
+                forward_rows
+            }
+        } else {
+            sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+                .bind(OP_BATCH_SIZE)
+                .fetch_all(&mut **tx)
+                .await?
+        };
         if rows.is_empty() {
             return Ok(("ai_translations|".to_owned(), 0, false));
         }
@@ -742,7 +758,7 @@ async fn backfill_batch(
                 },
             )
             .await?;
-            next = rowid;
+            next = next.max(rowid);
         }
         return Ok((
             format!("translation_work_items|{next}"),
@@ -751,10 +767,26 @@ async fn backfill_batch(
         ));
     }
 
-    let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
-        .bind(OP_BATCH_SIZE)
-        .fetch_all(&mut **tx)
-        .await?;
+    let rows = if last_rowid > 0 {
+        let forward_rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+            .bind(last_rowid)
+            .bind(OP_BATCH_SIZE)
+            .fetch_all(&mut **tx)
+            .await?;
+        if forward_rows.is_empty() {
+            sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+                .bind(OP_BATCH_SIZE)
+                .fetch_all(&mut **tx)
+                .await?
+        } else {
+            forward_rows
+        }
+    } else {
+        sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+            .bind(OP_BATCH_SIZE)
+            .fetch_all(&mut **tx)
+            .await?
+    };
     if rows.is_empty() {
         return Ok((cursor.to_owned(), 0, true));
     }
@@ -786,7 +818,7 @@ async fn backfill_batch(
             },
         )
         .await?;
-        next = rowid;
+        next = next.max(rowid);
     }
     Ok((format!("ai_translations|{next}"), rows.len() as i64, false))
 }
