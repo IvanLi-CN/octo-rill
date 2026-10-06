@@ -1699,7 +1699,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fast_success_request_does_not_emit_access_log() {
+    async fn fast_success_request_emits_normal_access_log() {
         let _lock = observability_test_lock().lock().await;
         let _thresholds =
             LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds::default());
@@ -1716,7 +1716,20 @@ mod tests {
         )
         .await;
 
-        assert!(http_access_events(&events).is_empty());
+        let access_events = http_access_events(&events);
+        assert_eq!(access_events.len(), 1);
+        let access_event = access_events[0];
+        assert_eq!(
+            access_event.get("request_id"),
+            Some(&Value::from("req-fast-123"))
+        );
+        assert_eq!(access_event.get("status"), Some(&Value::from(200)));
+        assert_eq!(access_event.get("slow"), Some(&Value::from(false)));
+        let serialized = serde_json::to_string(access_event).expect("serialize access event");
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("top-secret"));
+        assert!(!serialized.contains("session=super-secret"));
+        assert!(!serialized.contains("/users/42?"));
     }
 
     #[tokio::test(flavor = "current_thread")]

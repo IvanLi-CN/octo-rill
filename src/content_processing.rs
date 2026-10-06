@@ -15,11 +15,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
-    ai, api, content_identity_upgrade, error::ApiError, local_id,
-    sqlite_write::is_sqlite_database_error, state::AppState, translations,
+    ai, api, content_identity_upgrade,
+    error::ApiError,
+    local_id,
+    sqlite_write::{is_sqlite_background_admission_error, is_sqlite_database_error},
+    state::AppState,
+    translations,
     worker_backoff::WorkerBackoff,
 };
 use tower_sessions::Session;
@@ -507,6 +511,7 @@ struct AttemptRouteSnapshot {
 
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
 const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
+const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
 const GLOBAL_MAX_TOKENS: u32 = 3_000;
 const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
@@ -2184,6 +2189,13 @@ async fn renew_global_work_lease(state: &AppState, work: &WorkRow) -> Result<boo
 }
 
 async fn recover_due(state: &AppState) -> Result<()> {
+    if !state
+        .sqlite_writer
+        .admit_background_lane("content_processing_recover", GLOBAL_RECOVERY_CADENCE)
+    {
+        return Ok(());
+    }
+
     let now = Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
         .sqlite_writer
@@ -4244,6 +4256,7 @@ enum GlobalSchedulerAttempt {
     Idle,
     Claimed,
     ClaimedDatabaseFailure(anyhow::Error),
+    BackgroundAdmissionDenied(anyhow::Error),
 }
 
 async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttempt> {
@@ -4253,7 +4266,12 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     if !content_identity_upgrade::is_complete(&state.pool).await? {
         return Ok(GlobalSchedulerAttempt::Idle);
     }
-    recover_due(state).await?;
+    if let Err(error) = recover_due(state).await {
+        if is_sqlite_background_admission_error(error.as_ref()) {
+            return Ok(GlobalSchedulerAttempt::BackgroundAdmissionDenied(error));
+        }
+        return Err(error);
+    }
     if provider_breaker_open(state).await {
         defer_queued_for_provider(state).await?;
         return Ok(GlobalSchedulerAttempt::Idle);
@@ -4272,7 +4290,13 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     } else {
         1
     };
-    let Some(work) = claim_next(state, manual_limit).await? else {
+    let Some(work) = (match claim_next(state, manual_limit).await {
+        Ok(work) => work,
+        Err(error) if is_sqlite_background_admission_error(error.as_ref()) => {
+            return Ok(GlobalSchedulerAttempt::BackgroundAdmissionDenied(error));
+        }
+        Err(error) => return Err(error),
+    }) else {
         return Ok(GlobalSchedulerAttempt::Idle);
     };
     match execute(state, work).await {
@@ -4339,6 +4363,18 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
                                     );
                                     sleep(retry_after).await;
                                 }
+                                Ok(GlobalSchedulerAttempt::BackgroundAdmissionDenied(error)) => {
+                                    let retry_after = claim_backoff.next_delay();
+                                    debug!(
+                                        lane = "content_processing_background_admission",
+                                        error_kind = "background_admission",
+                                        failure_count = claim_backoff.failure_count(),
+                                        ?error,
+                                        retry_after_ms = retry_after.as_millis(),
+                                        "global content processing background writer admission was denied; backing off"
+                                    );
+                                    sleep(retry_after).await;
+                                }
                                 Err(error) => {
                                     let retry_after = claim_backoff.next_delay();
                                     warn!(
@@ -4370,17 +4406,27 @@ mod tests {
         borrow::Cow,
         collections::VecDeque,
         sync::{Arc, Mutex},
+        time::Duration as StdDuration,
     };
 
     use super::*;
     use crate::config::AppConfig;
     use crate::crypto::EncryptionKey;
     use crate::observability::LoggingThresholds;
+    use crate::session_store::{CoordinatedSessionLayer, CoordinatedSqliteSessionStore};
     use crate::state::{build_oauth_client, build_webauthn};
     use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
-    use axum::{Router, routing::post};
-    use sqlx::sqlite::SqlitePoolOptions;
+    use axum::{
+        Router,
+        body::Body,
+        http::Request,
+        middleware,
+        routing::{get, post},
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use tokio::sync::Notify;
+    use tower::{ServiceBuilder, ServiceExt};
+    use tower_sessions::{Expiry, Session};
     use url::Url;
 
     async fn pool(mode: &str) -> SqlitePool {
@@ -4507,6 +4553,13 @@ mod tests {
     }
 
     fn global_state(pool: SqlitePool) -> Arc<AppState> {
+        global_state_with_writer(pool, crate::sqlite_write::SqliteWriteCoordinator::new())
+    }
+
+    fn global_state_with_writer(
+        pool: SqlitePool,
+        sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator,
+    ) -> Arc<AppState> {
         let encryption_key =
             EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         let config = AppConfig {
@@ -4539,7 +4592,7 @@ mod tests {
         Arc::new(AppState {
             config,
             pool,
-            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            sqlite_writer,
             api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
             http: reqwest::Client::new(),
             github_rest_http: reqwest::Client::new(),
@@ -6675,6 +6728,268 @@ mod tests {
         );
         let claimed = claim_next(&state, 1).await.unwrap().unwrap();
         assert_eq!(claimed.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn global_scheduler_coalesces_recovery_across_workers() {
+        let pool = global_pool().await;
+        let state = global_state(pool);
+
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let worker_state = state.clone();
+            workers.push(tokio::spawn(async move {
+                run_once_with_outcome(worker_state.as_ref()).await
+            }));
+        }
+
+        for worker in workers {
+            worker
+                .await
+                .expect("scheduler worker should join")
+                .expect("scheduler recovery should succeed");
+        }
+
+        assert_eq!(
+            state
+                .sqlite_writer
+                .runtime_status()
+                .background_lane_admitted,
+            1,
+            "each worker should not repeat the same recovery pass"
+        );
+    }
+
+    async fn foreground_session_probe(session: Session) -> StatusCode {
+        session
+            .insert("foreground_probe", "ok")
+            .await
+            .expect("write foreground session probe");
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn file_backed_scheduler_pressure_preserves_foreground_session_writes() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-content-processing-load-{}.db",
+            crate::local_id::generate_local_id()
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(StdDuration::from_millis(100));
+        let reader_pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    crate::sqlite_write::cleanup_sqlite_pool_connection(connection).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(options.clone())
+            .await
+            .expect("create file-backed reader pool");
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    crate::sqlite_write::cleanup_sqlite_write_connection(connection).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await
+            .expect("create file-backed writer pool");
+        crate::database_migrations::run(&reader_pool)
+            .await
+            .expect("run production migrations");
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&reader_pool)
+            .await
+            .expect("enable global processing mode");
+        sqlx::query("UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1")
+            .execute(&reader_pool)
+            .await
+            .expect("complete identity upgrade");
+
+        let sqlite_writer =
+            crate::sqlite_write::SqliteWriteCoordinator::with_write_pool(writer_pool.clone());
+        let state = global_state_with_writer(reader_pool.clone(), sqlite_writer.clone());
+        let session_store = CoordinatedSqliteSessionStore::new(
+            tower_sessions_sqlx_store::SqliteStore::new(reader_pool.clone()),
+            reader_pool.clone(),
+            sqlite_writer.clone(),
+        );
+        session_store
+            .migrate()
+            .await
+            .expect("migrate production session store");
+
+        let (set_request_id, propagate_request_id) = crate::observability::request_id_layers();
+        let app = Router::new()
+            .route("/probe", get(foreground_session_probe))
+            .layer(
+                CoordinatedSessionLayer::new(session_store)
+                    .with_secure(false)
+                    .with_same_site(tower_sessions::cookie::SameSite::Lax)
+                    .with_expiry(Expiry::OnInactivity(time::Duration::days(30))),
+            )
+            .layer(
+                ServiceBuilder::new()
+                    .layer(set_request_id)
+                    .layer(middleware::from_fn(
+                        crate::observability::access_log_middleware,
+                    ))
+                    .layer(propagate_request_id),
+            );
+
+        let seed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("x-request-id", "session-seed")
+                    .body(Body::empty())
+                    .expect("build session seed request"),
+            )
+            .await
+            .expect("session seed response");
+        assert_eq!(seed_response.status(), StatusCode::NO_CONTENT);
+        let session_cookie = seed_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .expect("session seed cookie");
+
+        let hold_entered = Arc::new(Notify::new());
+        let release_hold = Arc::new(Notify::new());
+        let holder = {
+            let sqlite_writer = sqlite_writer.clone();
+            let hold_entered = hold_entered.clone();
+            let release_hold = release_hold.clone();
+            tokio::spawn(async move {
+                sqlite_writer
+                    .write_foreground("sqlite_acceptance_foreground_hold", move |_| {
+                        hold_entered.notify_one();
+                        let release_hold = release_hold.clone();
+                        async move {
+                            release_hold.notified().await;
+                            Ok::<_, anyhow::Error>(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(StdDuration::from_secs(1), hold_entered.notified())
+            .await
+            .expect("foreground writer hold should start");
+
+        let mut background_tasks = Vec::new();
+        for _ in 0..8 {
+            let worker_state = state.clone();
+            background_tasks.push(tokio::spawn(async move {
+                for _ in 0..16 {
+                    run_once_with_outcome(worker_state.as_ref())
+                        .await
+                        .expect("background scheduler attempt");
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if sqlite_writer.runtime_status().waiting_background > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background writer queue should show a waiter");
+
+        let mut foreground_tasks = Vec::new();
+        for request_index in 0..32 {
+            let request_cookie = session_cookie.clone();
+            let request_app = app.clone();
+            foreground_tasks.push(tokio::spawn(async move {
+                let response = tokio::time::timeout(
+                    StdDuration::from_secs(2),
+                    request_app.oneshot(
+                        Request::builder()
+                            .uri("/probe")
+                            .header(axum::http::header::COOKIE, request_cookie)
+                            .header("x-request-id", format!("foreground-{request_index}"))
+                            .body(Body::empty())
+                            .expect("build foreground session request"),
+                    ),
+                )
+                .await
+                .expect("foreground request should not exceed test deadline")
+                .expect("foreground request should produce a response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NO_CONTENT,
+                    "foreground session write returned an unexpected status"
+                );
+            }));
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        release_hold.notify_one();
+
+        for task in foreground_tasks {
+            task.await.expect("foreground request task should join");
+        }
+        for task in background_tasks {
+            task.await.expect("background scheduler task should join");
+        }
+        holder
+            .await
+            .expect("foreground writer hold task should join")
+            .expect("foreground writer hold should succeed");
+
+        let status = sqlite_writer.runtime_status();
+        assert!(!status.active, "writer permit must be released after load");
+        assert_eq!(status.waiting_foreground, 0);
+        assert_eq!(status.waiting_background, 0);
+        assert!(status.background_admitted >= status.background_lane_admitted);
+        assert!(
+            status.background_lane_admitted * 4 < 128,
+            "recovery admission should be materially lower than worker attempts: {status:?}"
+        );
+        assert!(
+            status.background_lane_coalesced + status.background_lane_admitted >= 128,
+            "recovery cadence should coalesce repeated worker passes: {status:?}"
+        );
+        assert!(
+            status.background_rejected > 0,
+            "background admission should expose contention under foreground load: {status:?}"
+        );
+
+        let cleanup_probe_pool = reader_pool.clone();
+        sqlite_writer
+            .write_foreground("acceptance_cleanup_probe", move |_| {
+                let cleanup_probe_pool = cleanup_probe_pool.clone();
+                async move {
+                    sqlx::query("CREATE TABLE IF NOT EXISTS acceptance_cleanup_probe (id INTEGER PRIMARY KEY)")
+                        .execute(&cleanup_probe_pool)
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+            })
+            .await
+            .expect("writer should accept a foreground write after load");
+
+        reader_pool.close().await;
+        writer_pool.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
     }
 
     #[tokio::test]

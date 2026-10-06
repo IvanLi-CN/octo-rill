@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     future::Future,
     ops::{Deref, DerefMut},
     sync::{
@@ -24,6 +25,7 @@ const FOREGROUND_DEADLINE: Duration = Duration::from_millis(900);
 const BACKGROUND_DEADLINE: Duration = Duration::from_millis(2500);
 const BEST_EFFORT_DEADLINE: Duration = BACKGROUND_DEADLINE;
 const ROLLBACK_CLEANUP_TIMEOUT: Duration = Duration::from_millis(150);
+const BACKGROUND_WRITER_QUEUE_LIMIT: usize = 1;
 
 #[derive(Clone, Debug)]
 pub struct SqliteWriteCoordinator {
@@ -58,12 +60,23 @@ impl Default for SqliteWriteDeadlines {
 struct SqliteWriteState {
     active: bool,
     waiting_foreground: usize,
+    waiting_background: usize,
+    background_admitted: u64,
+    background_lane_admitted: u64,
+    background_rejected: u64,
+    background_lane_next: HashMap<&'static str, Instant>,
+    background_lane_coalesced: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SqliteWriteRuntimeStatus {
     pub active: bool,
     pub waiting_foreground: usize,
+    pub waiting_background: usize,
+    pub background_admitted: u64,
+    pub background_lane_admitted: u64,
+    pub background_rejected: u64,
+    pub background_lane_coalesced: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,10 +86,62 @@ pub enum SqliteWritePriority {
     BestEffort,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "sqlite background writer admission denied: lane={lane}, waiting_foreground={waiting_foreground}, waiting_background={waiting_background}, queue_limit={queue_limit}"
+)]
+pub struct SqliteBackgroundAdmissionError {
+    pub lane: &'static str,
+    pub waiting_foreground: usize,
+    pub waiting_background: usize,
+    pub queue_limit: usize,
+}
+
 struct ForegroundWaiter {
     state: Arc<Mutex<SqliteWriteState>>,
     notify: Arc<Notify>,
     registered: bool,
+}
+
+struct BackgroundWaiter {
+    state: Arc<Mutex<SqliteWriteState>>,
+    notify: Arc<Notify>,
+    registered: bool,
+}
+
+impl BackgroundWaiter {
+    fn new(state: Arc<Mutex<SqliteWriteState>>, notify: Arc<Notify>) -> Self {
+        Self {
+            state,
+            notify,
+            registered: false,
+        }
+    }
+
+    fn register(&mut self, state: &mut SqliteWriteState) {
+        if !self.registered {
+            state.waiting_background += 1;
+            self.registered = true;
+        }
+    }
+
+    fn complete(&mut self, state: &mut SqliteWriteState) {
+        if self.registered {
+            state.waiting_background = state.waiting_background.saturating_sub(1);
+            self.registered = false;
+        }
+    }
+}
+
+impl Drop for BackgroundWaiter {
+    fn drop(&mut self) {
+        if self.registered
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.waiting_background = state.waiting_background.saturating_sub(1);
+            self.notify.notify_waiters();
+        }
+    }
 }
 
 impl ForegroundWaiter {
@@ -224,8 +289,47 @@ impl SqliteWriteCoordinator {
             .map(|state| SqliteWriteRuntimeStatus {
                 active: state.active,
                 waiting_foreground: state.waiting_foreground,
+                waiting_background: state.waiting_background,
+                background_admitted: state.background_admitted,
+                background_lane_admitted: state.background_lane_admitted,
+                background_rejected: state.background_rejected,
+                background_lane_coalesced: state.background_lane_coalesced,
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn admit_background_lane(&self, lane: &'static str, cadence: Duration) -> bool {
+        let now = Instant::now();
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if let Some(next_allowed_at) = state.background_lane_next.get(&lane).copied()
+            && next_allowed_at > now
+        {
+            state.background_lane_coalesced = state.background_lane_coalesced.saturating_add(1);
+            debug!(
+                event = "sqlite.write",
+                operation = lane,
+                priority = SqliteWritePriority::Background.as_str(),
+                request_id = %observability::current_request_id(),
+                background_admission = "coalesced",
+                retry_after_ms = next_allowed_at.duration_since(now).as_millis(),
+                "sqlite background lane coalesced by cadence"
+            );
+            return false;
+        }
+        state.background_lane_next.insert(lane, now + cadence);
+        state.background_lane_admitted = state.background_lane_admitted.saturating_add(1);
+        debug!(
+            event = "sqlite.write",
+            operation = lane,
+            priority = SqliteWritePriority::Background.as_str(),
+            request_id = %observability::current_request_id(),
+            background_admission = "granted",
+            cadence_ms = cadence.as_millis(),
+            "sqlite background lane admitted"
+        );
+        true
     }
 
     pub async fn write<T, Fut, Op>(&self, lane: &'static str, operation: Op) -> Result<T>
@@ -579,8 +683,11 @@ impl SqliteWriteCoordinator {
         deadline: Duration,
     ) -> Result<SqliteWritePermit> {
         let started = Instant::now();
-        match tokio::time::timeout_at(deadline_at, self.acquire_without_deadline(lane, priority))
-            .await
+        match tokio::time::timeout_at(
+            deadline_at,
+            self.acquire_without_deadline(lane, priority, deadline),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -606,26 +713,66 @@ impl SqliteWriteCoordinator {
         &self,
         lane: &'static str,
         priority: SqliteWritePriority,
+        deadline: Duration,
     ) -> Result<SqliteWritePermit> {
         let wait_started = Instant::now();
         let mut foreground_waiter = (priority == SqliteWritePriority::Foreground)
             .then(|| ForegroundWaiter::new(self.state.clone(), self.notify.clone()));
+        let mut background_waiter = (priority == SqliteWritePriority::Background)
+            .then(|| BackgroundWaiter::new(self.state.clone(), self.notify.clone()));
         loop {
             let notified = {
                 let mut state = self
                     .state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("sqlite writer coordinator poisoned"))?;
+                let background_registered = background_waiter
+                    .as_ref()
+                    .is_some_and(|waiter| waiter.registered);
+                if priority == SqliteWritePriority::Background
+                    && !background_registered
+                    && (state.waiting_foreground > 0
+                        || state.waiting_background >= BACKGROUND_WRITER_QUEUE_LIMIT)
+                {
+                    state.background_rejected = state.background_rejected.saturating_add(1);
+                    warn!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        waiting_foreground = state.waiting_foreground,
+                        waiting_background = state.waiting_background,
+                        queue_limit = BACKGROUND_WRITER_QUEUE_LIMIT,
+                        deadline_ms = deadline.as_millis(),
+                        error_kind = "background_admission",
+                        "sqlite background writer admission denied"
+                    );
+                    return Err(anyhow::Error::new(SqliteBackgroundAdmissionError {
+                        lane,
+                        waiting_foreground: state.waiting_foreground,
+                        waiting_background: state.waiting_background,
+                        queue_limit: BACKGROUND_WRITER_QUEUE_LIMIT,
+                    }));
+                }
                 if !state.active
                     && (!priority.waits_for_foreground() || state.waiting_foreground == 0)
                 {
                     if let Some(waiter) = foreground_waiter.as_mut() {
                         waiter.complete(&mut state);
                     }
+                    if let Some(waiter) = background_waiter.as_mut() {
+                        waiter.complete(&mut state);
+                    }
                     state.active = true;
+                    if priority == SqliteWritePriority::Background {
+                        state.background_admitted = state.background_admitted.saturating_add(1);
+                    }
                     break;
                 }
                 if let Some(waiter) = foreground_waiter.as_mut() {
+                    waiter.register(&mut state);
+                }
+                if let Some(waiter) = background_waiter.as_mut() {
                     waiter.register(&mut state);
                 }
                 self.notify.notified()
@@ -636,6 +783,9 @@ impl SqliteWriteCoordinator {
         debug!(
             sqlite_write_lane = lane,
             sqlite_write_priority = priority.as_str(),
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             wait_ms = waited.as_millis(),
             "sqlite writer permit acquired"
         );
@@ -1301,6 +1451,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                 event = "sqlite.write",
                 operation = self.lane,
                 priority = self.priority.as_str(),
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 writer_wait_ms = self.writer_wait_ms,
                 pool_wait_ms = self.pool_wait.as_millis(),
                 begin_ms = self.begin_elapsed.as_millis(),
@@ -1316,6 +1469,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                 event = "sqlite.write",
                 operation = self.lane,
                 priority = self.priority.as_str(),
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 writer_wait_ms = self.writer_wait_ms,
                 pool_wait_ms = self.pool_wait.as_millis(),
                 begin_ms = self.begin_elapsed.as_millis(),
@@ -1522,6 +1678,9 @@ pub fn is_sqlite_database_error(err: &(dyn std::error::Error + 'static)) -> bool
     while let Some(err) = current {
         if err.downcast_ref::<sqlx::Error>().is_some()
             || err.downcast_ref::<SqliteWriteDeadlineError>().is_some()
+            || err
+                .downcast_ref::<SqliteBackgroundAdmissionError>()
+                .is_some()
         {
             return true;
         }
@@ -1536,6 +1695,20 @@ pub fn is_sqlite_database_error(err: &(dyn std::error::Error + 'static)) -> bool
             || normalized.contains("pool timed out")
             || normalized.contains("pool closed")
             || (normalized.contains("code: 9") && normalized.contains("interrupted"))
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+pub fn is_sqlite_background_admission_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err
+            .downcast_ref::<SqliteBackgroundAdmissionError>()
+            .is_some()
         {
             return true;
         }
@@ -1819,6 +1992,66 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn background_writer_admission_is_bounded() {
+        let coordinator = SqliteWriteCoordinator::new();
+        let held = coordinator
+            .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
+            .await
+            .expect("acquire foreground hold");
+        let first_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_queue", |_| async { Ok::<_, anyhow::Error>(()) })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first background waiter should be admitted");
+
+        let mut rejected = Vec::new();
+        for _ in 0..7 {
+            let coordinator = coordinator.clone();
+            rejected.push(tokio::spawn(async move {
+                coordinator
+                    .write("background_queue", |_| async { Ok::<_, anyhow::Error>(()) })
+                    .await
+            }));
+        }
+        for task in rejected {
+            let error = task
+                .await
+                .expect("background admission task should join")
+                .expect_err("background queue limit should reject excess waiters");
+            assert!(
+                error
+                    .downcast_ref::<SqliteBackgroundAdmissionError>()
+                    .is_some(),
+                "unexpected background admission error: {error:?}"
+            );
+        }
+        assert_eq!(coordinator.runtime_status().waiting_background, 1);
+        drop(held);
+        first_background
+            .await
+            .expect("first background waiter should join")
+            .expect("first background waiter should run");
+
+        let status = coordinator.runtime_status();
+        assert!(!status.active);
+        assert_eq!(status.waiting_background, 0);
+        assert_eq!(status.background_rejected, 7);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn foreground_deadline_bounds_wait_for_writer_permit() {
         let deadline = Duration::from_millis(60);
@@ -2060,15 +2293,25 @@ mod tests {
         let _default_guard = tracing::subscriber::set_default(subscriber);
 
         let coordinator = SqliteWriteCoordinator::with_write_pool(writer_pool.clone());
-        let (_permit, mut tx) = coordinator
-            .begin_immediate(&pool, "transaction_telemetry")
-            .await
-            .expect("begin telemetry transaction");
-        sqlx::query("INSERT INTO telemetry_probe (value) VALUES (1)")
-            .execute(&mut *tx)
-            .await
-            .expect("insert telemetry probe");
-        tx.commit().await.expect("commit telemetry transaction");
+        crate::observability::with_request_context(
+            crate::observability::RequestContext {
+                request_id: "req-transaction-telemetry".to_owned(),
+                method: "POST".to_owned(),
+                route: "/telemetry".to_owned(),
+            },
+            async {
+                let (_permit, mut tx) = coordinator
+                    .begin_immediate(&pool, "transaction_telemetry")
+                    .await
+                    .expect("begin telemetry transaction");
+                sqlx::query("INSERT INTO telemetry_probe (value) VALUES (1)")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("insert telemetry probe");
+                tx.commit().await.expect("commit telemetry transaction");
+            },
+        )
+        .await;
 
         let events = buffer.json_events();
         assert!(events.iter().any(|event| {
@@ -2080,6 +2323,10 @@ mod tests {
                 && event.get("begin_ms").is_some()
                 && event.get("transaction_ms").is_some()
                 && event.get("deadline_ms").is_some()
+                && event.get("request_id")
+                    == Some(&Value::String("req-transaction-telemetry".to_owned()))
+                && event.get("request_method") == Some(&Value::String("POST".to_owned()))
+                && event.get("request_route") == Some(&Value::String("/telemetry".to_owned()))
         }));
 
         remove_test_database(writer_pool, &database_path).await;
