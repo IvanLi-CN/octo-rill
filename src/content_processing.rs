@@ -152,6 +152,25 @@ pub async fn ensure_legacy_writer(pool: &SqlitePool) -> Result<(), ApiError> {
     })))
 }
 
+pub(crate) async fn legacy_writer_route(
+    state: &AppState,
+) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, ApiError> {
+    let guard = state.sqlite_writer.acquire_content_mode_read().await;
+    match current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        ContentProcessingMode::Legacy => Ok(Some(guard)),
+        ContentProcessingMode::RollbackFreeze | ContentProcessingMode::Global => Ok(None),
+    }
+}
+
+pub(crate) async fn acquire_content_mode_transition_guard(
+    state: &AppState,
+) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    state.sqlite_writer.acquire_content_mode_write().await
+}
+
 pub async fn ensure_legacy_writer_runtime(pool: &SqlitePool) -> Result<bool> {
     Ok(current_mode(pool).await? == ContentProcessingMode::Legacy)
 }
@@ -256,6 +275,7 @@ pub async fn transition_to_global(pool: &SqlitePool, switch_token: &str) -> Resu
 }
 
 pub async fn transition_to_global_state(state: &AppState, switch_token: &str) -> Result<bool> {
+    let _content_mode_guard = acquire_content_mode_transition_guard(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_cutover")
@@ -273,6 +293,7 @@ pub async fn transition_to_rollback_freeze_state(
     state: &AppState,
     switch_token: &str,
 ) -> Result<bool> {
+    let _content_mode_guard = acquire_content_mode_transition_guard(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_freeze")
@@ -1018,6 +1039,7 @@ pub async fn submit_item(
     let now = Utc::now().to_rfc3339();
     let request_id = local_id::generate_local_id().to_string();
     let work_id = local_id::generate_local_id().to_string();
+    let _content_mode_guard = state.sqlite_writer.acquire_content_mode_write().await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -5174,6 +5196,32 @@ mod tests {
             ContentProcessingMode::Global
         );
         assert!(!transition_to_global(&pool, "cutover-2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_route_guard_serializes_mode_transition() {
+        let pool = pool("legacy").await;
+        let state = global_state(pool.clone());
+        let route = legacy_writer_route(state.as_ref())
+            .await
+            .unwrap()
+            .expect("legacy mode should expose the legacy route");
+
+        let transition_state = state.clone();
+        let transition = tokio::spawn(async move {
+            transition_to_rollback_freeze_state(transition_state.as_ref(), "freeze-guard")
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!transition.is_finished());
+
+        drop(route);
+        assert!(transition.await.unwrap());
+        assert_eq!(
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::RollbackFreeze
+        );
     }
 
     #[tokio::test]

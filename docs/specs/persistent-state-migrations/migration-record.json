@@ -46,7 +46,7 @@
       {
         "id": "backfill-001",
         "definition_checksum": "c83d2911124381439418c871a2441ad8ea1c7ba3b6eefc7965fc1c6ad346ccdf",
-        "description": "Record unobserved legacy translation_work_items and ai_translations rows in batches of at most 100. Use the durable SQLite rowid cursor for forward scans, then sweep for observation absence at the end to catch row reuse.",
+        "description": "Record unobserved legacy translation_work_items and ai_translations rows in batches of at most 100. Use the durable SQLite rowid cursor for forward scans, then repeatedly sweep from the beginning for observation absence to catch row reuse between batches.",
         "order": 3,
         "depends_on": ["ddl-001", "dml-001"],
         "observable": true,

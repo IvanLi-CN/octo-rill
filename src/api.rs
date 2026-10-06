@@ -53,12 +53,10 @@ const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
 ];
 
-async fn legacy_writer_available(state: &AppState) -> Result<bool, ApiError> {
-    match content_processing::ensure_legacy_writer(&state.pool).await {
-        Ok(()) => Ok(true),
-        Err(error) if error.code() == "content_processing_transition" => Ok(false),
-        Err(error) => Err(error),
-    }
+async fn legacy_writer_available(
+    state: &AppState,
+) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, ApiError> {
+    content_processing::legacy_writer_route(state).await
 }
 
 fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
@@ -22079,7 +22077,8 @@ pub async fn translate_releases_batch_for_user(
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
             let input = global_release_request_item(
@@ -23258,7 +23257,8 @@ pub async fn summarize_releases_smart_batch_for_user(
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
             let input = global_release_request_item(
@@ -23816,7 +23816,8 @@ pub async fn translate_releases_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let mut items = Vec::with_capacity(release_ids.len());
         let mut conflicts = Vec::new();
         let mut first_conflict = None;
@@ -23892,8 +23893,12 @@ pub async fn translate_releases_batch_stream(
 ) -> Result<Response, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let mut requests = Vec::with_capacity(release_ids.len());
+        let mut items = Vec::with_capacity(release_ids.len());
+        let mut conflicts = Vec::new();
+        let mut first_conflict = None;
         for release_id in release_ids {
             let input = global_release_request_item(
                 state.as_ref(),
@@ -23903,9 +23908,42 @@ pub async fn translate_releases_batch_stream(
                 "api.translate_releases_batch_stream",
             )
             .await?;
-            let (_status, response) =
+            let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "stream", &input).await?;
+            if status == StatusCode::CONFLICT {
+                let (item, details, code, message) = global_batch_conflict_item(&input, response);
+                if first_conflict.is_none() {
+                    first_conflict = Some((code, message));
+                }
+                conflicts.push(json!({"item": item.clone(), "details": details}));
+                items.push(item);
+                continue;
+            }
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: response.status,
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("summary_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
             requests.push((release_id, response.request_id));
+        }
+        if let Some((code, message)) = first_conflict {
+            return Err(
+                ApiError::new(StatusCode::CONFLICT, code, message).with_details(json!({
+                    "items": items,
+                    "conflicts": conflicts,
+                })),
+            );
         }
         return Ok(stream_global_release_batch_response(
             state.clone(),
@@ -23963,7 +24001,8 @@ pub async fn translate_release_for_user(
     user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
             state,
@@ -23996,7 +24035,8 @@ pub async fn translate_release(
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         return submit_global_release(
             state.as_ref(),
             &user_id,
@@ -24478,7 +24518,8 @@ pub async fn translate_release_detail(
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         return submit_global_release(
             state.as_ref(),
             &user_id,
@@ -24524,7 +24565,8 @@ pub async fn translate_release_detail_for_user(
     user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
             state,
@@ -24601,7 +24643,8 @@ pub async fn translate_release_detail_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let mut items = Vec::with_capacity(release_ids.len());
         let mut conflicts = Vec::new();
         let mut first_conflict = None;
@@ -24898,7 +24941,8 @@ pub async fn translate_announcement_detail_for_user(
     user_id: &str,
     discussion_key_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let item = global_announcement_request_item(
             state,
             user_id,
@@ -25103,7 +25147,8 @@ pub async fn summarize_announcement_smart_for_user(
     user_id: &str,
     discussion_key_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let item = global_announcement_request_item(
             state,
             user_id,
@@ -25635,7 +25680,8 @@ pub async fn translate_notifications_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let thread_ids = parse_unique_thread_ids(&req.thread_ids, 60)?;
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let mut items = Vec::with_capacity(thread_ids.len());
         let mut conflicts = Vec::new();
         let mut first_conflict = None;
@@ -25704,7 +25750,8 @@ pub async fn translate_notification(
     let thread_id = req.thread_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
-    if !legacy_writer_available(state.as_ref()).await? {
+    let legacy_route = legacy_writer_available(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let input = global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
         let (status, response) = content_processing::submit_item(
             state.as_ref(),
@@ -25765,7 +25812,8 @@ pub async fn translate_notification_for_user(
         return Err(ApiError::bad_request("thread_id is required"));
     }
 
-    if !legacy_writer_available(state).await? {
+    let legacy_route = legacy_writer_available(state).await?;
+    if legacy_route.is_none() {
         let input = global_notification_request_item(state, &user_id, &thread_id).await?;
         let (_, response) =
             content_processing::submit_item(state, &user_id, "wait", &input).await?;

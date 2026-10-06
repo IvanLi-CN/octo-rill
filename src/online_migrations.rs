@@ -12,7 +12,7 @@ use tower_sessions::Session;
 use tracing::warn;
 
 use crate::{
-    api, local_id,
+    api, content_processing, local_id,
     sqlite_write::{SqliteWritePriority, is_sqlite_retryable_write_error},
     state::AppState,
 };
@@ -191,6 +191,11 @@ async fn run_once(state: &AppState) -> Result<bool> {
         .fetch_optional(&state.pool)
         .await?;
         return Ok(status.as_deref() == Some("completed"));
+    };
+    let _content_mode_guard = if operation.operation_kind == "dml" {
+        Some(content_processing::acquire_content_mode_transition_guard(state).await)
+    } else {
+        None
     };
     let (_permit, mut tx) = state
         .sqlite_writer
@@ -682,24 +687,33 @@ async fn backfill_batch(
     tx: &mut Transaction<'_, Sqlite>,
     cursor: &str,
 ) -> Result<(String, i64, bool)> {
-    let (phase, raw_cursor) = cursor
-        .split_once('|')
-        .unwrap_or(("translation_work_items", ""));
+    let (phase, raw_cursor) = if cursor.is_empty() {
+        ("translation_work_items", "")
+    } else {
+        cursor
+            .split_once('|')
+            .ok_or_else(|| anyhow::anyhow!("invalid online migration backfill cursor: {cursor}"))?
+    };
     if !matches!(phase, "translation_work_items" | "ai_translations") {
         anyhow::bail!("unknown online migration backfill cursor phase: {phase}");
     }
     // Legacy primary keys are nanoid/text values and do not provide a stable
-    // ordering. Use rowid for the normal forward scan, then do an absence sweep
-    // from the beginning when the cursor reaches the end so SQLite row reuse is
-    // still observed. Observation absence remains the completion predicate.
+    // ordering. Use rowid for the normal forward scan, then repeatedly query
+    // from the beginning during the absence sweep so SQLite row reuse between
+    // batches is still observed. Observation absence remains the completion
+    // predicate.
     let sweep = raw_cursor.starts_with("sweep:");
     let rowid_cursor = raw_cursor.strip_prefix("sweep:").unwrap_or(raw_cursor);
     let last_rowid = if rowid_cursor.is_empty() {
         0
     } else {
-        rowid_cursor
+        let rowid = rowid_cursor
             .parse::<i64>()
-            .with_context(|| format!("invalid online migration backfill cursor: {cursor}"))?
+            .with_context(|| format!("invalid online migration backfill cursor: {cursor}"))?;
+        if rowid < 0 {
+            anyhow::bail!("invalid online migration backfill cursor: {cursor}");
+        }
+        rowid
     };
     let table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -716,7 +730,7 @@ async fn backfill_batch(
     }
 
     if phase == "translation_work_items" {
-        let rows = if last_rowid > 0 {
+        let rows = if !sweep && last_rowid > 0 {
             sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
                 .bind(last_rowid)
                 .bind(OP_BATCH_SIZE)
@@ -759,14 +773,14 @@ async fn backfill_batch(
             next = next.max(rowid);
         }
         let next_cursor = if sweep {
-            format!("translation_work_items|sweep:{next}")
+            "translation_work_items|sweep:".to_owned()
         } else {
             format!("translation_work_items|{next}")
         };
         return Ok((next_cursor, rows.len() as i64, false));
     }
 
-    let rows = if last_rowid > 0 {
+    let rows = if !sweep && last_rowid > 0 {
         sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
             .bind(last_rowid)
             .bind(OP_BATCH_SIZE)
@@ -816,7 +830,7 @@ async fn backfill_batch(
         next = next.max(rowid);
     }
     let next_cursor = if sweep {
-        format!("ai_translations|sweep:{next}")
+        "ai_translations|sweep:".to_owned()
     } else {
         format!("ai_translations|{next}")
     };
@@ -1369,6 +1383,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_rejects_cursor_without_phase_delimiter() {
+        let pool = pool().await;
+        let mut tx = pool.begin().await.expect("begin malformed cursor batch");
+        let error = backfill_batch(&mut tx, "translation_work_items")
+            .await
+            .expect_err("cursor without phase delimiter must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid online migration backfill cursor")
+        );
+        tx.rollback()
+            .await
+            .expect("rollback malformed cursor batch");
+    }
+
+    #[tokio::test]
     async fn backfill_reentry_does_not_duplicate_legacy_observations() {
         let pool = pool().await;
         sqlx::query(
@@ -1485,7 +1516,7 @@ mod tests {
         tx.commit().await.expect("commit reused rowid sweep");
         assert_eq!(processed, 1);
         assert!(!complete);
-        assert_eq!(next_cursor, "translation_work_items|sweep:2");
+        assert_eq!(next_cursor, "translation_work_items|sweep:");
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_table = 'translation_work_items'",
