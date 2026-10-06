@@ -288,7 +288,7 @@
 
 - Method: `sqlite_write::tests::background_writer_admission_is_bounded`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
 - covers: REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013, REQ-SQLITE-WRITER-014
-- Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under scheduler pressure, writer state is reusable after the run, and normal HTTP access logs carry request correlation fields.
+- Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under a real external SQLite writer lock, writer state is reusable after the run, and a request's `http.access` and `sqlite.write` events carry matching request ID, method, and route fields; fast 4xx access logs carry the complete field set at `warn` level.
 
 ## 验收清单（Acceptance checklist）
 

@@ -4413,6 +4413,7 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::VecDeque,
+        io,
         sync::{Arc, Mutex},
         time::Duration as StdDuration,
     };
@@ -4427,6 +4428,7 @@ mod tests {
     use axum::{
         Router,
         body::Body,
+        extract::Extension,
         http::Request,
         middleware,
         routing::{get, post},
@@ -4512,6 +4514,43 @@ mod tests {
             .await
             .unwrap();
         pool
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedLogBuffer {
+        fn json_events(&self) -> Vec<Value> {
+            let bytes = self.0.lock().expect("shared log buffer lock").clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
     }
 
     #[tokio::test]
@@ -6796,16 +6835,33 @@ mod tests {
         );
     }
 
-    async fn foreground_session_probe(session: Session) -> StatusCode {
+    async fn foreground_session_probe(
+        Extension(started): Extension<Arc<Notify>>,
+        session: Session,
+    ) -> StatusCode {
         session
-            .insert("foreground_probe", "ok")
+            .insert(
+                "foreground_probe",
+                crate::local_id::generate_local_id().to_string(),
+            )
             .await
             .expect("write foreground session probe");
+        started.notify_one();
         StatusCode::NO_CONTENT
     }
 
     #[tokio::test]
     async fn file_backed_scheduler_pressure_preserves_foreground_session_writes() {
+        let log_buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(log_buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-content-processing-load-{}.db",
             crate::local_id::generate_local_id()
@@ -6835,7 +6891,7 @@ mod tests {
                     Ok(true)
                 })
             })
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .expect("create file-backed writer pool");
         crate::database_migrations::run(&reader_pool)
@@ -6863,6 +6919,7 @@ mod tests {
             .await
             .expect("migrate production session store");
 
+        let foreground_started = Arc::new(Notify::new());
         let (set_request_id, propagate_request_id) = crate::observability::request_id_layers();
         let app = Router::new()
             .route("/probe", get(foreground_session_probe))
@@ -6874,6 +6931,7 @@ mod tests {
             )
             .layer(
                 ServiceBuilder::new()
+                    .layer(Extension(foreground_started.clone()))
                     .layer(set_request_id)
                     .layer(middleware::from_fn(
                         crate::observability::access_log_middleware,
@@ -6900,36 +6958,45 @@ mod tests {
             .and_then(|value| value.split(';').next())
             .map(str::to_owned)
             .expect("session seed cookie");
+        foreground_started.notified().await;
 
-        let hold_entered = Arc::new(Notify::new());
-        let release_hold = Arc::new(Notify::new());
-        let holder = {
+        let external_lock = reader_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock");
+
+        let contention_probe = {
             let sqlite_writer = sqlite_writer.clone();
             let reader_pool = reader_pool.clone();
-            let hold_entered = hold_entered.clone();
-            let release_hold = release_hold.clone();
             tokio::spawn(async move {
                 sqlite_writer
-                    .write_foreground("sqlite_acceptance_foreground_hold", move |_| {
+                    .write_foreground("sqlite_acceptance_lock_probe", move |_| {
                         let reader_pool = reader_pool.clone();
-                        hold_entered.notify_one();
-                        let release_hold = release_hold.clone();
                         async move {
-                            let mut connection = reader_pool.acquire().await?;
-                            sqlx::query("BEGIN IMMEDIATE")
-                                .execute(&mut *connection)
-                                .await?;
-                            release_hold.notified().await;
-                            sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+                            sqlx::query(
+                                "UPDATE content_processing_control SET updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+                            )
+                            .execute(&reader_pool)
+                            .await?;
                             Ok::<_, anyhow::Error>(())
                         }
                     })
                     .await
             })
         };
-        tokio::time::timeout(StdDuration::from_secs(1), hold_entered.notified())
-            .await
-            .expect("foreground writer hold should start");
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if log_buffer.json_events().iter().any(|event| {
+                    event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                        && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coordinated write should observe the external sqlite lock");
 
         let mut background_tasks = Vec::new();
         for _ in 0..8 {
@@ -6945,7 +7012,8 @@ mod tests {
         }
         tokio::time::timeout(StdDuration::from_secs(1), async {
             loop {
-                if sqlite_writer.runtime_status().waiting_background > 0 {
+                let status = sqlite_writer.runtime_status();
+                if status.waiting_background > 0 || status.background_rejected > 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -6980,10 +7048,13 @@ mod tests {
                 );
             }));
         }
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        release_hold.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(1), foreground_started.notified())
+            .await
+            .expect("foreground session request should start while sqlite lock is held");
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
 
         for task in foreground_tasks {
             task.await.expect("foreground request task should join");
@@ -6991,10 +7062,93 @@ mod tests {
         for task in background_tasks {
             task.await.expect("background scheduler task should join");
         }
-        holder
+        contention_probe
             .await
-            .expect("foreground writer hold task should join")
-            .expect("foreground writer hold should succeed");
+            .expect("sqlite contention probe should join")
+            .expect("sqlite contention probe should succeed after lock release");
+
+        let error_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .header("x-request-id", "fast-error-acceptance")
+                    .body(Body::empty())
+                    .expect("build fast error request"),
+            )
+            .await
+            .expect("fast error response");
+        assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
+
+        let events = log_buffer.json_events();
+        let correlated_access = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("http.access".to_owned()))
+                    && event.get("request_id") == Some(&Value::String("foreground-0".to_owned()))
+            })
+            .expect("foreground request should emit an access log");
+        assert_eq!(
+            correlated_access.get("method"),
+            Some(&Value::String("GET".to_owned()))
+        );
+        assert_eq!(
+            correlated_access.get("route"),
+            Some(&Value::String("/probe".to_owned()))
+        );
+        assert_eq!(correlated_access.get("status"), Some(&Value::from(204)));
+        assert!(correlated_access.get("latency_ms").is_some());
+        assert_eq!(correlated_access.get("slow"), Some(&Value::from(false)));
+        assert_eq!(
+            correlated_access.get("threshold_ms"),
+            Some(&Value::from(1000))
+        );
+        assert_eq!(
+            correlated_access.get("level"),
+            Some(&Value::String("INFO".to_owned()))
+        );
+
+        assert!(
+            events.iter().any(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event.get("request_id") == Some(&Value::String("foreground-0".to_owned()))
+                    && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                    && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+            }),
+            "the request's SQLite writer telemetry should share its correlation fields"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+            }),
+            "the production-shaped run should observe SQLite busy contention"
+        );
+
+        let error_access = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("http.access".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String("fast-error-acceptance".to_owned()))
+            })
+            .expect("fast error request should emit an access log");
+        assert_eq!(
+            error_access.get("method"),
+            Some(&Value::String("GET".to_owned()))
+        );
+        assert_eq!(
+            error_access.get("route"),
+            Some(&Value::String("/missing".to_owned()))
+        );
+        assert_eq!(error_access.get("status"), Some(&Value::from(404)));
+        assert!(error_access.get("latency_ms").is_some());
+        assert_eq!(error_access.get("slow"), Some(&Value::from(false)));
+        assert_eq!(error_access.get("threshold_ms"), Some(&Value::from(1000)));
+        assert_eq!(
+            error_access.get("level"),
+            Some(&Value::String("WARN".to_owned()))
+        );
 
         let status = sqlite_writer.runtime_status();
         assert!(!status.active, "writer permit must be released after load");

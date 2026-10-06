@@ -96,11 +96,11 @@
 
 - Given 任意 HTTP 请求
   When 请求完成
-  Then 输出一条 `http.access` 事件，并以 `slow` 标记是否超过慢阈值。
+  Then 输出一条 `http.access` 事件，并携带 `request_id`、`method`、`route`、`status`、`latency_ms`、`slow`、`threshold_ms` 全部标准字段。
 
 - Given 一个 `4xx/5xx` 请求
   When 请求快速完成
-  Then 仍输出 `http.access` 事件，且 `slow=false` 不影响错误级别。
+  Then 仍输出包含全部标准字段的 `http.access` 事件，使用 `warn` 级别，且 `slow=false` 不影响错误级别。
 
 - Given AI / sync / SQLite 热路径失败或变慢
   When 触发对应日志
