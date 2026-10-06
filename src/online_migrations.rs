@@ -103,8 +103,9 @@ fn spawn_operator_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(error) => {
+                    let safe_error = redact_error_summary(&error.to_string());
                     warn!(
-                        ?error,
+                        error = %safe_error,
                         migration_id = MIGRATION_ID,
                         "online migration operation failed"
                     );
@@ -113,11 +114,10 @@ fn spawn_operator_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                             migration_id = MIGRATION_ID,
                             "online migration deferred after transient sqlite writer contention"
                         );
-                    } else if let Err(mark_error) =
-                        mark_failed(state.as_ref(), &error.to_string()).await
-                    {
+                    } else if let Err(mark_error) = mark_failed(state.as_ref(), &safe_error).await {
+                        let safe_mark_error = redact_error_summary(&mark_error.to_string());
                         warn!(
-                            ?mark_error,
+                            error = %safe_mark_error,
                             migration_id = MIGRATION_ID,
                             "failed to persist migration error"
                         );
