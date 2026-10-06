@@ -18,9 +18,18 @@ struct AppliedMigration {
 }
 
 pub async fn run(pool: &SqlitePool) -> Result<()> {
-    let applied = load_applied_migrations(pool).await?;
-    validate_history(applied.as_deref(), &MIGRATOR)?;
+    let Some(applied) = load_applied_migrations(pool).await? else {
+        return apply_migrations(pool).await;
+    };
+    if applied.is_empty() {
+        return apply_migrations(pool).await;
+    }
+    validate_history(Some(&applied), &MIGRATOR)?;
+    ensure_no_pending_migrations(&applied, &MIGRATOR)?;
+    Ok(())
+}
 
+async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     let mut migrator = sqlx::migrate!("./migrations");
     // Version 81 is intentionally kept as historical evidence outside the
     // discovered source set. validate_history narrows this exception to that
@@ -30,6 +39,25 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
         .run(pool)
         .await
         .context("failed to apply database migrations")?;
+    Ok(())
+}
+
+fn ensure_no_pending_migrations(applied: &[AppliedMigration], migrator: &Migrator) -> Result<()> {
+    let applied_versions = applied
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<HashSet<_>>();
+    let pending = migrator
+        .iter()
+        .filter(|migration| !applied_versions.contains(&migration.version))
+        .map(|migration| migration.version.to_string())
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        bail!(
+            "database has pending SQLx migrations: {}",
+            pending.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -78,8 +106,12 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
     let highest_applied = applied.iter().map(|migration| migration.version).max();
 
     for migration in applied {
-        if migration.success == 0 {
-            bail!("database migration {} is dirty", migration.version);
+        if migration.success != 1 {
+            bail!(
+                "database migration {} has invalid success flag {}",
+                migration.version,
+                migration.success
+            );
         }
         if migration.version == LEGACY_SEARCH_MIGRATION_VERSION {
             if migration.checksum != legacy_checksum {
@@ -186,6 +218,35 @@ mod tests {
             success: 0,
         }];
         assert!(validate_history(Some(&dirty), &MIGRATOR).is_err());
+
+        let invalid_success = vec![AppliedMigration {
+            version: 80,
+            checksum: current_checksum(80),
+            success: 2,
+        }];
+        assert!(validate_history(Some(&invalid_success), &MIGRATOR).is_err());
+    }
+
+    #[test]
+    fn internal_history_gap_is_rejected() {
+        let missing_version = 84;
+        let mut history = MIGRATOR
+            .iter()
+            .map(|migration| AppliedMigration {
+                version: migration.version,
+                checksum: migration.checksum.to_vec(),
+                success: 1,
+            })
+            .collect::<Vec<_>>();
+        history.retain(|migration| migration.version != missing_version);
+
+        let error = validate_history(Some(&history), &MIGRATOR)
+            .expect_err("an internal migration history gap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("database migration 84 is missing from history")
+        );
     }
 
     #[tokio::test]
@@ -228,7 +289,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_fts_upgrade_defers_existing_corpus_rebuild() {
+    async fn existing_complete_history_validates_without_mutation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        run(&pool).await.expect("apply complete migration history");
+        let before = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read complete migration history");
+
+        run(&pool)
+            .await
+            .expect("validate complete existing migration history");
+        let after = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read validated migration history");
+        assert_eq!(after, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_backfill_state'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read validated schema"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_migration_history_restarts_initialization() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create empty SQLx history");
+
+        run(&pool)
+            .await
+            .expect("restart incomplete database initialization");
+        let applied =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("read recovered migration history");
+        assert_eq!(applied, MIGRATOR.iter().count() as i64);
+        let final_schema = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_backfill_state'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered final schema");
+        assert_eq!(final_schema, 1);
+    }
+
+    #[tokio::test]
+    async fn existing_history_rejects_pending_search_migration_without_rebuild() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -283,7 +412,10 @@ mod tests {
                 .expect("count old FTS corpus");
         assert!(old_fts_rows > 0);
 
-        run(&pool).await.expect("apply rowid recovery migration");
+        let error = run(&pool)
+            .await
+            .expect_err("existing history must reject pending migrations");
+        assert!(error.to_string().contains("pending SQLx migrations"));
 
         let state = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
@@ -291,7 +423,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read resumable recovery state");
-        assert_eq!(state, ("fts_documents".to_owned(), 0, "pending".to_owned()));
+        assert_eq!(state, ("translations".to_owned(), 0, "ready".to_owned()));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
                 .fetch_one(&pool)
@@ -300,11 +432,20 @@ mod tests {
             3
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_documents_fts_v2'",
+            )
                 .fetch_one(&pool)
                 .await
-                .expect("count new FTS corpus before background recovery"),
+                .expect("check pending FTS migration"),
             0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts")
+                .fetch_one(&pool)
+                .await
+                .expect("count retained FTS corpus"),
+            old_fts_rows
         );
     }
 
@@ -430,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_0082_history_upgrades_to_reconcile_demands_without_losing_observations() {
+    async fn existing_history_rejects_pending_reconcile_migration_without_mutation() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -509,7 +650,10 @@ mod tests {
         .await
         .expect("seed migrated webhook observation");
 
-        run(&pool).await.expect("apply reconcile demand migration");
+        let error = run(&pool)
+            .await
+            .expect_err("existing history must reject pending migrations");
+        assert!(error.to_string().contains("pending SQLx migrations"));
 
         let demand_table = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'webhook_push_reconcile_demands'",
@@ -517,14 +661,14 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read demand table");
-        assert_eq!(demand_table, 1);
+        assert_eq!(demand_table, 0);
         let scope = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT webhook_push_allows_private_repos FROM reaction_pat_tokens WHERE user_id = 'user-1'",
+            "SELECT COUNT(*) FROM pragma_table_info('reaction_pat_tokens') WHERE name = 'webhook_push_allows_private_repos'",
         )
         .fetch_one(&pool)
         .await
-        .expect("read nullable PAT scope");
-        assert_eq!(scope, None);
+        .expect("check pending PAT scope migration");
+        assert_eq!(scope, Some(0));
         let hook_id = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT hook_id FROM webhook_push_repos WHERE user_id = 'user-1' AND repo_id = 101",
         )
@@ -535,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_compatibility_migrator_reopens_schema_and_pre_0084_build_is_rejected() {
+    async fn existing_history_rejects_pending_identity_compatibility_without_mutation() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -590,22 +734,22 @@ mod tests {
         .await
         .expect("seed model-specific projection candidates");
 
-        run(&pool)
+        let error = run(&pool)
             .await
-            .expect("apply identity compatibility migration");
-        run(&pool)
-            .await
-            .expect("compatibility build reopens migrated schema");
+            .expect_err("existing history must reject pending migrations");
+        assert!(error.to_string().contains("pending SQLx migrations"));
 
         for table in [
             "content_work_identities",
             "content_work_identity_members",
             "content_current_result_projections",
         ] {
-            let row_count = sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .expect("read empty identity upgrade table");
+            let row_count = sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("check pending identity migration");
             assert_eq!(row_count, 0, "compatibility release backfilled {table}");
         }
         assert_eq!(
@@ -653,33 +797,5 @@ mod tests {
             .expect("read retained provider-call association"),
             1
         );
-        let attempt_snapshot: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT configuration_snapshot_json, route_snapshot_json, configuration_fingerprint FROM content_attempt_events WHERE id = 'attempt-start-a'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read nullable compatibility snapshot columns");
-        assert_eq!(attempt_snapshot, (None, None, None));
-
-        let pre_identity_compatibility_migrator = Migrator {
-            migrations: Cow::Owned(
-                current_migrations
-                    .iter()
-                    .filter(|migration| migration.version < 84)
-                    .cloned()
-                    .collect(),
-            ),
-            ignore_missing: false,
-            locking: true,
-            no_tx: false,
-        };
-        let error = pre_identity_compatibility_migrator
-            .run(&pool)
-            .await
-            .expect_err("a pre-0084 build must not open the upgraded database");
-        assert!(matches!(
-            error,
-            sqlx::migrate::MigrateError::VersionMissing(84)
-        ));
     }
 }

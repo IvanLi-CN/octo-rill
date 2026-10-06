@@ -2125,18 +2125,15 @@ pub async fn submit_translation_request(
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = normalize_mode(req.mode.trim())?;
-    if content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Legacy
-    {
+    let legacy_route = content_processing::legacy_writer_route(state.as_ref()).await?;
+    if legacy_route.is_none() {
         return submit_global_translation_request(state.as_ref(), &user_id, mode, req).await;
     }
-    content_processing::ensure_legacy_writer(&state.pool).await?;
 
     match normalize_submit_payload(mode, req)? {
         NormalizedTranslationSubmit::Single(item) => {
             let created = create_translation_request(state.as_ref(), &user_id, mode, &item).await?;
+            drop(legacy_route);
             match mode {
                 "async" => Ok(Json(created.to_public_response()).into_response()),
                 "wait" => {
@@ -2161,6 +2158,7 @@ pub async fn submit_translation_request(
             }
             let created =
                 create_translation_requests_batch(state.as_ref(), &user_id, mode, &items).await?;
+            drop(legacy_route);
             Ok(Json(TranslationBatchSubmitResponse {
                 requests: created
                     .into_iter()
@@ -2347,7 +2345,7 @@ pub async fn retry_translation_request(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Global
+        == content_processing::ContentProcessingMode::Legacy
     {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2410,11 +2408,8 @@ pub async fn resolve_translation_results(
     Json(req): Json<TranslationResolveRequest>,
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
-    if content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
-    {
+    let legacy_route = content_processing::legacy_writer_route(state.as_ref()).await?;
+    if legacy_route.is_none() {
         let items = normalize_request_items(&req.items)?;
         let mut responses = Vec::with_capacity(items.len());
         for item in items {
@@ -2501,7 +2496,6 @@ pub async fn resolve_translation_results(
         }
         return Ok(Json(json!({ "items": responses })).into_response());
     }
-    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = normalize_request_items(&req.items)?;
     let items =
         resolve_translation_results_for_user(state.as_ref(), &user_id, &items, req.retry_on_error)
@@ -2523,16 +2517,12 @@ pub async fn stream_translation_request(
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
-    if content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Legacy
-    {
+    let legacy_route = content_processing::legacy_writer_route(state.as_ref()).await?;
+    if legacy_route.is_none() {
         return Ok(stream_global_translation_request_response_for_api(
             state, user_id, request_id,
         ));
     }
-    content_processing::ensure_legacy_writer(&state.pool).await?;
     ensure_request_owner(state.as_ref(), &user_id, &request_id).await?;
     Ok(stream_translation_request_response(
         state,
