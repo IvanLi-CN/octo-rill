@@ -256,6 +256,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_complete_history_validates_without_mutation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        run(&pool).await.expect("apply complete migration history");
+        let before = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read complete migration history");
+
+        run(&pool)
+            .await
+            .expect("validate complete existing migration history");
+        let after = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read validated migration history");
+        assert_eq!(after, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_backfill_state'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read validated schema"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn empty_migration_history_restarts_initialization() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

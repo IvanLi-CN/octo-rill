@@ -25,17 +25,23 @@ const LEASE_NAME: &str = "online-migration-operator";
 const SUPERSEDED_MIGRATION_ID: &str = "content-processing-online-v1";
 const SUPERSEDED_MIGRATION_CHECKSUM: &str =
     "d7bf80e8389baa89db826966758ef410a960853bbae98605c0137504469a6846";
-const SUPERSEDED_OPERATION_DEFINITIONS: &[(&str, &str)] = &[
+const SUPERSEDED_OPERATION_DEFINITIONS: &[(&str, &str, i64, &str)] = &[
     (
         "ddl-001",
+        "ddl",
+        1,
         "65d459e9ec29e136329dc8bb8a2bbd7bf87280999ce7d6ae2ecef3118cad0d36",
     ),
     (
         "dml-001",
+        "dml",
+        2,
         "bd49f0b3c9584c116821cb8a70473424b5035cc2a912c393b349869bf76d6b13",
     ),
     (
         "backfill-001",
+        "backfill",
+        3,
         "abfd0ba152798ac3ba49736a257e0c34f4ca5a576691abbf4e3e199f4d49a4e3",
     ),
 ];
@@ -87,6 +93,10 @@ struct ObservationInput<'a> {
 }
 
 pub fn spawn_operator(state: Arc<AppState>) -> AbortHandle {
+    spawn_operator_task(state).abort_handle()
+}
+
+fn spawn_operator_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match run_once(state.as_ref()).await {
@@ -117,7 +127,6 @@ pub fn spawn_operator(state: Arc<AppState>) -> AbortHandle {
             sleep(Duration::from_secs(1)).await;
         }
     })
-    .abort_handle()
 }
 
 async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
@@ -463,24 +472,44 @@ async fn validate_superseded_migration_identity(tx: &mut Transaction<'_, Sqlite>
     .bind(SUPERSEDED_MIGRATION_ID)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(existing_checksum) = existing_checksum
-        && existing_checksum != SUPERSEDED_MIGRATION_CHECKSUM
+    if existing_checksum
+        .as_deref()
+        .is_some_and(|checksum| checksum != SUPERSEDED_MIGRATION_CHECKSUM)
     {
         anyhow::bail!("superseded online migration definition checksum mismatch");
     }
-    for (operation_id, checksum) in SUPERSEDED_OPERATION_DEFINITIONS {
-        let existing_checksum = sqlx::query_scalar::<_, String>(
-            "SELECT definition_checksum FROM online_migration_operations WHERE migration_id = ? AND operation_id = ?",
-        )
-        .bind(SUPERSEDED_MIGRATION_ID)
-        .bind(operation_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some(existing_checksum) = existing_checksum
-            && existing_checksum != *checksum
+    let existing_operations = sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT operation_id, operation_kind, operation_order, definition_checksum FROM online_migration_operations WHERE migration_id = ? ORDER BY operation_order, operation_id",
+    )
+    .bind(SUPERSEDED_MIGRATION_ID)
+    .fetch_all(&mut **tx)
+    .await?;
+    if existing_checksum.is_none() && existing_operations.is_empty() {
+        return Ok(());
+    }
+    if existing_checksum.is_none() {
+        anyhow::bail!("superseded online migration run identity is missing");
+    }
+    if existing_operations.len() != SUPERSEDED_OPERATION_DEFINITIONS.len() {
+        anyhow::bail!("superseded online migration operation definition set mismatch");
+    }
+    for (operation_id, expected_kind, expected_order, expected_checksum) in
+        SUPERSEDED_OPERATION_DEFINITIONS
+    {
+        let Some((_, actual_kind, actual_order, actual_checksum)) = existing_operations
+            .iter()
+            .find(|(actual_id, _, _, _)| actual_id == operation_id)
+        else {
+            anyhow::bail!(
+                "superseded online migration operation definition set mismatch: {operation_id}"
+            );
+        };
+        if actual_checksum != expected_checksum
+            || actual_kind != expected_kind
+            || actual_order != expected_order
         {
             anyhow::bail!(
-                "superseded online migration operation definition checksum mismatch: {operation_id}"
+                "superseded online migration operation definition identity mismatch: {operation_id}"
             );
         }
     }
@@ -626,11 +655,26 @@ async fn normalize_content_mode(tx: &mut Transaction<'_, Sqlite>) -> Result<()> 
     .fetch_one(&mut **tx)
     .await?;
     if exists == 0 {
+        anyhow::bail!("content processing control table is missing");
+    }
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("content processing control record is missing"))?;
+    if !matches!(mode.as_str(), "legacy" | "rollback_freeze" | "global") {
+        anyhow::bail!("invalid content processing control mode: {mode}");
+    }
+    if mode == "global" {
         return Ok(());
     }
-    sqlx::query("UPDATE content_processing_control SET mode = 'global', updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode IN ('legacy', 'rollback_freeze')")
+    let updated = sqlx::query("UPDATE content_processing_control SET mode = 'global', updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode IN ('legacy', 'rollback_freeze')")
         .execute(&mut **tx)
-        .await?;
+        .await?
+        .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("content processing control mode was not updated");
+    }
     Ok(())
 }
 
@@ -968,7 +1012,7 @@ mod tests {
             .await
             .expect("connect sqlite");
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, legacy_source_hash TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key, legacy_source_hash));",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, legacy_source_hash TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key, legacy_source_hash)); CREATE TABLE content_processing_control (id INTEGER PRIMARY KEY, mode TEXT NOT NULL, switch_token TEXT, updated_at TEXT NOT NULL); INSERT INTO content_processing_control (id, mode, updated_at) VALUES (1, 'legacy', CURRENT_TIMESTAMP);",
         )
         .execute(&pool)
         .await
@@ -1145,6 +1189,75 @@ mod tests {
             .expect("count operator observations"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dml_requires_the_content_processing_control_record() {
+        let pool = pool().await;
+        sqlx::query("DROP TABLE content_processing_control")
+            .execute(&pool)
+            .await
+            .expect("drop control table");
+        let mut tx = pool.begin().await.expect("begin missing table check");
+        let error = normalize_content_mode(&mut tx)
+            .await
+            .expect_err("missing control table must fail closed");
+        assert!(error.to_string().contains("control table is missing"));
+        tx.rollback().await.expect("rollback missing table check");
+
+        sqlx::query(
+            "CREATE TABLE content_processing_control (id INTEGER PRIMARY KEY, mode TEXT NOT NULL, switch_token TEXT, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("recreate control table");
+        let mut tx = pool.begin().await.expect("begin missing row check");
+        let error = normalize_content_mode(&mut tx)
+            .await
+            .expect_err("missing control record must fail closed");
+        assert!(error.to_string().contains("control record is missing"));
+        tx.rollback().await.expect("rollback missing row check");
+    }
+
+    #[tokio::test]
+    async fn completed_operator_task_exits_after_durable_terminal_state() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('terminal-runtime', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert terminal runtime owner");
+        let state = test_state(pool.clone(), "terminal-runtime");
+        assert!(
+            ensure_bootstrap(&state)
+                .await
+                .expect("bootstrap terminal run")
+        );
+        sqlx::query(
+            "UPDATE online_migration_operations SET status = 'completed' WHERE migration_id = ?",
+        )
+        .bind(MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("complete terminal operations");
+        sqlx::query("UPDATE online_migration_runs SET status = 'completed' WHERE migration_id = ?")
+            .bind(MIGRATION_ID)
+            .execute(&pool)
+            .await
+            .expect("complete terminal run");
+
+        let task = spawn_operator_task(state);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("completed operator task should exit")
+            .expect("completed operator task should not panic");
     }
 
     #[tokio::test]
@@ -1492,6 +1605,108 @@ mod tests {
             error
                 .to_string()
                 .contains("superseded online migration definition checksum mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_mutated_superseded_operation_identity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('owner-a', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert live owner");
+        let state = test_state(pool.clone(), "owner-a");
+        assert!(
+            ensure_bootstrap(&state)
+                .await
+                .expect("bootstrap control tables")
+        );
+
+        sqlx::query(
+            "INSERT INTO online_migration_runs (migration_id, definition_checksum, status, created_at, updated_at) VALUES (?, ?, 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .bind(SUPERSEDED_MIGRATION_CHECKSUM)
+        .execute(&pool)
+        .await
+        .expect("insert valid superseded run");
+        for (operation_id, kind, order, checksum) in SUPERSEDED_OPERATION_DEFINITIONS {
+            sqlx::query(
+                "INSERT INTO online_migration_operations (migration_id, operation_id, definition_checksum, operation_kind, operation_order, status, updated_at) VALUES (?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)",
+            )
+            .bind(SUPERSEDED_MIGRATION_ID)
+            .bind(operation_id)
+            .bind(checksum)
+            .bind(kind)
+            .bind(order)
+            .execute(&pool)
+            .await
+            .expect("insert valid superseded operation");
+        }
+        assert!(
+            ensure_bootstrap(&state)
+                .await
+                .expect("validate valid superseded history")
+        );
+
+        sqlx::query(
+            "UPDATE online_migration_operations SET operation_kind = 'dml' WHERE migration_id = ? AND operation_id = 'ddl-001'",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("mutate superseded operation kind");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("mutated superseded operation kind must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("superseded online migration operation definition identity mismatch")
+        );
+
+        sqlx::query(
+            "UPDATE online_migration_operations SET operation_kind = 'ddl', operation_order = 99 WHERE migration_id = ? AND operation_id = 'ddl-001'",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("mutate superseded operation order");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("mutated superseded operation order must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("superseded online migration operation definition identity mismatch")
+        );
+
+        sqlx::query(
+            "DELETE FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'backfill-001'",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("remove superseded operation");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("incomplete superseded operation set must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("superseded online migration operation definition set mismatch")
         );
     }
 
