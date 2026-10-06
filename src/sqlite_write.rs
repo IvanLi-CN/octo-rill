@@ -312,6 +312,8 @@ impl SqliteWriteCoordinator {
                 operation = lane,
                 priority = SqliteWritePriority::Background.as_str(),
                 request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 background_admission = "coalesced",
                 retry_after_ms = next_allowed_at.duration_since(now).as_millis(),
                 "sqlite background lane coalesced by cadence"
@@ -325,6 +327,8 @@ impl SqliteWriteCoordinator {
             operation = lane,
             priority = SqliteWritePriority::Background.as_str(),
             request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             background_admission = "granted",
             cadence_ms = cadence.as_millis(),
             "sqlite background lane admitted"
@@ -407,6 +411,9 @@ impl SqliteWriteCoordinator {
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
                             elapsed_ms,
                             completed_after_deadline,
                             deadline_overrun_ms,
@@ -424,6 +431,9 @@ impl SqliteWriteCoordinator {
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
                             elapsed_ms,
                             attempt,
                             writer_wait_ms,
@@ -456,6 +466,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms = elapsed.as_millis(),
                         attempt,
                         writer_wait_ms,
@@ -479,6 +492,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms = elapsed.as_millis(),
                         attempt,
                         writer_wait_ms,
@@ -497,6 +513,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms = elapsed.as_millis(),
                         attempt,
                         writer_wait_ms,
@@ -515,6 +534,9 @@ impl SqliteWriteCoordinator {
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
                             elapsed_ms = elapsed.as_millis(),
                             attempt,
                             writer_wait_ms,
@@ -551,6 +573,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = SqliteWritePriority::BestEffort.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     writer_wait_ms = 0_u128,
                     pool_wait_ms = 0_u128,
                     begin_ms = 0_u128,
@@ -586,6 +611,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = SqliteWritePriority::BestEffort.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms,
                         completed_after_deadline,
                         deadline_overrun_ms,
@@ -602,6 +630,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = SqliteWritePriority::BestEffort.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms,
                         writer_wait_ms,
                         pool_wait_ms = 0_u128,
@@ -618,6 +649,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = SqliteWritePriority::BestEffort.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     elapsed_ms = elapsed.as_millis(),
                     writer_wait_ms,
                     pool_wait_ms = 0_u128,
@@ -643,6 +677,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = SqliteWritePriority::BestEffort.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     elapsed_ms = elapsed.as_millis(),
                     writer_wait_ms,
                     pool_wait_ms = 0_u128,
@@ -696,6 +733,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = priority.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     writer_wait_ms,
                     pool_wait_ms = 0_u128,
                     begin_ms = 0_u128,
@@ -740,6 +780,8 @@ impl SqliteWriteCoordinator {
                         operation = lane,
                         priority = priority.as_str(),
                         request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         waiting_foreground = state.waiting_foreground,
                         waiting_background = state.waiting_background,
                         queue_limit = BACKGROUND_WRITER_QUEUE_LIMIT,
@@ -876,6 +918,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = priority.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     writer_wait_ms = 0_u128,
                     pool_wait_ms = 0_u128,
                     begin_ms = 0_u128,
@@ -896,6 +941,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = priority.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     writer_wait_ms,
                     pool_wait_ms = 0_u128,
                     begin_ms = 0_u128,
@@ -922,6 +970,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         writer_wait_ms,
                         pool_wait_ms = pool_wait.as_millis(),
                         begin_ms = 0_u128,
@@ -942,6 +993,9 @@ impl SqliteWriteCoordinator {
                     event = "sqlite.write",
                     operation = lane,
                     priority = priority.as_str(),
+                    request_id = %observability::current_request_id(),
+                    request_method = %observability::current_request_method(),
+                    request_route = %observability::current_request_route(),
                     writer_wait_ms,
                     pool_wait_ms = pool_wait.as_millis(),
                     begin_ms = 0_u128,
@@ -979,6 +1033,9 @@ impl SqliteWriteCoordinator {
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
                             writer_wait_ms,
                             pool_wait_ms = pool_wait.as_millis(),
                             begin_ms = begin_elapsed.as_millis(),
@@ -1029,6 +1086,9 @@ impl SqliteWriteCoordinator {
                                 event = "sqlite.write",
                                 operation = lane,
                                 priority = priority.as_str(),
+                                request_id = %observability::current_request_id(),
+                                request_method = %observability::current_request_method(),
+                                request_route = %observability::current_request_route(),
                                 writer_wait_ms,
                                 pool_wait_ms = pool_wait.as_millis(),
                                 begin_ms = begin_elapsed.as_millis(),
@@ -1054,6 +1114,9 @@ impl SqliteWriteCoordinator {
                                 event = "sqlite.write",
                                 operation = lane,
                                 priority = priority.as_str(),
+                                request_id = %observability::current_request_id(),
+                                request_method = %observability::current_request_method(),
+                                request_route = %observability::current_request_route(),
                                 writer_wait_ms = permit.writer_wait_ms(),
                                 pool_wait_ms = pool_wait.as_millis(),
                                 begin_ms = begin_elapsed.as_millis(),
@@ -1076,6 +1139,9 @@ impl SqliteWriteCoordinator {
                                 event = "sqlite.write",
                                 operation = lane,
                                 priority = priority.as_str(),
+                                request_id = %observability::current_request_id(),
+                                request_method = %observability::current_request_method(),
+                                request_route = %observability::current_request_route(),
                                 writer_wait_ms = permit.writer_wait_ms(),
                                 pool_wait_ms = pool_wait.as_millis(),
                                 begin_ms = begin_elapsed.as_millis(),
@@ -1098,6 +1164,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms = begin_elapsed.as_millis(),
                         attempt,
                         writer_wait_ms,
@@ -1142,6 +1211,9 @@ impl SqliteWriteCoordinator {
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
                         elapsed_ms = begin_elapsed.as_millis(),
                         error_kind,
                         sqlite_write_lane = lane,
@@ -1178,6 +1250,9 @@ impl SqliteWriteCoordinator {
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
                             elapsed_ms = begin_elapsed.as_millis(),
                             sqlite_write_lane = lane,
                             sqlite_write_priority = priority.as_str(),
@@ -1502,12 +1577,18 @@ async fn cleanup_sqlite_write_transaction(tx: Transaction<'_, Sqlite>, lane: &'s
         Ok(Err(error)) => warn!(
             event = "sqlite.write",
             operation = lane,
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             error = %error,
             "sqlite write rollback cleanup failed"
         ),
         Err(error) => warn!(
             event = "sqlite.write",
             operation = lane,
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             error = %error,
             "sqlite write rollback cleanup timed out"
         ),
@@ -1538,6 +1619,9 @@ async fn cleanup_sqlite_connection(
         warn!(
             event = "sqlite.write",
             operation = "writer_pool_after_release",
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             error_kind = "transaction_cleanup_pending",
             recovery = "evict",
             "sqlite writer connection still has an open transaction; evicting before reuse"
@@ -1548,6 +1632,9 @@ async fn cleanup_sqlite_connection(
         tracing::warn!(
             event = "sqlite.write",
             operation = "writer_pool_after_release",
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
             connection_recovery = "evict",
             error = %error,
             "sqlite writer connection cleanup evicted an open transaction"
@@ -1570,6 +1657,9 @@ async fn cleanup_sqlite_connection(
             tracing::debug!(
                 event = "sqlite.write",
                 operation = "writer_pool_after_release",
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 connection_recovery = "reused",
                 "sqlite writer connection cleanup completed before reuse"
             );
@@ -1582,6 +1672,9 @@ async fn cleanup_sqlite_connection(
             tracing::warn!(
                 event = "sqlite.write",
                 operation = "writer_pool_after_release",
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 connection_recovery = "evict",
                 error = %error,
                 "sqlite writer connection cleanup left an open transaction"
@@ -1592,6 +1685,9 @@ async fn cleanup_sqlite_connection(
             tracing::warn!(
                 event = "sqlite.write",
                 operation = "writer_pool_after_release",
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 connection_recovery = "evict",
                 error = %error,
                 "sqlite writer connection cleanup failed"
@@ -1605,6 +1701,9 @@ async fn cleanup_sqlite_connection(
             tracing::warn!(
                 event = "sqlite.write",
                 operation = "writer_pool_after_release",
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
                 connection_recovery = "evict",
                 error = %error,
                 "sqlite writer connection cleanup timed out"
@@ -1946,7 +2045,7 @@ mod tests {
             let max_active = max_active.clone();
             handles.push(tokio::spawn(async move {
                 coordinator
-                    .write("test", |_| {
+                    .write_foreground("test", |_| {
                         let active = active.clone();
                         let max_active = max_active.clone();
                         async move {
@@ -2502,8 +2601,13 @@ mod tests {
             let coordinator = coordinator.clone();
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
-                let (_sqlite_write, mut tx) =
-                    coordinator.begin_immediate(&pool, "test_wal_tx").await?;
+                let (_sqlite_write, mut tx) = coordinator
+                    .begin_immediate_with_priority(
+                        &pool,
+                        "test_wal_tx",
+                        SqliteWritePriority::Foreground,
+                    )
+                    .await?;
                 sqlx::query("INSERT INTO writer_probe (lane, value) VALUES (?, ?)")
                     .bind("test_wal_tx")
                     .bind(value)

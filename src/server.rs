@@ -1806,7 +1806,8 @@ mod tests {
             Some(&Value::from("/users/{user_id}"))
         );
         assert_eq!(access_event.get("status"), Some(&Value::from(400)));
-        assert!(access_event.get("threshold_ms").is_none());
+        assert_eq!(access_event.get("threshold_ms"), Some(&Value::from(1000)));
+        assert_eq!(access_event.get("slow"), Some(&Value::from(false)));
     }
 
     #[tokio::test]

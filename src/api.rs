@@ -990,7 +990,11 @@ pub async fn admin_patch_user(
 
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "admin_patch_user")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "admin_patch_user",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     let target = sqlx::query_as::<_, AdminPatchTargetRow>(
@@ -1932,6 +1936,7 @@ async fn validate_daily_brief_schedule_against_enabled_slots(
 fn sync_runtime_config_database_error(error: anyhow::Error) -> ApiError {
     if crate::sqlite_write::is_sqlite_busy_error(error.as_ref())
         || crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+        || crate::sqlite_write::is_sqlite_background_admission_error(error.as_ref())
     {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8363,7 +8368,7 @@ pub async fn admin_audit_llm_diagnostic_access(
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
-        .write("llm_diagnostic_access_audit", |_| async {
+        .write_foreground("llm_diagnostic_access_audit", |_| async {
             sqlx::query(
                 r#"
                 INSERT INTO llm_diagnostic_access_audit (id, call_id, actor_user_id, action, created_at)
@@ -10387,7 +10392,11 @@ async fn upsert_public_release_usage(
 
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "public_release_usage_register")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "public_release_usage_register",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     sqlx::query(
@@ -10556,7 +10565,7 @@ async fn resolve_public_release_usage_from_local_metadata(
 
     state
         .sqlite_writer
-        .write("public_release_usage_metadata_refresh", |_| async {
+        .write_foreground("public_release_usage_metadata_refresh", |_| async {
             sqlx::query(
                 r#"
                 UPDATE public_repo_release_usage
@@ -10593,7 +10602,11 @@ async fn resolve_public_release_usage_from_local_metadata(
     {
         let (_sqlite_write, mut tx) = state
             .sqlite_writer
-            .begin_immediate(&state.pool, "public_release_usage_sync_status")
+            .begin_immediate_with_priority(
+                &state.pool,
+                "public_release_usage_sync_status",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
             .await
             .map_err(ApiError::internal)?;
         sqlx::query(
@@ -11101,7 +11114,11 @@ pub async fn publish_repo_public_release(
     let now = chrono::Utc::now().to_rfc3339();
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "public_release_usage_publish")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "public_release_usage_publish",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     let release_count: i64 = sqlx::query_scalar(
@@ -11184,7 +11201,11 @@ pub async fn publish_repo_public_release(
     {
         let (_sqlite_write, mut tx) = state
             .sqlite_writer
-            .begin_immediate(&state.pool, "public_release_usage_publish_status")
+            .begin_immediate_with_priority(
+                &state.pool,
+                "public_release_usage_publish_status",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
             .await
             .map_err(ApiError::internal)?;
         sqlx::query(
@@ -11250,7 +11271,11 @@ pub async fn unpublish_repo_public_release(
     }
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "public_release_usage_unpublish")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "public_release_usage_unpublish",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
@@ -13437,7 +13462,11 @@ pub async fn admin_delete_public_release_repo(
 
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "admin_public_release_usage_delete")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "admin_public_release_usage_delete",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
@@ -20571,7 +20600,11 @@ async fn upsert_translation(
     let now = chrono::Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "legacy_translation_upsert")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "legacy_translation_upsert",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
@@ -20620,7 +20653,11 @@ async fn mark_translation_requested(
 ) -> Result<(), ApiError> {
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "legacy_translation_request")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "legacy_translation_request",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
@@ -21919,7 +21956,11 @@ async fn upsert_translation_terminal_status(
     let now = chrono::Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "legacy_translation_terminal_status")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "legacy_translation_terminal_status",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;

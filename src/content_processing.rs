@@ -1064,7 +1064,11 @@ pub async fn submit_item(
     let work_id = local_id::generate_local_id().to_string();
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_submit")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_submit",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
@@ -1804,7 +1808,11 @@ pub async fn retry_request(
     let breaker_open = provider_breaker_open(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_retry")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_retry",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
@@ -6733,13 +6741,21 @@ mod tests {
     #[tokio::test]
     async fn global_scheduler_coalesces_recovery_across_workers() {
         let pool = global_pool().await;
-        let state = global_state(pool);
+        insert_test_work(
+            &pool,
+            "recovery-work",
+            "failed",
+            1,
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .await;
+        let state = global_state(pool.clone());
 
         let mut workers = Vec::new();
         for _ in 0..8 {
             let worker_state = state.clone();
             workers.push(tokio::spawn(async move {
-                run_once_with_outcome(worker_state.as_ref()).await
+                recover_due(worker_state.as_ref()).await
             }));
         }
 
@@ -6749,6 +6765,26 @@ mod tests {
                 .expect("scheduler worker should join")
                 .expect("scheduler recovery should succeed");
         }
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'recovery-work' AND event_type = 'attempt_queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count recovery attempts"),
+            1,
+            "coalesced recovery should enqueue the due work item once"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'recovery-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read recovered work status"),
+            "queued"
+        );
 
         assert_eq!(
             state
@@ -6869,15 +6905,22 @@ mod tests {
         let release_hold = Arc::new(Notify::new());
         let holder = {
             let sqlite_writer = sqlite_writer.clone();
+            let reader_pool = reader_pool.clone();
             let hold_entered = hold_entered.clone();
             let release_hold = release_hold.clone();
             tokio::spawn(async move {
                 sqlite_writer
                     .write_foreground("sqlite_acceptance_foreground_hold", move |_| {
+                        let reader_pool = reader_pool.clone();
                         hold_entered.notify_one();
                         let release_hold = release_hold.clone();
                         async move {
+                            let mut connection = reader_pool.acquire().await?;
+                            sqlx::query("BEGIN IMMEDIATE")
+                                .execute(&mut *connection)
+                                .await?;
                             release_hold.notified().await;
+                            sqlx::query("ROLLBACK").execute(&mut *connection).await?;
                             Ok::<_, anyhow::Error>(())
                         }
                     })

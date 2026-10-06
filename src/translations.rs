@@ -25,7 +25,10 @@ use crate::{
     admin_runtime, ai, api, content_processing,
     error::ApiError,
     runtime,
-    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_write_deadline_error},
+    sqlite_write::{
+        SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_background_admission_error,
+        is_sqlite_write_deadline_error,
+    },
     state::AppState,
 };
 
@@ -5822,7 +5825,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref())
+                        || is_sqlite_background_admission_error(finalize_error.as_ref())
+                    {
                         match defer_translation_batch_after_finalize_deadline(state, &batch).await {
                             Ok(_) => Err(finalize_error),
                             Err(defer_error) => Err(anyhow!(
@@ -5879,7 +5884,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref())
+                        || is_sqlite_background_admission_error(finalize_error.as_ref())
+                    {
                         match defer_translation_batch_after_finalize_deadline(state, &batch).await {
                             Ok(_) => Err(anyhow!(finalize_error_text)),
                             Err(defer_error) => Err(anyhow!(

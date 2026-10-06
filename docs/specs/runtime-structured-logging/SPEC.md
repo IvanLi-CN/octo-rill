@@ -11,7 +11,7 @@
 - 统一进程日志为 `JSON Only` 单行 stdout，正式日志框架继续采用现有 `tracing + tracing-subscriber + tower-http`。
 - 固定 `Container-first` 运行时日志合同：容器 stdout 为主，现有 `OCTORILL_TASK_LOG_DIR` 文件任务日志保留为补充通道，不重写为主后端。
 - 固定 `Metadata Only + error chain` 披露面：日志保留稳定排障元数据，不记录 body、token、cookie、email、login、完整 query string，不默认输出 Rust backtrace。
-- 固定 HTTP access log 为 `Slow+Error Only`，同时落地 `Accept+Echo X-Request-Id` 契约。
+- 固定 HTTP access log 为每个请求一条结构化事件，使用 `slow` 标记慢请求，同时落地 `Accept+Echo X-Request-Id` 契约。
 - 为高价值慢路径与异常路径补统一字段：`event`、`operation`、`attempt`、`elapsed_ms`、`error_kind`、`error_chain`、`request_id`、`user_id`、`repo_id` 等。
 - 对运行时背压与非关键降级路径，也必须给出可区分的结构化原因字段，例如 translation backpressure 的 `reason`，以及 reaction persist skip 的 `downgrade_reason`。
 
@@ -55,9 +55,9 @@
 
 ### HTTP access log
 
-- 只记录慢请求与错误请求。
-- 快速 `2xx` 默认不打 access log。
-- 至少包含字段：`event=http.access`、`request_id`、`method`、`route`、`status`、`latency_ms`。
+- 每个请求都记录一条 access log；4xx/5xx 使用 `warn` 级别，其他状态使用 `info` 级别。
+- `slow` 表示请求是否达到 `OCTORILL_HTTP_SLOW_MS`，错误状态不因快速完成而省略 access log。
+- 至少包含字段：`event=http.access`、`request_id`、`method`、`route`、`status`、`latency_ms`、`slow`、`threshold_ms`。
 - `route` 记录路由模板或 path，不记录完整 query string。
 
 ### 慢阈值
@@ -94,13 +94,13 @@
   When 调用任意 HTTP 路由
   Then 响应头原样回显该值，且 access / error log 中使用同一值。
 
-- Given 一个快速 `2xx` 请求
-  When `latency_ms < OCTORILL_HTTP_SLOW_MS`
-  Then 默认不输出 `http.access` 事件。
-
-- Given 一个慢 `2xx/3xx` 请求或任意 `4xx/5xx`
+- Given 任意 HTTP 请求
   When 请求完成
-  Then 输出 `http.access` 事件并携带标准字段。
+  Then 输出一条 `http.access` 事件，并以 `slow` 标记是否超过慢阈值。
+
+- Given 一个 `4xx/5xx` 请求
+  When 请求快速完成
+  Then 仍输出 `http.access` 事件，且 `slow=false` 不影响错误级别。
 
 - Given AI / sync / SQLite 热路径失败或变慢
   When 触发对应日志
