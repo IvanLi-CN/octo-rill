@@ -406,18 +406,20 @@ async fn ensure_bootstrap_with_priority(
         .execute(&mut *tx)
         .await?;
     for (operation_id, kind, order, checksum) in OPERATION_DEFINITIONS {
-        let existing_checksum = sqlx::query_scalar::<_, String>(
-            "SELECT definition_checksum FROM online_migration_operations WHERE migration_id = ? AND operation_id = ?",
+        let existing = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT definition_checksum, operation_kind, operation_order FROM online_migration_operations WHERE migration_id = ? AND operation_id = ?",
         )
         .bind(MIGRATION_ID)
         .bind(operation_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(existing_checksum) = existing_checksum
-            && existing_checksum != *checksum
+        if let Some((existing_checksum, existing_kind, existing_order)) = existing
+            && (existing_checksum != *checksum
+                || existing_kind != *kind
+                || existing_order != *order)
         {
             anyhow::bail!(
-                "online migration operation definition checksum mismatch: {operation_id}"
+                "online migration operation definition identity mismatch: {operation_id}"
             );
         }
         sqlx::query("INSERT OR IGNORE INTO online_migration_operations (migration_id, operation_id, definition_checksum, operation_kind, operation_order, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)")
@@ -429,6 +431,15 @@ async fn ensure_bootstrap_with_priority(
             .bind(&now)
             .execute(&mut *tx)
             .await?;
+    }
+    let operation_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM online_migration_operations WHERE migration_id = ?",
+    )
+    .bind(MIGRATION_ID)
+    .fetch_one(&mut *tx)
+    .await?;
+    if operation_count != OPERATION_DEFINITIONS.len() as i64 {
+        anyhow::bail!("online migration operation definition set mismatch");
     }
     tx.commit().await?;
     Ok(true)
@@ -1315,6 +1326,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_rejects_mutated_operation_kind_or_order() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('owner-a', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert live owner");
+
+        let state = test_state(pool.clone(), "owner-a");
+        assert!(
+            ensure_bootstrap(&state)
+                .await
+                .expect("bootstrap operation identity")
+        );
+
+        sqlx::query(
+            "UPDATE online_migration_operations SET operation_kind = 'dml' WHERE migration_id = ? AND operation_id = 'ddl-001'",
+        )
+        .bind(MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("mutate operation kind");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("mutated operation kind must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("online migration operation definition identity mismatch")
+        );
+
+        sqlx::query(
+            "UPDATE online_migration_operations SET operation_kind = 'ddl', operation_order = 99 WHERE migration_id = ? AND operation_id = 'ddl-001'",
+        )
+        .bind(MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("mutate operation order");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("mutated operation order must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("online migration operation definition identity mismatch")
+        );
+    }
+
+    #[tokio::test]
     async fn ddl_rebuilds_observation_identity_without_losing_history() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1369,9 +1440,10 @@ mod tests {
     #[test]
     fn migration_failure_summary_is_redacted_and_bounded() {
         let summary = redact_error_summary(
-            "request failed: authorization=Bearer live-secret\nsource: safe\nsecret=private-value",
+            "request failed: authorization=Bearer live-secret secret=second-secret\nsource: safe\nsecret=private-value",
         );
         assert!(!summary.contains("live-secret"));
+        assert!(!summary.contains("second-secret"));
         assert!(!summary.contains("private-value"));
         assert!(summary.contains("authorization=<redacted>"));
         assert!(summary.len() <= 500);

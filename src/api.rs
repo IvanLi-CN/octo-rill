@@ -26285,7 +26285,8 @@ mod tests {
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
         RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
         ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
-        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslateReleaseRequest,
+        TranslateReleasesBatchRequest, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
         admin_get_llm_activity, admin_get_llm_call_detail, admin_get_llm_scheduler_status,
         admin_get_realtime_task_detail, admin_get_release_freshness_audit, admin_list_llm_calls,
@@ -26328,8 +26329,8 @@ mod tests {
         release_smart_diff_prompt, require_active_user_id, require_business_user_id,
         resolve_release_full_name, search, should_retry_public_compare_without_auth,
         smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
-        sync_all, sync_notifications, sync_releases, sync_starred, task_events_sse,
-        translate_release_detail_for_user, translate_releases_batch_for_user,
+        sync_all, sync_notifications, sync_releases, sync_starred, task_events_sse, translate_release,
+        translate_release_detail_for_user, translate_releases_batch, translate_releases_batch_for_user,
         translate_response_from_batch_item, unpublish_repo_public_release, upsert_translation,
     };
     use crate::ai;
@@ -39466,6 +39467,54 @@ line two",
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
         assert!(detail.repo_visual.is_none());
+    }
+
+    #[tokio::test]
+    async fn rollback_freeze_adapters_repair_mode_and_preserve_global_admission_status() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("set rollback freeze mode");
+        let state = setup_state_with_ai(pool.clone());
+
+        let response = translate_release(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(ReturnModeQuery {
+                return_mode: Some("task_id".to_owned()),
+            }),
+            Json(TranslateReleaseRequest {
+                release_id: "120".to_owned(),
+            }),
+        )
+        .await
+        .expect("rollback freeze adapter submission");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT mode FROM content_processing_control WHERE id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read repaired content mode"),
+            "global"
+        );
+
+        let error = translate_releases_batch(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Json(TranslateReleasesBatchRequest {
+                release_ids: vec!["120".to_owned()],
+            }),
+        )
+        .await
+        .expect_err("different producer must retain the global conflict");
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
