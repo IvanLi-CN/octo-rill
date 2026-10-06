@@ -23,8 +23,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     admin_runtime, ai, api, briefs, content_processing, local_id, runtime,
-    sqlite_write::is_sqlite_write_deadline_error, state::AppState, sync, translations,
-    webhook_push, worker_backoff::WorkerBackoff,
+    sqlite_write::{is_sqlite_background_admission_error, is_sqlite_write_deadline_error},
+    state::AppState,
+    sync, translations, webhook_push,
+    worker_backoff::WorkerBackoff,
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -2707,9 +2709,11 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             }
         }
         Err(err) => {
-            if is_sqlite_write_deadline_error(err.as_ref()) {
+            if is_sqlite_write_deadline_error(err.as_ref())
+                || is_sqlite_background_admission_error(err.as_ref())
+            {
                 heartbeat.stop().await;
-                defer_task_after_sqlite_write_deadline(state.as_ref(), &task, &payload).await?;
+                defer_task_after_sqlite_write_backpressure(state.as_ref(), &task, &payload).await?;
                 return Ok(());
             }
 
@@ -2752,7 +2756,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     Ok(())
 }
 
-async fn defer_task_after_sqlite_write_deadline(
+async fn defer_task_after_sqlite_write_backpressure(
     state: &AppState,
     task: &TaskRow,
     payload: &Value,
@@ -2770,7 +2774,7 @@ async fn defer_task_after_sqlite_write_deadline(
         available_at,
         retry_count,
         json!({
-            "reason": "sqlite_write_deadline",
+            "reason": "sqlite_write_backpressure",
             "retry_count": retry_count,
         }),
     )
@@ -2781,7 +2785,7 @@ async fn defer_task_after_sqlite_write_deadline(
             task_type = task.task_type,
             retry_count,
             available_at = %available_at.to_rfc3339(),
-            "background task deferred after sqlite write deadline"
+            "background task deferred after sqlite write backpressure"
         );
     }
     Ok(rescheduled)
@@ -4935,7 +4939,7 @@ mod tests {
         TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
         cancel_task, claim_next_queued_task, complete_task,
         current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
-        defer_task_after_sqlite_write_deadline, enqueue_brief_history_recompute_if_needed,
+        defer_task_after_sqlite_write_backpressure, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
         enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
@@ -6812,7 +6816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_write_deadline_persists_background_task_deferral() {
+    async fn sqlite_write_backpressure_persists_background_task_deferral() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_task(
@@ -6840,9 +6844,10 @@ mod tests {
         };
         let before = Utc::now();
 
-        let rescheduled = defer_task_after_sqlite_write_deadline(state.as_ref(), &task, &payload)
-            .await
-            .expect("defer task after sqlite deadline");
+        let rescheduled =
+            defer_task_after_sqlite_write_backpressure(state.as_ref(), &task, &payload)
+                .await
+                .expect("defer task after sqlite deadline");
 
         assert!(rescheduled);
         let (status, retry_count, available_at): (String, i64, String) = sqlx::query_as(

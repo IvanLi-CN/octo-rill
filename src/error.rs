@@ -84,7 +84,10 @@ impl ApiError {
             || error_chain_lower.contains("sqlite_busy")
             || error_chain_lower.contains("sqlite busy");
         let is_session_conflict = error_chain_lower.contains("retryable sqlite session conflict");
-        if is_write_deadline || is_write_busy || is_session_conflict {
+        let is_background_admission = display_lower
+            .contains("sqlite background writer admission denied")
+            || error_chain_lower.contains("sqlite background writer admission denied");
+        if is_write_deadline || is_write_busy || is_session_conflict || is_background_admission {
             return Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "sqlite_write_retryable",
@@ -188,6 +191,20 @@ mod tests {
             "retryable sqlite session conflict: request baseline unavailable"
         ))
         .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn sqlite_background_admission_maps_to_retryable_service_unavailable() {
+        let error = crate::sqlite_write::SqliteBackgroundAdmissionError {
+            lane: "content_processing_claim",
+            waiting_foreground: 1,
+            waiting_background: 1,
+            queue_limit: 1,
+        };
+        let response = ApiError::internal(error).into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");

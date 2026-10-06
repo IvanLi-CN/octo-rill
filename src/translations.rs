@@ -25,7 +25,10 @@ use crate::{
     admin_runtime, ai, api, content_processing,
     error::ApiError,
     runtime,
-    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_write_deadline_error},
+    sqlite_write::{
+        SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_background_admission_error,
+        is_sqlite_write_deadline_error,
+    },
     state::AppState,
 };
 
@@ -3517,12 +3520,18 @@ async fn try_resolve_translation_results_without_write(
     }
     tx.commit().await.map_err(ApiError::internal)?;
 
+    let sqlite_status = state.sqlite_writer.runtime_status();
     tracing::info!(
         event = "translation.backpressure",
         reason = reason.as_str(),
         item_count = out.len(),
-        sqlite_writer_active = state.sqlite_writer.runtime_status().active,
-        sqlite_writer_waiting_foreground = state.sqlite_writer.runtime_status().waiting_foreground,
+        sqlite_writer_active = sqlite_status.active,
+        sqlite_writer_waiting_foreground = sqlite_status.waiting_foreground,
+        sqlite_writer_waiting_background = sqlite_status.waiting_background,
+        sqlite_background_admitted = sqlite_status.background_admitted,
+        sqlite_background_lane_admitted = sqlite_status.background_lane_admitted,
+        sqlite_background_rejected = sqlite_status.background_rejected,
+        sqlite_background_lane_coalesced = sqlite_status.background_lane_coalesced,
         "translation resolve returned pending snapshot under backpressure"
     );
 
@@ -5816,7 +5825,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref())
+                        || is_sqlite_background_admission_error(finalize_error.as_ref())
+                    {
                         match defer_translation_batch_after_finalize_deadline(state, &batch).await {
                             Ok(_) => Err(finalize_error),
                             Err(defer_error) => Err(anyhow!(
@@ -5873,7 +5884,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref())
+                        || is_sqlite_background_admission_error(finalize_error.as_ref())
+                    {
                         match defer_translation_batch_after_finalize_deadline(state, &batch).await {
                             Ok(_) => Err(anyhow!(finalize_error_text)),
                             Err(defer_error) => Err(anyhow!(
