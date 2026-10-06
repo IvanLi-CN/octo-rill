@@ -682,7 +682,7 @@ async fn backfill_batch(
     tx: &mut Transaction<'_, Sqlite>,
     cursor: &str,
 ) -> Result<(String, i64, bool)> {
-    let (phase, last_rowid) = cursor
+    let (phase, raw_cursor) = cursor
         .split_once('|')
         .unwrap_or(("translation_work_items", ""));
     if !matches!(phase, "translation_work_items" | "ai_translations") {
@@ -692,10 +692,12 @@ async fn backfill_batch(
     // ordering. Use rowid for the normal forward scan, then do an absence sweep
     // from the beginning when the cursor reaches the end so SQLite row reuse is
     // still observed. Observation absence remains the completion predicate.
-    let last_rowid = if last_rowid.is_empty() {
+    let sweep = raw_cursor.starts_with("sweep:");
+    let rowid_cursor = raw_cursor.strip_prefix("sweep:").unwrap_or(raw_cursor);
+    let last_rowid = if rowid_cursor.is_empty() {
         0
     } else {
-        last_rowid
+        rowid_cursor
             .parse::<i64>()
             .with_context(|| format!("invalid online migration backfill cursor: {cursor}"))?
     };
@@ -715,19 +717,11 @@ async fn backfill_batch(
 
     if phase == "translation_work_items" {
         let rows = if last_rowid > 0 {
-            let forward_rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+            sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
                 .bind(last_rowid)
                 .bind(OP_BATCH_SIZE)
                 .fetch_all(&mut **tx)
-                .await?;
-            if forward_rows.is_empty() {
-                sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
-                    .bind(OP_BATCH_SIZE)
-                    .fetch_all(&mut **tx)
-                    .await?
-            } else {
-                forward_rows
-            }
+                .await?
         } else {
             sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
                 .bind(OP_BATCH_SIZE)
@@ -735,7 +729,11 @@ async fn backfill_batch(
                 .await?
         };
         if rows.is_empty() {
-            return Ok(("ai_translations|".to_owned(), 0, false));
+            return Ok(if !sweep && last_rowid > 0 {
+                ("translation_work_items|sweep:".to_owned(), 0, false)
+            } else {
+                ("ai_translations|".to_owned(), 0, false)
+            });
         }
         let mut next = last_rowid;
         for row in &rows {
@@ -760,27 +758,20 @@ async fn backfill_batch(
             .await?;
             next = next.max(rowid);
         }
-        return Ok((
-            format!("translation_work_items|{next}"),
-            rows.len() as i64,
-            false,
-        ));
+        let next_cursor = if sweep {
+            format!("translation_work_items|sweep:{next}")
+        } else {
+            format!("translation_work_items|{next}")
+        };
+        return Ok((next_cursor, rows.len() as i64, false));
     }
 
     let rows = if last_rowid > 0 {
-        let forward_rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
+        sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE legacy.rowid > ? AND NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
             .bind(last_rowid)
             .bind(OP_BATCH_SIZE)
             .fetch_all(&mut **tx)
-            .await?;
-        if forward_rows.is_empty() {
-            sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
-                .bind(OP_BATCH_SIZE)
-                .fetch_all(&mut **tx)
-                .await?
-        } else {
-            forward_rows
-        }
+            .await?
     } else {
         sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
             .bind(OP_BATCH_SIZE)
@@ -788,7 +779,11 @@ async fn backfill_batch(
             .await?
     };
     if rows.is_empty() {
-        return Ok((cursor.to_owned(), 0, true));
+        return Ok(if !sweep && last_rowid > 0 {
+            ("ai_translations|sweep:".to_owned(), 0, false)
+        } else {
+            (cursor.to_owned(), 0, true)
+        });
     }
     let mut next = last_rowid;
     for row in &rows {
@@ -820,7 +815,12 @@ async fn backfill_batch(
         .await?;
         next = next.max(rowid);
     }
-    Ok((format!("ai_translations|{next}"), rows.len() as i64, false))
+    let next_cursor = if sweep {
+        format!("ai_translations|sweep:{next}")
+    } else {
+        format!("ai_translations|{next}")
+    };
+    Ok((next_cursor, rows.len() as i64, false))
 }
 
 async fn insert_observation(
@@ -1195,12 +1195,26 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("read phase cursor"),
+            "translation_work_items|sweep:"
+        );
+
+        run_once(&restarted_state)
+            .await
+            .expect("complete work-item absence sweep");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT cursor FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'backfill-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read cache phase cursor"),
             "ai_translations|"
         );
 
         let completed = run_once(&restarted_state)
             .await
-            .expect("complete backfill operation");
+            .expect("complete cache backfill operation");
         assert!(completed, "terminal operator run should request shutdown");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -1457,13 +1471,21 @@ mod tests {
         .expect("insert row with reused rowid");
 
         let mut tx = pool.begin().await.expect("begin resumed batch");
-        let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+        let (sweep_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+            .await
+            .expect("start reused rowid sweep");
+        tx.commit().await.expect("commit resumed batch");
+        assert_eq!(processed, 0);
+        assert!(!complete);
+
+        let mut tx = pool.begin().await.expect("begin reused rowid sweep");
+        let (next_cursor, processed, complete) = backfill_batch(&mut tx, &sweep_cursor)
             .await
             .expect("backfill reused rowid");
-        tx.commit().await.expect("commit resumed batch");
+        tx.commit().await.expect("commit reused rowid sweep");
         assert_eq!(processed, 1);
         assert!(!complete);
-        assert_eq!(next_cursor, "translation_work_items|2");
+        assert_eq!(next_cursor, "translation_work_items|sweep:2");
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_table = 'translation_work_items'",
@@ -1472,6 +1494,78 @@ mod tests {
             .await
             .expect("count work observations"),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_sweep_resumes_across_multiple_reused_rowid_batches() {
+        let pool = pool().await;
+        for index in 0..205 {
+            sqlx::query(
+                "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES (?, 'release_summary', ?, ?, 'completed')",
+            )
+            .bind(format!("sweep-work-{index:03}"))
+            .bind(format!("release-sweep-{index}"))
+            .bind(format!("old-hash-{index}"))
+            .execute(&pool)
+            .await
+            .expect("insert initial sweep row");
+        }
+
+        let mut cursor = String::new();
+        for expected_processed in [100, 100, 5] {
+            let mut tx = pool.begin().await.expect("begin forward sweep batch");
+            let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+                .await
+                .expect("run forward sweep batch");
+            tx.commit().await.expect("commit forward sweep batch");
+            assert_eq!(processed, expected_processed);
+            assert!(!complete);
+            cursor = next_cursor;
+        }
+        assert_eq!(cursor, "translation_work_items|205");
+
+        sqlx::query("DELETE FROM translation_work_items")
+            .execute(&pool)
+            .await
+            .expect("delete initial sweep rows");
+        for index in 0..205 {
+            sqlx::query(
+                "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES (?, 'release_summary', ?, ?, 'completed')",
+            )
+            .bind(format!("sweep-work-{index:03}"))
+            .bind(format!("release-sweep-new-{index}"))
+            .bind(format!("new-hash-{index}"))
+            .execute(&pool)
+            .await
+            .expect("insert reused sweep row");
+        }
+
+        let mut processed_total = 0;
+        for _ in 0..8 {
+            let mut tx = pool.begin().await.expect("begin resumed sweep batch");
+            let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+                .await
+                .expect("run resumed sweep batch");
+            tx.commit().await.expect("commit resumed sweep batch");
+            processed_total += processed;
+            cursor = next_cursor;
+            if cursor == "ai_translations|" {
+                assert_eq!(processed, 0);
+                assert!(!complete);
+                break;
+            }
+        }
+        assert_eq!(processed_total, 205);
+        assert_eq!(cursor, "ai_translations|");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_table = 'translation_work_items' AND legacy_source_hash LIKE 'new-hash-%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count resumed sweep observations"),
+            205
         );
     }
 

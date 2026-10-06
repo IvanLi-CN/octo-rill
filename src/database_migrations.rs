@@ -106,8 +106,12 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
     let highest_applied = applied.iter().map(|migration| migration.version).max();
 
     for migration in applied {
-        if migration.success == 0 {
-            bail!("database migration {} is dirty", migration.version);
+        if migration.success != 1 {
+            bail!(
+                "database migration {} has invalid success flag {}",
+                migration.version,
+                migration.success
+            );
         }
         if migration.version == LEGACY_SEARCH_MIGRATION_VERSION {
             if migration.checksum != legacy_checksum {
@@ -214,6 +218,13 @@ mod tests {
             success: 0,
         }];
         assert!(validate_history(Some(&dirty), &MIGRATOR).is_err());
+
+        let invalid_success = vec![AppliedMigration {
+            version: 80,
+            checksum: current_checksum(80),
+            success: 2,
+        }];
+        assert!(validate_history(Some(&invalid_success), &MIGRATOR).is_err());
     }
 
     #[test]
