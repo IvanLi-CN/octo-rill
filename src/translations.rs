@@ -2347,7 +2347,7 @@ pub async fn retry_translation_request(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Global
+        == content_processing::ContentProcessingMode::Legacy
     {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2413,7 +2413,7 @@ pub async fn resolve_translation_results(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let items = normalize_request_items(&req.items)?;
         let mut responses = Vec::with_capacity(items.len());

@@ -22074,7 +22074,7 @@ pub async fn translate_releases_batch_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23258,7 +23258,7 @@ pub async fn summarize_releases_smart_batch_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23821,7 +23821,7 @@ pub async fn translate_releases_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         let mut conflicts = Vec::new();
@@ -23902,7 +23902,7 @@ pub async fn translate_releases_batch_stream(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut requests = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23978,7 +23978,7 @@ pub async fn translate_release_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
@@ -24016,7 +24016,7 @@ pub async fn translate_release(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         return submit_global_release(
             state.as_ref(),
@@ -24504,7 +24504,7 @@ pub async fn translate_release_detail(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         return submit_global_release(
             state.as_ref(),
@@ -24556,7 +24556,7 @@ pub async fn translate_release_detail_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
@@ -24638,7 +24638,7 @@ pub async fn translate_release_detail_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         let mut conflicts = Vec::new();
@@ -24940,7 +24940,7 @@ pub async fn translate_announcement_detail_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let item = global_announcement_request_item(
             state,
@@ -25150,7 +25150,7 @@ pub async fn summarize_announcement_smart_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let item = global_announcement_request_item(
             state,
@@ -25687,7 +25687,7 @@ pub async fn translate_notifications_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(thread_ids.len());
         let mut conflicts = Vec::new();
@@ -25761,7 +25761,7 @@ pub async fn translate_notification(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let input = global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
         let (status, response) = content_processing::submit_item(
@@ -25828,7 +25828,7 @@ pub async fn translate_notification_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let input = global_notification_request_item(state, &user_id, &thread_id).await?;
         let (_, response) =

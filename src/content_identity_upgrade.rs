@@ -11,7 +11,7 @@ use crate::{
     ai, api,
     error::ApiError,
     local_id,
-    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_retryable_write_error},
     state::AppState,
 };
 
@@ -879,12 +879,18 @@ pub fn spawn_worker(state: Arc<AppState>) -> tokio::task::AbortHandle {
                 },
                 Err(error) => {
                     tracing::warn!(?error, "content identity upgrade batch failed");
-                    if let Err(mark_error) =
-                        mark_failed(&state, "identity_upgrade_batch_failed").await
-                    {
-                        tracing::warn!(
-                            ?mark_error,
-                            "content identity upgrade failure state could not be saved"
+                    if !is_sqlite_retryable_write_error(error.as_ref()) {
+                        if let Err(mark_error) =
+                            mark_failed(&state, "identity_upgrade_batch_failed").await
+                        {
+                            tracing::warn!(
+                                ?mark_error,
+                                "content identity upgrade failure state could not be saved"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            "content identity upgrade deferred after transient sqlite writer contention"
                         );
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;

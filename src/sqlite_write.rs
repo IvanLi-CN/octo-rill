@@ -1816,6 +1816,12 @@ pub fn is_sqlite_background_admission_error(err: &(dyn std::error::Error + 'stat
     false
 }
 
+pub fn is_sqlite_retryable_write_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    is_sqlite_background_admission_error(err)
+        || is_sqlite_busy_error(err)
+        || is_sqlite_write_deadline_error(err)
+}
+
 pub struct SqliteWritePermit {
     lane: &'static str,
     priority: SqliteWritePriority,
