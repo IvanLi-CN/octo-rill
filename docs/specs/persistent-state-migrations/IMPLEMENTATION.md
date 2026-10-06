@@ -4,7 +4,7 @@
 
 `database_migrations::run` executes before the listener is bound. A fresh database applies the checked-in SQLx set before listen. A database that already has non-empty `_sqlx_migrations` history is validation-only: applied rows are checked for version, checksum, and dirty state, and pending SQLx migrations are not applied in place. An empty SQLx history table is treated as incomplete initialization and is safely restarted.
 
-After `runtime::register_runtime_owner`, the server starts the online operator. The named `online-migration-operator` lease creates the control tables and registers `content-processing-online-v2` with three ordered operations: `ddl-001`, `dml-001`, and `backfill-001`. The previous `content-processing-online-v1` identity and checksums remain historical and are validated read-only.
+After `runtime::register_runtime_owner`, the server starts the online operator. The named `online-migration-operator` lease creates the control tables and registers `content-processing-online-v2` with three ordered operations: `ddl-001`, `dml-001`, and `backfill-001`. The previous `content-processing-online-v1` identity and checksums remain historical and are validated read-only. The operator exits its loop after a durable `completed` state; paused and failed states remain available for explicit administrator resume.
 
 The DDL operation upgrades `content_legacy_observations` to include source-hash identity while preserving prior rows. The DML operation repairs historical `content_processing_control` values to `global`. The backfill observes legacy work and cache rows in batches of at most 100. Observation absence, rather than a rowid cursor alone, is the completion predicate; rowid is retained only as an informational progress cursor.
 

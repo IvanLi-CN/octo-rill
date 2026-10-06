@@ -277,7 +277,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("read recovered migration history");
-        assert!(applied > 0);
+        assert_eq!(applied, MIGRATOR.iter().count() as i64);
+        let final_schema = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_backfill_state'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered final schema");
+        assert_eq!(final_schema, 1);
     }
 
     #[tokio::test]

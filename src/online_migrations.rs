@@ -89,25 +89,29 @@ struct ObservationInput<'a> {
 pub fn spawn_operator(state: Arc<AppState>) -> AbortHandle {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = run_once(state.as_ref()).await {
-                warn!(
-                    ?error,
-                    migration_id = MIGRATION_ID,
-                    "online migration operation failed"
-                );
-                if is_sqlite_retryable_write_error(error.as_ref()) {
+            match run_once(state.as_ref()).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
                     warn!(
+                        ?error,
                         migration_id = MIGRATION_ID,
-                        "online migration deferred after transient sqlite writer contention"
+                        "online migration operation failed"
                     );
-                } else if let Err(mark_error) =
-                    mark_failed(state.as_ref(), &error.to_string()).await
-                {
-                    warn!(
-                        ?mark_error,
-                        migration_id = MIGRATION_ID,
-                        "failed to persist migration error"
-                    );
+                    if is_sqlite_retryable_write_error(error.as_ref()) {
+                        warn!(
+                            migration_id = MIGRATION_ID,
+                            "online migration deferred after transient sqlite writer contention"
+                        );
+                    } else if let Err(mark_error) =
+                        mark_failed(state.as_ref(), &error.to_string()).await
+                    {
+                        warn!(
+                            ?mark_error,
+                            migration_id = MIGRATION_ID,
+                            "failed to persist migration error"
+                        );
+                    }
                 }
             }
             sleep(Duration::from_secs(1)).await;
@@ -165,13 +169,19 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_once(state: &AppState) -> Result<()> {
+async fn run_once(state: &AppState) -> Result<bool> {
     if !ensure_bootstrap(state).await? {
-        return Ok(());
+        return Ok(false);
     }
 
     let Some(operation) = load_next_operation(state).await? else {
-        return Ok(());
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM online_migration_runs WHERE migration_id = ?",
+        )
+        .bind(MIGRATION_ID)
+        .fetch_optional(&state.pool)
+        .await?;
+        return Ok(status.as_deref() == Some("completed"));
     };
     let (_permit, mut tx) = state
         .sqlite_writer
@@ -183,7 +193,7 @@ async fn run_once(state: &AppState) -> Result<()> {
         .await?;
     if !renew_lease(tx.as_transaction_mut(), state).await? {
         tx.rollback().await.ok();
-        return Ok(());
+        return Ok(false);
     }
 
     let pause_requested = sqlx::query_scalar::<_, i64>(
@@ -212,7 +222,7 @@ async fn run_once(state: &AppState) -> Result<()> {
         )
         .await?;
         tx.commit().await?;
-        return Ok(());
+        return Ok(false);
     }
 
     update_run(
@@ -277,7 +287,8 @@ async fn run_once(state: &AppState) -> Result<()> {
     .bind(MIGRATION_ID)
     .fetch_one(&mut *tx)
     .await?;
-    if pending == 0 {
+    let completed = pending == 0;
+    if completed {
         update_run(
             tx.as_transaction_mut(),
             &state.runtime_owner_id,
@@ -287,7 +298,7 @@ async fn run_once(state: &AppState) -> Result<()> {
         .await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(completed)
 }
 
 pub(crate) async fn ensure_legacy_observation_identity_schema(
@@ -1076,9 +1087,30 @@ mod tests {
         assert_eq!(first_cursor.1, "translation_work_items|1");
         assert_eq!(first_cursor.2, 1);
 
-        run_once(&state)
+        sqlx::query(
+            "UPDATE runtime_owners SET lease_heartbeat_at = datetime('now', '-91 seconds') WHERE runtime_owner_id = 'operator-runtime'",
+        )
+        .execute(&pool)
+        .await
+        .expect("stale the interrupted runtime owner");
+        sqlx::query(
+            "UPDATE online_migration_leases SET lease_expires_at = datetime('now', '-1 second') WHERE lease_name = ?",
+        )
+        .bind(LEASE_NAME)
+        .execute(&pool)
+        .await
+        .expect("expire the interrupted lease");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('operator-runtime-restarted', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert restarted runtime owner");
+        let restarted_state = test_state(pool.clone(), "operator-runtime-restarted");
+
+        run_once(&restarted_state)
             .await
-            .expect("advance backfill phase cursor");
+            .expect("resume backfill after operator restart");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT cursor FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'backfill-001'",
@@ -1090,7 +1122,10 @@ mod tests {
             "ai_translations|"
         );
 
-        run_once(&state).await.expect("complete backfill operation");
+        let completed = run_once(&restarted_state)
+            .await
+            .expect("complete backfill operation");
+        assert!(completed, "terminal operator run should request shutdown");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM online_migration_runs WHERE migration_id = ?",
