@@ -466,6 +466,7 @@ pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
     Ok(match status.as_deref() {
         Some("ready") if !metadata_pending => "ready".to_owned(),
         Some("paused_low_disk") => "paused_low_disk".to_owned(),
+        Some("failed") => "failed".to_owned(),
         _ => "building".to_owned(),
     })
 }
@@ -1198,6 +1199,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_backfill_failed_state_is_terminal() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        sqlx::query("DELETE FROM search_documents WHERE id = 'release:4201'")
+            .execute(&pool)
+            .await
+            .expect("clear release projection before failed-state check");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'releases', cursor = 0, status = 'failed', last_error = 'previous failure' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed failed backfill state");
+        let state = setup_state(pool.clone());
+
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("failed backfill state should be terminal");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'release:4201'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count release projection after failed-state check"),
+            0
+        );
+        let backfill_state = sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+            "SELECT phase, cursor, status, last_error FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read failed backfill state");
+        assert_eq!(
+            backfill_state,
+            (
+                "releases".to_owned(),
+                0,
+                "failed".to_owned(),
+                Some("previous failure".to_owned())
+            )
+        );
+
+        assert!(
+            crate::search_index::resume_failed_for_test(state.as_ref())
+                .await
+                .expect("resume failed search projection")
+        );
+        let resumed_state = sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+            "SELECT phase, cursor, status, last_error FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read resumed backfill state");
+        assert_eq!(
+            resumed_state,
+            ("releases".to_owned(), 0, "building".to_owned(), None)
+        );
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run resumed search projection batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'release:4201'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count release projection after explicit resume"),
+            1
+        );
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT cursor FROM search_projection_backfill_state WHERE id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read cursor after explicit resume")
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_backfill_failure_rolls_back_before_marking_failed() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        sqlx::query("DELETE FROM search_documents WHERE id = 'release:4201'")
+            .execute(&pool)
+            .await
+            .expect("clear release projection before failure injection");
+        sqlx::query(
+            "CREATE TRIGGER search_test_fail_projection BEFORE INSERT ON search_documents WHEN NEW.id = 'release:4201' BEGIN SELECT RAISE(ABORT, 'forced search projection failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create search projection failure trigger");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'releases', cursor = 0, status = 'building', last_error = NULL WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed building backfill state");
+        let state = setup_state(pool.clone());
+
+        let error = crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect_err("forced search projection failure");
+        assert!(
+            error
+                .to_string()
+                .contains("forced search projection failure")
+        );
+
+        let backfill_state = sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+            "SELECT phase, cursor, status, last_error FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read terminal failure state");
+        assert_eq!(backfill_state.0, "releases");
+        assert_eq!(backfill_state.1, 0);
+        assert_eq!(backfill_state.2, "failed");
+        assert!(
+            backfill_state
+                .3
+                .as_deref()
+                .is_some_and(|value| value.contains("forced search projection failure"))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'release:4201'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count rolled-back release projection"),
+            0
+        );
+
+        let (_permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate_with_priority(
+                &state.pool,
+                "search_projection_foreground_regression",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("acquire foreground writer after failed backfill");
+        sqlx::query("UPDATE users SET updated_at = updated_at WHERE id = 'search-user'")
+            .execute(&mut *tx)
+            .await
+            .expect("foreground write after failed backfill");
+        tx.commit()
+            .await
+            .expect("commit foreground write after failed backfill");
+    }
+
+    #[tokio::test]
     async fn projection_backfill_resumes_in_bounded_batches() {
         let pool = setup_pool().await;
         seed_repo_association(&pool).await;
@@ -1250,6 +1410,169 @@ mod tests {
             announcements[0].id,
             "announcement:search-announcement-backfill"
         );
+    }
+
+    #[tokio::test]
+    async fn projection_backfill_releases_stays_within_batch_boundary() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        for index in 0..26_i64 {
+            let release_id = 4201 + index;
+            sqlx::query(
+                r#"
+                INSERT INTO repo_releases (
+                  id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+                  published_at, created_at, is_prerelease, is_draft, updated_at,
+                  react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
+                ) VALUES (?, 42, ?, ?, ?, ?, ?, ?, '2026-02-22T00:00:00Z',
+                          '2026-02-22T00:00:00Z', 0, 0, '2026-02-22T00:00:00Z',
+                          0, 0, 0, 0, 0, 0)
+                "#,
+            )
+            .bind(format!("search-release-{release_id}"))
+            .bind(release_id)
+            .bind(format!("node-search-{release_id}"))
+            .bind(format!("v{index}.0.0"))
+            .bind(format!("Release {index}"))
+            .bind(format!("release body {index}"))
+            .bind(format!(
+                "https://github.com/octo/rill/releases/tag/v{index}.0.0"
+            ))
+            .execute(&pool)
+            .await
+            .expect("seed bounded release batch");
+        }
+        sqlx::query("DELETE FROM search_documents WHERE resource_type = 'release'")
+            .execute(&pool)
+            .await
+            .expect("clear release projection before bounded backfill");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'releases', cursor = 0, status = 'building' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release backfill cursor");
+        let state = setup_state(pool.clone());
+
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run first bounded release batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE resource_type = 'release'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count first bounded release batch"),
+            25
+        );
+        let first_cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT cursor FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read first release batch cursor");
+        assert_eq!(first_cursor, 25);
+
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run second bounded release batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE resource_type = 'release'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count second bounded release batch"),
+            26
+        );
+        let second_cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT cursor FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read second release batch cursor");
+        assert_eq!(second_cursor, 26);
+    }
+
+    #[tokio::test]
+    async fn search_projection_lookup_plans_use_backfill_indexes() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        let visible_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT repo_id, full_name, owner_login FROM user_release_visible_repos WHERE repo_id = 42",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain visible repository lookup");
+        assert!(visible_plan.iter().any(|row| {
+            row.get::<String, _>("detail")
+                .contains("idx_user_repo_associations_repo_id")
+        }));
+
+        let release_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            WITH batch_releases AS (
+              SELECT release_id, repo_id
+              FROM repo_releases
+              WHERE rowid IN (1)
+            ), visible_repo_candidates AS (
+              SELECT ura.repo_id, ura.repo_full_name AS full_name, ura.owner_login,
+                     1 AS source_priority, ura.user_id
+              FROM user_repo_associations ura
+              JOIN batch_releases br ON br.repo_id = ura.repo_id
+              JOIN users u ON u.id = ura.user_id
+              WHERE ura.is_following != 0
+                AND ura.repo_id IS NOT NULL
+                AND (
+                  ura.has_personal_owned_source = 0
+                  OR ura.has_github_star_source != 0
+                  OR u.include_own_releases != 0
+                )
+            ), visible_repo_metadata AS (
+              SELECT repo_id, full_name, owner_login
+              FROM (
+                SELECT repo_id, full_name, owner_login,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY repo_id
+                         ORDER BY source_priority, user_id
+                       ) AS metadata_rank
+                FROM visible_repo_candidates
+              )
+              WHERE metadata_rank = 1
+            )
+            SELECT br.release_id, vr.full_name, vr.owner_login
+            FROM batch_releases br
+            LEFT JOIN visible_repo_metadata vr ON vr.repo_id = br.repo_id
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain release projection lookup");
+        let release_plan_details = release_plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            release_plan.iter().any(|row| {
+                row.get::<String, _>("detail")
+                    .contains("idx_user_repo_associations_repo_id")
+            }),
+            "release plan: {release_plan_details:?}"
+        );
+
+        let translation_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT user_id FROM ai_translations WHERE lang = 'zh-CN' AND entity_id = '4201' AND status IN ('ready', 'disabled', 'missing') AND lower(entity_type) LIKE 'release%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain translation lookup");
+        assert!(translation_plan.iter().any(|row| {
+            row.get::<String, _>("detail")
+                .contains("idx_ai_translations_search_entity")
+        }));
     }
 
     #[tokio::test]
@@ -1398,6 +1721,13 @@ mod tests {
             index_status(state.as_ref()).await.unwrap(),
             "paused_low_disk"
         );
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET status = 'failed', last_error = 'projection failed' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("fail search index");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "failed");
         sqlx::query("UPDATE search_projection_backfill_state SET status = 'ready' WHERE id = 1")
             .execute(&pool)
             .await

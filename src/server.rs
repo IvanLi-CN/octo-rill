@@ -414,6 +414,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
                 .post(content_identity_upgrade::admin_control),
         )
         .route(
+            "/admin/jobs/search-index",
+            get(search_index::admin_get_status),
+        )
+        .route(
+            "/admin/jobs/search-index/resume",
+            post(search_index::admin_resume),
+        )
+        .route(
             "/admin/jobs/translations/requests",
             get(translations::admin_list_translation_requests),
         )
