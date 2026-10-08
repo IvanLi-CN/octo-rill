@@ -7,7 +7,7 @@ This topic governs release-to-release changes to OctoRill's durable SQLite state
 ## Requirements
 
 - `REQ-PSM-ORDER`: DDL, current-state DML, and historical backfill are separate ordered operations with independent status, checksum, progress, and failure signals.
-- `REQ-PSM-COMPATIBILITY`: Fresh databases finish SQLx initialization before HTTP listen. Existing databases validate applied version, checksum, and dirty state without applying pending SQLx history in place.
+- `REQ-PSM-COMPATIBILITY`: Fresh databases finish SQLx initialization before HTTP listen. Existing databases validate applied version, checksum, dirty state, and internal gaps, then apply pending SQLx migrations through SQLx before HTTP listen; migration 81 remains accepted only with its exact legacy checksum.
 - `REQ-PSM-ADMISSION`: Valid global content admission remains available during every online operation. A `legacy` or `rollback_freeze` control value is atomically repaired to `global` inside the foreground admission transaction before unique work identity lookup or insertion.
 - `REQ-PSM-OBSERVATION`: Legacy rows remain read-only observations. The observation identity includes `(legacy_table, legacy_primary_key, legacy_source_hash)` so a deleted and reused legacy key creates a new incarnation.
 - `REQ-PSM-PAUSE`: Historical backfill commits at most 100 rows per batch, persists its cursor before releasing the writer permit, and resumes from durable progress after pause or interruption.
@@ -20,7 +20,7 @@ The administrator authentication boundary exposes `GET /admin/jobs/migrations`, 
 
 ## Verification
 
-- `VER-PSM-HISTORY`: Fresh initialization and existing-history validation cover the SQLx compatibility contract.
+- `VER-PSM-HISTORY`: Fresh initialization, a real v90-to-v91 existing-database upgrade, checksum/dirty/gap rejection, legacy version 81 compatibility, and transactional failure diagnostics cover the SQLx compatibility contract.
 - `VER-PSM-OPERATIONS`: Operation checksums and ordering are immutable; the named lease, live-owner protection, and stale-owner recovery are tested.
 - `VER-PSM-RESUME`: Bounded cursor batches, pause/resume, interruption re-entry, duplicate suppression, source-hash incarnations, and redacted failure state are tested.
 - `VER-PSM-ADMISSION`: Valid submissions in `legacy`, `rollback_freeze`, and `global` preserve `202` and active-work `409` semantics. API adapters do not route `rollback_freeze` submissions into the compatibility writer's migration `503` path.
@@ -28,7 +28,11 @@ The administrator authentication boundary exposes `GET /admin/jobs/migrations`, 
 
 ## Acceptance
 
-- Existing SQLx history is validated without applying pending SQLx migrations in place.
+- Existing SQLx history is validated before pending SQLx migrations are applied transactionally by SQLx; the listener is not bound until the upgrade succeeds.
 - DDL, current-state repair, and observation backfill remain independently observable, pauseable, and resumable.
 - Legacy facts are never rewritten or promoted into global work, result, or attempt history.
 - Foreground content admission retains its existing `202` or active-work `409` response while migration work yields.
+
+## Related ADRs
+
+- [ADR 0019: Validated SQLx Migrations Apply Before Startup](../../adr/0019-sqlx-startup-migration-compatibility.md)

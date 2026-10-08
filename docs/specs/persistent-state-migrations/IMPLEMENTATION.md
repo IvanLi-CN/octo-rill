@@ -2,7 +2,7 @@
 
 ## Runtime Lifecycle
 
-`database_migrations::run` executes before the listener is bound. A fresh database applies the checked-in SQLx set before listen. A database that already has non-empty `_sqlx_migrations` history is validation-only: applied rows are checked for version, checksum, and dirty state, and pending SQLx migrations are not applied in place. An empty SQLx history table is treated as incomplete initialization and is safely restarted.
+`database_migrations::run` executes before the listener is bound. A fresh database applies the checked-in SQLx set before listen. A database that already has non-empty `_sqlx_migrations` history validates applied versions, checksums, dirty state, and internal gaps, then applies pending SQLx migrations before listen. SQLx owns the transaction and history row; failures include the pending version list and leave the failed migration unapplied. An empty SQLx history table is treated as incomplete initialization and is safely restarted.
 
 After `runtime::register_runtime_owner`, the server starts the online operator. The named `online-migration-operator` lease creates the control tables and registers `content-processing-online-v2` with three ordered operations: `ddl-001`, `dml-001`, and `backfill-001`. The previous `content-processing-online-v1` identity and checksums remain historical and are validated read-only. The operator exits its loop after a durable `completed` state; paused and failed states remain available for explicit administrator resume.
 
@@ -24,4 +24,4 @@ The topology remains one Compose service with SQLite. There is no second databas
 
 ## Current Validation
 
-The focused migration suite covers bounded backfill, cursor re-entry, source-hash incarnations, complete SQLx-history validation, v1/v2 operation identity, stale-owner protection, redaction, admin pause/read behavior, ordered operator restart through durable cursor completion, and terminal operator shutdown. Content admission tests cover repair from both historical modes and preserve `202`/active `409` results. Current-head coordinator pressure tests cover foreground session writes while background work contends for SQLite.
+The focused migration suite covers fresh bootstrap, real v90-to-v91 SQLx upgrade execution, checksum/dirty/gap and legacy-history validation, transactional pending-migration failure diagnostics, bounded backfill, cursor re-entry, source-hash incarnations, v1/v2 operation identity, stale-owner protection, redaction, admin pause/read behavior, ordered operator restart through durable cursor completion, and terminal operator shutdown. Content admission tests cover repair from both historical modes and preserve `202`/active `409` results. Current-head coordinator pressure tests cover foreground session writes while background work contends for SQLite.
