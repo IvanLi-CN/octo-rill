@@ -21,9 +21,11 @@
 - Release projections refresh their repository metadata when owned-release visibility is discovered, renamed, or toggled, keeping repository filters and deep links aligned with the visibility view.
 - Migration `0089_association_search_update_repair.sql` narrows association-triggered search refreshes to repository projection changes and adds a `(resource_type, repo_id)` lookup for the retained release refresh path; source/follow/observation-only updates remain outside the FTS rebuild path.
 - Migration `0090_search_fts_rowid_recovery.sql` replaces the unindexed `doc_id` FTS maintenance path with rowid mapping tables and rebuildable v2 corpora, keeps compatibility view names for existing source triggers, and queues repository metadata fanout for resumable 25-release-row Background batches.
+- Migration `0091_search_projection_backfill_indexes.sql` adds repository-id and translation lookup indexes, and replaces the insert-side correlated translation winner scans with bounded per-user window selection.
 - Metadata source deletion also queues the affected repository, and a new metadata event resets its persisted release cursor so an in-flight fanout cannot leave the already-processed prefix stale.
 - The recovery worker now persists both historical projection cursors and per-repository metadata cursors, continues polling after reaching `ready`, and keeps search usable through `LIKE` fallback while FTS rebuild or metadata repair is pending.
 - Recovery commits at most 25 source rows per writer transaction, relies on projection triggers for ordinary FTS updates, and pauses repeated background acquisition between batches. Low-disk pause and resume events report observed free space and the configured watermark; an already-paused poll does not write the state row again.
+- A failed projection batch now rolls back before persisting a terminal `failed` state, stops automatic retry for the same cursor, exposes the failure through search status/admin status, and resumes only after an administrator explicitly calls the search-index resume action.
 - PR #315 tracks the bounded recovery writer-pressure fix and its resumable migration coverage.
 
 ## References
