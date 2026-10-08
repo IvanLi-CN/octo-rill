@@ -25,8 +25,13 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
         return apply_migrations(pool).await;
     }
     validate_history(Some(&applied), &MIGRATOR)?;
-    ensure_no_pending_migrations(&applied, &MIGRATOR)?;
-    Ok(())
+    let pending = pending_migration_versions(&applied, &MIGRATOR);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    apply_migrations(pool)
+        .await
+        .with_context(|| format!("failed to apply pending SQLx migrations: {pending:?}"))
 }
 
 async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
@@ -42,23 +47,16 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_no_pending_migrations(applied: &[AppliedMigration], migrator: &Migrator) -> Result<()> {
+fn pending_migration_versions(applied: &[AppliedMigration], migrator: &Migrator) -> Vec<i64> {
     let applied_versions = applied
         .iter()
         .map(|migration| migration.version)
         .collect::<HashSet<_>>();
-    let pending = migrator
+    migrator
         .iter()
         .filter(|migration| !applied_versions.contains(&migration.version))
-        .map(|migration| migration.version.to_string())
-        .collect::<Vec<_>>();
-    if !pending.is_empty() {
-        bail!(
-            "database has pending SQLx migrations: {}",
-            pending.join(", ")
-        );
-    }
-    Ok(())
+        .map(|migration| migration.version)
+        .collect()
 }
 
 async fn load_applied_migrations(pool: &SqlitePool) -> Result<Option<Vec<AppliedMigration>>> {
@@ -357,18 +355,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_history_rejects_pending_search_migration_without_rebuild() {
+    async fn existing_v90_database_applies_pending_search_migration() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .expect("connect sqlite");
 
-        let pre_0090 = Migrator {
+        let pre_0091 = Migrator {
             migrations: Cow::Owned(
                 MIGRATOR
                     .iter()
-                    .filter(|migration| migration.version < 90)
+                    .filter(|migration| migration.version < 91)
                     .cloned()
                     .collect(),
             ),
@@ -376,10 +374,10 @@ mod tests {
             locking: true,
             no_tx: false,
         };
-        pre_0090
+        pre_0091
             .run(&pool)
             .await
-            .expect("apply schema before rowid recovery");
+            .expect("apply schema before projection index migration");
 
         for index in 0..3 {
             let document_id = format!("release:upgrade-{index}");
@@ -412,10 +410,45 @@ mod tests {
                 .expect("count old FTS corpus");
         assert!(old_fts_rows > 0);
 
-        let error = run(&pool)
+        run(&pool)
             .await
-            .expect_err("existing history must reject pending migrations");
-        assert!(error.to_string().contains("pending SQLx migrations"));
+            .expect("apply pending migration to existing v90 database");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 91 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read applied migration 91"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 91",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 91 checksum"),
+            current_checksum(91)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_user_repo_associations_repo_id', 'idx_ai_translations_search_entity', 'idx_ai_translations_search_entity_lower')",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 91 indexes"),
+            3
+        );
+        let trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rebuilt search projection trigger");
+        assert!(trigger_sql.contains("ROW_NUMBER"));
+        assert!(trigger_sql.contains("search_document_user_lanes"));
 
         let state = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
@@ -437,8 +470,8 @@ mod tests {
             )
                 .fetch_one(&pool)
                 .await
-                .expect("check pending FTS migration"),
-            0
+                .expect("check existing FTS migration"),
+            1
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts")
@@ -446,6 +479,60 @@ mod tests {
                 .await
                 .expect("count retained FTS corpus"),
             old_fts_rows
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pending_migration_reports_version_and_rolls_back() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let pre_0091 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 91)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0091
+            .run(&pool)
+            .await
+            .expect("apply schema before failed migration");
+        sqlx::query("DROP TABLE ai_translations")
+            .execute(&pool)
+            .await
+            .expect("create migration failure fixture");
+
+        let error = run(&pool)
+            .await
+            .expect_err("invalid pending migration must fail startup");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed to apply pending SQLx migrations: [91]"));
+        assert!(rendered.contains("failed to apply database migrations"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 91",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read failed migration history"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_user_repo_associations_repo_id', 'idx_ai_translations_search_entity', 'idx_ai_translations_search_entity_lower')",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read rolled back migration indexes"),
+            0
         );
     }
 
@@ -571,48 +658,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_history_rejects_pending_reconcile_migration_without_mutation() {
+    async fn existing_history_applies_pending_reconcile_migration_without_losing_data() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .expect("connect sqlite");
-        sqlx::raw_sql(
-            r#"
-            CREATE TABLE _sqlx_migrations (
-              version BIGINT PRIMARY KEY NOT NULL,
-              description TEXT NOT NULL,
-              installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              success BOOLEAN NOT NULL,
-              checksum BLOB NOT NULL,
-              execution_time BIGINT NOT NULL
-            );
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("create migration history");
-
-        for migration in MIGRATOR.iter().filter(|migration| migration.version < 83) {
-            sqlx::raw_sql(&migration.sql)
-                .execute(&pool)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "apply migration {} {}: {error}",
-                        migration.version, migration.description
-                    )
-                });
-            sqlx::query(
-                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?, ?, 1, ?, 0)",
-            )
-            .bind(migration.version)
-            .bind(migration.description.as_ref())
-            .bind(migration.checksum.as_ref())
-            .execute(&pool)
+        let pre_0083 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 83)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0083
+            .run(&pool)
             .await
-            .expect("record applied migration");
-        }
+            .expect("apply schema through version 82");
 
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -650,10 +717,9 @@ mod tests {
         .await
         .expect("seed migrated webhook observation");
 
-        let error = run(&pool)
+        run(&pool)
             .await
-            .expect_err("existing history must reject pending migrations");
-        assert!(error.to_string().contains("pending SQLx migrations"));
+            .expect("apply pending reconcile migrations");
 
         let demand_table = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'webhook_push_reconcile_demands'",
@@ -661,14 +727,14 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read demand table");
-        assert_eq!(demand_table, 0);
+        assert_eq!(demand_table, 1);
         let scope = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT COUNT(*) FROM pragma_table_info('reaction_pat_tokens') WHERE name = 'webhook_push_allows_private_repos'",
         )
         .fetch_one(&pool)
         .await
         .expect("check pending PAT scope migration");
-        assert_eq!(scope, Some(0));
+        assert_eq!(scope, Some(1));
         let hook_id = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT hook_id FROM webhook_push_repos WHERE user_id = 'user-1' AND repo_id = 101",
         )
@@ -679,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_history_rejects_pending_identity_compatibility_without_mutation() {
+    async fn existing_history_applies_pending_identity_compatibility_without_losing_data() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -734,10 +800,9 @@ mod tests {
         .await
         .expect("seed model-specific projection candidates");
 
-        let error = run(&pool)
+        run(&pool)
             .await
-            .expect_err("existing history must reject pending migrations");
-        assert!(error.to_string().contains("pending SQLx migrations"));
+            .expect("apply pending identity compatibility migrations");
 
         for table in [
             "content_work_identities",
@@ -750,7 +815,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("check pending identity migration");
-            assert_eq!(row_count, 0, "compatibility release backfilled {table}");
+            assert_eq!(row_count, 1, "compatibility release created {table}");
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

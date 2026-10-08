@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0019](./0019-sqlx-startup-migration-compatibility.md) for SQLx startup migration handling. The online migration operator and its durable-state decisions remain historical context.
 
 ## Decision
 

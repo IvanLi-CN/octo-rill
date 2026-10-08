@@ -16,7 +16,7 @@
       "from_program_versions": "current SQLx history through migration 0090",
       "to_program_version": "content-processing-online-v2",
       "direct_major_skips_supported": false,
-      "existing_history_behavior": "validate-only; pending SQLx migrations are not applied to an existing database"
+      "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
     }
   },
   "database_migration": {

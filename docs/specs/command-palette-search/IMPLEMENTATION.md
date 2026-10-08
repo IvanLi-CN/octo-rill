@@ -23,7 +23,7 @@
 - 配额状态必须与 SQLite writer 事务一致，服务重启和多标签页共享同一用户窗口。
 - actions 仅复用既有导航、同步、日报生成和仓库关注边界，不新增任意命令执行器。
 - 启动迁移只调整 schema、lookup indexes 和恢复状态；已有 FTS corpus 由 listener 绑定后的 worker 按阶段恢复，25 行一批持久化游标并在批间让出 writer。磁盘低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时状态转为 `paused_low_disk`，只在暂停/恢复转换时写状态；结构化日志 `search.index.paused_low_disk` 与 `search.index.resumed` 包含观测空闲字节数和阈值，`GET /api/search` 的 `index_status` 同时向命令面板暴露暂停和失败状态。
-- Rollout: `0091` 作为普通增量迁移应用；已存储的阶段与 metadata 游标会继续使用。失败状态不会自动重试，管理员确认错误原因后调用 search-index resume；低磁盘状态仍可在水位恢复后由 worker 自行继续，最终达到 `ready`。历史回填只应在索引状态为 `ready` 且生产磁盘容量满足水位后启动。
+- Rollout: `0091` 在启动时由 SQLx 作为普通增量迁移应用，已存储的阶段与 metadata 游标会继续使用；迁移失败会阻止 listener 绑定并保留可诊断错误。失败状态不会自动重试，管理员确认错误原因后调用 search-index resume；低磁盘状态仍可在水位恢复后由 worker 自行继续，最终达到 `ready`。历史回填只应在索引状态为 `ready` 且生产磁盘容量满足水位后启动。
 
 ## Verification Coverage
 
@@ -40,7 +40,7 @@
 - `search::tests::projection_backfill_failure_rolls_back_before_marking_failed`：覆盖批次失败先 rollback、再持久化 failed，并验证后续 foreground writer 可继续写入。
 - `search::tests::projection_backfill_releases_stays_within_batch_boundary`：覆盖 release phase 的 25 行边界与稳定 rowid cursor。
 - `search::tests::search_projection_lookup_plans_use_backfill_indexes`：覆盖 repository-id 与 translation-lane lookup 的 SQLite query plan。
-- `database_migrations::tests::search_fts_upgrade_defers_existing_corpus_rebuild`：覆盖已有 FTS 数据升级时保留投影、清空可重建 FTS cache 并排队后台恢复。
+- `database_migrations::tests::existing_v90_database_applies_pending_search_migration`：覆盖已有 v90 FTS 数据升级时由 SQLx 执行 0091、保留可重建 FTS cache，并验证 lookup indexes 与 bounded trigger SQL 已落地。
 - `search::tests::metadata_fanout_resumes_in_release_row_batches`：覆盖单仓库 250 条 release metadata fanout 的 25 行提交、队列 drain 与 FTS 一致性。
 - `search::tests::work_item_deletion_repairs_release_metadata`：覆盖删除最后一个 release work item metadata source 后的队列入队与 metadata 清理。
 - `search::tests::metadata_fallback_matches_current_short_repo_name`：覆盖 metadata fanout 尚未完成时，当前 metadata view 仍能匹配短 repository filter。
