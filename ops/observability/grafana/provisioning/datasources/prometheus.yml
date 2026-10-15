@@ -1,0 +1,9 @@
+apiVersion: 1
+datasources:
+  - name: OctoRill Prometheus
+    uid: octorill-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

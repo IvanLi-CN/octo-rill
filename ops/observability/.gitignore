@@ -1,0 +1,4 @@
+prometheus/secrets/*
+!prometheus/secrets/.gitkeep
+secrets/*
+!secrets/.gitkeep

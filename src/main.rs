@@ -15,6 +15,7 @@ mod github;
 mod jobs;
 mod linuxdo;
 mod local_id;
+mod metrics;
 mod observability;
 mod online_migrations;
 mod passkeys;

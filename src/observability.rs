@@ -3,8 +3,10 @@ use std::time::Duration;
 use std::{cell::RefCell, fmt, future::Future};
 
 use axum::{
-    extract::MatchedPath, extract::Request, http::StatusCode, middleware::Next, response::Response,
+    body::Body, extract::MatchedPath, extract::Request, http::StatusCode, middleware::Next,
+    response::Response,
 };
+use futures_util::StreamExt;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tracing::Span;
 
@@ -148,9 +150,33 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     };
     let thresholds = logging_thresholds();
     let started = std::time::Instant::now();
-    let response = with_request_context(request_context, next.run(request)).await;
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.begin_http();
+    }
+    let mut response = with_request_context(request_context, next.run(request)).await;
     let latency = started.elapsed();
     let status = response.status();
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.finish_http(&method, &route, status.as_u16(), latency);
+    }
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    let body_route = route.clone();
+    let body_stream = async_stream::stream! {
+        let mut guard = crate::metrics::HttpBodyGuard::new(&body_route);
+        let mut data_stream = body.into_data_stream();
+        while let Some(item) = data_stream.next().await {
+            match item {
+                Ok(chunk) => yield Ok::<_, axum::Error>(chunk),
+                Err(error) => {
+                    guard.finish("error");
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        guard.finish("completed");
+    };
+    *response.body_mut() = Body::from_stream(body_stream);
     let latency_ms = latency.as_millis();
     let slow = if status.is_client_error() || status.is_server_error() {
         false

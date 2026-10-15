@@ -59,6 +59,13 @@ jobs:
       - name: Validate brand media source packages
         run: python3 scripts/brand_media_sources.py --check
 
+      - name: Validate monitoring assets and topic contract
+        run: |
+          python3 scripts/validate_observability.py
+          python3 bin/spec_contract_check.py --path docs/specs/monitoring-dashboard/SPEC.md
+          python3 -m py_compile scripts/octorill-observe scripts/validate_observability.py scripts/test_octorill_observe.py bin/spec_contract_check.py
+          python3 scripts/test_octorill_observe.py
+
       - name: Set up Bun (optional)
         if: hashFiles('web/package.json') != ''
         uses: oven-sh/setup-bun@v2

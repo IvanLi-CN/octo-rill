@@ -1,0 +1,53 @@
+groups:
+  - name: octorill-alerts
+    rules:
+      - alert: OctoRillMetricsScrapeMissing
+        expr: absent(up{job="octorill"}) or min by (service, environment, instance) (up{job="octorill"}) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill metrics scrape is unavailable
+          runbook: docs-site/docs/monitoring.md#排查
+      - alert: OctoRillHttpErrors
+        expr: sum by (service, environment, instance) (rate(octorill_http_requests_total{status_class="5xx"}[5m])) / clamp_min(sum by (service, environment, instance) (rate(octorill_http_requests_total[5m])), 1) > 0.05 and sum by (service, environment, instance) (increase(octorill_http_requests_total[5m])) >= 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill HTTP 5xx ratio is above 5 percent
+      - alert: OctoRillHttpLatency
+        expr: histogram_quantile(0.95, sum by (le, service, environment, instance) (rate(octorill_http_duration_seconds_bucket[5m]))) > 1 and sum by (service, environment, instance) (increase(octorill_http_requests_total[5m])) >= 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill response generation p95 is above one second
+      - alert: OctoRillSqliteWriterWait
+        expr: histogram_quantile(0.95, sum by (le, service, environment, instance, phase) (rate(octorill_sqlite_wait_seconds_bucket{priority="foreground",phase=~"attempt|begin"}[5m]))) > 0.25 and sum by (service, environment, instance, phase) (increase(octorill_sqlite_operations_total{priority="foreground",phase=~"attempt|begin"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill foreground SQLite writer wait is high
+      - alert: OctoRillOldestRunnableTask
+        expr: max by (service, environment, instance) (octorill_queue_oldest_age_seconds) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill runnable work is older than five minutes
+      - alert: OctoRillUpstreamFailures
+        expr: sum by (service, environment, instance) (rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|transport_error|decode_error|graphql_error|http_4xx|http_5xx"}[5m])) / clamp_min(sum by (service, environment, instance) (rate(octorill_upstream_requests_total[5m])), 1) > 0.10 and sum by (service, environment, instance) (increase(octorill_upstream_requests_total[5m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill upstream failure ratio is above ten percent
+      - alert: OctoRillSamplerStale
+        expr: max by (service, environment, instance) (octorill_sampler_stale) == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: OctoRill state sampler is stale

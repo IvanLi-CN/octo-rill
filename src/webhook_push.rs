@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -425,27 +425,28 @@ async fn validate_pat_with_github(
             "Webhook 推送当前仅支持 classic PAT。",
         ));
     }
-    let response = state
-        .github_rest_http
-        .get(
-            state
-                .github_rest_api_base
-                .join("user")
-                .map_err(ApiError::internal)?,
-        )
-        .bearer_auth(&token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "github_unavailable",
-                format!("GitHub user API 暂时不可用：{error}"),
+    let response = send_github_webhook_request(
+        state
+            .github_rest_http
+            .get(
+                state
+                    .github_rest_api_base
+                    .join("user")
+                    .map_err(ApiError::internal)?,
             )
-        })?;
+            .bearer_auth(&token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github_unavailable",
+            format!("GitHub user API 暂时不可用：{error}"),
+        )
+    })?;
     let status = response.status();
     let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
         || response
@@ -1494,6 +1495,25 @@ fn github_url(state: &AppState, repo: &TargetRepo, suffix: &str) -> Result<url::
         .context("build github webhook URL")
 }
 
+async fn send_github_webhook_request(
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let started_at = Instant::now();
+    let result = request.send().await;
+    if let Some(metrics) = crate::metrics::global() {
+        let outcome = match &result {
+            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+            Ok(response) if response.status().is_client_error() => "http_4xx",
+            Ok(response) if response.status().is_server_error() => "http_5xx",
+            Ok(response) if response.status().is_success() => "success",
+            Ok(_) => "other",
+            Err(_) => "transport_error",
+        };
+        metrics.record_upstream("github", "webhook", outcome, started_at.elapsed());
+    }
+    result
+}
+
 async fn resolve_delete_target(
     state: &AppState,
     token: &str,
@@ -1509,21 +1529,22 @@ async fn resolve_delete_target(
             retry_after: None,
             message: error.to_string(),
         })?;
-    let response = state
-        .github_rest_http
-        .get(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|error| GitHubCallError {
-            status: error.status(),
-            rate_limited: false,
-            retry_after: None,
-            message: error.to_string(),
-        })?;
+    let response = send_github_webhook_request(
+        state
+            .github_rest_http
+            .get(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|error| GitHubCallError {
+        status: error.status(),
+        rate_limited: false,
+        retry_after: None,
+        message: error.to_string(),
+    })?;
     if !response.status().is_success() {
         return Err(response_error(response).await);
     }
@@ -1619,21 +1640,22 @@ async fn list_hooks(
             .clear()
             .append_pair("per_page", "100")
             .append_pair("page", &page.to_string());
-        let response = state
-            .github_rest_http
-            .get(url.clone())
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(|err| GitHubCallError {
-                status: err.status(),
-                rate_limited: false,
-                retry_after: None,
-                message: err.to_string(),
-            })?;
+        let response = send_github_webhook_request(
+            state
+                .github_rest_http
+                .get(url.clone())
+                .bearer_auth(token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .map_err(|err| GitHubCallError {
+            status: err.status(),
+            rate_limited: false,
+            retry_after: None,
+            message: err.to_string(),
+        })?;
         if !response.status().is_success() {
             return Err(response_error(response).await);
         }
@@ -1674,32 +1696,33 @@ async fn create_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = state
-        .github_rest_http
-        .post(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&HookRequest {
-            name: "web",
-            active: true,
-            events: ["release"],
-            config: HookRequestConfig {
-                url: callback,
-                content_type: "json",
-                secret,
-                insecure_ssl: "0",
-            },
-        })
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|err| GitHubCallError {
-            status: err.status(),
-            rate_limited: false,
-            retry_after: None,
-            message: err.to_string(),
-        })?;
+    let response = send_github_webhook_request(
+        state
+            .github_rest_http
+            .post(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&HookRequest {
+                name: "web",
+                active: true,
+                events: ["release"],
+                config: HookRequestConfig {
+                    url: callback,
+                    content_type: "json",
+                    secret,
+                    insecure_ssl: "0",
+                },
+            })
+            .timeout(Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|err| GitHubCallError {
+        status: err.status(),
+        rate_limited: false,
+        retry_after: None,
+        message: err.to_string(),
+    })?;
     if !response.status().is_success() {
         return Err(response_error(response).await);
     }
@@ -1726,32 +1749,33 @@ async fn update_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = state
-        .github_rest_http
-        .patch(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&HookRequest {
-            name: "web",
-            active,
-            events: ["release"],
-            config: HookRequestConfig {
-                url: callback,
-                content_type: "json",
-                secret,
-                insecure_ssl: "0",
-            },
-        })
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|err| GitHubCallError {
-            status: err.status(),
-            rate_limited: false,
-            retry_after: None,
-            message: err.to_string(),
-        })?;
+    let response = send_github_webhook_request(
+        state
+            .github_rest_http
+            .patch(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&HookRequest {
+                name: "web",
+                active,
+                events: ["release"],
+                config: HookRequestConfig {
+                    url: callback,
+                    content_type: "json",
+                    secret,
+                    insecure_ssl: "0",
+                },
+            })
+            .timeout(Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|err| GitHubCallError {
+        status: err.status(),
+        rate_limited: false,
+        retry_after: None,
+        message: err.to_string(),
+    })?;
     if !response.status().is_success() {
         return Err(response_error(response).await);
     }
@@ -1775,21 +1799,22 @@ async fn delete_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = state
-        .github_rest_http
-        .delete(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|err| GitHubCallError {
-            status: err.status(),
-            rate_limited: false,
-            retry_after: None,
-            message: err.to_string(),
-        })?;
+    let response = send_github_webhook_request(
+        state
+            .github_rest_http
+            .delete(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration::from_secs(60)),
+    )
+    .await
+    .map_err(|err| GitHubCallError {
+        status: err.status(),
+        rate_limited: false,
+        retry_after: None,
+        message: err.to_string(),
+    })?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
         return Ok(());
     }
