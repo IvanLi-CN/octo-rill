@@ -203,7 +203,13 @@ pub fn spawn_task_worker(state: Arc<AppState>) {
             match claim_next_queued_task(state.as_ref()).await {
                 Ok(Some(task)) => {
                     claim_backoff.reset();
-                    if let Err(err) = process_task(Arc::clone(&state), task).await {
+                    if let Err(err) = crate::metrics::observe_worker(
+                        "jobs",
+                        "logical",
+                        process_task(Arc::clone(&state), task),
+                    )
+                    .await
+                    {
                         tracing::warn!(?err, "task worker: process task failed");
                     }
                 }
@@ -1957,6 +1963,7 @@ pub fn task_sse_response(
     last_event_id: Option<String>,
 ) -> Response {
     let events = stream! {
+        let _metrics_guard = crate::metrics::SseGuard::new("/api/tasks/*/events");
         let mut last_event_seq = if let Some(last_event_id) = last_event_id.as_deref() {
             sqlx::query_scalar::<_, i64>(
                 r#"
@@ -2221,6 +2228,7 @@ async fn load_translation_stream_rows(
 
 pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
     let events = stream! {
+        let _metrics_guard = crate::metrics::SseGuard::new("/api/admin/jobs/events");
         #[derive(Debug, sqlx::FromRow)]
         struct EventRow {
             seq: i64,
@@ -2631,7 +2639,11 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     let heartbeat = spawn_task_lease_heartbeat(state.clone(), task.id.clone());
     let result = ai::with_llm_call_context(
         context,
-        execute_task(state.as_ref(), &task.id, &task.task_type, &payload),
+        crate::metrics::observe_worker(
+            "jobs",
+            "attempt",
+            execute_task(state.as_ref(), &task.id, &task.task_type, &payload),
+        ),
     )
     .await;
 

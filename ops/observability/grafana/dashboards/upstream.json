@@ -1,0 +1,16 @@
+{
+  "uid": "octorill-upstream",
+  "title": "OctoRill GitHub and LLM Upstreams",
+  "tags": ["octorill", "upstream"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "templating": {"list": [{"name": "service", "type": "query", "query": "label_values(octorill_enabled, service)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "environment", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\"}, environment)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "instance", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\",environment=~\"$environment\"}, instance)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}]},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Upstream failure ratio", "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "upstream_failure_rate", "expr": "sum(rate(octorill_upstream_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\",outcome=~\"error|timeout|rate_limited|transport_error|decode_error|graphql_error|http_4xx|http_5xx\"}[5m])) by (provider, operation) / clamp_min(sum(rate(octorill_upstream_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (provider, operation), 1)", "legendFormat": "{{provider}} {{operation}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Upstream response p95", "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "upstream_p95", "expr": "histogram_quantile(0.95, sum(rate(octorill_upstream_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (le, provider, operation))", "legendFormat": "{{provider}} {{operation}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Upstream request outcomes", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "upstream_rate_by_outcome", "expr": "sum(rate(octorill_upstream_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (provider, outcome)", "legendFormat": "{{provider}} {{outcome}}"}]},
+    {"id": 4, "type": "table", "title": "Active upstream labels", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "upstream_requests", "expr": "octorill_upstream_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}"}]}
+  ]
+}

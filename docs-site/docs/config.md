@@ -22,6 +22,10 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 - `OCTORILL_HTTP_SLOW_MS`：HTTP access log 慢请求阈值（毫秒）。默认 `1000`。
 - `OCTORILL_UPSTREAM_SLOW_MS`：上游 HTTP / AI 调用慢请求阈值（毫秒）。默认 `2000`。
 - `OCTORILL_SQLITE_WRITE_SLOW_MS`：SQLite 写路径慢操作阈值（毫秒）。默认 `250`。
+- `OCTORILL_METRICS_ENABLED`：启用独立 Prometheus/OpenMetrics 采集入口；默认 `false`，关闭时不绑定 listener 或启动 sampler。
+- `OCTORILL_METRICS_BIND`：独立 metrics listener 的 `ip:port`，默认 `127.0.0.1:58091`。
+- `OCTORILL_METRICS_TOKEN_FILE`：启用 metrics 时必须提供的 Bearer token 文件路径；应用不会把 token 写入日志或指标。
+- `OCTORILL_METRICS_SAMPLE_INTERVAL_SECONDS`：状态 sampler 周期，默认 5 秒，应用限制在 1 到 60 秒。
 - `OCTORILL_TASK_WORKERS`：后台任务 worker 数量。默认 `4`，必须是正整数。
 - `OCTORILL_ENCRYPTION_KEY_BASE64`：32 字节 base64 密钥。**必填**；用于本地敏感信息加密。
 - `APP_DEFAULT_TIME_ZONE`：默认时区。未设置时会优先尝试系统时区，再回退到内置日报时区；必须是整点偏移的 IANA time zone。

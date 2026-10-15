@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use reqwest::{
-    Response,
+    RequestBuilder, Response,
     header::{
         ACCEPT, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT,
     },
@@ -428,8 +428,12 @@ pub fn spawn_repo_release_workers(state: Arc<AppState>) {
                 match claim_next_repo_release_work_item(state.as_ref()).await {
                     Ok(Some(work_item)) => {
                         claim_backoff.reset();
-                        if let Err(err) =
-                            process_repo_release_work_item(state.clone(), work_item).await
+                        if let Err(err) = crate::metrics::observe_worker(
+                            "repo_release",
+                            "logical",
+                            process_repo_release_work_item(state.clone(), work_item),
+                        )
+                        .await
                         {
                             tracing::warn!(?err, "repo release worker: process work item failed");
                         }
@@ -1519,9 +1523,15 @@ async fn with_subscription_timeout<T, Fut>(
 where
     Fut: Future<Output = Result<T, SyncRequestError>>,
 {
+    let started_at = Instant::now();
     tokio::time::timeout(SUBSCRIPTION_HTTP_TIMEOUT, future)
         .await
-        .map_err(|_| subscription_timeout_error(operation))?
+        .map_err(|_| {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream("github", operation, "timeout", started_at.elapsed());
+            }
+            subscription_timeout_error(operation)
+        })?
 }
 
 struct SubscriptionEventRecord<'a> {
@@ -9107,7 +9117,12 @@ async fn process_repo_release_work_item(
         },
     );
 
-    let result = execute_repo_release_work_item(state.as_ref(), &work_item).await;
+    let result = crate::metrics::observe_worker(
+        "repo_release",
+        "attempt",
+        execute_repo_release_work_item(state.as_ref(), &work_item),
+    )
+    .await;
     heartbeat.stop().await;
 
     let now = Utc::now().to_rfc3339();
@@ -11240,6 +11255,43 @@ fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestEr
         .with_phase(phase)
 }
 
+async fn send_github_request(
+    request: RequestBuilder,
+    operation: &str,
+) -> std::result::Result<(Response, Instant), reqwest::Error> {
+    let started_at = Instant::now();
+    match request.send().await {
+        Ok(response) => Ok((response, started_at)),
+        Err(error) => {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream(
+                    "github",
+                    operation,
+                    if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    },
+                    started_at.elapsed(),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn github_http_outcome(status: StatusCode) -> &'static str {
+    if status.as_u16() == 429 {
+        "rate_limited"
+    } else if status.is_client_error() {
+        "http_4xx"
+    } else if status.is_server_error() {
+        "http_5xx"
+    } else {
+        "other"
+    }
+}
+
 fn reqwest_error_phase(err: &reqwest::Error) -> &'static str {
     let message = err.to_string().to_ascii_lowercase();
     if err.is_timeout() {
@@ -11400,28 +11452,81 @@ fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequ
 async fn fetch_json_response<T: DeserializeOwned>(
     response: Response,
     operation: &str,
+    started_at: Instant,
+    record_success: bool,
 ) -> Result<T, SyncRequestError> {
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream(
+                "github",
+                operation,
+                github_http_outcome(status),
+                started_at.elapsed(),
+            );
+        }
         return Err(classify_github_http_error(
             operation, status, &headers, &body,
         ));
     }
-    response.json::<T>().await.map_err(|err| {
-        let phase = decode_error_phase(&err);
-        let request_error = if decode_error_is_retryable(&err) {
-            SyncRequestError::retryable("decode_error", format!("{operation}: {err}"), Some(status))
-        } else {
-            SyncRequestError::non_retryable(
-                "decode_error",
-                format!("{operation}: {err}"),
-                Some(status),
-            )
-        };
-        request_error.with_phase(phase)
-    })
+    match response.json::<T>().await {
+        Ok(value) => {
+            if record_success && let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream("github", operation, "success", started_at.elapsed());
+            }
+            Ok(value)
+        }
+        Err(err) => {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream("github", operation, "decode_error", started_at.elapsed());
+            }
+            let phase = decode_error_phase(&err);
+            let request_error = if decode_error_is_retryable(&err) {
+                SyncRequestError::retryable(
+                    "decode_error",
+                    format!("{operation}: {err}"),
+                    Some(status),
+                )
+            } else {
+                SyncRequestError::non_retryable(
+                    "decode_error",
+                    format!("{operation}: {err}"),
+                    Some(status),
+                )
+            };
+            Err(request_error.with_phase(phase))
+        }
+    }
+}
+
+async fn fetch_graphql_response<T: DeserializeOwned>(
+    response: Response,
+    operation: &str,
+    started_at: Instant,
+) -> Result<GraphQlResponse<T>, SyncRequestError> {
+    let payload: GraphQlResponse<T> =
+        fetch_json_response(response, operation, started_at, false).await?;
+    let outcome = payload
+        .errors
+        .as_ref()
+        .filter(|errors| !errors.is_empty())
+        .map(|errors| {
+            if errors
+                .iter()
+                .any(|error| error.message.to_ascii_lowercase().contains("rate limit"))
+            {
+                "rate_limited"
+            } else {
+                "graphql_error"
+            }
+        })
+        .unwrap_or("success");
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.record_upstream("github", operation, outcome, started_at.elapsed());
+    }
+    Ok(payload)
 }
 
 fn github_rest_url(state: &AppState, path_and_query: &str) -> Result<String, SyncRequestError> {
@@ -11454,18 +11559,18 @@ async fn fetch_github_rest_page<T: DeserializeOwned>(
     operation: &str,
 ) -> Result<T, SyncRequestError> {
     with_subscription_timeout(operation, async {
-        let response = state
+        let request = state
             .github_rest_http
             .get(url)
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, accept)
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .send()
+            .header("X-GitHub-Api-Version", API_VERSION);
+        let (response, started_at) = send_github_request(request, operation)
             .await
             .map_err(|err| classify_reqwest_error(operation, err))?;
 
-        fetch_json_response::<T>(response, operation).await
+        fetch_json_response::<T>(response, operation, started_at, true).await
     })
     .await
 }
@@ -11507,7 +11612,7 @@ async fn fetch_owned_repo_snapshot(
 
     loop {
         let payload = with_subscription_timeout("sync social owned repos graphql", async {
-            let response = state
+            let request = state
                 .http
                 .post(state.github_graphql_url.clone())
                 .bearer_auth(access_token)
@@ -11517,14 +11622,18 @@ async fn fetch_owned_repo_snapshot(
                 .json(&json!({
                     "query": query,
                     "variables": { "after": after },
-                }))
-                .send()
-                .await
-                .map_err(|err| classify_reqwest_error("sync social owned repos graphql", err))?;
+                }));
+            let (response, started_at) =
+                send_github_request(request, "sync social owned repos graphql")
+                    .await
+                    .map_err(|err| {
+                        classify_reqwest_error("sync social owned repos graphql", err)
+                    })?;
 
-            fetch_json_response::<GraphQlResponse<OwnedRepoData>>(
+            fetch_graphql_response::<OwnedRepoData>(
                 response,
                 "sync social owned repos graphql",
+                started_at,
             )
             .await
         })
@@ -11788,19 +11897,19 @@ async fn fetch_discussion_announcement_batch(
 
     let operation = "sync discussion announcement categories graphql";
     let payload = with_subscription_timeout(operation, async {
-        let response = state
+        let request = state
             .http
             .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&json!({ "query": query }))
-            .send()
+            .json(&json!({ "query": query }));
+        let (response, started_at) = send_github_request(request, operation)
             .await
             .map_err(|err| classify_reqwest_error(operation, err))?;
 
-        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+        fetch_graphql_response::<Value>(response, operation, started_at).await
     })
     .await?;
 
@@ -11895,19 +12004,19 @@ async fn fetch_discussion_announcement_category_discussions(
 
     let operation = "sync discussion announcements graphql";
     let payload = with_subscription_timeout(operation, async {
-        let response = state
+        let request = state
             .http
             .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&json!({ "query": query }))
-            .send()
+            .json(&json!({ "query": query }));
+        let (response, started_at) = send_github_request(request, operation)
             .await
             .map_err(|err| classify_reqwest_error(operation, err))?;
 
-        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+        fetch_graphql_response::<Value>(response, operation, started_at).await
     })
     .await?;
 
@@ -12521,7 +12630,7 @@ async fn fetch_starred_page_with_token(
     let mut attempt = 1;
     let payload = 'fetch: loop {
         let result = with_subscription_timeout("sync starred graphql page", async {
-            let response = state
+            let request = state
                 .http
                 .post(state.github_graphql_url.clone())
                 .bearer_auth(token)
@@ -12531,15 +12640,12 @@ async fn fetch_starred_page_with_token(
                 .json(&json!({
                     "query": query,
                     "variables": { "after": after, "first": first },
-                }))
-                .send()
+                }));
+            let (response, started_at) = send_github_request(request, "sync starred graphql page")
                 .await
                 .map_err(|err| classify_reqwest_error("sync starred graphql page", err))?;
-            fetch_json_response::<GraphQlResponse<StarredData>>(
-                response,
-                "sync starred graphql page",
-            )
-            .await
+            fetch_graphql_response::<StarredData>(response, "sync starred graphql page", started_at)
+                .await
         })
         .await;
 
@@ -13388,7 +13494,7 @@ async fn fetch_starred_snapshot_with_token(
 
     loop {
         let payload = with_subscription_timeout("sync starred graphql", async {
-            let response = state
+            let request = state
                 .http
                 .post(state.github_graphql_url.clone())
                 .bearer_auth(token)
@@ -13398,12 +13504,12 @@ async fn fetch_starred_snapshot_with_token(
                 .json(&json!({
                     "query": query,
                     "variables": { "after": after },
-                }))
-                .send()
+                }));
+            let (response, started_at) = send_github_request(request, "sync starred graphql")
                 .await
                 .map_err(|err| classify_reqwest_error("sync starred graphql", err))?;
 
-            fetch_json_response::<GraphQlResponse<StarredData>>(response, "sync starred graphql")
+            fetch_graphql_response::<StarredData>(response, "sync starred graphql", started_at)
                 .await
         })
         .await?;
@@ -13843,8 +13949,7 @@ async fn fetch_repo_releases_with_optional_token(
                     request = request.header(IF_MODIFIED_SINCE, last_modified);
                 }
             }
-            let response = request
-                .send()
+            let (response, started_at) = send_github_request(request, operation.as_str())
                 .await
                 .map_err(|err| classify_reqwest_error(operation.as_str(), err))?;
             let status = response.status();
@@ -13860,11 +13965,24 @@ async fn fetch_repo_releases_with_optional_token(
                     .map(str::to_owned);
             }
             if status == StatusCode::NOT_MODIFIED {
+                if let Some(metrics) = crate::metrics::global() {
+                    metrics.record_upstream(
+                        "github",
+                        operation.as_str(),
+                        "success",
+                        started_at.elapsed(),
+                    );
+                }
                 return Ok(None);
             }
-            fetch_json_response::<Vec<GitHubRelease>>(response, operation.as_str())
-                .await
-                .map(Some)
+            fetch_json_response::<Vec<GitHubRelease>>(
+                response,
+                operation.as_str(),
+                started_at,
+                true,
+            )
+            .await
+            .map(Some)
         })
         .await?;
         let Some(page_releases) = page_result else {
@@ -13938,20 +14056,54 @@ pub async fn sync_notifications(
                     url.push_str("&page=");
                     url.push_str(&page.to_string());
 
-                    client
+                    let request = client
                         .get(url)
                         .bearer_auth(&token)
                         .header(USER_AGENT, "OctoRill")
                         .header(ACCEPT, "application/vnd.github+json")
-                        .header("X-GitHub-Api-Version", API_VERSION)
-                        .send()
+                        .header("X-GitHub-Api-Version", API_VERSION);
+                    let (response, started_at) = send_github_request(request, "sync notifications")
                         .await
-                        .context("github notifications request failed")?
+                        .context("github notifications request failed")?;
+                    let status = response.status();
+                    if !status.is_success()
+                        && let Some(metrics) = crate::metrics::global()
+                    {
+                        metrics.record_upstream(
+                            "github",
+                            "sync notifications",
+                            github_http_outcome(status),
+                            started_at.elapsed(),
+                        );
+                    }
+                    let response = response
                         .error_for_status()
-                        .context("github notifications returned error")?
-                        .json::<Vec<GitHubNotification>>()
-                        .await
-                        .context("github notifications json decode failed")
+                        .context("github notifications returned error")?;
+                    match response.json::<Vec<GitHubNotification>>().await {
+                        Ok(value) => {
+                            if let Some(metrics) = crate::metrics::global() {
+                                metrics.record_upstream(
+                                    "github",
+                                    "sync notifications",
+                                    "success",
+                                    started_at.elapsed(),
+                                );
+                            }
+                            Ok(value)
+                        }
+                        Err(error) => {
+                            if let Some(metrics) = crate::metrics::global() {
+                                metrics.record_upstream(
+                                    "github",
+                                    "sync notifications",
+                                    "decode_error",
+                                    started_at.elapsed(),
+                                );
+                            }
+                            Err(anyhow::Error::new(error)
+                                .context("github notifications json decode failed"))
+                        }
+                    }
                 }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
             },
             |thread_id| {
@@ -13959,22 +14111,41 @@ pub async fn sync_notifications(
                 let token = token.clone();
                 Box::pin(async move {
                     let url = format!("{REST_API_BASE}/notifications/threads/{thread_id}");
-                    let response = client
+                    let request = client
                         .get(url)
                         .bearer_auth(&token)
                         .header(USER_AGENT, "OctoRill")
                         .header(ACCEPT, "application/vnd.github+json")
-                        .header("X-GitHub-Api-Version", API_VERSION)
-                        .send()
+                        .header("X-GitHub-Api-Version", API_VERSION);
+                    let (response, started_at) = send_github_request(request, "sync notification thread")
                         .await
                         .context("github notification thread request failed")?;
                     let status = response.status();
                     if status.is_success() {
-                        return response
-                            .json::<GitHubNotification>()
-                            .await
+                        let result = response.json::<GitHubNotification>().await;
+                        if let Some(metrics) = crate::metrics::global() {
+                            metrics.record_upstream(
+                                "github",
+                                "sync notification thread",
+                                if result.is_ok() {
+                                    "success"
+                                } else {
+                                    "decode_error"
+                                },
+                                started_at.elapsed(),
+                            );
+                        }
+                        return result
                             .map(Some)
                             .context("github notification thread json decode failed");
+                    }
+                    if let Some(metrics) = crate::metrics::global() {
+                        metrics.record_upstream(
+                            "github",
+                            "sync notification thread",
+                            github_http_outcome(status),
+                            started_at.elapsed(),
+                        );
                     }
                     let headers = response.headers().clone();
                     let body = response

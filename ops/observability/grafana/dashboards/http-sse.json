@@ -1,0 +1,16 @@
+{
+  "uid": "octorill-http-sse",
+  "title": "OctoRill HTTP and SSE",
+  "tags": ["octorill", "http"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "templating": {"list": [{"name": "service", "type": "query", "query": "label_values(octorill_enabled, service)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "environment", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\"}, environment)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "instance", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\",environment=~\"$environment\"}, instance)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}]},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Response generation p95 and p99", "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "http_p95", "expr": "histogram_quantile(0.95, sum(rate(octorill_http_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (le, route))", "legendFormat": "p95 {{route}}"}, {"refId": "B", "catalog_query_id": "http_p99", "expr": "histogram_quantile(0.99, sum(rate(octorill_http_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (le, route))", "legendFormat": "p99 {{route}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Request rate", "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "http_rate_detailed", "expr": "sum(rate(octorill_http_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (method, route, status_class)", "legendFormat": "{{method}} {{route}} {{status_class}}"}]},
+    {"id": 3, "type": "timeseries", "title": "SSE active connections", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "sse_active", "expr": "octorill_sse_active{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{instance}}"}]},
+    {"id": 4, "type": "timeseries", "title": "SSE lifetime p95", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "sse_p95", "expr": "histogram_quantile(0.95, sum(rate(octorill_sse_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (le, route))", "legendFormat": "{{route}}"}]}
+  ]
+}

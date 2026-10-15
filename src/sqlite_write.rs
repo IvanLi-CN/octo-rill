@@ -397,11 +397,43 @@ impl SqliteWriteCoordinator {
     {
         let mut attempt = 1usize;
         loop {
-            let permit = self
+            let acquire_started = Instant::now();
+            let mut metric_guard = crate::metrics::SqliteGuard::new(
+                "attempt",
+                lane,
+                priority.as_str(),
+                Duration::ZERO,
+            );
+            if let Some(guard) = metric_guard.as_mut() {
+                guard.start_wait(acquire_started.into());
+            }
+            let permit = match self
                 .acquire_until(lane, priority, deadline_at, deadline)
-                .await?;
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    if let Some(guard) = metric_guard.as_mut() {
+                        guard.set_wait(acquire_started.elapsed());
+                        guard.finish(if is_sqlite_write_deadline_error(error.as_ref()) {
+                            "deadline"
+                        } else {
+                            "error"
+                        });
+                    }
+                    return Err(error);
+                }
+            };
 
+            let writer_wait_ms = permit.writer_wait_ms();
+            let wait = Duration::from_millis(writer_wait_ms.min(u128::from(u64::MAX)) as u64);
+            if let Some(guard) = metric_guard.as_mut() {
+                guard.set_wait(wait);
+            }
             if Instant::now() >= deadline_at {
+                if let Some(guard) = metric_guard.as_mut() {
+                    guard.finish("deadline");
+                }
                 drop(permit);
                 return Err(self.deadline_error(lane, priority, "callback_start", deadline));
             }
@@ -409,7 +441,15 @@ impl SqliteWriteCoordinator {
             let op_started = Instant::now();
             let result = operation(attempt).await;
             let elapsed = op_started.elapsed();
-            let writer_wait_ms = permit.writer_wait_ms();
+            if let Some(guard) = metric_guard.as_mut() {
+                let outcome = match result.as_ref() {
+                    Ok(_) => "success",
+                    Err(error) if is_sqlite_busy_error(error.as_ref()) => "busy",
+                    Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => "deadline",
+                    Err(_) => "error",
+                };
+                guard.finish(outcome);
+            }
             drop(permit);
 
             match result {
@@ -582,6 +622,16 @@ impl SqliteWriteCoordinator {
         let permit = match self.try_acquire(lane, SqliteWritePriority::BestEffort) {
             Some(permit) => permit,
             None => {
+                if let Some(metrics) = crate::metrics::global() {
+                    metrics.record_sqlite(
+                        "try_write",
+                        lane,
+                        SqliteWritePriority::BestEffort.as_str(),
+                        "rejected",
+                        Duration::ZERO,
+                        Duration::ZERO,
+                    );
+                }
                 debug!(
                     event = "sqlite.write",
                     operation = lane,
@@ -602,14 +652,39 @@ impl SqliteWriteCoordinator {
         };
 
         if Instant::now() >= deadline_at {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_sqlite(
+                    "try_write",
+                    lane,
+                    SqliteWritePriority::BestEffort.as_str(),
+                    "deadline",
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
+            }
             drop(permit);
             return Ok(None);
         }
 
         let op_started = Instant::now();
+        let writer_wait_ms = permit.writer_wait_ms();
+        let mut metric_guard = crate::metrics::SqliteGuard::new(
+            "try_write",
+            lane,
+            SqliteWritePriority::BestEffort.as_str(),
+            Duration::from_millis(writer_wait_ms.min(u128::from(u64::MAX)) as u64),
+        );
         let result = operation().await;
         let elapsed = op_started.elapsed();
-        let writer_wait_ms = permit.writer_wait_ms();
+        if let Some(guard) = metric_guard.as_mut() {
+            let outcome = match result.as_ref() {
+                Ok(_) => "success",
+                Err(error) if is_sqlite_busy_error(error.as_ref()) => "busy",
+                Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => "deadline",
+                Err(_) => "skipped",
+            };
+            guard.finish(outcome);
+        }
         drop(permit);
 
         match result {
@@ -927,6 +1002,16 @@ impl SqliteWriteCoordinator {
         let mut attempt = 1usize;
         loop {
             if Instant::now() >= deadline_at {
+                if let Some(metrics) = crate::metrics::global() {
+                    metrics.record_sqlite(
+                        "begin",
+                        lane,
+                        priority.as_str(),
+                        "deadline",
+                        Duration::ZERO,
+                        Duration::ZERO,
+                    );
+                }
                 warn!(
                     event = "sqlite.write",
                     operation = lane,
@@ -944,11 +1029,39 @@ impl SqliteWriteCoordinator {
                 );
                 return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
             }
-            let permit = self
+            let acquire_started = Instant::now();
+            let mut begin_metrics =
+                crate::metrics::SqliteGuard::new("begin", lane, priority.as_str(), Duration::ZERO);
+            if let Some(guard) = begin_metrics.as_mut() {
+                guard.start_wait(acquire_started.into());
+            }
+            let permit = match self
                 .acquire_until(lane, priority, deadline_at, deadline)
-                .await?;
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    if let Some(guard) = begin_metrics.as_mut() {
+                        guard.set_wait(acquire_started.elapsed());
+                        guard.finish(if is_sqlite_write_deadline_error(error.as_ref()) {
+                            "deadline"
+                        } else {
+                            "error"
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+            let writer_wait_ms = permit.writer_wait_ms();
+            if let Some(guard) = begin_metrics.as_mut() {
+                guard.set_wait(Duration::from_millis(
+                    writer_wait_ms.min(u128::from(u64::MAX)) as u64,
+                ));
+            }
             if Instant::now() >= deadline_at {
-                let writer_wait_ms = permit.writer_wait_ms();
+                if let Some(guard) = begin_metrics.as_mut() {
+                    guard.finish("deadline");
+                }
                 drop(permit);
                 warn!(
                     event = "sqlite.write",
@@ -968,17 +1081,35 @@ impl SqliteWriteCoordinator {
                 return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
             }
             let pool_wait_started = Instant::now();
+            let mut pool_metrics =
+                crate::metrics::SqliteGuard::new("pool", lane, priority.as_str(), Duration::ZERO);
+            if let Some(guard) = pool_metrics.as_mut() {
+                guard.start_wait(pool_wait_started.into());
+            }
             let connection = tokio::time::timeout_at(deadline_at, write_pool.acquire()).await;
             let pool_wait = pool_wait_started.elapsed();
-            let writer_wait_ms = permit.writer_wait_ms();
             let connection = match connection {
                 Ok(Ok(connection)) => connection,
                 Ok(Err(error)) => {
+                    if let Some(guard) = pool_metrics.as_mut() {
+                        guard.set_wait(pool_wait);
+                        guard.finish("error");
+                    }
+                    if let Some(guard) = begin_metrics.as_mut() {
+                        guard.finish("error");
+                    }
                     drop(permit);
                     return Err(anyhow::Error::new(error)
                         .context(format!("acquire sqlite write connection ({lane})")));
                 }
                 Err(_) => {
+                    if let Some(guard) = pool_metrics.as_mut() {
+                        guard.set_wait(pool_wait);
+                        guard.finish("deadline");
+                    }
+                    if let Some(guard) = begin_metrics.as_mut() {
+                        guard.finish("deadline");
+                    }
                     warn!(
                         event = "sqlite.write",
                         operation = lane,
@@ -998,8 +1129,14 @@ impl SqliteWriteCoordinator {
                     return Err(self.deadline_error(lane, priority, "write_pool", deadline));
                 }
             };
+            if let Some(guard) = pool_metrics.as_mut() {
+                guard.set_wait(pool_wait);
+                guard.finish("success");
+            }
             if Instant::now() >= deadline_at {
-                let writer_wait_ms = permit.writer_wait_ms();
+                if let Some(guard) = begin_metrics.as_mut() {
+                    guard.finish("deadline");
+                }
                 drop(connection);
                 drop(permit);
                 warn!(
@@ -1036,6 +1173,14 @@ impl SqliteWriteCoordinator {
                 }
             };
             let mut begin_elapsed = begin_started.elapsed();
+            if let Some(guard) = begin_metrics.as_mut() {
+                let outcome = match result.as_ref() {
+                    Ok(_) => "success",
+                    Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => "deadline",
+                    Err(_) => "error",
+                };
+                guard.finish(outcome);
+            }
 
             match result {
                 Ok(mut tx) => {
@@ -1363,6 +1508,12 @@ impl<'a> SqliteWriteTransaction<'a> {
             .inner
             .take()
             .expect("sqlite write transaction already completed");
+        let mut commit_metrics = crate::metrics::SqliteGuard::new(
+            "commit",
+            self.lane,
+            self.priority.as_str(),
+            Duration::ZERO,
+        );
         if Instant::now() >= self.deadline_at {
             self.request_progress_interrupt();
             cleanup_sqlite_write_transaction(tx, self.lane).await;
@@ -1370,6 +1521,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                 "write_deadline",
                 "sqlite write transaction rolled back at deadline",
             );
+            if let Some(guard) = commit_metrics.as_mut() {
+                guard.finish("deadline");
+            }
             return Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                 self.lane,
                 self.priority,
@@ -1389,6 +1543,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                     "transaction_error",
                     "sqlite write progress handler could not be disabled before commit",
                 );
+                if let Some(guard) = commit_metrics.as_mut() {
+                    guard.finish("error");
+                }
                 return Err(anyhow::Error::new(error)
                     .context("disable sqlite write progress handler before commit"));
             }
@@ -1399,6 +1556,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                     "write_deadline",
                     "sqlite write progress handler disable exceeded deadline",
                 );
+                if let Some(guard) = commit_metrics.as_mut() {
+                    guard.finish("deadline");
+                }
                 return Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                     self.lane,
                     self.priority,
@@ -1415,6 +1575,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                 "write_deadline",
                 "sqlite write transaction rolled back before commit dispatch",
             );
+            if let Some(guard) = commit_metrics.as_mut() {
+                guard.finish("deadline");
+            }
             return Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                 self.lane,
                 self.priority,
@@ -1428,6 +1591,9 @@ impl<'a> SqliteWriteTransaction<'a> {
             Ok(()) => {
                 drop(tx);
                 self.log_transaction_end("ok", "sqlite write transaction committed");
+                if let Some(guard) = commit_metrics.as_mut() {
+                    guard.finish("success");
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1438,6 +1604,9 @@ impl<'a> SqliteWriteTransaction<'a> {
                         "write_deadline",
                         "sqlite write commit returned busy after deadline and was rolled back",
                     );
+                    if let Some(guard) = commit_metrics.as_mut() {
+                        guard.finish("deadline");
+                    }
                     Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                         self.lane,
                         self.priority,
@@ -1458,6 +1627,13 @@ impl<'a> SqliteWriteTransaction<'a> {
                             "sqlite write transaction commit failed"
                         },
                     );
+                    if let Some(guard) = commit_metrics.as_mut() {
+                        guard.finish(if error_kind == "sqlite_busy" {
+                            "busy"
+                        } else {
+                            "error"
+                        });
+                    }
                     Err(anyhow::Error::new(error).context("commit sqlite write transaction"))
                 }
             }

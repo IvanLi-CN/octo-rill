@@ -4285,7 +4285,7 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     }) else {
         return Ok(GlobalSchedulerAttempt::Idle);
     };
-    match execute(state, work).await {
+    match crate::metrics::observe_worker("content", "attempt", execute(state, work)).await {
         Ok(()) => Ok(GlobalSchedulerAttempt::Claimed),
         Err(error) if is_sqlite_database_error(error.as_ref()) => {
             Ok(GlobalSchedulerAttempt::ClaimedDatabaseFailure(error))
@@ -4325,7 +4325,13 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
                             if worker_index >= worker_target.load(Ordering::Acquire) {
                                 break;
                             }
-                            match run_once_with_outcome(worker_state.as_ref()).await {
+                            match crate::metrics::observe_worker(
+                                "content",
+                                "logical",
+                                run_once_with_outcome(worker_state.as_ref()),
+                            )
+                            .await
+                            {
                                 Ok(GlobalSchedulerAttempt::Idle) => {
                                     claim_backoff.reset();
                                     execution_backoff.reset();
