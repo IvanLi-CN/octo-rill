@@ -9,4 +9,4 @@ groups:
       - record: octorill:sqlite_writer_wait_p95:sum
         expr: histogram_quantile(0.95, sum(rate(octorill_sqlite_wait_seconds_bucket[5m])) by (le, phase, priority))
       - record: octorill:upstream_failure_ratio:sum
-        expr: sum(rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|forbidden|transport_error|decode_error|http_4xx|http_5xx"}[5m])) / clamp_min(sum(rate(octorill_upstream_requests_total[5m])), 1)
+        expr: sum(rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|forbidden|transport_error|decode_error|http_4xx|http_5xx"}[5m])) / clamp_min(sum(rate(octorill_upstream_requests_total{outcome!="fallback"}[5m])), 1)

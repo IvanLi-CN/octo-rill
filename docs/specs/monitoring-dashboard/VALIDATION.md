@@ -3,7 +3,7 @@
 ## Local checks
 
 - The pre-repair candidate passed `cargo test --locked --all-features` with 1050 passed, 0 failed, and 2 ignored after the SQLite lifecycle instrumentation change.
-- The repair candidate passes the focused metrics suite (18 tests) and the GitHub outcome classification test locally; a fresh full suite is delegated to CI because the first Agent VM cold build exceeded the 25-minute CI envelope before producing a test result.
+- The repair candidate passes the focused metrics suite (19 tests), the webhook outcome classification test, the GitHub outcome classification test, and `cargo check --locked --all-features` locally; a fresh full suite is delegated to CI because the first Agent VM cold build exceeded the 25-minute CI envelope before producing a test result.
 - `cargo fmt --all -- --check`, Rust source quality checks, observability asset validation, CLI fixture tests, and the topic contract checker are required release gates.
 - The docs site production build completed with `DOCS_BASE=/octo-rill/ bun run build`.
 
