@@ -448,16 +448,12 @@ async fn validate_pat_with_github(
         )
     })?;
     let status = response.status();
-    let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-        || response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == "0")
-        || response.headers().contains_key("retry-after");
     if status != StatusCode::OK {
         let headers = response.headers().clone();
         let body_read = response.text().await;
+        let rate_limited =
+            webhook_http_outcome_with_context(status, &headers, body_read.as_deref().ok())
+                == "rate_limited";
         record_webhook_response(
             status,
             &headers,
@@ -1708,13 +1704,10 @@ async fn response_error(response: reqwest::Response, started_at: Instant) -> Git
                 })
                 .ok()
         });
-    let rate_limited = response
-        .headers()
-        .get("x-ratelimit-remaining")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == "0")
-        || response.headers().contains_key("retry-after");
     let body_result = response.text().await;
+    let rate_limited =
+        webhook_http_outcome_with_context(status, &headers, body_result.as_deref().ok())
+            == "rate_limited";
     record_webhook_response(
         status,
         &headers,

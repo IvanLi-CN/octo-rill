@@ -14141,7 +14141,7 @@ pub async fn sync_notifications(
                                 metrics.record_upstream(
                                     "github",
                                     "sync notifications",
-                                    "decode_error",
+                                    github_response_body_outcome(&error),
                                     started_at.elapsed(),
                                 );
                             }
@@ -14172,11 +14172,10 @@ pub async fn sync_notifications(
                             metrics.record_upstream(
                                 "github",
                                 "sync notification thread",
-                                if result.is_ok() {
-                                    "success"
-                                } else {
-                                    "decode_error"
-                                },
+                                result
+                                    .as_ref()
+                                    .map(|_| "success")
+                                    .unwrap_or_else(|error| github_response_body_outcome(error)),
                                 started_at.elapsed(),
                             );
                         }
