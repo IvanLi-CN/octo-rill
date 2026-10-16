@@ -457,7 +457,7 @@ async fn validate_pat_with_github(
         || response.headers().contains_key("retry-after");
     if status != StatusCode::OK {
         let body_read = response.text().await;
-        record_webhook_response(status, body_read.is_ok(), started_at.elapsed());
+        record_webhook_response(status, body_read.as_ref().err(), started_at.elapsed());
         if rate_limited {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1540,18 +1540,32 @@ fn webhook_http_outcome(status: StatusCode) -> &'static str {
     }
 }
 
-fn record_webhook_response(status: StatusCode, body_ok: bool, elapsed: Duration) {
+fn webhook_body_error_outcome(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_body() || error.is_connect() || error.is_request() {
+        "transport_error"
+    } else {
+        "decode_error"
+    }
+}
+
+fn record_webhook_response(
+    status: StatusCode,
+    body_error: Option<&reqwest::Error>,
+    elapsed: Duration,
+) {
     if let Some(metrics) = crate::metrics::global() {
-        metrics.record_upstream(
-            "github",
-            "webhook",
-            if body_ok {
-                webhook_http_outcome(status)
+        let outcome = if let Some(error) = body_error {
+            if status.is_success() {
+                webhook_body_error_outcome(error)
             } else {
-                "decode_error"
-            },
-            elapsed,
-        );
+                webhook_http_outcome(status)
+            }
+        } else {
+            webhook_http_outcome(status)
+        };
+        metrics.record_upstream("github", "webhook", outcome, elapsed);
     }
 }
 
@@ -1561,7 +1575,7 @@ async fn decode_webhook_json<T: DeserializeOwned>(
 ) -> std::result::Result<T, reqwest::Error> {
     let status = response.status();
     let result = response.json::<T>().await;
-    record_webhook_response(status, result.is_ok(), started_at.elapsed());
+    record_webhook_response(status, result.as_ref().err(), started_at.elapsed());
     result
 }
 
@@ -1662,7 +1676,7 @@ async fn response_error(response: reqwest::Response, started_at: Instant) -> Git
         .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
     let body_result = response.text().await;
-    record_webhook_response(status, body_result.is_ok(), started_at.elapsed());
+    record_webhook_response(status, body_result.as_ref().err(), started_at.elapsed());
     let body = body_result.unwrap_or_default();
     GitHubCallError {
         status: Some(status),
@@ -1870,9 +1884,10 @@ async fn delete_hook(
         message: err.to_string(),
     })?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
-        let status = response.status();
-        let body_read = response.text().await;
-        record_webhook_response(status, body_read.is_ok(), started_at.elapsed());
+        let _ = response.text().await;
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream("github", "webhook", "success", started_at.elapsed());
+        }
         return Ok(());
     }
     Err(response_error(response, started_at).await)

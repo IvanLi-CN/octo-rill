@@ -956,14 +956,14 @@ async fn sample_queues(pool: &SqlitePool, metrics: &Metrics) -> Result<()> {
     let translations = sample_queue(
         &mut connection,
         "translation_work_items",
-        "status = 'queued' AND (deadline_at IS NULL OR deadline_at >= CURRENT_TIMESTAMP) AND EXISTS (SELECT 1 FROM users u WHERE u.id = translation_work_items.scope_user_id AND u.is_disabled = 0 AND u.paused_at IS NULL)",
+        "status = 'queued' AND EXISTS (SELECT 1 FROM users u WHERE u.id = translation_work_items.scope_user_id AND u.is_disabled = 0 AND u.paused_at IS NULL)",
         deadline,
     )
     .await?;
     let repo_release = sample_queue(
         &mut connection,
         "repo_release_work_items",
-        "status = 'queued' AND deadline_at >= CURRENT_TIMESTAMP AND NOT EXISTS (SELECT 1 FROM repo_release_sync_state state WHERE state.repo_id = repo_release_work_items.repo_id AND state.backoff_until IS NOT NULL AND julianday(state.backoff_until) > julianday('now'))",
+        "status = 'queued' AND NOT EXISTS (SELECT 1 FROM repo_release_sync_state state WHERE state.repo_id = repo_release_work_items.repo_id AND state.backoff_until IS NOT NULL AND julianday(state.backoff_until) > julianday('now'))",
         deadline,
     )
     .await?;

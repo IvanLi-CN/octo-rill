@@ -11340,6 +11340,16 @@ fn decode_error_is_retryable(err: &reqwest::Error) -> bool {
     decode_error_phase(err) == "response"
 }
 
+fn github_response_body_outcome(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_body() || err.is_connect() || err.is_request() {
+        "transport_error"
+    } else {
+        "decode_error"
+    }
+}
+
 fn notification_thread_refresh_is_fresher(
     current_updated_at: Option<&str>,
     thread_updated_at: Option<&str>,
@@ -11482,7 +11492,12 @@ async fn fetch_json_response<T: DeserializeOwned>(
         }
         Err(err) => {
             if let Some(metrics) = crate::metrics::global() {
-                metrics.record_upstream("github", operation, "decode_error", started_at.elapsed());
+                metrics.record_upstream(
+                    "github",
+                    operation,
+                    github_response_body_outcome(&err),
+                    started_at.elapsed(),
+                );
             }
             let phase = decode_error_phase(&err);
             let request_error = if decode_error_is_retryable(&err) {
