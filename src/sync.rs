@@ -11404,6 +11404,7 @@ fn classify_github_http_error(
         || status == StatusCode::REQUEST_TIMEOUT
         || status.is_server_error()
         || remaining == "0"
+        || headers.contains_key("retry-after")
         || body_lower.contains("secondary rate limit")
         || body_lower.contains("abuse detection")
     {
@@ -17162,6 +17163,16 @@ mod tests {
         );
         assert!(rate_limited.retryable);
         assert!(!is_terminal_notification_thread_error(&rate_limited));
+
+        let mut retry_after_headers = HeaderMap::new();
+        retry_after_headers.insert("retry-after", HeaderValue::from_static("1"));
+        let retry_after = classify_github_http_error(
+            "github notification thread",
+            StatusCode::FORBIDDEN,
+            &retry_after_headers,
+            "",
+        );
+        assert!(retry_after.retryable);
     }
 
     #[test]
