@@ -2,7 +2,8 @@
 
 ## Local checks
 
-- `cargo test --locked --all-features`: 1050 passed, 0 failed, 2 ignored after the final SQLite lifecycle instrumentation change.
+- The pre-repair candidate passed `cargo test --locked --all-features` with 1050 passed, 0 failed, and 2 ignored after the SQLite lifecycle instrumentation change.
+- The repair candidate passes the focused metrics suite (18 tests) and the GitHub outcome classification test locally; a fresh full suite is delegated to CI because the first Agent VM cold build exceeded the 25-minute CI envelope before producing a test result.
 - `cargo fmt --all -- --check`, Rust source quality checks, observability asset validation, CLI fixture tests, and the topic contract checker are required release gates.
 - The docs site production build completed with `DOCS_BASE=/octo-rill/ bun run build`.
 
@@ -10,10 +11,11 @@
 
 - Metrics disabled leaves port `58091` closed; enabling metrics with the configured token exposes OpenMetrics on the independent listener.
 - Wrong Bearer credentials return `401`; the correct token returns OpenMetrics without querying the business database during scrape.
-- On the final candidate synced into the isolated VM, Prometheus 3.15.0 reports the application target `up=1` with an empty error; Grafana 13.2.3 reports healthy and provisions the five stable dashboard UIDs (`octorill-overview`, `octorill-http-sse`, `octorill-sqlite`, `octorill-queues`, `octorill-upstream`).
+- On the visual-evidence candidate synced into the isolated VM, Prometheus 3.15.0 reports the application target `up=1` with an empty error; Grafana 13.2.3 reports healthy and provisions the five stable dashboard UIDs (`octorill-overview`, `octorill-http-sse`, `octorill-sqlite`, `octorill-queues`, `octorill-upstream`). The repair candidate has not changed dashboard layout or provisioning inputs, but its full application rebuild remains a CI gate.
 - The Grafana datasource proxy and direct Prometheus backend both return the fixed CLI health query; default rules are not loaded by the sample Compose file.
-- The final candidate smoke returned `401` for an incorrect token and OpenMetrics for the correct token; `octorill_enabled=1`, `octorill_sampler_stale=0`, and the payload was 206078 bytes. The Grafana datasource proxy returned CLI schema 1 with `status=ok` and finite samples for all six health queries.
-- An earlier 100-scrape enabled sample measured p50 4.64ms, p95 35.23ms, p99 61.95ms, maximum 61.95ms, and maximum payload 78051 bytes; the latest smoke confirms the same listener and sampler contract after the final candidate rebuild.
+- The visual-evidence candidate smoke returned `401` for an incorrect token and OpenMetrics for the correct token; `octorill_enabled=1`, `octorill_sampler_stale=0`, and the payload was 206078 bytes. The Grafana datasource proxy returned CLI schema 1 with `status=ok` and finite samples for all six health queries.
+- An earlier 100-scrape enabled sample measured p50 4.64ms, p95 35.23ms, p99 61.95ms, maximum 61.95ms, and maximum payload 78051 bytes; the latest smoke confirms the same listener and sampler contract after the visual-evidence candidate rebuild.
+- The repair-candidate Agent VM check parsed `docker compose config` and all 11 Prometheus rules with `promtool`; the application full-suite container was stopped after a 180-second hard timeout without a test result.
 
 ## Runtime A/B measurements
 

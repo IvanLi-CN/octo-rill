@@ -11,6 +11,7 @@ use chrono::{
     offset::LocalResult,
 };
 use rand::RngExt;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -3009,6 +3010,8 @@ async fn chat_completion_once(
                 "chat_completions",
                 if status.as_u16() == 429 {
                     "rate_limited"
+                } else if status == StatusCode::FORBIDDEN {
+                    "forbidden"
                 } else if status.is_client_error() {
                     "http_4xx"
                 } else if status.is_server_error() {

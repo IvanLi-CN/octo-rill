@@ -150,15 +150,11 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     };
     let thresholds = logging_thresholds();
     let started = std::time::Instant::now();
-    if let Some(metrics) = crate::metrics::global() {
-        metrics.begin_http();
-    }
+    let mut http_guard = crate::metrics::HttpRequestGuard::new(&method, &route);
     let mut response = with_request_context(request_context, next.run(request)).await;
     let latency = started.elapsed();
     let status = response.status();
-    if let Some(metrics) = crate::metrics::global() {
-        metrics.finish_http(&method, &route, status.as_u16(), latency);
-    }
+    http_guard.finish(status.as_u16());
     let body = std::mem::replace(response.body_mut(), Body::empty());
     let body_route = route.clone();
     let body_stream = async_stream::stream! {

@@ -11283,6 +11283,8 @@ async fn send_github_request(
 fn github_http_outcome(status: StatusCode) -> &'static str {
     if status.as_u16() == 429 {
         "rate_limited"
+    } else if status == StatusCode::FORBIDDEN {
+        "forbidden"
     } else if status.is_client_error() {
         "http_4xx"
     } else if status.is_server_error() {
@@ -14937,7 +14939,7 @@ mod tests {
         execute_subscription_prune_phases, expire_repo_release_deadlines,
         fail_repo_release_work_item, fail_repo_release_work_item_if_stale,
         feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        hydrate_repo_refresh_candidates, insert_feed_activity_events,
+        github_http_outcome, hydrate_repo_refresh_candidates, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
         load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
@@ -17114,6 +17116,16 @@ mod tests {
         );
         assert!(rate_limited.retryable);
         assert!(!is_terminal_notification_thread_error(&rate_limited));
+    }
+
+    #[test]
+    fn github_metric_outcome_distinguishes_forbidden_from_other_client_errors() {
+        assert_eq!(github_http_outcome(StatusCode::FORBIDDEN), "forbidden");
+        assert_eq!(github_http_outcome(StatusCode::UNAUTHORIZED), "http_4xx");
+        assert_eq!(
+            github_http_outcome(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limited"
+        );
     }
 
     #[tokio::test]
