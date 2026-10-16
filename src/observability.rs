@@ -157,20 +157,20 @@ pub async fn access_log_middleware(request: Request, next: Next) -> Response {
     http_guard.finish(status.as_u16());
     let body = std::mem::replace(response.body_mut(), Body::empty());
     let body_route = route.clone();
+    let mut body_guard = crate::metrics::HttpBodyGuard::new(&body_route);
     let body_stream = async_stream::stream! {
-        let mut guard = crate::metrics::HttpBodyGuard::new(&body_route);
         let mut data_stream = body.into_data_stream();
         while let Some(item) = data_stream.next().await {
             match item {
                 Ok(chunk) => yield Ok::<_, axum::Error>(chunk),
                 Err(error) => {
-                    guard.finish("error");
+                    body_guard.finish("error");
                     yield Err(error);
                     return;
                 }
             }
         }
-        guard.finish("completed");
+        body_guard.finish("completed");
     };
     *response.body_mut() = Body::from_stream(body_stream);
     let latency_ms = latency.as_millis();

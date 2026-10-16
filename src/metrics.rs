@@ -949,21 +949,21 @@ async fn sample_queues(pool: &SqlitePool, metrics: &Metrics) -> Result<()> {
     let content = sample_queue(
         &mut connection,
         "content_work_items",
-        "status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')))",
+        "status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < MAX(1, COALESCE((SELECT translation_general_worker_concurrency - 1 FROM admin_runtime_settings WHERE id = 1), 1))))",
         deadline,
     )
     .await?;
     let translations = sample_queue(
         &mut connection,
         "translation_work_items",
-        "status = 'queued' AND (deadline_at IS NULL OR deadline_at >= CURRENT_TIMESTAMP)",
+        "status = 'queued' AND (deadline_at IS NULL OR deadline_at >= CURRENT_TIMESTAMP) AND EXISTS (SELECT 1 FROM users u WHERE u.id = translation_work_items.scope_user_id AND u.is_disabled = 0 AND u.paused_at IS NULL)",
         deadline,
     )
     .await?;
     let repo_release = sample_queue(
         &mut connection,
         "repo_release_work_items",
-        "status = 'queued' AND deadline_at >= CURRENT_TIMESTAMP",
+        "status = 'queued' AND deadline_at >= CURRENT_TIMESTAMP AND NOT EXISTS (SELECT 1 FROM repo_release_sync_state state WHERE state.repo_id = repo_release_work_items.repo_id AND state.backoff_until IS NOT NULL AND julianday(state.backoff_until) > julianday('now'))",
         deadline,
     )
     .await?;
@@ -1157,8 +1157,12 @@ where
 
 impl HttpBodyGuard {
     pub fn new(route: &str) -> Self {
+        Self::with_metrics(global(), route)
+    }
+
+    fn with_metrics(metrics: Option<Arc<Metrics>>, route: &str) -> Self {
         Self {
-            metrics: global(),
+            metrics,
             route: route.to_owned(),
             finished: false,
         }
@@ -1391,5 +1395,17 @@ mod tests {
         assert!(body.contains("octorill_http_in_flight 0"));
         assert!(body.contains("status_class=\"4xx\""));
         assert!(body.contains("outcome=\"cancelled\""));
+    }
+
+    #[test]
+    fn http_body_guard_records_discard_when_dropped_before_poll() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_enabled(true);
+        {
+            let _guard = HttpBodyGuard::with_metrics(Some(Arc::clone(&metrics)), "/api/health");
+        }
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_http_body_events_total"));
+        assert!(body.contains("outcome=\"discarded\""));
     }
 }
