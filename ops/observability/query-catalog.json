@@ -26,7 +26,7 @@
     "process_cpu_rate": "rate(octorill_process_cpu_seconds{SERVICE_SELECTOR}[WINDOW])",
     "database_size": "octorill_database_size_bytes{SERVICE_SELECTOR}",
     "wal_size": "octorill_wal_size_bytes{SERVICE_SELECTOR}",
-    "upstream_rate_by_outcome": "sum(rate(octorill_upstream_requests_total{SERVICE_SELECTOR}[WINDOW])) by (provider, outcome)",
+    "upstream_rate_by_outcome": "sum(rate(octorill_upstream_requests_total{SERVICE_SELECTOR,operation!=\"scheduler_wait\"}[WINDOW])) by (provider, outcome)",
     "upstream_requests": "octorill_upstream_requests_total{SERVICE_SELECTOR}"
   },
   "commands": {
