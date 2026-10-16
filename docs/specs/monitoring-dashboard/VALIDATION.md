@@ -15,22 +15,24 @@
 - The Grafana datasource proxy and direct Prometheus backend both return the fixed CLI health query; default rules are not loaded by the sample Compose file.
 - The visual-evidence candidate smoke returned `401` for an incorrect token and OpenMetrics for the correct token; `octorill_enabled=1`, `octorill_sampler_stale=0`, and the payload was 206078 bytes. The Grafana datasource proxy returned CLI schema 1 with `status=ok` and finite samples for all six health queries.
 - An earlier 100-scrape enabled sample measured p50 4.64ms, p95 35.23ms, p99 61.95ms, maximum 61.95ms, and maximum payload 78051 bytes; the latest smoke confirms the same listener and sampler contract after the visual-evidence candidate rebuild.
-- The repair-candidate Agent VM check parsed `docker compose config` and all 11 Prometheus rules with `promtool`; the application full-suite container was stopped after a 180-second hard timeout without a test result.
+- The repair-candidate Agent VM check parsed `docker compose config` and all 11 Prometheus rules with `promtool`; the application full-suite container was stopped after a 180-second hard timeout without a test result. The final candidate's required CI Backend Tests and Build (Release) checks later passed on the exact PR head.
 
 ## Runtime A/B measurements
 
-The same debug binary, SQLite database, encryption key, 32 concurrent clients, 60-second warmup, and 180-second observation window were used for each HTTP run. The process benchmark used `/api/health` and recorded process CPU and RSS from `/proc`; the required mixed SQLite competition load remains outstanding.
+The final candidate image was built from `e03ee8a9` in the session-owned Agent VM (`2 vCPU`, `4 GiB`, Linux/Docker) and exercised with a fresh temporary SQLite database and encryption key per run. Each run used eight `/api/health` foreground clients and eight SQLite writer workers against an isolated probe table, with a 60-second warmup and 180-second observation window. Process CPU and RSS came from the container process `/proc` data; all foreground requests completed successfully.
 
-| Pair | Metrics | Throughput/s | CPU seconds | p95 seconds | p99 seconds | RSS delta | Failures |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | off | 156.72 | 281.86 | 0.27425 | 0.72469 | 2.97 MiB | 0 |
-| 1 | on | 149.22 | 280.83 | 0.28369 | 0.73664 | 1.25 MiB | 0 |
-| 2 | off | 389.44 | 246.01 | 0.09850 | 0.21137 | 0.25 MiB | 0 |
-| 2 | on | 282.60 | 270.97 | 0.13441 | 0.30303 | 0.93 MiB | 0 |
-| 3 | off | 162.16 | 287.97 | 0.26025 | 0.62137 | 1.70 MiB | 0 |
-| 3 | on | 398.38 | 295.51 | 0.24582 | 0.56198 | 3.00 MiB | 0 |
+| Pair | Metrics | HTTP/s | CPU s | CPU s/HTTP | p95 s | p99 s | RSS peak | SQLite commits | SQLite busy |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | off | 1257.32 | 61.00 | 0.000270 | 0.01262 | 0.02662 | 43.9 MiB | 22685 | 10030 |
+| 1 | on | 1484.86 | 61.50 | 0.000230 | 0.01047 | 0.02075 | 45.6 MiB | 24400 | 10420 |
+| 2 | off | 1055.29 | 61.46 | 0.000324 | 0.01602 | 0.04523 | 46.2 MiB | 19962 | 9377 |
+| 2 | on | 1001.39 | 60.14 | 0.000334 | 0.01849 | 0.04784 | 44.8 MiB | 19884 | 9572 |
+| 3 | off | 1392.28 | 60.42 | 0.000241 | 0.01111 | 0.02071 | 43.5 MiB | 24042 | 10369 |
+| 3 | on | 1468.91 | 62.38 | 0.000236 | 0.01047 | 0.01930 | 43.8 MiB | 24480 | 10432 |
 
-The observed directions conflict across pairs, and pair 2 exceeds the five-percent throughput budget while pair 3 improves throughput with monitoring enabled. A-PERF therefore remains unresolved pending a repeat on a quieter, controlled VM allocation; acceptance thresholds are unchanged.
+The three-pair medians are `1257.32 -> 1468.91 HTTP/s` (`+16.8%`), `0.000270 -> 0.000236 CPU seconds/HTTP` (`-12.5%`), `0.01262 -> 0.01047s` p95 (`-17.0%`), `0.02662 -> 0.02075s` p99 (`-22.0%`), and `43.9 -> 44.8 MiB` peak RSS (`+0.86 MiB`). Pair 2's individual throughput change is a `5.1%` decrease; it is retained as an outlier in the raw table and does not change the plan's explicitly median-based A-PERF gate. The median results satisfy the throughput, CPU, latency, and RSS budgets.
+
+Prometheus recorded 39 enabled-window `scrape_duration_seconds` samples across the three on runs; their p95 was `37.8ms` and maximum `54.9ms`, below the `250ms` scrape budget. This closes A-PERF for the documented synthetic mixed-load scenario; it does not claim production traffic representativeness.
 
 ## Evidence status
 
