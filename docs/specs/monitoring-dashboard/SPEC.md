@@ -93,3 +93,19 @@
 - Given writer/reader 竞争、任务积压或上游失败，When 查询 Grafana 或 CLI，Then 可区分对应瓶颈、样本量、窗口和 stale/degraded/unavailable 状态。
 - Given sampler 或监控后端停止，When 业务继续处理请求，Then 业务结果继续可用，恢复后采样继续更新而不把缺测显示为零。
 - Given Compose 全新启动，When provisioning 完成，Then 五个固定 UID 看板和共享查询目录可用，告警样例默认未启用。
+
+## Visual Evidence
+
+- Source: real Grafana 13.2.3 runtime in the session-owned Agent VM; `target_program=Grafana`; capture scope is limited to the five OctoRill dashboard viewports.
+- Visual comparison: current-only because this topic had no readable historical screenshot baseline; the owner confirmed the displayed candidate screenshots before they were persisted here.
+- The captured runtime shows real HTTP, SQLite, queue, resource, sampler, and no-sample upstream states; the temporary VM port binding used for capture is not part of the repository Compose contract.
+
+![OctoRill Overview](./assets/grafana-overview.png)
+
+![OctoRill HTTP and SSE](./assets/grafana-http-sse.png)
+
+![OctoRill SQLite](./assets/grafana-sqlite.png)
+
+![OctoRill Task Queues](./assets/grafana-queues.png)
+
+![OctoRill GitHub and LLM Upstreams](./assets/grafana-upstream.png)

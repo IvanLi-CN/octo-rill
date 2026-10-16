@@ -33,4 +33,4 @@ The observed directions conflict across pairs, and pair 2 exceeds the five-perce
 ## Evidence status
 
 - The 101 instance was inspected read-only; production target enablement, network changes, credentials, and online connectivity remain deferred.
-- Real Grafana screenshots require per-shot owner authorization and remain pending; VM API and provisioning evidence is retained instead of using representative images.
+- Real Grafana screenshots were captured from the final candidate in the session-owned Agent VM after Grafana provisioning completed; the owner confirmed the five current-only images. The canonical image set and capture scope are recorded in the [SPEC Visual Evidence section](./SPEC.md#visual-evidence), with no representative or mock images used.
