@@ -79,6 +79,12 @@ jobs:
             --entrypoint promtool \
             -v "$PWD/prometheus:/etc/prometheus:ro" \
             prom/prometheus:v3.15.0 \
+            check config \
+            /etc/prometheus/prometheus.yml
+          docker run --rm \
+            --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.15.0 \
             check rules \
             /etc/prometheus/rules/octorill-recording.yml \
             /etc/prometheus/rules/octorill-alerts.yml

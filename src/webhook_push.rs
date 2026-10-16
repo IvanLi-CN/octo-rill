@@ -15,7 +15,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tower_sessions::Session;
@@ -425,7 +425,7 @@ async fn validate_pat_with_github(
             "Webhook 推送当前仅支持 classic PAT。",
         ));
     }
-    let response = send_github_webhook_request(
+    let (response, started_at) = send_github_webhook_request(
         state
             .github_rest_http
             .get(
@@ -456,6 +456,8 @@ async fn validate_pat_with_github(
             .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
     if status != StatusCode::OK {
+        let body_read = response.text().await;
+        record_webhook_response(status, body_read.is_ok(), started_at.elapsed());
         if rate_limited {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -478,6 +480,15 @@ async fn validate_pat_with_github(
         ));
     }
     let scopes = parse_scopes(response.headers());
+    let github_user = decode_webhook_json::<GitHubUser>(response, started_at)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "github_unavailable",
+                format!("GitHub user API 响应无效：{error}"),
+            )
+        })?;
     if !scopes
         .iter()
         .any(|scope| scope == "public_repo" || scope == "repo")
@@ -489,13 +500,6 @@ async fn validate_pat_with_github(
             "classic PAT 需要 public_repo（仅公开仓库）或 repo（包含私有仓库）权限。",
         ));
     }
-    let github_user = response.json::<GitHubUser>().await.map_err(|error| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "github_unavailable",
-            format!("GitHub user API 响应无效：{error}"),
-        )
-    })?;
     if pat.owner_github_user_id != Some(github_user.id) {
         let _ = clear_pat_scope_observation(state, user_id).await;
         return Err(ApiError::new(
@@ -1497,22 +1501,67 @@ fn github_url(state: &AppState, repo: &TargetRepo, suffix: &str) -> Result<url::
 
 async fn send_github_webhook_request(
     request: reqwest::RequestBuilder,
-) -> std::result::Result<reqwest::Response, reqwest::Error> {
+) -> std::result::Result<(reqwest::Response, Instant), reqwest::Error> {
     let started_at = Instant::now();
     let result = request.send().await;
-    if let Some(metrics) = crate::metrics::global() {
-        let outcome = match &result {
-            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
-            Ok(response) if response.status() == StatusCode::FORBIDDEN => "forbidden",
-            Ok(response) if response.status().is_client_error() => "http_4xx",
-            Ok(response) if response.status().is_server_error() => "http_5xx",
-            Ok(response) if response.status().is_success() => "success",
-            Ok(_) => "other",
-            Err(error) if error.is_timeout() => "timeout",
-            Err(_) => "transport_error",
-        };
-        metrics.record_upstream("github", "webhook", outcome, started_at.elapsed());
+    match result {
+        Ok(response) => Ok((response, started_at)),
+        Err(error) => {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream(
+                    "github",
+                    "webhook",
+                    if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    },
+                    started_at.elapsed(),
+                );
+            }
+            Err(error)
+        }
     }
+}
+
+fn webhook_http_outcome(status: StatusCode) -> &'static str {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limited"
+    } else if status == StatusCode::FORBIDDEN {
+        "forbidden"
+    } else if status.is_client_error() {
+        "http_4xx"
+    } else if status.is_server_error() {
+        "http_5xx"
+    } else if status.is_success() {
+        "success"
+    } else {
+        "other"
+    }
+}
+
+fn record_webhook_response(status: StatusCode, body_ok: bool, elapsed: Duration) {
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.record_upstream(
+            "github",
+            "webhook",
+            if body_ok {
+                webhook_http_outcome(status)
+            } else {
+                "decode_error"
+            },
+            elapsed,
+        );
+    }
+}
+
+async fn decode_webhook_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    started_at: Instant,
+) -> std::result::Result<T, reqwest::Error> {
+    let status = response.status();
+    let result = response.json::<T>().await;
+    record_webhook_response(status, result.is_ok(), started_at.elapsed());
     result
 }
 
@@ -1531,7 +1580,7 @@ async fn resolve_delete_target(
             retry_after: None,
             message: error.to_string(),
         })?;
-    let response = send_github_webhook_request(
+    let (response, started_at) = send_github_webhook_request(
         state
             .github_rest_http
             .get(url)
@@ -1548,10 +1597,9 @@ async fn resolve_delete_target(
         message: error.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(response_error(response).await);
+        return Err(response_error(response, started_at).await);
     }
-    let identity = response
-        .json::<GitHubRepoIdentity>()
+    let identity = decode_webhook_json::<GitHubRepoIdentity>(response, started_at)
         .await
         .map_err(|error| GitHubCallError {
             status: None,
@@ -1587,7 +1635,7 @@ async fn resolve_delete_target(
     })
 }
 
-async fn response_error(response: reqwest::Response) -> GitHubCallError {
+async fn response_error(response: reqwest::Response, started_at: Instant) -> GitHubCallError {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -1613,7 +1661,9 @@ async fn response_error(response: reqwest::Response) -> GitHubCallError {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
-    let body = response.text().await.unwrap_or_default();
+    let body_result = response.text().await;
+    record_webhook_response(status, body_result.is_ok(), started_at.elapsed());
+    let body = body_result.unwrap_or_default();
     GitHubCallError {
         status: Some(status),
         rate_limited,
@@ -1642,7 +1692,7 @@ async fn list_hooks(
             .clear()
             .append_pair("per_page", "100")
             .append_pair("page", &page.to_string());
-        let response = send_github_webhook_request(
+        let (response, started_at) = send_github_webhook_request(
             state
                 .github_rest_http
                 .get(url.clone())
@@ -1659,18 +1709,16 @@ async fn list_hooks(
             message: err.to_string(),
         })?;
         if !response.status().is_success() {
-            return Err(response_error(response).await);
+            return Err(response_error(response, started_at).await);
         }
-        let page_hooks =
-            response
-                .json::<Vec<GitHubHook>>()
-                .await
-                .map_err(|err| GitHubCallError {
-                    status: None,
-                    rate_limited: false,
-                    retry_after: None,
-                    message: err.to_string(),
-                })?;
+        let page_hooks = decode_webhook_json::<Vec<GitHubHook>>(response, started_at)
+            .await
+            .map_err(|err| GitHubCallError {
+                status: None,
+                rate_limited: false,
+                retry_after: None,
+                message: err.to_string(),
+            })?;
         let is_last_page = page_hooks.len() < 100;
         hooks.extend(page_hooks);
         if is_last_page {
@@ -1698,7 +1746,7 @@ async fn create_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = send_github_webhook_request(
+    let (response, started_at) = send_github_webhook_request(
         state
             .github_rest_http
             .post(url)
@@ -1726,14 +1774,16 @@ async fn create_hook(
         message: err.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(response_error(response).await);
+        return Err(response_error(response, started_at).await);
     }
-    response.json().await.map_err(|err| GitHubCallError {
-        status: None,
-        rate_limited: false,
-        retry_after: None,
-        message: err.to_string(),
-    })
+    decode_webhook_json(response, started_at)
+        .await
+        .map_err(|err| GitHubCallError {
+            status: None,
+            rate_limited: false,
+            retry_after: None,
+            message: err.to_string(),
+        })
 }
 
 async fn update_hook(
@@ -1751,7 +1801,7 @@ async fn update_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = send_github_webhook_request(
+    let (response, started_at) = send_github_webhook_request(
         state
             .github_rest_http
             .patch(url)
@@ -1779,14 +1829,16 @@ async fn update_hook(
         message: err.to_string(),
     })?;
     if !response.status().is_success() {
-        return Err(response_error(response).await);
+        return Err(response_error(response, started_at).await);
     }
-    response.json().await.map_err(|err| GitHubCallError {
-        status: None,
-        rate_limited: false,
-        retry_after: None,
-        message: err.to_string(),
-    })
+    decode_webhook_json(response, started_at)
+        .await
+        .map_err(|err| GitHubCallError {
+            status: None,
+            rate_limited: false,
+            retry_after: None,
+            message: err.to_string(),
+        })
 }
 
 async fn delete_hook(
@@ -1801,7 +1853,7 @@ async fn delete_hook(
         retry_after: None,
         message: err.to_string(),
     })?;
-    let response = send_github_webhook_request(
+    let (response, started_at) = send_github_webhook_request(
         state
             .github_rest_http
             .delete(url)
@@ -1818,9 +1870,12 @@ async fn delete_hook(
         message: err.to_string(),
     })?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+        let status = response.status();
+        let body_read = response.text().await;
+        record_webhook_response(status, body_read.is_ok(), started_at.elapsed());
         return Ok(());
     }
-    Err(response_error(response).await)
+    Err(response_error(response, started_at).await)
 }
 
 fn is_permission_error(error: &GitHubCallError) -> bool {
@@ -3529,6 +3584,17 @@ pub async fn receive(
 mod tests {
     use super::*;
     use axum::{body::Body, extract::FromRequest, http::Request};
+
+    #[test]
+    fn webhook_http_outcomes_preserve_rate_limit_and_forbidden() {
+        assert_eq!(
+            webhook_http_outcome(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limited"
+        );
+        assert_eq!(webhook_http_outcome(StatusCode::FORBIDDEN), "forbidden");
+        assert_eq!(webhook_http_outcome(StatusCode::BAD_REQUEST), "http_4xx");
+        assert_eq!(webhook_http_outcome(StatusCode::OK), "success");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn receiver_stage_started_before_deadline_finishes_with_actual_result() {
