@@ -456,8 +456,15 @@ async fn validate_pat_with_github(
             .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
     if status != StatusCode::OK {
+        let headers = response.headers().clone();
         let body_read = response.text().await;
-        record_webhook_response(status, body_read.as_ref().err(), started_at.elapsed());
+        record_webhook_response(
+            status,
+            &headers,
+            body_read.as_deref().ok(),
+            body_read.as_ref().err(),
+            started_at.elapsed(),
+        );
         if rate_limited {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1540,6 +1547,28 @@ fn webhook_http_outcome(status: StatusCode) -> &'static str {
     }
 }
 
+fn webhook_http_outcome_with_context(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Option<&str>,
+) -> &'static str {
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let body_lower = body.unwrap_or_default().to_ascii_lowercase();
+    if status == StatusCode::FORBIDDEN
+        && (remaining == "0"
+            || headers.contains_key("retry-after")
+            || body_lower.contains("secondary rate limit")
+            || body_lower.contains("abuse detection"))
+    {
+        "rate_limited"
+    } else {
+        webhook_http_outcome(status)
+    }
+}
+
 fn webhook_body_error_outcome(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "timeout"
@@ -1552,6 +1581,8 @@ fn webhook_body_error_outcome(error: &reqwest::Error) -> &'static str {
 
 fn record_webhook_response(
     status: StatusCode,
+    headers: &HeaderMap,
+    body: Option<&str>,
     body_error: Option<&reqwest::Error>,
     elapsed: Duration,
 ) {
@@ -1560,10 +1591,10 @@ fn record_webhook_response(
             if status.is_success() {
                 webhook_body_error_outcome(error)
             } else {
-                webhook_http_outcome(status)
+                webhook_http_outcome_with_context(status, headers, body)
             }
         } else {
-            webhook_http_outcome(status)
+            webhook_http_outcome_with_context(status, headers, body)
         };
         metrics.record_upstream("github", "webhook", outcome, elapsed);
     }
@@ -1574,8 +1605,15 @@ async fn decode_webhook_json<T: DeserializeOwned>(
     started_at: Instant,
 ) -> std::result::Result<T, reqwest::Error> {
     let status = response.status();
+    let headers = response.headers().clone();
     let result = response.json::<T>().await;
-    record_webhook_response(status, result.as_ref().err(), started_at.elapsed());
+    record_webhook_response(
+        status,
+        &headers,
+        None,
+        result.as_ref().err(),
+        started_at.elapsed(),
+    );
     result
 }
 
@@ -1651,6 +1689,7 @@ async fn resolve_delete_target(
 
 async fn response_error(response: reqwest::Response, started_at: Instant) -> GitHubCallError {
     let status = response.status();
+    let headers = response.headers().clone();
     let retry_after = response
         .headers()
         .get("retry-after")
@@ -1676,7 +1715,13 @@ async fn response_error(response: reqwest::Response, started_at: Instant) -> Git
         .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
     let body_result = response.text().await;
-    record_webhook_response(status, body_result.as_ref().err(), started_at.elapsed());
+    record_webhook_response(
+        status,
+        &headers,
+        body_result.as_deref().ok(),
+        body_result.as_ref().err(),
+        started_at.elapsed(),
+    );
     let body = body_result.unwrap_or_default();
     GitHubCallError {
         status: Some(status),
@@ -3599,6 +3644,7 @@ pub async fn receive(
 mod tests {
     use super::*;
     use axum::{body::Body, extract::FromRequest, http::Request};
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn webhook_http_outcomes_preserve_rate_limit_and_forbidden() {
@@ -3609,6 +3655,28 @@ mod tests {
         assert_eq!(webhook_http_outcome(StatusCode::FORBIDDEN), "forbidden");
         assert_eq!(webhook_http_outcome(StatusCode::BAD_REQUEST), "http_4xx");
         assert_eq!(webhook_http_outcome(StatusCode::OK), "success");
+    }
+
+    #[test]
+    fn webhook_metric_outcome_preserves_rate_limit_context_for_forbidden() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        assert_eq!(
+            webhook_http_outcome_with_context(StatusCode::FORBIDDEN, &headers, None),
+            "rate_limited"
+        );
+        assert_eq!(
+            webhook_http_outcome_with_context(
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                Some("secondary rate limit exceeded"),
+            ),
+            "rate_limited"
+        );
+        assert_eq!(
+            webhook_http_outcome_with_context(StatusCode::FORBIDDEN, &HeaderMap::new(), None),
+            "forbidden"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

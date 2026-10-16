@@ -40,6 +40,8 @@ docker compose up -d
 
 ## 只读诊断
 
+独立 Compose 样例不发布 Prometheus 的 `9090` 端口；下面的 Prometheus 直连命令只适用于已有的受控私网入口或部署侧显式发布的端口。使用独立样例时，使用 Grafana datasource proxy 命令，或从监控网络内运行 CLI。
+
 ```console
 scripts/octorill-observe --url http://127.0.0.1:9090 --token-file /run/secrets/prometheus_read_token overview
 scripts/octorill-observe --backend grafana --url http://127.0.0.1:53000 --datasource-uid octorill-prometheus --org 1 --token-file /run/secrets/grafana_token --json compare http
