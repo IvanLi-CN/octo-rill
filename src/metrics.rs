@@ -173,8 +173,9 @@ fn normalize_upstream_operation(operation: &str) -> String {
 
 fn normalize_upstream_outcome(outcome: &str) -> String {
     match outcome {
-        "success" | "rate_limited" | "timeout" | "http_4xx" | "http_5xx" | "transport_error"
-        | "decode_error" | "graphql_error" | "fallback" => outcome.to_owned(),
+        "success" | "rate_limited" | "forbidden" | "timeout" | "http_4xx" | "http_5xx"
+        | "transport_error" | "decode_error" | "graphql_error" | "fallback" | "queued"
+        | "admitted" => outcome.to_owned(),
         _ => "other".to_owned(),
     }
 }
@@ -499,7 +500,7 @@ impl Metrics {
         let labels = BodyLabels {
             route: normalize_route(route),
             outcome: match outcome {
-                "completed" | "error" | "discarded" => outcome.to_owned(),
+                "completed" | "error" | "discarded" | "cancelled" => outcome.to_owned(),
                 _ => "other".to_owned(),
             },
         };
@@ -666,11 +667,9 @@ impl Metrics {
             return;
         }
         self.queue_depth.get_or_create(&labels).set(depth.max(0));
-        if let Some(age) = oldest_age_seconds {
-            self.queue_oldest_age
-                .get_or_create(&labels)
-                .set(age.max(0.0));
-        }
+        self.queue_oldest_age
+            .get_or_create(&labels)
+            .set(oldest_age_seconds.unwrap_or(0.0).max(0.0));
     }
 
     pub fn record_sampler_failure(&self) {
@@ -940,11 +939,17 @@ async fn sample_queues(pool: &SqlitePool, metrics: &Metrics) -> Result<()> {
     let mut connection = timeout_at(deadline, pool.acquire())
         .await
         .context("queue sample connection timed out")??;
-    let jobs = sample_queue(&mut connection, "job_tasks", "status = 'queued'", deadline).await?;
+    let jobs = sample_queue(
+        &mut connection,
+        "job_tasks",
+        "status = 'queued' AND (available_at IS NULL OR datetime(available_at) <= datetime('now')) AND (task_type NOT IN ('sync.subscriptions', 'retry.recent_failures') OR NOT EXISTS (SELECT 1 FROM job_tasks running WHERE running.task_type = job_tasks.task_type AND running.status = 'running'))",
+        deadline,
+    )
+    .await?;
     let content = sample_queue(
         &mut connection,
         "content_work_items",
-        "status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)",
+        "status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')))",
         deadline,
     )
     .await?;
@@ -1006,12 +1011,20 @@ fn process_snapshot() -> (f64, f64) {
         let cpu_seconds = fs::read_to_string("/proc/self/stat")
             .ok()
             .and_then(|stat| {
-                stat.rsplit_once(") ")?
+                let fields = stat
+                    .rsplit_once(") ")?
                     .1
                     .split_whitespace()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                fields
                     .get(11)
-                    .and_then(|value| value.parse::<f64>().ok())
+                    .and_then(|user_ticks| user_ticks.parse::<f64>().ok())
+                    .zip(
+                        fields
+                            .get(12)
+                            .and_then(|system_ticks| system_ticks.parse::<f64>().ok()),
+                    )
+                    .map(|(user_ticks, system_ticks)| user_ticks + system_ticks)
             })
             .map(|ticks| ticks / 100.0)
             .unwrap_or(f64::NAN);
@@ -1042,6 +1055,14 @@ pub struct SseGuard {
 pub struct HttpBodyGuard {
     metrics: Option<Arc<Metrics>>,
     route: String,
+    finished: bool,
+}
+
+pub struct HttpRequestGuard {
+    metrics: Option<Arc<Metrics>>,
+    method: String,
+    route: String,
+    started_at: Instant,
     finished: bool,
 }
 
@@ -1150,6 +1171,48 @@ impl HttpBodyGuard {
         self.finished = true;
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.record_http_body(&self.route, outcome);
+        }
+    }
+}
+
+impl HttpRequestGuard {
+    pub fn new(method: &str, route: &str) -> Self {
+        Self::with_metrics(global(), method, route)
+    }
+
+    fn with_metrics(metrics: Option<Arc<Metrics>>, method: &str, route: &str) -> Self {
+        if let Some(metrics) = metrics.as_ref() {
+            metrics.begin_http();
+        }
+        Self {
+            metrics,
+            method: method.to_owned(),
+            route: route.to_owned(),
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub fn finish(&mut self, status: u16) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.finish_http(&self.method, &self.route, status, self.started_at.elapsed());
+        }
+    }
+}
+
+impl Drop for HttpRequestGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.finish_http(&self.method, &self.route, 499, self.started_at.elapsed());
+            metrics.record_http_body(&self.route, "cancelled");
         }
     }
 }
@@ -1290,5 +1353,43 @@ mod tests {
         assert!(constant_time_eq(b"token", b"token"));
         assert!(!constant_time_eq(b"token", b"other"));
         assert!(!constant_time_eq(b"token", b"token-long"));
+    }
+
+    #[test]
+    fn queue_age_clears_when_a_queue_becomes_empty() {
+        let metrics = Metrics::new();
+        metrics.set_enabled(true);
+        metrics.set_queue("jobs", 2, Some(4.0));
+        metrics.set_queue("jobs", 0, None);
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_queue_depth{executor=\"jobs\"} 0"));
+        assert!(body.contains("octorill_queue_oldest_age_seconds{executor=\"jobs\"} 0"));
+    }
+
+    #[test]
+    fn upstream_outcomes_preserve_scheduler_and_forbidden_categories() {
+        let metrics = Metrics::new();
+        metrics.set_enabled(true);
+        metrics.record_upstream("llm", "scheduler_wait", "queued", Duration::ZERO);
+        metrics.record_upstream("llm", "scheduler_wait", "admitted", Duration::ZERO);
+        metrics.record_upstream("github", "webhook", "forbidden", Duration::ZERO);
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("outcome=\"queued\""));
+        assert!(body.contains("outcome=\"admitted\""));
+        assert!(body.contains("outcome=\"forbidden\""));
+    }
+
+    #[test]
+    fn http_request_guard_records_cancellation_once() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_enabled(true);
+        {
+            let _guard =
+                HttpRequestGuard::with_metrics(Some(Arc::clone(&metrics)), "GET", "/api/health");
+        }
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_http_in_flight 0"));
+        assert!(body.contains("status_class=\"4xx\""));
+        assert!(body.contains("outcome=\"cancelled\""));
     }
 }

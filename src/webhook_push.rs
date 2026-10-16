@@ -1503,10 +1503,12 @@ async fn send_github_webhook_request(
     if let Some(metrics) = crate::metrics::global() {
         let outcome = match &result {
             Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+            Ok(response) if response.status() == StatusCode::FORBIDDEN => "forbidden",
             Ok(response) if response.status().is_client_error() => "http_4xx",
             Ok(response) if response.status().is_server_error() => "http_5xx",
             Ok(response) if response.status().is_success() => "success",
             Ok(_) => "other",
+            Err(error) if error.is_timeout() => "timeout",
             Err(_) => "transport_error",
         };
         metrics.record_upstream("github", "webhook", outcome, started_at.elapsed());
