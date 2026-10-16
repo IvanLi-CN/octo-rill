@@ -38,7 +38,7 @@ groups:
         annotations:
           summary: OctoRill runnable work is older than five minutes
       - alert: OctoRillUpstreamFailures
-        expr: sum by (service, environment, instance) (rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|forbidden|transport_error|decode_error|graphql_error|http_4xx|http_5xx"}[5m])) / clamp_min(sum by (service, environment, instance) (rate(octorill_upstream_requests_total{outcome!="fallback"}[5m])), 1) > 0.10 and sum by (service, environment, instance) (increase(octorill_upstream_requests_total{outcome!="fallback"}[5m])) >= 20
+        expr: sum by (service, environment, instance) (rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|forbidden|transport_error|decode_error|graphql_error|http_4xx|http_5xx",operation!="scheduler_wait"}[5m])) / clamp_min(sum by (service, environment, instance) (rate(octorill_upstream_requests_total{outcome!="fallback",operation!="scheduler_wait"}[5m])), 1) > 0.10 and sum by (service, environment, instance) (increase(octorill_upstream_requests_total{outcome!="fallback",operation!="scheduler_wait"}[5m])) >= 20
         for: 10m
         labels:
           severity: warning

@@ -14107,18 +14107,22 @@ pub async fn sync_notifications(
                     let status = response.status();
                     let headers = response.headers().clone();
                     if !status.is_success()
-                        && let Some(metrics) = crate::metrics::global()
                     {
-                        metrics.record_upstream(
-                            "github",
-                            "sync notifications",
-                            github_http_outcome_with_context(status, &headers, None),
-                            started_at.elapsed(),
-                        );
+                        let body_result = response.text().await;
+                        if let Some(metrics) = crate::metrics::global() {
+                            metrics.record_upstream(
+                                "github",
+                                "sync notifications",
+                                github_http_outcome_with_context(
+                                    status,
+                                    &headers,
+                                    body_result.as_deref().ok(),
+                                ),
+                                started_at.elapsed(),
+                            );
+                        }
+                        return Err(anyhow!("github notifications returned error {status}"));
                     }
-                    let response = response
-                        .error_for_status()
-                        .context("github notifications returned error")?;
                     match response.json::<Vec<GitHubNotification>>().await {
                         Ok(value) => {
                             if let Some(metrics) = crate::metrics::global() {
