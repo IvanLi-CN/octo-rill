@@ -677,10 +677,7 @@ impl Metrics {
             return;
         }
         self.sampler_failures.inc();
-        let last_success = self.sampler_last_success_at.load(Ordering::Relaxed);
-        let stale = last_success == 0
-            || now_unix_seconds().saturating_sub(last_success) >= STALE_AFTER.as_secs();
-        self.sampler_stale.set(i64::from(stale));
+        self.refresh_sampler_stale();
     }
 
     pub fn record_sampler_success(&self) {
@@ -691,6 +688,16 @@ impl Metrics {
         self.sampler_last_success_at.store(now, Ordering::Relaxed);
         self.sampler_last_success.set(now);
         self.sampler_stale.set(0);
+    }
+
+    fn refresh_sampler_stale(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let last_success = self.sampler_last_success_at.load(Ordering::Relaxed);
+        let stale = last_success == 0
+            || now_unix_seconds().saturating_sub(last_success) >= STALE_AFTER.as_secs();
+        self.sampler_stale.set(i64::from(stale));
     }
 
     pub fn encode(&self) -> Result<String, MetricsEncodeError> {
@@ -747,11 +754,21 @@ impl Metrics {
     ) -> AbortHandle {
         let metrics = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = interval(sample_interval);
+            // Refresh health at the stale deadline without sampling the database more often
+            // than the configured interval.
+            let mut ticker = interval(sample_interval.min(STALE_AFTER));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut next_sample_at = Instant::now();
             loop {
                 ticker.tick().await;
+                let now = Instant::now();
+                if now < next_sample_at {
+                    metrics.refresh_sampler_stale();
+                    continue;
+                }
+                next_sample_at = now + sample_interval;
                 let Ok(_guard) = metrics.sample_guard.try_lock() else {
+                    metrics.refresh_sampler_stale();
                     continue;
                 };
                 metrics.install_process_snapshot(&database_url);
@@ -1407,5 +1424,18 @@ mod tests {
         let body = metrics.encode().expect("encode metrics");
         assert!(body.contains("octorill_http_body_events_total"));
         assert!(body.contains("outcome=\"discarded\""));
+    }
+
+    #[test]
+    fn sampler_stale_refresh_uses_last_success_deadline() {
+        let metrics = Metrics::new();
+        metrics.set_enabled(true);
+        metrics.sampler_last_success_at.store(
+            now_unix_seconds().saturating_sub(STALE_AFTER.as_secs()),
+            Ordering::Relaxed,
+        );
+        metrics.refresh_sampler_stale();
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_sampler_stale 1"));
     }
 }
