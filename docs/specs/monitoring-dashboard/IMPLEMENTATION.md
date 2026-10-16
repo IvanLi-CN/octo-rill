@@ -3,7 +3,7 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: 应用 exporter、生命周期埋点、Grafana/Prometheus 资产和只读 CLI 已落地；隔离 VM 的 listener、Compose、Grafana 查询路径和 HTTP 性能采集已完成，SQLite 竞争负载、视觉证据、CI 与 PR 收敛待完成。
+- Implementation: 应用 exporter、生命周期埋点、Grafana/Prometheus 资产和只读 CLI 已落地；隔离 VM 的 listener、Compose、Grafana 查询路径、HTTP 性能采集和真实看板视觉证据已完成，SQLite 竞争负载、CI 与 PR 收敛仍待完成。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -28,7 +28,7 @@
 - JSON catalog, dashboard files, rule files and CLI contract are checked by `scripts/validate_observability.py`.
 - `python3 bin/spec_contract_check.py --path docs/specs/monitoring-dashboard/SPEC.md` validates stable requirement/verification references.
 - Agent VM validation covers Compose provisioning, token boundary, Prometheus/Grafana query paths, sampler fault recovery and HTTP A/B runtime overhead; raw measurements are recorded in [VALIDATION.md](./VALIDATION.md).
-- Real Grafana screenshots remain owner-authorized evidence; without per-shot approval the visual gate stays pending.
+- Real Grafana screenshots were captured from the session-owned Agent VM with `target_program=Grafana` and dashboard-only scope; the owner confirmed the five current-only images and they are persisted in the topic Spec's Visual Evidence section.
 
 ## Known Limits
 
