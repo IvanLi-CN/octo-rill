@@ -756,11 +756,14 @@ impl Metrics {
         tokio::spawn(async move {
             let mut sample_ticker = interval(sample_interval);
             sample_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut stale_ticker = interval(STALE_AFTER);
-            stale_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let stale_deadline = tokio::time::sleep(STALE_AFTER);
+            tokio::pin!(stale_deadline);
             loop {
                 tokio::select! {
-                    _ = stale_ticker.tick() => metrics.refresh_sampler_stale(),
+                    _ = &mut stale_deadline => {
+                        metrics.refresh_sampler_stale();
+                        stale_deadline.as_mut().reset(tokio::time::Instant::now() + STALE_AFTER);
+                    }
                     _ = sample_ticker.tick() => {
                         let Ok(_guard) = metrics.sample_guard.try_lock() else {
                             metrics.refresh_sampler_stale();
@@ -772,6 +775,7 @@ impl Metrics {
                             metrics.record_sampler_failure();
                         } else {
                             metrics.record_sampler_success();
+                            stale_deadline.as_mut().reset(tokio::time::Instant::now() + STALE_AFTER);
                         }
                     }
                 }

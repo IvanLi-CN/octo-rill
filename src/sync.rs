@@ -11306,6 +11306,7 @@ fn github_http_outcome_with_context(
     let body_lower = body.unwrap_or_default().to_ascii_lowercase();
     if status == StatusCode::FORBIDDEN
         && (remaining == "0"
+            || headers.contains_key("retry-after")
             || body_lower.contains("secondary rate limit")
             || body_lower.contains("abuse detection"))
     {
@@ -14179,18 +14180,21 @@ pub async fn sync_notifications(
                             .context("github notification thread json decode failed");
                     }
                     let headers = response.headers().clone();
-                    let body = response
-                        .text()
-                        .await
-                        .context("github notification thread error body decode failed")?;
+                    let body_result = response.text().await;
                     if let Some(metrics) = crate::metrics::global() {
                         metrics.record_upstream(
                             "github",
                             "sync notification thread",
-                            github_http_outcome_with_context(status, &headers, Some(&body)),
+                            github_http_outcome_with_context(
+                                status,
+                                &headers,
+                                body_result.as_deref().ok(),
+                            ),
                             started_at.elapsed(),
                         );
                     }
+                    let body = body_result
+                        .context("github notification thread error body decode failed")?;
                     let error = classify_github_http_error(
                         "github notification thread",
                         status,
@@ -17179,6 +17183,12 @@ mod tests {
                 Some("resource not accessible"),
             ),
             "forbidden"
+        );
+        let mut retry_after_headers = HeaderMap::new();
+        retry_after_headers.insert("retry-after", HeaderValue::from_static("1"));
+        assert_eq!(
+            github_http_outcome_with_context(StatusCode::FORBIDDEN, &retry_after_headers, None,),
+            "rate_limited"
         );
     }
 
