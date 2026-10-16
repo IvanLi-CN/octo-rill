@@ -11294,6 +11294,27 @@ fn github_http_outcome(status: StatusCode) -> &'static str {
     }
 }
 
+fn github_http_outcome_with_context(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Option<&str>,
+) -> &'static str {
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let body_lower = body.unwrap_or_default().to_ascii_lowercase();
+    if status == StatusCode::FORBIDDEN
+        && (remaining == "0"
+            || body_lower.contains("secondary rate limit")
+            || body_lower.contains("abuse detection"))
+    {
+        "rate_limited"
+    } else {
+        github_http_outcome(status)
+    }
+}
+
 fn reqwest_error_phase(err: &reqwest::Error) -> &'static str {
     let message = err.to_string().to_ascii_lowercase();
     if err.is_timeout() {
@@ -11475,7 +11496,7 @@ async fn fetch_json_response<T: DeserializeOwned>(
             metrics.record_upstream(
                 "github",
                 operation,
-                github_http_outcome(status),
+                github_http_outcome_with_context(status, &headers, Some(&body)),
                 started_at.elapsed(),
             );
         }
@@ -14083,13 +14104,14 @@ pub async fn sync_notifications(
                         .await
                         .context("github notifications request failed")?;
                     let status = response.status();
+                    let headers = response.headers().clone();
                     if !status.is_success()
                         && let Some(metrics) = crate::metrics::global()
                     {
                         metrics.record_upstream(
                             "github",
                             "sync notifications",
-                            github_http_outcome(status),
+                            github_http_outcome_with_context(status, &headers, None),
                             started_at.elapsed(),
                         );
                     }
@@ -14156,19 +14178,19 @@ pub async fn sync_notifications(
                             .map(Some)
                             .context("github notification thread json decode failed");
                     }
-                    if let Some(metrics) = crate::metrics::global() {
-                        metrics.record_upstream(
-                            "github",
-                            "sync notification thread",
-                            github_http_outcome(status),
-                            started_at.elapsed(),
-                        );
-                    }
                     let headers = response.headers().clone();
                     let body = response
                         .text()
                         .await
                         .context("github notification thread error body decode failed")?;
+                    if let Some(metrics) = crate::metrics::global() {
+                        metrics.record_upstream(
+                            "github",
+                            "sync notification thread",
+                            github_http_outcome_with_context(status, &headers, Some(&body)),
+                            started_at.elapsed(),
+                        );
+                    }
                     let error = classify_github_http_error(
                         "github notification thread",
                         status,
@@ -14954,8 +14976,9 @@ mod tests {
         execute_subscription_prune_phases, expire_repo_release_deadlines,
         fail_repo_release_work_item, fail_repo_release_work_item_if_stale,
         feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        github_http_outcome, hydrate_repo_refresh_candidates, insert_feed_activity_events,
-        insert_social_activity_event_tx, install_social_activity_snapshot_after_first_chunk_hook,
+        github_http_outcome, github_http_outcome_with_context, hydrate_repo_refresh_candidates,
+        insert_feed_activity_events, insert_social_activity_event_tx,
+        install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
         load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
         load_public_release_usage_sync_access, load_repo_release_candidate_users,
@@ -17131,6 +17154,32 @@ mod tests {
         );
         assert!(rate_limited.retryable);
         assert!(!is_terminal_notification_thread_error(&rate_limited));
+    }
+
+    #[test]
+    fn github_metric_outcome_preserves_rate_limit_context_for_forbidden() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        assert_eq!(
+            github_http_outcome_with_context(StatusCode::FORBIDDEN, &headers, None),
+            "rate_limited"
+        );
+        assert_eq!(
+            github_http_outcome_with_context(
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                Some("You have exceeded a secondary rate limit"),
+            ),
+            "rate_limited"
+        );
+        assert_eq!(
+            github_http_outcome_with_context(
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                Some("resource not accessible"),
+            ),
+            "forbidden"
+        );
     }
 
     #[test]

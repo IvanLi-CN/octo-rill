@@ -754,29 +754,26 @@ impl Metrics {
     ) -> AbortHandle {
         let metrics = Arc::clone(self);
         tokio::spawn(async move {
-            // Refresh health at the stale deadline without sampling the database more often
-            // than the configured interval.
-            let mut ticker = interval(sample_interval.min(STALE_AFTER));
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut next_sample_at = Instant::now();
+            let mut sample_ticker = interval(sample_interval);
+            sample_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut stale_ticker = interval(STALE_AFTER);
+            stale_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
-                let now = Instant::now();
-                if now < next_sample_at {
-                    metrics.refresh_sampler_stale();
-                    continue;
-                }
-                next_sample_at = now + sample_interval;
-                let Ok(_guard) = metrics.sample_guard.try_lock() else {
-                    metrics.refresh_sampler_stale();
-                    continue;
-                };
-                metrics.install_process_snapshot(&database_url);
-                if let Err(error) = sample_queues(&pool, &metrics).await {
-                    tracing::warn!(error = %error, "observability sampler failed");
-                    metrics.record_sampler_failure();
-                } else {
-                    metrics.record_sampler_success();
+                tokio::select! {
+                    _ = stale_ticker.tick() => metrics.refresh_sampler_stale(),
+                    _ = sample_ticker.tick() => {
+                        let Ok(_guard) = metrics.sample_guard.try_lock() else {
+                            metrics.refresh_sampler_stale();
+                            continue;
+                        };
+                        metrics.install_process_snapshot(&database_url);
+                        if let Err(error) = sample_queues(&pool, &metrics).await {
+                            tracing::warn!(error = %error, "observability sampler failed");
+                            metrics.record_sampler_failure();
+                        } else {
+                            metrics.record_sampler_success();
+                        }
+                    }
                 }
             }
         })
