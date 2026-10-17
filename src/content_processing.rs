@@ -1013,6 +1013,7 @@ struct SupersessionCursor {
 struct SupersessionChange {
     work_item_id: String,
     replacement_work_item_id: String,
+    replacement_source_snapshot_json: String,
     source_hash: String,
     source_snapshot_json: String,
 }
@@ -2430,6 +2431,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    drop(_lock);
     if supersession_admitted {
         run_supersession_batch(state).await?;
     }
@@ -2530,6 +2532,7 @@ async fn load_supersession_batch(
         changes.push(SupersessionChange {
             work_item_id: work.id.clone(),
             replacement_work_item_id: current.id.clone(),
+            replacement_source_snapshot_json: current.source_snapshot_json.clone(),
             source_hash: work.source_hash.clone(),
             source_snapshot_json: work.source_snapshot_json.clone(),
         });
@@ -2555,7 +2558,7 @@ async fn apply_supersession_batch(state: &AppState, changes: &[SupersessionChang
     let mut changed = 0;
     for change in changes {
         let updated = sqlx::query(
-            "UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND source_hash = ? AND source_snapshot_json = ? AND status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS replacement WHERE replacement.id = ? AND replacement.status NOT IN ('cancelled', 'superseded'))",
+            "UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND source_hash = ? AND source_snapshot_json = ? AND status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS replacement WHERE replacement.id = ? AND replacement.source_snapshot_json = ? AND replacement.status NOT IN ('cancelled', 'superseded'))",
         )
         .bind(&now)
         .bind(&now)
@@ -2563,6 +2566,7 @@ async fn apply_supersession_batch(state: &AppState, changes: &[SupersessionChang
         .bind(&change.source_hash)
         .bind(&change.source_snapshot_json)
         .bind(&change.replacement_work_item_id)
+        .bind(&change.replacement_source_snapshot_json)
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() != 1 {
@@ -7438,6 +7442,59 @@ mod tests {
                 .background_lane_admitted,
             2,
             "each worker should not repeat the recovery or supersession pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_releases_writer_before_supersession_apply() {
+        let pool = global_pool().await;
+        for (id, hash, revision) in [
+            ("recovery-old", "recovery-old-hash", "2026-01-01T00:00:00Z"),
+            ("recovery-new", "recovery-new-hash", "2026-01-02T00:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', 'recovery-release', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'ready', 0, 0, 1, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(
+                json!({
+                    "source_blocks": [{"slot": "source_observed_at", "text": revision}],
+                    "target_slots": ["title_zh"]
+                })
+                .to_string(),
+            )
+            .bind(revision)
+            .bind(revision)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let state = global_state(pool.clone());
+
+        tokio::time::timeout(StdDuration::from_secs(1), recover_due(&state))
+            .await
+            .expect("recovery should not wait on its own writer permit")
+            .unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'recovery-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE work_item_id = 'recovery-old' AND event_type = 'reconciliation_superseded'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
         );
     }
 
