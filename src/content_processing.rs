@@ -2442,18 +2442,25 @@ async fn load_supersession_batch(
     pool: &SqlitePool,
     cursor: Option<&SupersessionCursor>,
 ) -> Result<SupersessionBatch> {
-    let cursor_created_at = cursor.map(|cursor| cursor.created_at.as_str());
-    let cursor_id = cursor.map(|cursor| cursor.id.as_str());
-    let candidates = sqlx::query_as::<_, WorkRow>(
-        "SELECT candidate.id, candidate.canonical_resource_type, candidate.canonical_resource_id, candidate.pipeline, candidate.variant, candidate.target_lang, candidate.source_hash, candidate.protocol_version, candidate.model_profile, candidate.source_snapshot_json, candidate.configuration_fingerprint, candidate.status, candidate.priority, candidate.cache_hit, candidate.token_estimate, candidate.batch_id, candidate.attempt_count, candidate.next_retry_at, candidate.retry_expires_at, candidate.retry_after_at, candidate.created_at FROM content_work_items AS candidate WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (? IS NULL OR candidate.created_at > ? OR (candidate.created_at = ? AND candidate.id > ?)) ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT ?",
-    )
-    .bind(cursor_created_at)
-    .bind(cursor_created_at)
-    .bind(cursor_created_at)
-    .bind(cursor_id)
-    .bind(GLOBAL_SUPERSESSION_BATCH_SIZE as i64)
-    .fetch_all(pool)
-    .await?;
+    let cursor_predicate = if cursor.is_some() {
+        " AND (candidate.created_at > ? OR (candidate.created_at = ? AND candidate.id > ?))"
+    } else {
+        ""
+    };
+    let candidate_sql = format!(
+        "SELECT candidate.id, candidate.canonical_resource_type, candidate.canonical_resource_id, candidate.pipeline, candidate.variant, candidate.target_lang, candidate.source_hash, candidate.protocol_version, candidate.model_profile, candidate.source_snapshot_json, candidate.configuration_fingerprint, candidate.status, candidate.priority, candidate.cache_hit, candidate.token_estimate, candidate.batch_id, candidate.attempt_count, candidate.next_retry_at, candidate.retry_expires_at, candidate.retry_after_at, candidate.created_at FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version){cursor_predicate} ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT ?"
+    );
+    let mut candidate_query = sqlx::query_as::<_, WorkRow>(&candidate_sql);
+    if let Some(cursor) = cursor {
+        candidate_query = candidate_query
+            .bind(&cursor.created_at)
+            .bind(&cursor.created_at)
+            .bind(&cursor.id);
+    }
+    let candidates = candidate_query
+        .bind(GLOBAL_SUPERSESSION_BATCH_SIZE as i64)
+        .fetch_all(pool)
+        .await?;
 
     let selected = candidates.len();
     let next_cursor = candidates.last().map(|candidate| SupersessionCursor {
@@ -6868,9 +6875,15 @@ mod tests {
     #[tokio::test]
     async fn supersession_scan_uses_resource_scope_index() {
         let pool = global_pool().await;
-        for query in [
-            "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
-            "EXPLAIN QUERY PLAN SELECT work.id FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND (work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.protocol_version) IN (VALUES ('release', 'release-1', 'translation', 'summary', 'zh-CN', 'content-processing.v1'))",
+        for (query, expected_index) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (candidate.created_at > '2026-01-01T00:00:00Z' OR (candidate.created_at = '2026-01-01T00:00:00Z' AND candidate.id > 'cursor-id')) ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
+                "idx_content_work_items_supersession_cursor",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT work.id FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND (work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.protocol_version) IN (VALUES ('release', 'release-1', 'translation', 'summary', 'zh-CN', 'content-processing.v1'))",
+                "idx_content_work_items_resource_scope_status",
+            ),
         ] {
             let plan = sqlx::query(query)
                 .fetch_all(&pool)
@@ -6881,10 +6894,8 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert!(
-                plan.iter().any(|detail| {
-                    detail.contains("idx_content_work_items_resource_scope_status")
-                }),
-                "supersession query must use the resource scope index: {plan:?}"
+                plan.iter().any(|detail| detail.contains(expected_index)),
+                "supersession query must use {expected_index}: {plan:?}"
             );
         }
     }
