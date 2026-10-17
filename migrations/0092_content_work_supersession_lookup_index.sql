@@ -18,3 +18,17 @@ CREATE INDEX IF NOT EXISTS idx_content_work_items_resource_scope_status
 CREATE INDEX IF NOT EXISTS idx_content_work_items_supersession_cursor
   ON content_work_items(created_at ASC, id ASC)
   WHERE status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready');
+
+-- Bound active-history pages without sorting unrelated work items.
+CREATE INDEX IF NOT EXISTS idx_content_work_items_supersession_history
+  ON content_work_items(
+    canonical_resource_type,
+    canonical_resource_id,
+    pipeline,
+    variant,
+    target_lang,
+    protocol_version,
+    created_at ASC,
+    id ASC
+  )
+  WHERE status NOT IN ('cancelled', 'superseded');

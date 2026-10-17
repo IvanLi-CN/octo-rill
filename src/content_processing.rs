@@ -556,6 +556,7 @@ const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
 const GLOBAL_SUPERSESSION_CADENCE: Duration = Duration::from_secs(60);
 const GLOBAL_SUPERSESSION_LANE: &str = "content_processing_supersession";
 const GLOBAL_SUPERSESSION_BATCH_SIZE: usize = 100;
+const GLOBAL_SUPERSESSION_READ_PAGE_SIZE: usize = 256;
 const GLOBAL_MAX_TOKENS: u32 = 3_000;
 const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
@@ -1021,6 +1022,9 @@ struct SupersessionChange {
 #[derive(Debug, Default)]
 struct SupersessionBatch {
     selected: usize,
+    read_rows: usize,
+    read_pages: usize,
+    largest_read_page: usize,
     next_cursor: Option<SupersessionCursor>,
     changes: Vec<SupersessionChange>,
 }
@@ -2443,7 +2447,7 @@ async fn load_supersession_batch(
     cursor: Option<&SupersessionCursor>,
 ) -> Result<SupersessionBatch> {
     let cursor_predicate = if cursor.is_some() {
-        " AND (candidate.created_at > ? OR (candidate.created_at = ? AND candidate.id > ?))"
+        " AND (candidate.created_at, candidate.id) > (?, ?)"
     } else {
         ""
     };
@@ -2452,10 +2456,7 @@ async fn load_supersession_batch(
     );
     let mut candidate_query = sqlx::query_as::<_, WorkRow>(&candidate_sql);
     if let Some(cursor) = cursor {
-        candidate_query = candidate_query
-            .bind(&cursor.created_at)
-            .bind(&cursor.created_at)
-            .bind(&cursor.id);
+        candidate_query = candidate_query.bind(&cursor.created_at).bind(&cursor.id);
     }
     let candidates = candidate_query
         .bind(GLOBAL_SUPERSESSION_BATCH_SIZE as i64)
@@ -2471,82 +2472,100 @@ async fn load_supersession_batch(
         return Ok(SupersessionBatch::default());
     }
 
-    let mut resource_keys = Vec::new();
-    let mut seen_resource_keys = HashSet::new();
-    for candidate in &candidates {
-        let key = OwnedWorkResourceKey::from(candidate);
-        if seen_resource_keys.insert(key.clone()) {
-            resource_keys.push(key);
+    let mut resource_candidates = HashMap::<OwnedWorkResourceKey, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        resource_candidates
+            .entry(OwnedWorkResourceKey::from(candidate))
+            .or_default()
+            .push(index);
+    }
+    let mut replacements: Vec<Option<WorkRow>> = (0..candidates.len()).map(|_| None).collect();
+    let mut read_rows = 0;
+    let mut read_pages = 0;
+    let mut largest_read_page = 0;
+    for (key, candidate_indexes) in resource_candidates {
+        let mut resource_cursor: Option<SupersessionCursor> = None;
+        loop {
+            // Use a separate bounded reader request for each page. No writer permit or
+            // long-lived read transaction spans pages, including unusually large histories.
+            let cursor_predicate = if resource_cursor.is_some() {
+                " AND (work.created_at, work.id) > (?, ?)"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT work.id, work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.source_hash, work.protocol_version, work.model_profile, work.source_snapshot_json, work.configuration_fingerprint, work.status, work.priority, work.cache_hit, work.token_estimate, work.batch_id, work.attempt_count, work.next_retry_at, work.retry_expires_at, work.retry_after_at, work.created_at FROM content_work_items AS work INDEXED BY idx_content_work_items_supersession_history WHERE work.status NOT IN ('cancelled', 'superseded') AND work.canonical_resource_type = ? AND work.canonical_resource_id = ? AND work.pipeline = ? AND work.variant = ? AND work.target_lang = ? AND work.protocol_version = ?{cursor_predicate} ORDER BY work.created_at ASC, work.id ASC LIMIT ?"
+            );
+            let mut query = sqlx::query_as::<_, WorkRow>(&sql)
+                .bind(&key.canonical_resource_type)
+                .bind(&key.canonical_resource_id)
+                .bind(&key.pipeline)
+                .bind(&key.variant)
+                .bind(&key.target_lang)
+                .bind(&key.protocol_version);
+            if let Some(cursor) = &resource_cursor {
+                query = query.bind(&cursor.created_at).bind(&cursor.id);
+            }
+            let rows = query
+                .bind(GLOBAL_SUPERSESSION_READ_PAGE_SIZE as i64)
+                .fetch_all(pool)
+                .await?;
+            read_pages += 1;
+            read_rows += rows.len();
+            largest_read_page = largest_read_page.max(rows.len());
+            let page_complete = rows.len() < GLOBAL_SUPERSESSION_READ_PAGE_SIZE;
+            resource_cursor = rows.last().map(|row| SupersessionCursor {
+                created_at: row.created_at.clone(),
+                id: row.id.clone(),
+            });
+            for current in rows {
+                for &index in &candidate_indexes {
+                    let candidate = &candidates[index];
+                    if current.id == candidate.id
+                        || !source_version_is_newer(
+                            &current.source_snapshot_json,
+                            &candidate.source_snapshot_json,
+                        )
+                    {
+                        continue;
+                    }
+                    let replace = replacements[index].as_ref().is_none_or(|replacement| {
+                        source_version_is_newer(
+                            &current.source_snapshot_json,
+                            &replacement.source_snapshot_json,
+                        )
+                    });
+                    if replace {
+                        replacements[index] = Some(current.clone());
+                    }
+                }
+            }
+            if page_complete {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
     }
-    let values = resource_keys
-        .iter()
-        .map(|_| "(?, ?, ?, ?, ?, ?)")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT work.id, work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.source_hash, work.protocol_version, work.model_profile, work.source_snapshot_json, work.configuration_fingerprint, work.status, work.priority, work.cache_hit, work.token_estimate, work.batch_id, work.attempt_count, work.next_retry_at, work.retry_expires_at, work.retry_after_at, work.created_at FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND (work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.protocol_version) IN (VALUES {values}) ORDER BY work.created_at ASC, work.id ASC"
-    );
-    let mut query = sqlx::query_as::<_, WorkRow>(&sql);
-    for key in &resource_keys {
-        query = query
-            .bind(&key.canonical_resource_type)
-            .bind(&key.canonical_resource_id)
-            .bind(&key.pipeline)
-            .bind(&key.variant)
-            .bind(&key.target_lang)
-            .bind(&key.protocol_version);
-    }
-    let rows = query.fetch_all(pool).await?;
-    let mut grouped = HashMap::<OwnedWorkResourceKey, Vec<WorkRow>>::new();
-    for work in rows {
-        grouped
-            .entry(OwnedWorkResourceKey::from(&work))
-            .or_default()
-            .push(work);
-    }
 
-    let mut changes = Vec::new();
-    for work in candidates.iter().filter(|work| {
-        matches!(
-            work.status.as_str(),
-            "queued" | "failed" | "deferred_provider" | "blocked_config" | "ready"
-        )
-    }) {
-        let key = OwnedWorkResourceKey::from(work);
-        let Some(works) = grouped.get(&key) else {
-            continue;
-        };
-        let Some(current) = works
-            .iter()
-            .filter(|candidate| candidate.id != work.id)
-            .filter(|candidate| {
-                source_version_is_newer(&candidate.source_snapshot_json, &work.source_snapshot_json)
+    let changes = candidates
+        .iter()
+        .zip(replacements)
+        .filter_map(|(work, replacement)| {
+            replacement.map(|current| SupersessionChange {
+                work_item_id: work.id.clone(),
+                replacement_work_item_id: current.id,
+                replacement_source_snapshot_json: current.source_snapshot_json,
+                source_hash: work.source_hash.clone(),
+                source_snapshot_json: work.source_snapshot_json.clone(),
             })
-            .reduce(|current, candidate| {
-                if source_version_is_newer(
-                    &candidate.source_snapshot_json,
-                    &current.source_snapshot_json,
-                ) {
-                    candidate
-                } else {
-                    current
-                }
-            })
-        else {
-            continue;
-        };
-        changes.push(SupersessionChange {
-            work_item_id: work.id.clone(),
-            replacement_work_item_id: current.id.clone(),
-            replacement_source_snapshot_json: current.source_snapshot_json.clone(),
-            source_hash: work.source_hash.clone(),
-            source_snapshot_json: work.source_snapshot_json.clone(),
-        });
-    }
+        })
+        .collect();
 
     Ok(SupersessionBatch {
         selected,
+        read_rows,
+        read_pages,
+        largest_read_page,
         next_cursor,
         changes,
     })
@@ -2619,6 +2638,10 @@ async fn run_supersession_batch(state: &AppState) -> Result<u64> {
     debug!(
         event = "content.supersession",
         selected = batch.selected,
+        read_rows = batch.read_rows,
+        read_pages = batch.read_pages,
+        largest_read_page = batch.largest_read_page,
+        reader_page_size = GLOBAL_SUPERSESSION_READ_PAGE_SIZE,
         changed,
         writer_batch_size = GLOBAL_SUPERSESSION_BATCH_SIZE,
         "bounded supersession batch completed"
@@ -6873,11 +6896,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supersession_reads_large_resource_history_in_bounded_pages() {
+        let pool = global_pool().await;
+        let row_count = GLOBAL_SUPERSESSION_READ_PAGE_SIZE * 3 + 17;
+        let newest_source_index = GLOBAL_SUPERSESSION_READ_PAGE_SIZE + 7;
+        let mut tx = pool.begin().await.unwrap();
+        for index in 0..row_count {
+            // The newest source occurs in the middle of the history, not at the
+            // largest created_at/id, so stopping at one page or taking its tail is wrong.
+            let revision = if index == newest_source_index {
+                100_000
+            } else {
+                index
+            };
+            let snapshot = json!({
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": revision.to_string()}
+                ],
+                "target_slots": ["title_zh"]
+            });
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', 'large-history-release', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', ?, 0, 0, 1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("history-{index:05}"))
+            .bind(format!("history-hash-{index}"))
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(snapshot.to_string())
+            .bind(if index == 0 { "queued" } else { "not_applicable" })
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let batch = load_supersession_batch(&pool, None).await.unwrap();
+        assert_eq!(batch.selected, 1);
+        assert_eq!(batch.read_rows, row_count);
+        assert_eq!(batch.read_pages, 4);
+        assert_eq!(batch.largest_read_page, GLOBAL_SUPERSESSION_READ_PAGE_SIZE);
+        assert_eq!(batch.changes.len(), 1);
+        assert_eq!(batch.changes[0].work_item_id, "history-00000");
+        assert_eq!(
+            batch.changes[0].replacement_work_item_id,
+            format!("history-{newest_source_index:05}")
+        );
+        let state = global_state(pool);
+        assert_eq!(
+            apply_supersession_batch(&state, &batch.changes)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn supersession_scan_uses_resource_scope_index() {
         let pool = global_pool().await;
         for (query, expected_index) in [
             (
-                "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (candidate.created_at > '2026-01-01T00:00:00Z' OR (candidate.created_at = '2026-01-01T00:00:00Z' AND candidate.id > 'cursor-id')) ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
+                "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (candidate.created_at, candidate.id) > ('2026-01-01T00:00:00Z', 'cursor-id') ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
                 "idx_content_work_items_supersession_cursor",
             ),
             (
@@ -6898,6 +6976,57 @@ mod tests {
                 "supersession query must use {expected_index}: {plan:?}"
             );
         }
+
+        let history_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT work.id FROM content_work_items AS work INDEXED BY idx_content_work_items_supersession_history WHERE work.status NOT IN ('cancelled', 'superseded') AND work.canonical_resource_type = ? AND work.canonical_resource_id = ? AND work.pipeline = ? AND work.variant = ? AND work.target_lang = ? AND work.protocol_version = ? AND (work.created_at, work.id) > (?, ?) ORDER BY work.created_at ASC, work.id ASC LIMIT ?",
+        )
+        .bind("release")
+        .bind("release-1")
+        .bind("translation")
+        .bind("summary")
+        .bind("zh-CN")
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("cursor-id")
+        .bind(GLOBAL_SUPERSESSION_READ_PAGE_SIZE as i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        assert!(
+            history_plan.iter().any(|detail| detail
+                .contains("SEARCH work USING INDEX idx_content_work_items_supersession_history")
+                && detail.contains("(created_at,id)>(?,?)")),
+            "resource history pages must seek through the full keyset: {history_plan:?}"
+        );
+        assert!(
+            !history_plan
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "resource history pages must not sort the full history: {history_plan:?}"
+        );
+
+        let bound_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND (candidate.created_at, candidate.id) > (?, ?) ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .bind("cursor-id")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        assert!(
+            bound_plan.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH candidate USING INDEX idx_content_work_items_supersession_cursor",
+                )
+            }),
+            "bound supersession cursor must use an index range: {bound_plan:?}"
+        );
     }
 
     #[tokio::test]
