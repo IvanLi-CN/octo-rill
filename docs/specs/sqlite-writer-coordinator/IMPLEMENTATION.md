@@ -75,7 +75,7 @@
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
 - 当前 parent `fa5f72d8` 的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates `48ms`、session save `42ms`、task enqueue `38ms`，最大前台请求 `48ms`，`busy_or_500=0`；social snapshot 15 个分块、最大分块 `111ms`、最大 writer wait `0ms`。
-- 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 54 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
+- 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 55 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
 - 当前 parent PR #326 的最新 GitHub CI runs `39056635621` / `39056635629`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
 
 ## Remaining Gaps
