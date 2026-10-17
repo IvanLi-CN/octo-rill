@@ -14123,10 +14123,6 @@ struct DashboardUpdatesToken {
     notifications: Vec<String>,
     #[serde(default)]
     feed_version: u8,
-    #[serde(default)]
-    briefs_version: u8,
-    #[serde(default)]
-    notifications_version: u8,
 }
 
 const DASHBOARD_UPDATES_SIGNATURE_VERSION: u8 = 1;
@@ -15063,23 +15059,10 @@ pub async fn dashboard_updates(
     if include.briefs {
         let signatures = load_dashboard_brief_signatures(state.as_ref(), &user_id).await?;
         let previous_briefs = previous.as_ref().map(|token| token.briefs.as_slice());
-        let briefs_version = previous.as_ref().map_or(0, |token| token.briefs_version);
-        lists.briefs = Some(
-            if previous.is_some() && briefs_version < DASHBOARD_UPDATES_SIGNATURE_VERSION {
-                DashboardListUpdate {
-                    changed: false,
-                    new_count: 0,
-                    latest_keys: Vec::new(),
-                }
-            } else {
-                build_dashboard_list_update(previous_briefs, &signatures)
-            },
-        );
+        lists.briefs = Some(build_dashboard_list_update(previous_briefs, &signatures));
         next_token.briefs = compact_dashboard_signatures(&signatures);
-        next_token.briefs_version = DASHBOARD_UPDATES_SIGNATURE_VERSION;
     } else if let Some(previous) = previous.as_ref() {
         next_token.briefs = previous.briefs.clone();
-        next_token.briefs_version = previous.briefs_version;
     }
 
     if include.notifications {
@@ -15087,25 +15070,13 @@ pub async fn dashboard_updates(
         let previous_notifications = previous
             .as_ref()
             .map(|token| token.notifications.as_slice());
-        let notifications_version = previous
-            .as_ref()
-            .map_or(0, |token| token.notifications_version);
-        lists.notifications = Some(
-            if previous.is_some() && notifications_version < DASHBOARD_UPDATES_SIGNATURE_VERSION {
-                DashboardListUpdate {
-                    changed: false,
-                    new_count: 0,
-                    latest_keys: Vec::new(),
-                }
-            } else {
-                build_dashboard_list_update(previous_notifications, &signatures)
-            },
-        );
+        lists.notifications = Some(build_dashboard_list_update(
+            previous_notifications,
+            &signatures,
+        ));
         next_token.notifications = compact_dashboard_signatures(&signatures);
-        next_token.notifications_version = DASHBOARD_UPDATES_SIGNATURE_VERSION;
     } else if let Some(previous) = previous.as_ref() {
         next_token.notifications = previous.notifications.clone();
-        next_token.notifications_version = previous.notifications_version;
     }
 
     Ok(Json(DashboardUpdatesResponse {
@@ -36428,8 +36399,6 @@ line two",
             briefs: compact_dashboard_signatures(&briefs),
             notifications: compact_dashboard_signatures(&notifications),
             feed_version: super::DASHBOARD_UPDATES_SIGNATURE_VERSION,
-            briefs_version: super::DASHBOARD_UPDATES_SIGNATURE_VERSION,
-            notifications_version: super::DASHBOARD_UPDATES_SIGNATURE_VERSION,
         };
         let encoded = encode_dashboard_updates_token(&token).expect("encode compact token");
 
@@ -36641,6 +36610,7 @@ line two",
         .await
         .expect("load dashboard signatures for tied items");
         let feed_update = updates.lists.feed.expect("feed update");
+        assert!(!feed_update.latest_keys.is_empty());
         assert_eq!(&feed_update.latest_keys[..2], &feed_keys[..2]);
 
         let token = super::decode_dashboard_updates_token(Some(updates.token.as_str()))
@@ -36704,8 +36674,6 @@ line two",
             migrated_token.feed_version,
             super::DASHBOARD_UPDATES_SIGNATURE_VERSION
         );
-        assert_eq!(migrated_token.briefs_version, 0);
-        assert_eq!(migrated_token.notifications_version, 0);
 
         let Json(next_poll) = dashboard_updates(
             State(state),
@@ -36733,6 +36701,82 @@ line two",
             migrated_token.feed, next_token.feed,
             "migrated feed digests must equal the next poll baseline"
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_preserves_legacy_brief_and_notification_changes() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let old_brief_date = "2026-02-22";
+        let old_notification_time = "2026-02-22T08:00:00Z";
+        seed_brief(&pool, user_id.as_str(), old_brief_date, "## Previous brief").await;
+        seed_notification(&pool, user_id.as_str(), "thread-old", old_notification_time).await;
+        let old_brief_signature =
+            format!("brief:brief-{old_brief_date}|{old_brief_date}T08:00:00Z");
+        let old_notification_signature =
+            format!("notification:thread-old|{old_notification_time}|1");
+        let old_brief_digests = compact_dashboard_signatures(&[old_brief_signature]);
+        let old_notification_digests = compact_dashboard_signatures(&[old_notification_signature]);
+        let legacy_token = super::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "feed": ["legacy-feed-digest"],
+                "briefs": old_brief_digests,
+                "notifications": old_notification_digests
+            }))
+            .expect("serialize legacy dashboard token"),
+        );
+        let state = setup_state(pool.clone());
+
+        let Json(feed_only) = dashboard_updates(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(legacy_token),
+                feed_type: Some("all".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("poll legacy token with feed only");
+        let retained_token = super::decode_dashboard_updates_token(Some(feed_only.token.as_str()))
+            .expect("decode token after feed migration")
+            .expect("token after feed migration exists");
+        assert_eq!(retained_token.briefs, old_brief_digests);
+        assert_eq!(retained_token.notifications, old_notification_digests);
+
+        let new_brief_date = "2026-02-23";
+        let new_notification_time = "2026-02-23T08:00:00Z";
+        seed_brief(&pool, user_id.as_str(), new_brief_date, "## New brief").await;
+        seed_notification(&pool, user_id.as_str(), "thread-new", new_notification_time).await;
+
+        let Json(changed) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(feed_only.token),
+                feed_type: Some("all".to_owned()),
+                include: Some("briefs,notifications".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("poll legacy signatures for briefs and notifications");
+
+        let briefs = changed.lists.briefs.expect("briefs update");
+        assert!(briefs.changed);
+        assert_eq!(briefs.new_count, 1);
+        assert_eq!(briefs.latest_keys, vec!["brief:brief-2026-02-23"]);
+        let notifications = changed.lists.notifications.expect("notifications update");
+        assert!(notifications.changed);
+        assert_eq!(notifications.new_count, 1);
+        assert_eq!(notifications.latest_keys, vec!["notification:thread-new"]);
     }
 
     #[tokio::test]
