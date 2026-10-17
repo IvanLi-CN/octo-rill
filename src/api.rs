@@ -14121,7 +14121,11 @@ struct DashboardUpdatesToken {
     feed: Vec<String>,
     briefs: Vec<String>,
     notifications: Vec<String>,
+    #[serde(default)]
+    feed_version: u8,
 }
+
+const DASHBOARD_UPDATES_SIGNATURE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FeedScope {
@@ -14715,7 +14719,7 @@ fn build_dashboard_list_update(
         return DashboardListUpdate {
             changed: false,
             new_count: 0,
-            latest_keys,
+            latest_keys: Vec::new(),
         };
     }
     let previous = previous_signature_digests
@@ -14758,34 +14762,6 @@ fn dashboard_update_signature_key(signature: &str) -> &str {
         .unwrap_or(signature)
 }
 
-fn option_signature_value(value: Option<&str>) -> &str {
-    value.unwrap_or("")
-}
-
-fn dashboard_feed_signature(row: &FeedRow) -> String {
-    let key = format!("{}:{}", row.kind, row.entity_id);
-    let state_hash = ai::sha256_hex(&format!(
-        "sort={}\ntrans_hash={}\ntrans_status={}\ntrans_work={}\ntrans_title={}\ntrans_summary={}\ndetail_hash={}\ndetail_status={}\ndetail_work={}\ndetail_title={}\ndetail_summary={}\nsmart_hash={}\nsmart_status={}\nsmart_work={}\nsmart_title={}\nsmart_summary={}\n",
-        row.sort_ts,
-        option_signature_value(row.trans_source_hash.as_deref()),
-        option_signature_value(row.trans_status.as_deref()),
-        option_signature_value(row.trans_work_status.as_deref()),
-        option_signature_value(row.trans_title.as_deref()),
-        option_signature_value(row.trans_summary.as_deref()),
-        option_signature_value(row.detail_trans_source_hash.as_deref()),
-        option_signature_value(row.detail_trans_status.as_deref()),
-        option_signature_value(row.detail_trans_work_status.as_deref()),
-        option_signature_value(row.detail_trans_title.as_deref()),
-        option_signature_value(row.detail_trans_summary.as_deref()),
-        option_signature_value(row.smart_source_hash.as_deref()),
-        option_signature_value(row.smart_status.as_deref()),
-        option_signature_value(row.smart_work_status.as_deref()),
-        option_signature_value(row.smart_title.as_deref()),
-        option_signature_value(row.smart_summary.as_deref()),
-    ));
-    format!("{key}|{state_hash}")
-}
-
 async fn load_dashboard_feed_signatures(
     state: &AppState,
     user_id: &str,
@@ -14793,13 +14769,168 @@ async fn load_dashboard_feed_signatures(
     scope: Option<&FeedScope>,
     viewer_login: Option<&str>,
 ) -> Result<Vec<String>, ApiError> {
-    fetch_feed_items(state, user_id, None, types, scope, viewer_login, 30, None)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| dashboard_feed_signature(&row))
-                .collect()
+    let scope_kind = match scope {
+        Some(FeedScope::Repo { .. }) => "repo",
+        Some(FeedScope::Repos { .. }) => "repos",
+        Some(FeedScope::Org { .. }) => "org",
+        Some(FeedScope::Mine) => "mine",
+        Some(FeedScope::Following) => "following",
+        None => "",
+    };
+    let scope_repo_item = match scope {
+        Some(FeedScope::Repo { owner, repo }) => Some(format!("{owner}/{repo}")),
+        _ => None,
+    };
+    let scope_repo_items_json = match scope {
+        Some(FeedScope::Repos { items }) => {
+            Some(serde_json::to_string(items).map_err(ApiError::internal)?)
+        }
+        _ => None,
+    };
+    let scope_org = match scope {
+        Some(FeedScope::Org { org }) => Some(org.as_str()),
+        _ => None,
+    };
+    let scope_mine_owner = if matches!(scope, Some(FeedScope::Mine)) {
+        viewer_login.unwrap_or("")
+    } else {
+        ""
+    };
+    let scoped_all = scope.is_some();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct DashboardFeedSignatureRow {
+        kind: String,
+        entity_id: String,
+        sort_ts: String,
+    }
+
+    let rows = sqlx::query_as::<_, DashboardFeedSignatureRow>(
+        r#"
+        WITH scoped_visible_repos AS (
+          SELECT vr.repo_id, vr.full_name, vr.owner_login
+          FROM user_release_visible_repos vr
+          WHERE vr.user_id = ?
+            AND (? != 'mine')
+            AND (? = '' OR (? = 'org' AND lower(vr.owner_login) = lower(?)))
+          UNION
+          SELECT fr.repo_id, fr.full_name, fr.owner_login
+          FROM user_following_repos fr
+          WHERE fr.user_id = ? AND ? = 'following'
+          UNION
+          SELECT ura.repo_id, ura.repo_full_name, ura.owner_login
+          FROM user_repo_associations ura
+          WHERE ura.user_id = ? AND ura.repo_id IS NOT NULL
+            AND ((? = 'repo' AND lower(ura.repo_full_name) = lower(?))
+              OR (? = 'repos' AND EXISTS (
+                SELECT 1 FROM json_each(?) WHERE lower(json_each.value) = lower(ura.repo_full_name)
+              ))
+              OR (? = 'org' AND lower(ura.owner_login) = lower(?)))
+          UNION
+          SELECT sr.repo_id, sr.full_name, sr.owner_login
+          FROM starred_repos sr
+          WHERE sr.user_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM user_repo_associations ura
+              WHERE ura.user_id = sr.user_id
+                AND ura.repo_full_name_lower = lower(sr.full_name)
+            )
+            AND ((? = 'repo' AND lower(sr.full_name) = lower(?))
+              OR (? = 'repos' AND EXISTS (
+                SELECT 1 FROM json_each(?) WHERE lower(json_each.value) = lower(sr.full_name)
+              ))
+              OR (? = 'org' AND lower(sr.owner_login) = lower(?)))
+          UNION
+          SELECT ob.repo_id, ob.repo_full_name,
+                 substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)
+          FROM owned_repo_star_baselines ob
+          WHERE ob.user_id = ? AND ? = 'mine'
+            AND instr(ob.repo_full_name, '/') > 1
+            AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
+        ),
+        release_rows AS (
+          SELECT 'release' AS kind, CAST(r.release_id AS TEXT) AS entity_id,
+                 COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
+                 r.release_id AS numeric_id
+          FROM repo_releases r
+          JOIN scoped_visible_repos vr ON vr.repo_id = r.repo_id
+          WHERE ? = 1
+        ),
+        social_rows AS (
+          SELECT e.kind, e.id AS entity_id, e.occurred_at AS sort_ts, NULL AS numeric_id
+          FROM social_activity_events e
+          LEFT JOIN scoped_visible_repos vr ON vr.repo_id = e.repo_id
+          WHERE e.user_id = ?
+            AND (? = 0 OR (e.repo_full_name IS NOT NULL AND vr.repo_id IS NOT NULL))
+            AND ((? = 1 AND e.kind = 'repo_star_received')
+              OR (? = 1 AND e.kind = 'follower_received')
+              OR (? = 1 AND e.kind IN ('announcement', 'release_update', 'repo_forked')))
+        ),
+        feed_rows AS (
+          SELECT kind, entity_id, sort_ts, numeric_id FROM release_rows
+          UNION ALL
+          SELECT kind, entity_id, sort_ts, numeric_id FROM social_rows
+        )
+        SELECT f.kind, f.entity_id, f.sort_ts
+        FROM feed_rows f
+        ORDER BY f.sort_ts DESC,
+          CASE f.kind WHEN 'release' THEN 5 WHEN 'announcement' THEN 4 WHEN 'release_update' THEN 4
+            WHEN 'repo_forked' THEN 3 WHEN 'repo_star_received' THEN 2
+            WHEN 'follower_received' THEN 1 ELSE 0 END DESC,
+          COALESCE(f.numeric_id, 0) DESC, f.entity_id DESC
+        LIMIT 30
+        "#,
+    )
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_kind)
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_repo_item.as_deref())
+    .bind(scope_kind)
+    .bind(scope_repo_items_json.as_deref())
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_repo_item.as_deref())
+    .bind(scope_kind)
+    .bind(scope_repo_items_json.as_deref())
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_mine_owner)
+    .bind(if scoped_all || types.releases {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(user_id)
+    .bind(if scoped_all { 1_i64 } else { 0_i64 })
+    .bind(if types.stars { 1_i64 } else { 0_i64 })
+    .bind(if types.followers { 1_i64 } else { 0_i64 })
+    .bind(if scoped_all || types.ambient {
+        1_i64
+    } else {
+        0_i64
+    })
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let key = format!("{}:{}", row.kind, row.entity_id);
+            let state_hash = ai::sha256_hex(&format!("sort={}\n", row.sort_ts));
+            format!("{key}|{state_hash}")
         })
+        .collect())
 }
 
 async fn load_dashboard_brief_signatures(
@@ -14905,21 +15036,30 @@ pub async fn dashboard_updates(
             Some(viewer.login.as_str()),
         )
         .await?;
-        lists.feed = Some(build_dashboard_list_update(
-            previous.as_ref().map(|token| token.feed.as_slice()),
-            &signatures,
-        ));
+        let previous_feed = previous.as_ref().map(|token| token.feed.as_slice());
+        let feed_version = previous.as_ref().map_or(0, |token| token.feed_version);
+        lists.feed = Some(
+            if previous.is_some() && feed_version < DASHBOARD_UPDATES_SIGNATURE_VERSION {
+                DashboardListUpdate {
+                    changed: false,
+                    new_count: 0,
+                    latest_keys: Vec::new(),
+                }
+            } else {
+                build_dashboard_list_update(previous_feed, &signatures)
+            },
+        );
         next_token.feed = compact_dashboard_signatures(&signatures);
+        next_token.feed_version = DASHBOARD_UPDATES_SIGNATURE_VERSION;
     } else if let Some(previous) = previous.as_ref() {
         next_token.feed = previous.feed.clone();
+        next_token.feed_version = previous.feed_version;
     }
 
     if include.briefs {
         let signatures = load_dashboard_brief_signatures(state.as_ref(), &user_id).await?;
-        lists.briefs = Some(build_dashboard_list_update(
-            previous.as_ref().map(|token| token.briefs.as_slice()),
-            &signatures,
-        ));
+        let previous_briefs = previous.as_ref().map(|token| token.briefs.as_slice());
+        lists.briefs = Some(build_dashboard_list_update(previous_briefs, &signatures));
         next_token.briefs = compact_dashboard_signatures(&signatures);
     } else if let Some(previous) = previous.as_ref() {
         next_token.briefs = previous.briefs.clone();
@@ -14927,10 +15067,11 @@ pub async fn dashboard_updates(
 
     if include.notifications {
         let signatures = load_dashboard_notification_signatures(state.as_ref(), &user_id).await?;
+        let previous_notifications = previous
+            .as_ref()
+            .map(|token| token.notifications.as_slice());
         lists.notifications = Some(build_dashboard_list_update(
-            previous
-                .as_ref()
-                .map(|token| token.notifications.as_slice()),
+            previous_notifications,
             &signatures,
         ));
         next_token.notifications = compact_dashboard_signatures(&signatures);
@@ -26025,6 +26166,7 @@ mod tests {
     use std::{collections::HashMap, sync::atomic::AtomicBool};
 
     use axum::body::{Body, Bytes};
+    use base64::Engine as _;
     use hmac::Mac;
     use sqlx::Connection;
 
@@ -36256,6 +36398,7 @@ line two",
             feed: compact_dashboard_signatures(&feed),
             briefs: compact_dashboard_signatures(&briefs),
             notifications: compact_dashboard_signatures(&notifications),
+            feed_version: super::DASHBOARD_UPDATES_SIGNATURE_VERSION,
         };
         let encoded = encode_dashboard_updates_token(&token).expect("encode compact token");
 
@@ -36396,7 +36539,248 @@ line two",
     }
 
     #[tokio::test]
-    async fn dashboard_updates_reports_existing_feed_item_processing_change() {
+    async fn dashboard_updates_tie_order_matches_feed_and_token_order() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let tied_at = "2026-02-24T08:00:00Z";
+        seed_repo_release_at(&pool, 42, 120, tied_at).await;
+        seed_star(&pool, 42).await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "tie-social-event",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
+                actor_login: "octocat",
+                occurred_at: tied_at,
+            },
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(feed) = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("load feed with tied release and social event");
+        let feed_keys = feed
+            .items
+            .iter()
+            .map(|item| format!("{}:{}", item.kind, item.id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &feed_keys[..2],
+            &[
+                "release:120".to_owned(),
+                "repo_star_received:tie-social-event".to_owned()
+            ]
+        );
+
+        let Json(updates) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("all".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("load dashboard signatures for tied items");
+        let feed_update = updates.lists.feed.expect("feed update");
+        assert!(!feed_update.latest_keys.is_empty());
+        assert_eq!(&feed_update.latest_keys[..2], &feed_keys[..2]);
+
+        let token = super::decode_dashboard_updates_token(Some(updates.token.as_str()))
+            .expect("decode generated dashboard token")
+            .expect("dashboard token exists");
+        let tied_signatures = [
+            format!(
+                "release:120|{}",
+                ai::sha256_hex(&format!("sort={tied_at}\n"))
+            ),
+            format!(
+                "repo_star_received:tie-social-event|{}",
+                ai::sha256_hex(&format!("sort={tied_at}\n"))
+            ),
+        ];
+        assert_eq!(
+            &token.feed[..2],
+            &compact_dashboard_signatures(&tied_signatures)
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_migrates_legacy_signatures_without_notices() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+        let legacy_token = super::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "feed": ["legacy-feed-digest"],
+                "briefs": ["legacy-brief-digest"],
+                "notifications": ["legacy-notification-digest"]
+            }))
+            .expect("serialize legacy dashboard token"),
+        );
+
+        let Json(migrated) = dashboard_updates(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(legacy_token),
+                feed_type: Some("all".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("migrate legacy dashboard token");
+
+        let feed = migrated.lists.feed.as_ref().expect("feed update");
+        assert!(!feed.changed);
+        assert_eq!(feed.new_count, 0);
+        assert!(feed.latest_keys.is_empty());
+        let migrated_token = super::decode_dashboard_updates_token(Some(migrated.token.as_str()))
+            .expect("decode migrated dashboard token")
+            .expect("migrated token exists");
+        assert_eq!(
+            migrated_token.feed_version,
+            super::DASHBOARD_UPDATES_SIGNATURE_VERSION
+        );
+
+        let Json(next_poll) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(migrated.token),
+                feed_type: Some("all".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("poll with migrated dashboard token");
+        let feed = next_poll.lists.feed.expect("feed update");
+        assert!(!feed.changed);
+        assert_eq!(feed.new_count, 0);
+        assert!(feed.latest_keys.is_empty());
+        let next_token = super::decode_dashboard_updates_token(Some(next_poll.token.as_str()))
+            .expect("decode next dashboard token")
+            .expect("next token exists");
+        assert_eq!(
+            migrated_token.feed, next_token.feed,
+            "migrated feed digests must equal the next poll baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_preserves_legacy_brief_and_notification_changes() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let old_brief_date = "2026-02-22";
+        let old_notification_time = "2026-02-22T08:00:00Z";
+        seed_brief(&pool, user_id.as_str(), old_brief_date, "## Previous brief").await;
+        seed_notification(&pool, user_id.as_str(), "thread-old", old_notification_time).await;
+        let old_brief_signature =
+            format!("brief:brief-{old_brief_date}|{old_brief_date}T08:00:00Z");
+        let old_notification_signature =
+            format!("notification:thread-old|{old_notification_time}|1");
+        let old_brief_digests = compact_dashboard_signatures(&[old_brief_signature]);
+        let old_notification_digests = compact_dashboard_signatures(&[old_notification_signature]);
+        let legacy_token = super::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "feed": ["legacy-feed-digest"],
+                "briefs": old_brief_digests,
+                "notifications": old_notification_digests
+            }))
+            .expect("serialize legacy dashboard token"),
+        );
+        let state = setup_state(pool.clone());
+
+        let Json(feed_only) = dashboard_updates(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(legacy_token),
+                feed_type: Some("all".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("poll legacy token with feed only");
+        let retained_token = super::decode_dashboard_updates_token(Some(feed_only.token.as_str()))
+            .expect("decode token after feed migration")
+            .expect("token after feed migration exists");
+        assert_eq!(retained_token.briefs, old_brief_digests);
+        assert_eq!(retained_token.notifications, old_notification_digests);
+
+        let new_brief_date = "2026-02-23";
+        let new_notification_time = "2026-02-23T08:00:00Z";
+        seed_brief(&pool, user_id.as_str(), new_brief_date, "## New brief").await;
+        seed_notification(&pool, user_id.as_str(), "thread-new", new_notification_time).await;
+
+        let Json(changed) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: Some(feed_only.token),
+                feed_type: Some("all".to_owned()),
+                include: Some("briefs,notifications".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("poll legacy signatures for briefs and notifications");
+
+        let briefs = changed.lists.briefs.expect("briefs update");
+        assert!(briefs.changed);
+        assert_eq!(briefs.new_count, 1);
+        assert_eq!(briefs.latest_keys, vec!["brief:brief-2026-02-23"]);
+        let notifications = changed.lists.notifications.expect("notifications update");
+        assert!(notifications.changed);
+        assert_eq!(notifications.new_count, 1);
+        assert_eq!(notifications.latest_keys, vec!["notification:thread-new"]);
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_signature_ignores_translation_content_and_returns_empty_results() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
         seed_repo_release(&pool, 42, 120).await;
@@ -36462,12 +36846,96 @@ line two",
         .expect("processed dashboard updates");
 
         let feed = changed.lists.feed.as_ref().expect("feed update");
-        assert!(feed.changed);
-        assert_eq!(feed.new_count, 1);
-        assert_eq!(
-            feed.latest_keys.first().map(String::as_str),
-            Some("release:120")
+        assert!(!feed.changed);
+        assert_eq!(feed.new_count, 0);
+
+        let Json(empty) = dashboard_updates(
+            State(setup_state(setup_pool().await)),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("releases".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: Some("repo".to_owned()),
+                items: Some("missing/repo".to_owned()),
+                org: None,
+            }),
+        )
+        .await
+        .expect("empty scoped dashboard updates");
+        assert!(
+            empty
+                .lists
+                .feed
+                .expect("feed update")
+                .latest_keys
+                .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_signature_scope_and_source_plans_use_indexes() {
+        let pool = setup_pool().await;
+        let visible_repo_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT repo_id FROM user_release_visible_repos WHERE user_id = ?
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_all(&pool)
+        .await
+        .expect("explain visible repos");
+        let release_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT release_id
+            FROM repo_releases
+            WHERE repo_id = ?
+            ORDER BY COALESCE(published_at, created_at, updated_at) DESC, release_id DESC
+            LIMIT 30
+            "#,
+        )
+        .bind(42_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("explain release signature source");
+        let social_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM social_activity_events
+            WHERE user_id = ?
+            ORDER BY occurred_at DESC, created_at DESC, id DESC
+            LIMIT 30
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_all(&pool)
+        .await
+        .expect("explain social signature source");
+        let details = |rows: &[sqlx::sqlite::SqliteRow]| {
+            rows.iter()
+                .map(|row| row.get::<String, _>(3))
+                .collect::<Vec<_>>()
+        };
+        let visible_details = details(&visible_repo_plan);
+        let release_details = details(&release_plan);
+        let social_details = details(&social_plan);
+        assert!(visible_details.iter().any(|detail| {
+            detail.contains("idx_user_repo_associations_user_repo_id")
+                || detail.contains("sqlite_autoindex_user_repo_associations")
+        }));
+        assert!(
+            release_details
+                .iter()
+                .any(|detail| detail.contains("idx_repo_releases_repo_sort_ts"))
+        );
+        assert!(social_details.iter().any(|detail| {
+            detail.contains("idx_social_activity_events_user_sort")
+                || detail.contains("idx_social_activity_events_dashboard_readable")
+        }));
     }
 
     #[tokio::test]

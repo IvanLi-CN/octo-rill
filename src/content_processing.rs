@@ -21,12 +21,19 @@ use crate::{
     ai, api, content_identity_upgrade,
     error::ApiError,
     local_id,
-    sqlite_write::{is_sqlite_background_admission_error, is_sqlite_database_error},
+    sqlite_write::{
+        is_sqlite_background_admission_error, is_sqlite_database_error,
+        is_sqlite_write_deadline_error,
+    },
     state::AppState,
     translations,
-    worker_backoff::WorkerBackoff,
+    worker_backoff::{ClaimAdmission, ClaimAdmissionResult, WorkerBackoff},
 };
 use tower_sessions::Session;
+
+static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
+#[cfg(test)]
+static CONTENT_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -2010,13 +2017,108 @@ pub async fn retry_request(
 }
 
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
+    #[cfg(test)]
+    let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
+    let mut admission = match CONTENT_CLAIM_ADMISSION.try_admit() {
+        ClaimAdmissionResult::Admitted(guard) => guard,
+        ClaimAdmissionResult::Coalesced => {
+            tracing::debug!(event = "claim_coalesced", lane = "content_processing_claim");
+            return Ok(None);
+        }
+        ClaimAdmissionResult::CoolingDown => {
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "content_processing_claim"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::debug!(event = "claim_admitted", lane = "content_processing_claim");
+    let result = claim_next_admitted(state, manual_limit).await;
+    if result.is_ok() {
+        admission.success();
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::warn!(event = "writer_deadline", lane = "content_processing_claim");
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::debug!(
+            event = "background_admission_denied",
+            lane = "content_processing_claim"
+        );
+    } else {
+        admission.fail();
+    }
+    result
+}
+
+async fn claim_next_admitted(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
+    claim_next_admitted_inner(state, manual_limit, || {}).await
+}
+
+#[cfg(test)]
+async fn claim_next_admitted_with_hook<F>(
+    state: &AppState,
+    manual_limit: i64,
+    before_settings_lock: F,
+) -> Result<Option<WorkRow>>
+where
+    F: FnOnce() + Send,
+{
+    claim_next_admitted_inner(state, manual_limit, before_settings_lock).await
+}
+
+async fn claim_next_admitted_inner<F>(
+    state: &AppState,
+    manual_limit: i64,
+    before_settings_lock: F,
+) -> Result<Option<WorkRow>>
+where
+    F: FnOnce() + Send,
+{
+    // Maintenance and route discovery happen before the short claim transaction.
+    if current_mode(&state.pool).await? != ContentProcessingMode::Global {
+        return Ok(None);
+    }
+    before_settings_lock();
+    let _runtime_settings_guard = crate::admin_runtime::runtime_settings_update_lock()
+        .lock()
+        .await;
+    let mut route_tx = state.pool.begin().await?;
+    let persisted_models =
+        crate::admin_runtime::load_llm_models_in_transaction(&mut route_tx, &state.config).await?;
+    route_tx.commit().await?;
+    state
+        .llm_scheduler
+        .set_model_routing(persisted_models)
+        .await;
+    let attempt_snapshot = current_attempt_route_snapshot(state).await;
+
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
-    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
-    refresh_model_routes_in_transaction(state, tx.as_transaction_mut()).await?;
-    let attempt_snapshot = current_attempt_route_snapshot(state).await;
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if mode
+        .as_deref()
+        .map(ContentProcessingMode::parse)
+        .transpose()?
+        != Some(ContentProcessingMode::Global)
+    {
+        tx.rollback().await?;
+        return Ok(None);
+    }
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
@@ -6662,7 +6764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_snapshots_the_persisted_route_under_the_claim_transaction() {
+    async fn claim_snapshots_the_persisted_route_before_the_claim_transaction() {
         let pool = global_pool().await;
         sqlx::query(
             "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
@@ -6699,6 +6801,125 @@ mod tests {
             .await
             .unwrap(),
             r#"["current-route"]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_does_not_cross_a_content_mode_freeze() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "frozen-work", "queued", 0, None).await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = global_state(pool.clone());
+
+        assert!(claim_next(&state, 1).await.unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'frozen-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "queued"
+        );
+        assert_eq!(
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::RollbackFreeze
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_submit_is_not_blocked_by_claim_settings_wait() {
+        let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
+        let pool = global_pool().await;
+        let state = global_state(pool);
+        let settings_guard = crate::admin_runtime::runtime_settings_update_lock()
+            .lock()
+            .await;
+        let preparing = Arc::new(Notify::new());
+        let preparing_signal = preparing.clone();
+        let claim_state = state.clone();
+        let claim = tokio::spawn(async move {
+            claim_next_admitted_with_hook(&claim_state, 1, move || {
+                preparing_signal.notify_one();
+            })
+            .await
+        });
+        preparing.notified().await;
+
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "feed.auto_translate:release:lock-order-1".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "lock-order-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "Foreground submission remains available".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let (status, response) = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            submit_item(&state, "user-1", "async", &item),
+        )
+        .await
+        .expect("foreground submission must not wait for the claim settings lock")
+        .unwrap();
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response.status, "queued");
+        drop(settings_guard);
+        assert!(claim.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_rechecks_freeze_in_transaction_without_repairing_mode() {
+        let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
+        let pool = global_pool().await;
+        insert_test_work(&pool, "freeze-during-claim", "queued", 0, None).await;
+        let state = global_state(pool.clone());
+        let settings_guard = crate::admin_runtime::runtime_settings_update_lock()
+            .lock()
+            .await;
+        let preparing = Arc::new(Notify::new());
+        let preparing_signal = preparing.clone();
+        let claim_state = state.clone();
+        let claim = tokio::spawn(async move {
+            claim_next_admitted_with_hook(&claim_state, 1, move || {
+                preparing_signal.notify_one();
+            })
+            .await
+        });
+        preparing.notified().await;
+
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(settings_guard);
+
+        assert!(claim.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT mode FROM content_processing_control WHERE id = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "rollback_freeze"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'freeze-during-claim'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "queued"
         );
     }
 
@@ -7238,8 +7459,8 @@ mod tests {
             "recovery cadence should coalesce repeated worker passes: {status:?}"
         );
         assert!(
-            status.background_rejected > 0,
-            "background admission should expose contention under foreground load: {status:?}"
+            status.background_rejected > 0 || status.background_lane_coalesced > 0,
+            "background admission or shared claim admission should expose contention under foreground load: {status:?}"
         );
 
         let cleanup_probe_pool = reader_pool.clone();
