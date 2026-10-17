@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicUsize, Ordering},
@@ -34,6 +34,10 @@ use tower_sessions::Session;
 static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 #[cfg(test)]
 static CONTENT_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+tokio::task_local! {
+    static CONTENT_SUPERSESSION_RESOURCE_LOOKUPS: std::cell::Cell<usize>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -549,6 +553,7 @@ struct AttemptRouteSnapshot {
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
 const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
 const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
+const GLOBAL_SUPERSESSION_CADENCE: Duration = Duration::from_secs(60);
 const GLOBAL_MAX_TOKENS: u32 = 3_000;
 const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
@@ -960,6 +965,10 @@ async fn newer_work_for_resource_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<Option<WorkRow>> {
+    #[cfg(test)]
+    let _ = CONTENT_SUPERSESSION_RESOURCE_LOOKUPS.try_with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
     newer_work_for_source_in_transaction(
         tx,
         WorkResourceKey {
@@ -985,6 +994,29 @@ struct WorkResourceKey<'a> {
     variant: &'a str,
     target_lang: &'a str,
     protocol_version: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OwnedWorkResourceKey {
+    canonical_resource_type: String,
+    canonical_resource_id: String,
+    pipeline: String,
+    variant: String,
+    target_lang: String,
+    protocol_version: String,
+}
+
+impl From<&WorkRow> for OwnedWorkResourceKey {
+    fn from(work: &WorkRow) -> Self {
+        Self {
+            canonical_resource_type: work.canonical_resource_type.clone(),
+            canonical_resource_id: work.canonical_resource_id.clone(),
+            pipeline: work.pipeline.clone(),
+            variant: work.variant.clone(),
+            target_lang: work.target_lang.clone(),
+            protocol_version: work.protocol_version.clone(),
+        }
+    }
 }
 
 struct WorkSourceKey<'a> {
@@ -2290,7 +2322,12 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .begin_immediate(&state.pool, "content_processing_recover")
         .await?;
     ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
-    supersede_stale_work_in_transaction(tx.as_transaction_mut()).await?;
+    if state.sqlite_writer.admit_background_lane(
+        "content_processing_supersession",
+        GLOBAL_SUPERSESSION_CADENCE,
+    ) {
+        supersede_stale_work_in_transaction(tx.as_transaction_mut()).await?;
+    }
     sqlx::query(
         "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
@@ -2381,38 +2418,80 @@ async fn recover_due(state: &AppState) -> Result<()> {
 }
 
 async fn supersede_stale_work_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Result<u64> {
+    let has_candidate = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (SELECT 1 FROM content_work_items AS candidate WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version))",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_candidate == 0 {
+        return Ok(0);
+    }
+
     let rows = sqlx::query_as::<_, WorkRow>(
-        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready')",
+        "SELECT work.id, work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.source_hash, work.protocol_version, work.model_profile, work.source_snapshot_json, work.configuration_fingerprint, work.status, work.priority, work.cache_hit, work.token_estimate, work.batch_id, work.attempt_count, work.next_retry_at, work.retry_expires_at, work.retry_after_at, work.created_at FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND EXISTS (SELECT 1 FROM content_work_items AS candidate WHERE candidate.id <> work.id AND candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND candidate.canonical_resource_type = work.canonical_resource_type AND candidate.canonical_resource_id = work.canonical_resource_id AND candidate.pipeline = work.pipeline AND candidate.variant = work.variant AND candidate.target_lang = work.target_lang AND candidate.protocol_version = work.protocol_version)",
     )
     .fetch_all(&mut **tx)
     .await?;
+    let mut grouped = HashMap::<OwnedWorkResourceKey, Vec<WorkRow>>::new();
+    for work in rows {
+        grouped
+            .entry(OwnedWorkResourceKey::from(&work))
+            .or_default()
+            .push(work);
+    }
     let now = Utc::now().to_rfc3339();
     let mut changed = 0;
-    for work in rows {
-        let Some(current) = newer_work_for_resource_in_transaction(tx, &work).await? else {
-            continue;
-        };
-        sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'superseded', 'running')")
-            .bind(&now)
-            .bind(&now)
-            .bind(&work.id)
-            .execute(&mut **tx)
+    for works in grouped.values() {
+        for work in works.iter().filter(|work| {
+            matches!(
+                work.status.as_str(),
+                "queued" | "failed" | "deferred_provider" | "blocked_config" | "ready"
+            )
+        }) {
+            let Some(current) = works
+                .iter()
+                .filter(|candidate| candidate.id != work.id)
+                .filter(|candidate| {
+                    source_version_is_newer(
+                        &candidate.source_snapshot_json,
+                        &work.source_snapshot_json,
+                    )
+                })
+                .reduce(|current, candidate| {
+                    if source_version_is_newer(
+                        &candidate.source_snapshot_json,
+                        &current.source_snapshot_json,
+                    ) {
+                        candidate
+                    } else {
+                        current
+                    }
+                })
+            else {
+                continue;
+            };
+            sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'superseded', 'running')")
+                .bind(&now)
+                .bind(&now)
+                .bind(&work.id)
+                .execute(&mut **tx)
+                .await?;
+            record_work_admission_event(
+                tx,
+                WorkAdmissionEvent {
+                    work_item_id: &work.id,
+                    event_type: "reconciliation_superseded",
+                    replaced_by_work_item_id: Some(&current.id),
+                    source_hash: &work.source_hash,
+                    source_snapshot_json: &work.source_snapshot_json,
+                    producer_ref: "",
+                    requester_id: None,
+                    reason_code: "newer_source_exists",
+                },
+            )
             .await?;
-        record_work_admission_event(
-            tx,
-            WorkAdmissionEvent {
-                work_item_id: &work.id,
-                event_type: "reconciliation_superseded",
-                replaced_by_work_item_id: Some(&current.id),
-                source_hash: &work.source_hash,
-                source_snapshot_json: &work.source_snapshot_json,
-                producer_ref: "",
-                requester_id: None,
-                reason_code: "newer_source_exists",
-            },
-        )
-        .await?;
-        changed += 1;
+            changed += 1;
+        }
     }
     Ok(changed)
 }
@@ -4573,6 +4652,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0092_content_work_supersession_lookup_index.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
             .execute(&pool)
             .await
@@ -6575,6 +6660,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supersession_scan_skips_unique_ready_items() {
+        CONTENT_SUPERSESSION_RESOURCE_LOOKUPS
+            .scope(std::cell::Cell::new(0), async {
+                let pool = global_pool().await;
+                for index in 0..5_185 {
+                    let id = format!("unique-ready-{index}");
+                    let resource_id = format!("unique-release-{index}");
+                    let source_hash = format!("unique-hash-{index}");
+                    let snapshot = json!({
+                        "source_blocks": [{
+                            "slot": "source_observed_at",
+                            "text": format!("2026-01-01T00:{index:02}:00Z")
+                        }],
+                        "target_slots": ["title_zh"]
+                    });
+                    sqlx::query(
+                        "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'ready', 0, 0, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    )
+                    .bind(id)
+                    .bind(resource_id)
+                    .bind(source_hash)
+                    .bind(GLOBAL_PROTOCOL_VERSION)
+                    .bind(snapshot.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+
+                let mut tx = pool.begin().await.unwrap();
+                assert_eq!(
+                    supersede_stale_work_in_transaction(&mut tx).await.unwrap(),
+                    0
+                );
+                tx.commit().await.unwrap();
+
+                assert_eq!(
+                    CONTENT_SUPERSESSION_RESOURCE_LOOKUPS
+                        .try_with(|counter| counter.get())
+                        .unwrap(),
+                    0,
+                    "unique ready items must not trigger per-item resource lookups"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn supersession_scan_uses_resource_scope_index() {
+        let pool = global_pool().await;
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT work.id FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND EXISTS (SELECT 1 FROM content_work_items AS candidate WHERE candidate.id <> work.id AND candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND candidate.canonical_resource_type = work.canonical_resource_type AND candidate.canonical_resource_id = work.canonical_resource_id AND candidate.pipeline = work.pipeline AND candidate.variant = work.variant AND candidate.target_lang = work.target_lang AND candidate.protocol_version = work.protocol_version)",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_content_work_items_resource_scope_status")),
+            "supersession probe must use the resource scope index: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn submission_uses_persisted_routes_when_the_local_scheduler_is_stale() {
         let pool = global_pool().await;
         sqlx::query(
@@ -7125,8 +7277,8 @@ mod tests {
                 .sqlite_writer
                 .runtime_status()
                 .background_lane_admitted,
-            1,
-            "each worker should not repeat the same recovery pass"
+            2,
+            "each worker should not repeat the recovery or supersession pass"
         );
     }
 
