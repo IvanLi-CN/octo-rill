@@ -21,12 +21,17 @@ use crate::{
     ai, api, content_identity_upgrade,
     error::ApiError,
     local_id,
-    sqlite_write::{is_sqlite_background_admission_error, is_sqlite_database_error},
+    sqlite_write::{
+        is_sqlite_background_admission_error, is_sqlite_database_error,
+        is_sqlite_write_deadline_error,
+    },
     state::AppState,
     translations,
-    worker_backoff::WorkerBackoff,
+    worker_backoff::{ClaimAdmission, ClaimAdmissionResult, WorkerBackoff},
 };
 use tower_sessions::Session;
+
+static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -2010,13 +2015,70 @@ pub async fn retry_request(
 }
 
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
+    let mut admission = match CONTENT_CLAIM_ADMISSION.try_admit() {
+        ClaimAdmissionResult::Admitted(guard) => guard,
+        ClaimAdmissionResult::Coalesced => {
+            tracing::debug!(event = "claim_coalesced", lane = "content_processing_claim");
+            return Ok(None);
+        }
+        ClaimAdmissionResult::CoolingDown => {
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "content_processing_claim"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::debug!(event = "claim_admitted", lane = "content_processing_claim");
+    let result = claim_next_admitted(state, manual_limit).await;
+    if result.is_ok() {
+        admission.success();
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::warn!(event = "writer_deadline", lane = "content_processing_claim");
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::debug!(
+            event = "background_admission_denied",
+            lane = "content_processing_claim"
+        );
+    } else {
+        admission.fail();
+    }
+    result
+}
+
+async fn claim_next_admitted(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
+    // Maintenance and route discovery happen before the short claim transaction.
+    let (_maintenance_permit, mut maintenance_tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "content_processing_claim_prepare")
+        .await?;
+    ensure_global_mode_in_transaction(maintenance_tx.as_transaction_mut()).await?;
+    maintenance_tx.commit().await?;
+    drop(_maintenance_permit);
+    let mut route_tx = state.pool.begin().await?;
+    let persisted_models =
+        crate::admin_runtime::load_llm_models_in_transaction(&mut route_tx, &state.config).await?;
+    route_tx.commit().await?;
+    state
+        .llm_scheduler
+        .set_model_routing(persisted_models)
+        .await;
+    let attempt_snapshot = current_attempt_route_snapshot(state).await;
+
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
-    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
-    refresh_model_routes_in_transaction(state, tx.as_transaction_mut()).await?;
-    let attempt_snapshot = current_attempt_route_snapshot(state).await;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
@@ -7238,8 +7300,8 @@ mod tests {
             "recovery cadence should coalesce repeated worker passes: {status:?}"
         );
         assert!(
-            status.background_rejected > 0,
-            "background admission should expose contention under foreground load: {status:?}"
+            status.background_rejected > 0 || status.background_lane_coalesced > 0,
+            "background admission or shared claim admission should expose contention under foreground load: {status:?}"
         );
 
         let cleanup_probe_pool = reader_pool.clone();
