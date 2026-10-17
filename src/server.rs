@@ -78,6 +78,9 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     observability::set_logging_thresholds(config.logging.clone());
+    let metrics_config = crate::metrics::MetricsConfig::from_env()?;
+    let metrics = crate::metrics::install_global(Arc::new(crate::metrics::Metrics::new()));
+    metrics.set_enabled(metrics_config.enabled);
     ensure_sqlite_dir(&config.database_url)?;
     ensure_dir_exists(&config.task_log_dir)?;
 
@@ -589,6 +592,22 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     runtime::register_runtime_owner(app_state.as_ref()).await?;
     let runtime_owner_heartbeat = runtime::spawn_runtime_owner_heartbeat(app_state.clone());
+    let metrics_sampler = metrics_config.enabled.then(|| {
+        metrics.spawn_sampler(
+            pool.clone(),
+            config.database_url.clone(),
+            metrics_config.sample_interval,
+        )
+    });
+    let metrics_listener = match crate::metrics::spawn_listener(&metrics_config, metrics.clone())
+        .await
+    {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(error = %error, "metrics listener unavailable; continuing without metrics endpoint");
+            None
+        }
+    };
 
     let serve_result = async {
         jobs::recover_runtime_state_on_startup(app_state.as_ref()).await?;
@@ -659,6 +678,12 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             search_index_abort_handle,
             online_migration_abort_handle,
         ];
+        if let Some(handle) = metrics_sampler {
+            abort_handles.push(handle);
+        }
+        if let Some(handle) = metrics_listener {
+            abort_handles.push(handle);
+        }
         if let Some(handle) = model_catalog_abort_handle {
             abort_handles.push(handle);
         }

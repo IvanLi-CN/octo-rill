@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Bounded, read-only OctoRill performance diagnostics.
+
+The command intentionally exposes only query ids from the versioned catalog. It
+never accepts arbitrary PromQL, SQL, shell commands, or credentials on output.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import json
+import math
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+MAX_WINDOW_SECONDS = 24 * 60 * 60
+MAX_POINTS = 1000
+MIN_STEP_SECONDS = 15
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_CONCURRENCY = 2
+COMMANDS = ("overview", "http", "sqlite", "queues", "upstream", "health", "compare")
+
+
+def catalog_path() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parents[1] / "ops" / "observability" / "query-catalog.json"
+
+
+def load_catalog() -> dict[str, Any]:
+    with catalog_path().open(encoding="utf-8") as handle:
+        catalog = json.load(handle)
+    if catalog.get("schema_version") != SCHEMA_VERSION:
+        raise RuntimeError("unsupported query catalog schema")
+    return catalog
+
+
+def parse_time(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        normalized = value.strip().replace("Z", "+00:00")
+        parsed = dt.datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.timestamp()
+
+
+def bounded_window(
+    from_value: str | None,
+    to_value: str | None,
+    default_end: float,
+    default_duration: float,
+    requested_step: int,
+) -> tuple[float, float, int]:
+    end = parse_time(to_value, default_end)
+    start = parse_time(from_value, end - default_duration)
+    if start >= end:
+        raise ValueError("--from must be before --to")
+    duration = end - start
+    if duration > MAX_WINDOW_SECONDS:
+        raise ValueError("query window cannot exceed 24 hours")
+    step = max(MIN_STEP_SECONDS, int(math.ceil(duration / MAX_POINTS)), requested_step)
+    return start, end, step
+
+
+def window(args: argparse.Namespace) -> tuple[float, float, int]:
+    return bounded_window(
+        args.from_time,
+        args.to,
+        dt.datetime.now(dt.timezone.utc).timestamp(),
+        args.window_minutes * 60,
+        args.step,
+    )
+
+
+def baseline_window(
+    args: argparse.Namespace,
+    current_start: float,
+    current_end: float,
+    current_step: int,
+) -> tuple[float, float, int]:
+    baseline_from = getattr(args, "baseline_from", None)
+    baseline_to = getattr(args, "baseline_to", None)
+    if (baseline_from is None) != (baseline_to is None):
+        raise ValueError("--baseline-from and --baseline-to must be provided together")
+    if baseline_from is None:
+        duration = current_end - current_start
+        return current_start - duration, current_start, current_step
+    return bounded_window(
+        baseline_from,
+        baseline_to,
+        current_start,
+        current_end - current_start,
+        getattr(args, "step", current_step),
+    )
+
+
+def regex_value(value: str | None) -> str:
+    if not value:
+        return ".*"
+    if len(value) > 128:
+        raise ValueError("label value is too long")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def selector(args: argparse.Namespace) -> str:
+    return ",".join(
+        f'{label}=~"{regex_value(value)}"'
+        for label, value in (
+            ("service", args.service),
+            ("environment", args.environment),
+            ("instance", args.instance),
+        )
+    )
+
+
+class PrometheusClient:
+    def __init__(self, args: argparse.Namespace) -> None:
+        backend = args.backend or os.environ.get("OCTORILL_OBSERVE_BACKEND", "prometheus")
+        self.backend = backend
+        if backend not in {"prometheus", "grafana"}:
+            raise ValueError("backend must be prometheus or grafana")
+        self.base_url = (args.url or os.environ.get("OCTORILL_OBSERVE_URL", "http://127.0.0.1:9090")).rstrip("/")
+        self.datasource_uid = args.datasource_uid or os.environ.get("OCTORILL_OBSERVE_DATASOURCE_UID", "octorill-prometheus")
+        self.org = args.org or os.environ.get("OCTORILL_OBSERVE_ORG", "1")
+        token_path = args.token_file or os.environ.get("OCTORILL_OBSERVE_TOKEN_FILE")
+        self.token = pathlib.Path(token_path).read_text(encoding="utf-8").strip() if token_path else None
+        if self.token and len(self.token) > 4096:
+            raise ValueError("token file is too large")
+
+    def url(self) -> str:
+        if self.backend == "grafana":
+            prefix = f"/api/datasources/proxy/uid/{urllib.parse.quote(self.datasource_uid, safe='')}"
+        else:
+            prefix = ""
+        return f"{self.base_url}{prefix}/api/v1/query_range"
+
+    def query_range(self, expression: str, start: float, end: float, step: int) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"query": expression, "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)})
+        request = urllib.request.Request(self.url() + "?" + query, headers={"Accept": "application/json"})
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+        if self.backend == "grafana":
+            request.add_header("X-Grafana-Org-Id", self.org)
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = response.read(min(65536, MAX_RESPONSE_BYTES + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > MAX_RESPONSE_BYTES:
+                        raise RuntimeError("query response exceeds 4 MiB")
+            payload = json.loads(b"".join(chunks).decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"backend unavailable: {type(error).__name__}") from error
+        if payload.get("status") != "success" or not isinstance(payload.get("data"), dict):
+            raise RuntimeError("backend returned an unsuccessful response")
+        return payload
+
+
+def summarize(payload: dict[str, Any]) -> dict[str, Any]:
+    results = payload.get("data", {}).get("result", [])
+    points = 0
+    latest: list[float] = []
+    sample_timestamps: list[float] = []
+    for series in results:
+        values = series.get("values") or ([series["value"]] if "value" in series else [])
+        if values:
+            try:
+                value = float(values[-1][1])
+                if math.isfinite(value):
+                    latest.append(value)
+            except (TypeError, ValueError, IndexError):
+                continue
+        for value in values:
+            try:
+                if math.isfinite(float(value[1])):
+                    points += 1
+                    timestamp = float(value[0])
+                    if math.isfinite(timestamp):
+                        sample_timestamps.append(timestamp)
+            except (TypeError, ValueError, IndexError):
+                continue
+    return {
+        "series": len(results),
+        "samples": points,
+        "latest": latest[:20],
+        "has_samples": points > 0,
+        "last_sample_at": max(sample_timestamps) if sample_timestamps else None,
+    }
+
+
+def query_ids(catalog: dict[str, Any], command: str) -> list[str]:
+    if command not in catalog["commands"]:
+        raise ValueError(f"unsupported command: {command}")
+    return list(catalog["commands"][command])
+
+
+def run_queries(client: PrometheusClient, catalog: dict[str, Any], ids: list[str], args: argparse.Namespace, start: float, end: float, step: int) -> dict[str, Any]:
+    query_templates = catalog["queries"]
+    selector_text = selector(args)
+
+    def run(query_id: str) -> tuple[str, dict[str, Any]]:
+        expression = query_templates[query_id].replace("SERVICE_SELECTOR", selector_text).replace("WINDOW", f"{max(step * 2, 60)}s")
+        try:
+            payload = client.query_range(expression, start, end, step)
+            summary = summarize(payload)
+            last_sample_at = summary["last_sample_at"]
+            freshness_seconds = (
+                max(0.0, end - last_sample_at) if last_sample_at is not None else None
+            )
+            summary["freshness_seconds"] = freshness_seconds
+            summary["stale"] = (
+                last_sample_at is None or freshness_seconds > max(60, step * 2)
+            )
+            return query_id, {"ok": True, "query": query_id, **summary}
+        except RuntimeError as error:
+            return query_id, {
+                "ok": False,
+                "query": query_id,
+                "error": str(error),
+                "series": 0,
+                "samples": 0,
+                "latest": [],
+                "has_samples": False,
+                "last_sample_at": None,
+                "freshness_seconds": None,
+                "stale": True,
+            }
+
+    results: dict[str, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        for query_id, result in executor.map(run, ids):
+            results[query_id] = result
+    return results
+
+
+def status_for(results: dict[str, Any]) -> str:
+    if any(not item["ok"] for item in results.values()):
+        return "unavailable"
+    if any(not item["has_samples"] or item.get("stale", True) for item in results.values()):
+        return "degraded"
+    return "ok"
+
+
+def render(payload: dict[str, Any], as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+    else:
+        print(f"status={payload['status']} command={payload['command']} window={payload['window']['from']}..{payload['window']['to']} step={payload['window']['step']}s")
+        for query_id, result in payload["queries"].items():
+            results = (
+                (("current", result["current"]), ("baseline", result["baseline"]))
+                if payload["command"] == "compare"
+                else (("current", result),)
+            )
+            rendered: list[str] = []
+            for label, item in results:
+                if item["ok"]:
+                    state = "sampled" if item["has_samples"] else "no-sample"
+                    freshness = item.get("freshness_seconds")
+                    freshness_text = "unknown" if freshness is None else f"{freshness:.1f}s"
+                    rendered.append(
+                        f"{label}={state} series={item['series']} samples={item['samples']} freshness={freshness_text}"
+                    )
+                else:
+                    rendered.append(f"{label}=unavailable reason={item['error']}")
+            print(f"{query_id}: " + "; ".join(rendered))
+    return 0 if payload["status"] != "unavailable" else 3
+
+
+def run(args: argparse.Namespace) -> int:
+    catalog = load_catalog()
+    command = args.command
+    start, end, step = window(args)
+    client = PrometheusClient(args)
+    if command == "compare":
+        scope = args.scope
+        ids = query_ids(catalog, scope)
+        baseline_start, baseline_end, baseline_step = baseline_window(args, start, end, step)
+        current = run_queries(client, catalog, ids, args, start, end, step)
+        baseline = run_queries(client, catalog, ids, args, baseline_start, baseline_end, baseline_step)
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "unavailable" if status_for(current) == "unavailable" or status_for(baseline) == "unavailable" else ("degraded" if status_for(current) != "ok" or status_for(baseline) != "ok" else "ok"),
+            "command": "compare",
+            "scope": scope,
+            "window": {"from": start, "to": end, "step": step},
+            "baseline_window": {"from": baseline_start, "to": baseline_end, "step": baseline_step},
+            "queries": {query_id: {"current": current[query_id], "baseline": baseline[query_id]} for query_id in ids},
+        }
+    else:
+        ids = query_ids(catalog, command)
+        results = run_queries(client, catalog, ids, args, start, end, step)
+        result = {"schema_version": SCHEMA_VERSION, "status": status_for(results), "command": command, "window": {"from": start, "to": end, "step": step}, "queries": results}
+    return render(result, args.json)
+
+
+def parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Read-only bounded OctoRill metrics diagnostics")
+    parser.add_argument("--backend", choices=("prometheus", "grafana"))
+    parser.add_argument("--url")
+    parser.add_argument("--datasource-uid")
+    parser.add_argument("--org")
+    parser.add_argument("--token-file")
+    parser.add_argument("--service")
+    parser.add_argument("--environment")
+    parser.add_argument("--instance")
+    parser.add_argument("--window-minutes", type=int, default=15)
+    parser.add_argument("--from", dest="from_time")
+    parser.add_argument("--to", dest="to")
+    parser.add_argument("--step", type=int, default=MIN_STEP_SECONDS)
+    parser.add_argument("--json", action="store_true")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in COMMANDS:
+        sub = subparsers.add_parser(command)
+        if command == "compare":
+            sub.add_argument("scope", choices=("overview", "http", "sqlite", "queues", "upstream", "health"), nargs="?", default="overview")
+            sub.add_argument("--baseline-from")
+            sub.add_argument("--baseline-to")
+    return parser
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        if args.window_minutes < 1 or args.window_minutes > 24 * 60:
+            raise ValueError("--window-minutes must be between 1 and 1440")
+        if args.step < 1:
+            raise ValueError("--step must be positive")
+        return run(args)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

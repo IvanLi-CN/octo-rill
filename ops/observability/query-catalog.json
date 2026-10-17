@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "metric_prefix": "octorill_",
+  "queries": {
+    "http_rate": "sum(rate(octorill_http_requests_total{SERVICE_SELECTOR}[WINDOW])) by (status_class)",
+    "http_rate_detailed": "sum(rate(octorill_http_requests_total{SERVICE_SELECTOR}[WINDOW])) by (method, route, status_class)",
+    "http_p95": "histogram_quantile(0.95, sum(rate(octorill_http_duration_seconds_bucket{SERVICE_SELECTOR}[WINDOW])) by (le, route))",
+    "http_p99": "histogram_quantile(0.99, sum(rate(octorill_http_duration_seconds_bucket{SERVICE_SELECTOR}[WINDOW])) by (le, route))",
+    "http_in_flight": "sum(octorill_http_in_flight{SERVICE_SELECTOR})",
+    "sse_active": "octorill_sse_active{SERVICE_SELECTOR}",
+    "sse_p95": "histogram_quantile(0.95, sum(rate(octorill_sse_duration_seconds_bucket{SERVICE_SELECTOR}[WINDOW])) by (le, route))",
+    "sqlite_wait_p95": "histogram_quantile(0.95, sum(rate(octorill_sqlite_wait_seconds_bucket{SERVICE_SELECTOR}[WINDOW])) by (le, phase, priority, operation))",
+    "sqlite_wait_p95_foreground": "histogram_quantile(0.95, sum(rate(octorill_sqlite_wait_seconds_bucket{SERVICE_SELECTOR,priority=\"foreground\"}[WINDOW])) by (le, phase, operation))",
+    "sqlite_rate": "sum(rate(octorill_sqlite_operations_total{SERVICE_SELECTOR}[WINDOW])) by (priority, outcome)",
+    "queue_depth": "octorill_queue_depth{SERVICE_SELECTOR}",
+    "queue_oldest_age": "octorill_queue_oldest_age_seconds{SERVICE_SELECTOR}",
+    "worker_rate": "sum(rate(octorill_worker_operations_total{SERVICE_SELECTOR,phase=\"attempt\"}[WINDOW])) by (executor, outcome)",
+    "worker_p95": "histogram_quantile(0.95, sum(rate(octorill_worker_duration_seconds_bucket{SERVICE_SELECTOR,phase=\"attempt\"}[WINDOW])) by (le, executor))",
+    "worker_active": "octorill_worker_active{SERVICE_SELECTOR}",
+    "upstream_failure_rate": "sum(rate(octorill_upstream_requests_total{SERVICE_SELECTOR,outcome=~\"error|timeout|rate_limited|forbidden|transport_error|decode_error|graphql_error|http_4xx|http_5xx\",operation!=\"scheduler_wait\"}[WINDOW])) by (provider, operation) / clamp_min(sum(rate(octorill_upstream_requests_total{SERVICE_SELECTOR,outcome!=\"fallback\",operation!=\"scheduler_wait\"}[WINDOW])) by (provider, operation), 1)",
+    "upstream_p95": "histogram_quantile(0.95, sum(rate(octorill_upstream_duration_seconds_bucket{SERVICE_SELECTOR,outcome!=\"fallback\",operation!=\"scheduler_wait\"}[WINDOW])) by (le, provider, operation))",
+    "sampler_stale": "octorill_sampler_stale{SERVICE_SELECTOR}",
+    "sampler_failures": "increase(octorill_sampler_failures_total{SERVICE_SELECTOR}[WINDOW])",
+    "sampler_stale_max": "max(octorill_sampler_stale{SERVICE_SELECTOR})",
+    "process_rss": "octorill_process_rss_bytes{SERVICE_SELECTOR}",
+    "process_cpu_rate": "rate(octorill_process_cpu_seconds{SERVICE_SELECTOR}[WINDOW])",
+    "database_size": "octorill_database_size_bytes{SERVICE_SELECTOR}",
+    "wal_size": "octorill_wal_size_bytes{SERVICE_SELECTOR}",
+    "upstream_rate_by_outcome": "sum(rate(octorill_upstream_requests_total{SERVICE_SELECTOR,operation!=\"scheduler_wait\"}[WINDOW])) by (provider, outcome)",
+    "upstream_requests": "octorill_upstream_requests_total{SERVICE_SELECTOR}"
+  },
+  "commands": {
+    "overview": ["http_rate", "http_p95", "queue_depth", "queue_oldest_age", "worker_active", "sampler_stale", "process_rss", "process_cpu_rate"],
+    "http": ["http_rate", "http_p95", "http_p99", "http_in_flight", "sse_active", "sse_p95"],
+    "sqlite": ["sqlite_wait_p95", "sqlite_rate", "database_size", "wal_size"],
+    "queues": ["queue_depth", "queue_oldest_age", "worker_rate", "worker_p95", "worker_active"],
+    "upstream": ["upstream_failure_rate", "upstream_p95"],
+    "health": ["sampler_stale", "sampler_failures", "process_rss", "process_cpu_rate", "database_size", "wal_size"]
+  }
+}

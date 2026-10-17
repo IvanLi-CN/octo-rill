@@ -118,3 +118,4 @@
 | 品牌媒体源完整性 | active | [IMPLEMENTATION.md](./brand-media-source-integrity/IMPLEMENTATION.md) / [HISTORY.md](./brand-media-source-integrity/HISTORY.md) | [SPEC.md](./brand-media-source-integrity/SPEC.md) | - | 已交付；四个 campaign export 的可验证 OpenRaster 保真母版源包 |
 | 统一活动图组件与探索交互 | active | [IMPLEMENTATION.md](./activity-grid-unification/IMPLEMENTATION.md) / [HISTORY.md](./activity-grid-unification/HISTORY.md) | [SPEC.md](./activity-grid-unification/SPEC.md) | - | 已实现；统一采集记录与 LLM 活动图组件、密度、加载、探索交互、详情读取隔离及 Demo 四种数据状态切换 |
 | 公开指标 API | active | [IMPLEMENTATION.md](./public-metrics-api/IMPLEMENTATION.md) / [HISTORY.md](./public-metrics-api/HISTORY.md) | [SPEC.md](./public-metrics-api/SPEC.md) | - | 实施中；公开治理统计 API + 真实可用的部分小时趋势 |
+| 核心性能监控 | active | [IMPLEMENTATION.md](./monitoring-dashboard/IMPLEMENTATION.md) / [HISTORY.md](./monitoring-dashboard/HISTORY.md) | [SPEC.md](./monitoring-dashboard/SPEC.md) | - | 应用 metrics + Grafana/Prometheus 资产 + 固定只读诊断 CLI；隔离运行验收与 PR 收敛进行中 |

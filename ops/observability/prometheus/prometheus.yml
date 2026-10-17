@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: octorill
+    metrics_path: /metrics
+    bearer_token_file: /etc/prometheus/secrets/octorill_metrics_token
+    static_configs:
+      # Attach the application to the octorill-monitoring network and keep this
+      # target private. Replace the hostname for a host-process deployment.
+      - targets: ["octorill:58091"]
+        labels:
+          service: octorill
+          environment: self-hosted
+
+# Rules are intentionally not loaded in the sample stack. Copy the rule files
+# from prometheus/rules into this config only after setting deployment thresholds
+# and notification ownership.

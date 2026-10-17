@@ -1,0 +1,22 @@
+{
+  "uid": "octorill-overview",
+  "title": "OctoRill Overview",
+  "tags": ["octorill", "performance"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "templating": {"list": [
+    {"name": "service", "label": "Service", "type": "query", "query": "label_values(octorill_enabled, service)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}},
+    {"name": "environment", "label": "Environment", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\"}, environment)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}},
+    {"name": "instance", "label": "Instance", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\",environment=~\"$environment\"}, instance)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}
+  ]},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "HTTP request rate by status", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "http_rate", "expr": "sum(rate(octorill_http_requests_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (status_class)", "legendFormat": "{{status_class}}"}]},
+    {"id": 2, "type": "timeseries", "title": "HTTP response p95", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "http_p95", "expr": "histogram_quantile(0.95, sum(rate(octorill_http_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (le, route))", "legendFormat": "{{route}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Runnable queue depth", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"refId": "A", "catalog_query_id": "queue_depth", "expr": "octorill_queue_depth{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{executor}}"}]},
+    {"id": 4, "type": "timeseries", "title": "Process RSS", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"refId": "A", "catalog_query_id": "process_rss", "expr": "octorill_process_rss_bytes{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{instance}}"}]},
+    {"id": 5, "type": "stat", "title": "Sampler stale", "gridPos": {"h": 5, "w": 6, "x": 0, "y": 16}, "targets": [{"refId": "A", "catalog_query_id": "sampler_stale_max", "expr": "max(octorill_sampler_stale{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"})"}]},
+    {"id": 6, "type": "stat", "title": "HTTP in flight", "gridPos": {"h": 5, "w": 6, "x": 6, "y": 16}, "targets": [{"refId": "A", "catalog_query_id": "http_in_flight", "expr": "sum(octorill_http_in_flight{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"})"}]}
+  ]
+}
