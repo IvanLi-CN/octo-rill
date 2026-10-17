@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；parent 性能修复已合入 `th/perf-guarded-write-and-feed`，当前整合 SHA 为 `54e00b23d86f273450cd9555f855b4a1266bcec4`
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；parent 性能修复已合入 `th/perf-guarded-write-and-feed`，当前整合 SHA 为 `fa5f72d853eab1807466e5dd4f0e4574cd45e20d`
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -72,12 +72,13 @@
 - `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
-- 当前 parent PR #326 的 GitHub CI run `39054778386`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
+- 当前 parent `fa5f72d8` 的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates `48ms`、session save `42ms`、task enqueue `38ms`，最大前台请求 `48ms`，`busy_or_500=0`；social snapshot 15 个分块、最大分块 `111ms`、最大 writer wait `0ms`。
+- 当前 parent PR #326 的最新 GitHub CI runs `39056635621` / `39056635629`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
 
 ## Remaining Gaps
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；已发布版本仍为 `v2.77.0`，目标 SHA 为 `0a6cafbac8bd0e9c4ef35586621ad131ccf5360d`。
-- 计划要求的当前候选 file-backed WAL/HTTP 经验验收（HTTP p95/p99、CPU、writer wait/admission/deadline）尚未形成可绑定 `54e00b23` 的证据卡；仓库中的 `tmp/sqlite_acceptance.py` 仅存在于历史记录，当前工作树没有该 harness。parent PR 可审查且 CI 已通过，但在该经验验收完成前不应宣称线上性能已验证或生成新 release。
+- 计划要求的完整当前候选 file-backed WAL/HTTP 经验验收（HTTP p95/p99、CPU、writer wait/admission/deadline 汇总）仍未形成可绑定 `fa5f72d8` 的完整证据卡；当前已完成的是上述生产形状并发回归，尚未测量 CPU 五分钟中位数，也未进行合并后的 101 线上 30 分钟观察。仓库中的 `tmp/sqlite_acceptance.py` 仅存在于历史记录，当前工作树没有该 harness。parent PR 可审查且 CI 已通过，但在这两项完成前不应宣称线上性能已验证或生成新 release。
 
 ## Related Changes
 
