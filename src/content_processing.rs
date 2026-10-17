@@ -32,6 +32,8 @@ use crate::{
 use tower_sessions::Session;
 
 static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
+#[cfg(test)]
+static CONTENT_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -2015,6 +2017,8 @@ pub async fn retry_request(
 }
 
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
+    #[cfg(test)]
+    let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
     let mut admission = match CONTENT_CLAIM_ADMISSION.try_admit() {
         ClaimAdmissionResult::Admitted(guard) => guard,
         ClaimAdmissionResult::Coalesced => {
