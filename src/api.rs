@@ -14758,34 +14758,6 @@ fn dashboard_update_signature_key(signature: &str) -> &str {
         .unwrap_or(signature)
 }
 
-fn option_signature_value(value: Option<&str>) -> &str {
-    value.unwrap_or("")
-}
-
-fn dashboard_feed_signature(row: &FeedRow) -> String {
-    let key = format!("{}:{}", row.kind, row.entity_id);
-    let state_hash = ai::sha256_hex(&format!(
-        "sort={}\ntrans_hash={}\ntrans_status={}\ntrans_work={}\ntrans_title={}\ntrans_summary={}\ndetail_hash={}\ndetail_status={}\ndetail_work={}\ndetail_title={}\ndetail_summary={}\nsmart_hash={}\nsmart_status={}\nsmart_work={}\nsmart_title={}\nsmart_summary={}\n",
-        row.sort_ts,
-        option_signature_value(row.trans_source_hash.as_deref()),
-        option_signature_value(row.trans_status.as_deref()),
-        option_signature_value(row.trans_work_status.as_deref()),
-        option_signature_value(row.trans_title.as_deref()),
-        option_signature_value(row.trans_summary.as_deref()),
-        option_signature_value(row.detail_trans_source_hash.as_deref()),
-        option_signature_value(row.detail_trans_status.as_deref()),
-        option_signature_value(row.detail_trans_work_status.as_deref()),
-        option_signature_value(row.detail_trans_title.as_deref()),
-        option_signature_value(row.detail_trans_summary.as_deref()),
-        option_signature_value(row.smart_source_hash.as_deref()),
-        option_signature_value(row.smart_status.as_deref()),
-        option_signature_value(row.smart_work_status.as_deref()),
-        option_signature_value(row.smart_title.as_deref()),
-        option_signature_value(row.smart_summary.as_deref()),
-    ));
-    format!("{key}|{state_hash}")
-}
-
 async fn load_dashboard_feed_signatures(
     state: &AppState,
     user_id: &str,
@@ -14793,13 +14765,168 @@ async fn load_dashboard_feed_signatures(
     scope: Option<&FeedScope>,
     viewer_login: Option<&str>,
 ) -> Result<Vec<String>, ApiError> {
-    fetch_feed_items(state, user_id, None, types, scope, viewer_login, 30, None)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| dashboard_feed_signature(&row))
-                .collect()
+    let scope_kind = match scope {
+        Some(FeedScope::Repo { .. }) => "repo",
+        Some(FeedScope::Repos { .. }) => "repos",
+        Some(FeedScope::Org { .. }) => "org",
+        Some(FeedScope::Mine) => "mine",
+        Some(FeedScope::Following) => "following",
+        None => "",
+    };
+    let scope_repo_item = match scope {
+        Some(FeedScope::Repo { owner, repo }) => Some(format!("{owner}/{repo}")),
+        _ => None,
+    };
+    let scope_repo_items_json = match scope {
+        Some(FeedScope::Repos { items }) => {
+            Some(serde_json::to_string(items).map_err(ApiError::internal)?)
+        }
+        _ => None,
+    };
+    let scope_org = match scope {
+        Some(FeedScope::Org { org }) => Some(org.as_str()),
+        _ => None,
+    };
+    let scope_mine_owner = if matches!(scope, Some(FeedScope::Mine)) {
+        viewer_login.unwrap_or("")
+    } else {
+        ""
+    };
+    let scoped_all = scope.is_some();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct DashboardFeedSignatureRow {
+        kind: String,
+        entity_id: String,
+        sort_ts: String,
+    }
+
+    let rows = sqlx::query_as::<_, DashboardFeedSignatureRow>(
+        r#"
+        WITH scoped_visible_repos AS (
+          SELECT vr.repo_id, vr.full_name, vr.owner_login
+          FROM user_release_visible_repos vr
+          WHERE vr.user_id = ?
+            AND (? != 'mine')
+            AND (? = '' OR (? = 'org' AND lower(vr.owner_login) = lower(?)))
+          UNION
+          SELECT fr.repo_id, fr.full_name, fr.owner_login
+          FROM user_following_repos fr
+          WHERE fr.user_id = ? AND ? = 'following'
+          UNION
+          SELECT ura.repo_id, ura.repo_full_name, ura.owner_login
+          FROM user_repo_associations ura
+          WHERE ura.user_id = ? AND ura.repo_id IS NOT NULL
+            AND ((? = 'repo' AND lower(ura.repo_full_name) = lower(?))
+              OR (? = 'repos' AND EXISTS (
+                SELECT 1 FROM json_each(?) WHERE lower(json_each.value) = lower(ura.repo_full_name)
+              ))
+              OR (? = 'org' AND lower(ura.owner_login) = lower(?)))
+          UNION
+          SELECT sr.repo_id, sr.full_name, sr.owner_login
+          FROM starred_repos sr
+          WHERE sr.user_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM user_repo_associations ura
+              WHERE ura.user_id = sr.user_id
+                AND ura.repo_full_name_lower = lower(sr.full_name)
+            )
+            AND ((? = 'repo' AND lower(sr.full_name) = lower(?))
+              OR (? = 'repos' AND EXISTS (
+                SELECT 1 FROM json_each(?) WHERE lower(json_each.value) = lower(sr.full_name)
+              ))
+              OR (? = 'org' AND lower(sr.owner_login) = lower(?)))
+          UNION
+          SELECT ob.repo_id, ob.repo_full_name,
+                 substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)
+          FROM owned_repo_star_baselines ob
+          WHERE ob.user_id = ? AND ? = 'mine'
+            AND instr(ob.repo_full_name, '/') > 1
+            AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
+        ),
+        release_rows AS (
+          SELECT 'release' AS kind, CAST(r.release_id AS TEXT) AS entity_id,
+                 COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
+                 r.release_id AS numeric_id
+          FROM repo_releases r
+          JOIN scoped_visible_repos vr ON vr.repo_id = r.repo_id
+          WHERE ? = 1
+        ),
+        social_rows AS (
+          SELECT e.kind, e.id AS entity_id, e.occurred_at AS sort_ts, NULL AS numeric_id
+          FROM social_activity_events e
+          LEFT JOIN scoped_visible_repos vr ON vr.repo_id = e.repo_id
+          WHERE e.user_id = ?
+            AND (? = 0 OR (e.repo_full_name IS NOT NULL AND vr.repo_id IS NOT NULL))
+            AND ((? = 1 AND e.kind = 'repo_star_received')
+              OR (? = 1 AND e.kind = 'follower_received')
+              OR (? = 1 AND e.kind IN ('announcement', 'release_update', 'repo_forked')))
+        ),
+        feed_rows AS (
+          SELECT kind, entity_id, sort_ts, numeric_id FROM release_rows
+          UNION ALL
+          SELECT kind, entity_id, sort_ts, numeric_id FROM social_rows
+        )
+        SELECT f.kind, f.entity_id, f.sort_ts
+        FROM feed_rows f
+        ORDER BY f.sort_ts DESC,
+          CASE f.kind WHEN 'announcement' THEN 4 WHEN 'release_update' THEN 4
+            WHEN 'repo_forked' THEN 3 WHEN 'repo_star_received' THEN 2
+            WHEN 'follower_received' THEN 1 ELSE 0 END DESC,
+          COALESCE(f.numeric_id, 0) DESC, f.entity_id DESC
+        LIMIT 30
+        "#,
+    )
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_kind)
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_repo_item.as_deref())
+    .bind(scope_kind)
+    .bind(scope_repo_items_json.as_deref())
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_repo_item.as_deref())
+    .bind(scope_kind)
+    .bind(scope_repo_items_json.as_deref())
+    .bind(scope_kind)
+    .bind(scope_org)
+    .bind(user_id)
+    .bind(scope_kind)
+    .bind(scope_mine_owner)
+    .bind(if scoped_all || types.releases {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(user_id)
+    .bind(if scoped_all { 1_i64 } else { 0_i64 })
+    .bind(if types.stars { 1_i64 } else { 0_i64 })
+    .bind(if types.followers { 1_i64 } else { 0_i64 })
+    .bind(if scoped_all || types.ambient {
+        1_i64
+    } else {
+        0_i64
+    })
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let key = format!("{}:{}", row.kind, row.entity_id);
+            let state_hash = ai::sha256_hex(&format!("sort={}\n", row.sort_ts));
+            format!("{key}|{state_hash}")
         })
+        .collect())
 }
 
 async fn load_dashboard_brief_signatures(
@@ -36396,7 +36523,7 @@ line two",
     }
 
     #[tokio::test]
-    async fn dashboard_updates_reports_existing_feed_item_processing_change() {
+    async fn dashboard_updates_signature_ignores_translation_content_and_returns_empty_results() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
         seed_repo_release(&pool, 42, 120).await;
@@ -36462,12 +36589,96 @@ line two",
         .expect("processed dashboard updates");
 
         let feed = changed.lists.feed.as_ref().expect("feed update");
-        assert!(feed.changed);
-        assert_eq!(feed.new_count, 1);
-        assert_eq!(
-            feed.latest_keys.first().map(String::as_str),
-            Some("release:120")
+        assert!(!feed.changed);
+        assert_eq!(feed.new_count, 0);
+
+        let Json(empty) = dashboard_updates(
+            State(setup_state(setup_pool().await)),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("releases".to_owned()),
+                include: Some("feed".to_owned()),
+                scope: Some("repo".to_owned()),
+                items: Some("missing/repo".to_owned()),
+                org: None,
+            }),
+        )
+        .await
+        .expect("empty scoped dashboard updates");
+        assert!(
+            empty
+                .lists
+                .feed
+                .expect("feed update")
+                .latest_keys
+                .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_signature_scope_and_source_plans_use_indexes() {
+        let pool = setup_pool().await;
+        let visible_repo_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT repo_id FROM user_release_visible_repos WHERE user_id = ?
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_all(&pool)
+        .await
+        .expect("explain visible repos");
+        let release_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT release_id
+            FROM repo_releases
+            WHERE repo_id = ?
+            ORDER BY COALESCE(published_at, created_at, updated_at) DESC, release_id DESC
+            LIMIT 30
+            "#,
+        )
+        .bind(42_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("explain release signature source");
+        let social_plan = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM social_activity_events
+            WHERE user_id = ?
+            ORDER BY occurred_at DESC, created_at DESC, id DESC
+            LIMIT 30
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_all(&pool)
+        .await
+        .expect("explain social signature source");
+        let details = |rows: &[sqlx::sqlite::SqliteRow]| {
+            rows.iter()
+                .map(|row| row.get::<String, _>(3))
+                .collect::<Vec<_>>()
+        };
+        let visible_details = details(&visible_repo_plan);
+        let release_details = details(&release_plan);
+        let social_details = details(&social_plan);
+        assert!(visible_details.iter().any(|detail| {
+            detail.contains("idx_user_repo_associations_user_repo_id")
+                || detail.contains("sqlite_autoindex_user_repo_associations")
+        }));
+        assert!(
+            release_details
+                .iter()
+                .any(|detail| detail.contains("idx_repo_releases_repo_sort_ts"))
+        );
+        assert!(social_details.iter().any(|detail| {
+            detail.contains("idx_social_activity_events_user_sort")
+                || detail.contains("idx_social_activity_events_dashboard_readable")
+        }));
     }
 
     #[tokio::test]
