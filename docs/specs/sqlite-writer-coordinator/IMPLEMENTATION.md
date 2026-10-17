@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 当前工作树已补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；fresh review, CI and merge remain
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；parent 性能修复已合入 `th/perf-guarded-write-and-feed`，当前整合 SHA 为 `54e00b23d86f273450cd9555f855b4a1266bcec4`
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
@@ -24,6 +24,8 @@
 - content processing recovery/claim、已领取任务的数据库执行、job task claim 与 repo release claim loop 共用 `worker_backoff`，连续失败的基础等待为 1/2/4/8/16/30 秒并加入不提前的抖动；content claim 成功后立即复位 claim 退避，执行阶段的数据库失败使用独立退避，其他 worker 在成功 DB 尝试后复位；每个 worker 只有一笔同类 claim 在途，日志记录 lane、错误类别、失败计数和 retry wait。
 - deadline telemetry 区分 writer queue、write-pool acquisition、`BEGIN IMMEDIATE` 与 transaction 阶段，并记录 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 和 `deadline_ms`。
 - PR3.9.3 为 background writer 增加共享有界等待预算（最多一个 waiting background，foreground waiter 出现后拒绝新的 background admission），并暴露 waiting/admitted/rejected/coalesced runtime counters；content processing recovery 通过 coordinator 的 1 秒 per-lane cadence admission 合并重复 worker pass，admission denial 进入已有 worker backoff。
+- 本轮 parent 的 writer child `#328`（`fd2bb6935516cc51f239b8edafdcd57b6933a888`）保持 worker 业务并发，只限制每个 claim lane 的数据库领取准入；dashboard child `#327`（`d36d34b01a8fae78b706d5a3903e50874795dd14`）将 `/api/dashboard/updates` 改为有界 signature 查询。
+- repair child `#329`（`54e00b23d86f273450cd9555f855b4a1266bcec4`）释放 content claim 准备阶段的 mode 读锁，并在短 claim transaction 内重新检查持久化 mode；这避免后台 claim 等待 runtime settings 时阻塞 foreground `submit_item`，同时保留 rollback freeze 语义。
 - HTTP access middleware 现在为正常成功请求也写入 `http.access`，并在 task-local request context 中保留 request ID、method、route；SQLite transaction-end、session write 与 background admission telemetry 复用这些字段完成 request-to-writer correlation。
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
@@ -69,10 +71,13 @@
 - `bash scripts/check-rust-source-quality.sh`（code candidate `12c8ea90`: source quality scan passed）
 - `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
+- 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
+- 当前 parent PR #326 的 GitHub CI run `39054778386`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
 
 ## Remaining Gaps
 
-- 待完成当前候选的 fresh review、PR CI 收敛及 merge 后 target CI 验证。
+- 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；已发布版本仍为 `v2.77.0`，目标 SHA 为 `0a6cafbac8bd0e9c4ef35586621ad131ccf5360d`。
+- 计划要求的当前候选 file-backed WAL/HTTP 经验验收（HTTP p95/p99、CPU、writer wait/admission/deadline）尚未形成可绑定 `54e00b23` 的证据卡；仓库中的 `tmp/sqlite_acceptance.py` 仅存在于历史记录，当前工作树没有该 harness。parent PR 可审查且 CI 已通过，但在该经验验收完成前不应宣称线上性能已验证或生成新 release。
 
 ## Related Changes
 
