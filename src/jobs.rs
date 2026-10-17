@@ -160,6 +160,8 @@ const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60)
 #[cfg(test)]
 const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
 static TASK_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
+#[cfg(test)]
+static TASK_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 pub fn is_scheduled_task_type(task_type: &str) -> bool {
@@ -2492,6 +2494,8 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 }
 
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
+    #[cfg(test)]
+    let _test_claim_guard = TASK_CLAIM_TEST_SERIALIZER.lock().await;
     let mut admission = match TASK_CLAIM_ADMISSION.try_admit() {
         ClaimAdmissionResult::Admitted(guard) => guard,
         ClaimAdmissionResult::Coalesced => {
