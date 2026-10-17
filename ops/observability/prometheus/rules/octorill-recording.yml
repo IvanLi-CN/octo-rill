@@ -1,0 +1,12 @@
+groups:
+  - name: octorill-recording
+    interval: 30s
+    rules:
+      - record: octorill:http_request_rate:sum
+        expr: sum(rate(octorill_http_requests_total[5m]))
+      - record: octorill:http_5xx_ratio:sum
+        expr: sum(rate(octorill_http_requests_total{status_class="5xx"}[5m])) / clamp_min(sum(rate(octorill_http_requests_total[5m])), 1)
+      - record: octorill:sqlite_writer_wait_p95:sum
+        expr: histogram_quantile(0.95, sum(rate(octorill_sqlite_wait_seconds_bucket[5m])) by (le, phase, priority))
+      - record: octorill:upstream_failure_ratio:sum
+        expr: sum(rate(octorill_upstream_requests_total{outcome=~"error|timeout|rate_limited|forbidden|transport_error|decode_error|graphql_error|http_4xx|http_5xx",operation!="scheduler_wait"}[5m])) / clamp_min(sum(rate(octorill_upstream_requests_total{outcome!="fallback",operation!="scheduler_wait"}[5m])), 1)

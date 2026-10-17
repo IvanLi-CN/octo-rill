@@ -1,0 +1,16 @@
+{
+  "uid": "octorill-sqlite",
+  "title": "OctoRill SQLite",
+  "tags": ["octorill", "sqlite"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "templating": {"list": [{"name": "service", "type": "query", "query": "label_values(octorill_enabled, service)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "environment", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\"}, environment)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "instance", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\",environment=~\"$environment\"}, instance)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}]},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Foreground SQLite wait p95", "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "sqlite_wait_p95_foreground", "expr": "histogram_quantile(0.95, sum(rate(octorill_sqlite_wait_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\",priority=\"foreground\"}[5m])) by (le, phase, operation))", "legendFormat": "{{phase}} / {{operation}}"}]},
+    {"id": 2, "type": "timeseries", "title": "SQLite operation rate and outcome", "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "sqlite_rate", "expr": "sum(rate(octorill_sqlite_operations_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])) by (priority, outcome)", "legendFormat": "{{priority}} {{outcome}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Database and WAL size", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "database_size", "expr": "octorill_database_size_bytes{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "database"}, {"refId": "B", "catalog_query_id": "wal_size", "expr": "octorill_wal_size_bytes{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "wal"}]},
+    {"id": 4, "type": "table", "title": "Sampler state", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "sampler_stale", "expr": "octorill_sampler_stale{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}"}]}
+  ]
+}

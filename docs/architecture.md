@@ -28,6 +28,7 @@ OctoRill 当前由 4 个长期维护面组成：
 - 翻译请求、批次执行与日报生成
 - 管理员运行时配置与后台任务观测
 - 容器 stdout 结构化日志、request-id 贯通与运行期排障入口
+- 独立、默认关闭的 Prometheus/OpenMetrics exporter；Grafana、固定查询 CLI 与监控 Compose 位于 `ops/observability/`
 
 ### 数据与外部依赖
 
@@ -43,6 +44,7 @@ OctoRill 当前由 4 个长期维护面组成：
 - `src/main.rs` 负责读取 `.env.local` / `.env`、初始化 tracing，然后把 `AppConfig` 交给 `server::serve()`
 - `src/server.rs` 负责完成真正的运行时装配：数据库、migrations、session store、HTTP client、OAuth client、WebAuthn、scheduler、router、request-id / access log middleware 与静态文件服务
 - `src/observability.rs` 负责 JSON stdout subscriber、慢阈值、request-id helper、access log 与 error-chain 共用逻辑
+- `src/metrics.rs` 负责实例级有界 registry、独立 token listener、HTTP/SSE/SQLite/upstream 事件更新和 reader-pool sampler；scrape 不执行业务查询
 
 ### 共享应用状态
 
@@ -162,6 +164,7 @@ Storybook 在这个仓库里不是展示橱窗，而是**稳定验证面**。改
 - 默认只记录慢请求与错误请求的 `http.access`，快速 `2xx` 不记 access log。
 - 运行时日志只保留 `request_id`、`task_id`、`user_id`、`repo_id`、`operation`、`attempt`、`elapsed_ms`、`error_chain` 等排障必要字段。
 - 不记录 body、token、cookie、email、login、完整 query string；生产默认不输出 Rust backtrace。
+- 性能趋势从 `ops/observability/` 的 Prometheus/Grafana 资产和 `scripts/octorill-observe` 进入；先确认 `OCTORILL_METRICS_ENABLED`、独立 token、target up 与 sampler stale，再按 HTTP、SQLite、队列和 upstream 看板分层排查。
 
 ### 登录 / 绑定 / 会话问题
 

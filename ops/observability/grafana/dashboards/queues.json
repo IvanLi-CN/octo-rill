@@ -1,0 +1,19 @@
+{
+  "uid": "octorill-queues",
+  "title": "OctoRill Task Queues",
+  "tags": ["octorill", "queues"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "templating": {"list": [{"name": "service", "type": "query", "query": "label_values(octorill_enabled, service)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "environment", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\"}, environment)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}, {"name": "instance", "type": "query", "query": "label_values(octorill_enabled{service=~\"$service\",environment=~\"$environment\"}, instance)", "includeAll": true, "multi": true, "current": {"text": "All", "value": ["$__all"]}}]},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Runnable queue depth", "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "queue_depth", "expr": "octorill_queue_depth{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{executor}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Oldest runnable age", "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "catalog_query_id": "queue_oldest_age", "expr": "octorill_queue_oldest_age_seconds{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{executor}}"}]},
+    {"id": 3, "type": "stat", "title": "Queue sampler stale", "gridPos": {"h": 6, "w": 8, "x": 0, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "sampler_stale_max", "expr": "max(octorill_sampler_stale{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"})"}]},
+    {"id": 4, "type": "timeseries", "title": "Worker attempt rate", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "worker_rate", "expr": "sum(rate(octorill_worker_operations_total{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\",phase=\"attempt\"}[5m])) by (executor, outcome)", "legendFormat": "{{executor}} {{outcome}}"}]},
+    {"id": 5, "type": "timeseries", "title": "Worker attempt p95", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 9}, "targets": [{"refId": "A", "catalog_query_id": "worker_p95", "expr": "histogram_quantile(0.95, sum(rate(octorill_worker_duration_seconds_bucket{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\",phase=\"attempt\"}[5m])) by (le, executor))", "legendFormat": "{{executor}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Worker active", "gridPos": {"h": 6, "w": 12, "x": 0, "y": 17}, "targets": [{"refId": "A", "catalog_query_id": "worker_active", "expr": "octorill_worker_active{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}", "legendFormat": "{{executor}}"}]},
+    {"id": 7, "type": "timeseries", "title": "Process CPU rate", "gridPos": {"h": 6, "w": 12, "x": 12, "y": 17}, "targets": [{"refId": "A", "catalog_query_id": "process_cpu_rate", "expr": "rate(octorill_process_cpu_seconds{service=~\"$service\",environment=~\"$environment\",instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}]}
+  ]
+}

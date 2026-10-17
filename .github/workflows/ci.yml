@@ -59,6 +59,36 @@ jobs:
       - name: Validate brand media source packages
         run: python3 scripts/brand_media_sources.py --check
 
+      - name: Validate monitoring assets and topic contract
+        run: |
+          python3 scripts/validate_observability.py
+          python3 bin/spec_contract_check.py --path docs/specs/monitoring-dashboard/SPEC.md
+          python3 -m py_compile scripts/octorill-observe scripts/validate_observability.py scripts/test_octorill_observe.py bin/spec_contract_check.py
+          python3 scripts/test_octorill_observe.py
+
+      - name: Validate monitoring deployment syntax
+        working-directory: ops/observability
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f prometheus/secrets/octorill_metrics_token secrets/grafana_admin_password' EXIT
+          printf 'ci-token\n' > prometheus/secrets/octorill_metrics_token
+          printf 'ci-password\n' > secrets/grafana_admin_password
+          docker compose config --quiet
+          docker run --rm \
+            --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.15.0 \
+            check config \
+            /etc/prometheus/prometheus.yml
+          docker run --rm \
+            --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.15.0 \
+            check rules \
+            /etc/prometheus/rules/octorill-recording.yml \
+            /etc/prometheus/rules/octorill-alerts.yml
+
       - name: Set up Bun (optional)
         if: hashFiles('web/package.json') != ''
         uses: oven-sh/setup-bun@v2
@@ -477,6 +507,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && inputs.ci_performance_target_sha || github.sha }}
+
+      - name: Set up Rust toolchain (macOS application compile)
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+
+      - name: Compile application on macOS
+        if: runner.os == 'macOS'
+        run: cargo check --locked --all-features
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2

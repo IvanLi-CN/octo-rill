@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: OctoRill monitoring
+    orgId: 1
+    folder: OctoRill
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

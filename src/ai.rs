@@ -11,6 +11,7 @@ use chrono::{
     offset::LocalResult,
 };
 use rand::RngExt;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -568,6 +569,14 @@ impl LlmScheduler {
 
         drop(waiting_guard);
         let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream(
+                "llm",
+                "scheduler_wait",
+                if wait_ms > 0 { "queued" } else { "admitted" },
+                Duration::from_millis(wait_ms.max(0) as u64),
+            );
+        }
         (
             wait_ms,
             SchedulerInFlightGuard {
@@ -2900,15 +2909,30 @@ async fn chat_completion_once(
     };
 
     let response_wait_started_at = Instant::now();
+    let upstream_started_at = Instant::now();
     let resp = state
         .http
         .post(url)
         .bearer_auth(&ai.api_key)
         .json(&req)
         .send()
-        .await
-        .map_err(|err| {
-            ChatCompletionAttemptError::new(
+        .await;
+    let resp = match resp {
+        Ok(resp) => resp,
+        Err(err) => {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream(
+                    "llm",
+                    "chat_completions",
+                    if err.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    },
+                    upstream_started_at.elapsed(),
+                );
+            }
+            return Err(ChatCompletionAttemptError::new(
                 anyhow!("AI request failed: {err}"),
                 if is_retryable_transport_error(&err) {
                     LlmFailureClass::Transient
@@ -2917,8 +2941,9 @@ async fn chat_completion_once(
                 },
                 None,
                 None,
-            )
-        })?;
+            ));
+        }
+    };
     let first_token_wait_ms =
         i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
     if first_token_wait_ms >= state.config.logging.upstream_slow_ms as i64 {
@@ -2949,17 +2974,54 @@ async fn chat_completion_once(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .unwrap_or_default();
-    let body = resp.bytes().await.map_err(|err| {
-        ChatCompletionAttemptError::new(
-            anyhow!("AI read response failed: {err}"),
-            LlmFailureClass::Transient,
-            None,
-            first_token_wait_ms,
-        )
-        .with_provider_metadata(provider_request_id.clone(), provider_http_status, None)
-    })?;
+    let body = match resp.bytes().await {
+        Ok(body) => body,
+        Err(err) => {
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream(
+                    "llm",
+                    "chat_completions",
+                    if err.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport_error"
+                    },
+                    upstream_started_at.elapsed(),
+                );
+            }
+            return Err(ChatCompletionAttemptError::new(
+                anyhow!("AI read response failed: {err}"),
+                LlmFailureClass::Transient,
+                None,
+                first_token_wait_ms,
+            )
+            .with_provider_metadata(
+                provider_request_id.clone(),
+                provider_http_status,
+                None,
+            ));
+        }
+    };
 
     if !status.is_success() {
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream(
+                "llm",
+                "chat_completions",
+                if status.as_u16() == 429 {
+                    "rate_limited"
+                } else if status == StatusCode::FORBIDDEN {
+                    "forbidden"
+                } else if status.is_client_error() {
+                    "http_4xx"
+                } else if status.is_server_error() {
+                    "http_5xx"
+                } else {
+                    "other"
+                },
+                upstream_started_at.elapsed(),
+            );
+        }
         let msg = extract_error_message(&body).unwrap_or_else(|| "upstream_error".to_owned());
         return Err(ChatCompletionAttemptError::new(
             anyhow!("AI returned {status}: {msg}"),
@@ -2972,19 +3034,40 @@ async fn chat_completion_once(
 
     let content_type_lower = content_type.to_ascii_lowercase();
     if content_type_lower.contains("text/event-stream") {
-        return parse_chat_completion_sse_output(
+        let result = parse_chat_completion_sse_output(
             &body,
             content_type.as_str(),
             first_token_wait_ms,
             provider_request_id,
             provider_http_status,
         );
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream(
+                "llm",
+                "chat_completions",
+                if result.is_ok() {
+                    "success"
+                } else {
+                    "decode_error"
+                },
+                upstream_started_at.elapsed(),
+            );
+        }
+        return result;
     }
     if !content_type_lower.is_empty()
         && !content_type_lower.contains("application/json")
         && !content_type_lower.contains("+json")
     {
         let msg = extract_error_message(&body).unwrap_or_else(|| "non_json_success".to_owned());
+        if let Some(metrics) = crate::metrics::global() {
+            metrics.record_upstream(
+                "llm",
+                "chat_completions",
+                "decode_error",
+                upstream_started_at.elapsed(),
+            );
+        }
         return Err(ChatCompletionAttemptError::new(
             anyhow!("AI returned non-json success response (content-type {content_type}): {msg}"),
             LlmFailureClass::Configuration,
@@ -2994,21 +3077,44 @@ async fn chat_completion_once(
         .with_provider_metadata(provider_request_id, provider_http_status, None));
     }
 
-    let resp: ChatCompletionsResponse = serde_json::from_slice(&body).map_err(|err| {
-        let message = extract_error_message(&body)
-            .unwrap_or_else(|| format!("{err}; upstream_json_decode_failed"));
-        ChatCompletionAttemptError::new(
-            anyhow!("AI response json decode failed: {message}"),
-            if ai_response_message_is_non_retryable(&message) {
-                LlmFailureClass::Configuration
-            } else {
-                LlmFailureClass::Transient
-            },
-            None,
-            first_token_wait_ms,
-        )
-        .with_provider_metadata(provider_request_id.clone(), provider_http_status, None)
-    })?;
+    let resp: ChatCompletionsResponse = match serde_json::from_slice(&body) {
+        Ok(response) => response,
+        Err(err) => {
+            let message = extract_error_message(&body)
+                .unwrap_or_else(|| format!("{err}; upstream_json_decode_failed"));
+            if let Some(metrics) = crate::metrics::global() {
+                metrics.record_upstream(
+                    "llm",
+                    "chat_completions",
+                    "decode_error",
+                    upstream_started_at.elapsed(),
+                );
+            }
+            return Err(ChatCompletionAttemptError::new(
+                anyhow!("AI response json decode failed: {message}"),
+                if ai_response_message_is_non_retryable(&message) {
+                    LlmFailureClass::Configuration
+                } else {
+                    LlmFailureClass::Transient
+                },
+                None,
+                first_token_wait_ms,
+            )
+            .with_provider_metadata(
+                provider_request_id.clone(),
+                provider_http_status,
+                None,
+            ));
+        }
+    };
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.record_upstream(
+            "llm",
+            "chat_completions",
+            "success",
+            upstream_started_at.elapsed(),
+        );
+    }
 
     let ChatCompletionsResponse { id, choices, usage } = resp;
 
@@ -3201,6 +3307,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
     loop {
         attempt = attempt.saturating_add(1);
         candidate_attempts = candidate_attempts.saturating_add(1);
+        let attempt_started_at = Instant::now();
         let model_for_call = candidates[candidate_index].clone();
         let mut ai = base_ai.clone();
         ai.model = model_for_call.clone();
@@ -3556,6 +3663,14 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     candidate_index += 1;
                     candidate_attempts = 0;
                     fallback_count = fallback_count.saturating_add(1);
+                    if let Some(metrics) = crate::metrics::global() {
+                        metrics.record_upstream(
+                            "llm",
+                            "chat_completions",
+                            "fallback",
+                            attempt_started_at.elapsed(),
+                        );
+                    }
                     let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
                         set_llm_admin_override_if_owned(

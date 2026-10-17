@@ -1560,7 +1560,12 @@ impl TranslationSchedulerController {
                 break;
             };
 
-            if let Err(err) = run_translation_scheduler_once(state.as_ref(), profile.clone()).await
+            if let Err(err) = crate::metrics::observe_worker(
+                "translation",
+                "logical",
+                run_translation_scheduler_once(state.as_ref(), profile.clone()),
+            )
+            .await
             {
                 warn!(
                     ?err,
@@ -5245,7 +5250,12 @@ async fn run_translation_scheduler_once(
         }
         return Ok(());
     };
-    execute_claimed_batch(state, batch).await
+    crate::metrics::observe_worker(
+        "translation",
+        "attempt",
+        execute_claimed_batch(state, batch),
+    )
+    .await
 }
 
 async fn claim_next_batch(
