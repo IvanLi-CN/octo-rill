@@ -441,6 +441,15 @@ mod tests {
             .expect("read migration 91 indexes"),
             3
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_content_work_items_resource_scope_status'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read content work supersession index"),
+            1
+        );
         let trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
         )

@@ -69,6 +69,7 @@ struct SqliteWriteState {
     background_lane_admitted: u64,
     background_rejected: u64,
     background_lane_next: HashMap<&'static str, Instant>,
+    background_lane_cursor: HashMap<&'static str, (String, String)>,
     background_lane_coalesced: u64,
 }
 
@@ -347,6 +348,27 @@ impl SqliteWriteCoordinator {
             "sqlite background lane admitted"
         );
         true
+    }
+
+    pub(crate) fn background_lane_cursor(&self, lane: &'static str) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.background_lane_cursor.get(lane).cloned())
+    }
+
+    pub(crate) fn set_background_lane_cursor(
+        &self,
+        lane: &'static str,
+        cursor: Option<(String, String)>,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(cursor) = cursor {
+                state.background_lane_cursor.insert(lane, cursor);
+            } else {
+                state.background_lane_cursor.remove(lane);
+            }
+        }
     }
 
     pub async fn write<T, Fut, Op>(&self, lane: &'static str, operation: Op) -> Result<T>
