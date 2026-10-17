@@ -8,6 +8,12 @@
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
+## Current performance follow-up
+
+- 本轮 parent PR 只收敛两个实现缺口：claim lane 的共享 admission/in-flight 合并，以及 Dashboard updates 的轻量 signature 查询。
+- worker 处理并发不等同于 SQLite writer 并发；网络、GitHub 和 LLM 工作继续在 writer permit 外执行，只有 claim 的短写入段受 admission 约束。
+- 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
+
 ## Coverage / rollout summary
 
 - 新增 `src/sqlite_write.rs`，提供 `SqliteWriteCoordinator`、单 writer permit、foreground/background/best-effort priority、`BEGIN IMMEDIATE` 事务入口、busy/locked 分类、bounded retry 与 tracing telemetry。
