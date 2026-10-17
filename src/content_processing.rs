@@ -2058,13 +2058,13 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
 
 async fn claim_next_admitted(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
     // Maintenance and route discovery happen before the short claim transaction.
-    let (_maintenance_permit, mut maintenance_tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_claim_prepare")
-        .await?;
-    ensure_global_mode_in_transaction(maintenance_tx.as_transaction_mut()).await?;
-    maintenance_tx.commit().await?;
-    drop(_maintenance_permit);
+    let _content_mode_guard = state.sqlite_writer.acquire_content_mode_read().await;
+    if current_mode(&state.pool).await? != ContentProcessingMode::Global {
+        return Ok(None);
+    }
+    let _runtime_settings_guard = crate::admin_runtime::runtime_settings_update_lock()
+        .lock()
+        .await;
     let mut route_tx = state.pool.begin().await?;
     let persisted_models =
         crate::admin_runtime::load_llm_models_in_transaction(&mut route_tx, &state.config).await?;
@@ -6724,7 +6724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_snapshots_the_persisted_route_under_the_claim_transaction() {
+    async fn claim_snapshots_the_persisted_route_before_the_claim_transaction() {
         let pool = global_pool().await;
         sqlx::query(
             "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
@@ -6761,6 +6761,32 @@ mod tests {
             .await
             .unwrap(),
             r#"["current-route"]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_does_not_cross_a_content_mode_freeze() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "frozen-work", "queued", 0, None).await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = global_state(pool.clone());
+
+        assert!(claim_next(&state, 1).await.unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'frozen-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "queued"
+        );
+        assert_eq!(
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::RollbackFreeze
         );
     }
 
