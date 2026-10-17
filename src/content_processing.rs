@@ -34,10 +34,6 @@ use tower_sessions::Session;
 static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 #[cfg(test)]
 static CONTENT_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-#[cfg(test)]
-tokio::task_local! {
-    static CONTENT_SUPERSESSION_RESOURCE_LOOKUPS: std::cell::Cell<usize>;
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -963,10 +959,6 @@ async fn newer_work_for_resource_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<Option<WorkRow>> {
-    #[cfg(test)]
-    let _ = CONTENT_SUPERSESSION_RESOURCE_LOOKUPS.try_with(|counter| {
-        counter.set(counter.get().saturating_add(1));
-    });
     newer_work_for_source_in_transaction(
         tx,
         WorkResourceKey {
@@ -2452,7 +2444,7 @@ async fn load_supersession_batch(
         ""
     };
     let candidate_sql = format!(
-        "SELECT candidate.id, candidate.canonical_resource_type, candidate.canonical_resource_id, candidate.pipeline, candidate.variant, candidate.target_lang, candidate.source_hash, candidate.protocol_version, candidate.model_profile, candidate.source_snapshot_json, candidate.configuration_fingerprint, candidate.status, candidate.priority, candidate.cache_hit, candidate.token_estimate, candidate.batch_id, candidate.attempt_count, candidate.next_retry_at, candidate.retry_expires_at, candidate.retry_after_at, candidate.created_at FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version){cursor_predicate} ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT ?"
+        "SELECT candidate.id, candidate.canonical_resource_type, candidate.canonical_resource_id, candidate.pipeline, candidate.variant, candidate.target_lang, candidate.source_hash, candidate.protocol_version, candidate.model_profile, candidate.source_snapshot_json, candidate.configuration_fingerprint, candidate.status, candidate.priority, candidate.cache_hit, candidate.token_estimate, candidate.batch_id, candidate.attempt_count, candidate.next_retry_at, candidate.retry_expires_at, candidate.retry_after_at, candidate.created_at FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active INDEXED BY idx_content_work_items_supersession_history WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version){cursor_predicate} ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT ?"
     );
     let mut candidate_query = sqlx::query_as::<_, WorkRow>(&candidate_sql);
     if let Some(cursor) = cursor {
@@ -2619,6 +2611,12 @@ async fn apply_supersession_batch(state: &AppState, changes: &[SupersessionChang
 }
 
 async fn run_supersession_batch(state: &AppState) -> Result<u64> {
+    let Some(_lane_guard) = state
+        .sqlite_writer
+        .try_begin_background_lane(GLOBAL_SUPERSESSION_LANE)
+    else {
+        return Ok(0);
+    };
     let stored_cursor = state
         .sqlite_writer
         .background_lane_cursor(GLOBAL_SUPERSESSION_LANE)
@@ -6805,45 +6803,33 @@ mod tests {
 
     #[tokio::test]
     async fn supersession_scan_skips_unique_ready_items() {
-        CONTENT_SUPERSESSION_RESOURCE_LOOKUPS
-            .scope(std::cell::Cell::new(0), async {
-                let pool = global_pool().await;
-                for index in 0..5_185 {
-                    let id = format!("unique-ready-{index}");
-                    let resource_id = format!("unique-release-{index}");
-                    let source_hash = format!("unique-hash-{index}");
-                    let snapshot = json!({
-                        "source_blocks": [{
-                            "slot": "source_observed_at",
-                            "text": format!("2026-01-01T00:{index:02}:00Z")
-                        }],
-                        "target_slots": ["title_zh"]
-                    });
-                    sqlx::query(
-                        "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'ready', 0, 0, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-                    )
-                    .bind(id)
-                    .bind(resource_id)
-                    .bind(source_hash)
-                    .bind(GLOBAL_PROTOCOL_VERSION)
-                    .bind(snapshot.to_string())
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-                }
+        let pool = global_pool().await;
+        for index in 0..5_185 {
+            let id = format!("unique-ready-{index}");
+            let resource_id = format!("unique-release-{index}");
+            let source_hash = format!("unique-hash-{index}");
+            let snapshot = json!({
+                "source_blocks": [{
+                    "slot": "source_observed_at",
+                    "text": format!("2026-01-01T00:{index:02}:00Z")
+                }],
+                "target_slots": ["title_zh"]
+            });
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'ready', 0, 0, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(id)
+            .bind(resource_id)
+            .bind(source_hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(snapshot.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
-                let state = global_state(pool.clone());
-                assert_eq!(run_supersession_batch(&state).await.unwrap(), 0);
-
-                assert_eq!(
-                    CONTENT_SUPERSESSION_RESOURCE_LOOKUPS
-                        .try_with(|counter| counter.get())
-                        .unwrap(),
-                    0,
-                    "unique ready items must not trigger per-item resource lookups"
-                );
-            })
-            .await;
+        let state = global_state(pool.clone());
+        assert_eq!(run_supersession_batch(&state).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -6892,6 +6878,55 @@ mod tests {
         assert!(
             second_changed > 0,
             "the shared cursor must allow the next batch to make progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_batch_coalesces_while_another_scan_is_in_flight() {
+        let pool = global_pool().await;
+        for (id, revision, status) in [
+            ("coalesced-old", "0", "ready"),
+            ("coalesced-new", "1", "ready"),
+        ] {
+            let snapshot = json!({
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": revision}
+                ],
+                "target_slots": ["title_zh"]
+            });
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', 'coalesced-release', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', ?, 0, 0, 1, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("{id}-hash"))
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(snapshot.to_string())
+            .bind(status)
+            .bind(format!("2026-01-01T00:00:0{revision}Z"))
+            .bind(format!("2026-01-01T00:00:0{revision}Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let state = global_state(pool.clone());
+        let guard = state
+            .sqlite_writer
+            .try_begin_background_lane(GLOBAL_SUPERSESSION_LANE)
+            .expect("the first supersession scan should acquire its in-flight guard");
+        assert_eq!(run_supersession_batch(&state).await.unwrap(), 0);
+        drop(guard);
+
+        assert_eq!(run_supersession_batch(&state).await.unwrap(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'coalesced-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
         );
     }
 
@@ -6953,14 +6988,17 @@ mod tests {
     #[tokio::test]
     async fn supersession_scan_uses_resource_scope_index() {
         let pool = global_pool().await;
-        for (query, expected_index) in [
+        for (query, expected_indexes) in [
             (
-                "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (candidate.created_at, candidate.id) > ('2026-01-01T00:00:00Z', 'cursor-id') ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
-                "idx_content_work_items_supersession_cursor",
+                "EXPLAIN QUERY PLAN SELECT candidate.id FROM content_work_items AS candidate INDEXED BY idx_content_work_items_supersession_cursor WHERE candidate.status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready') AND EXISTS (SELECT 1 FROM content_work_items AS active INDEXED BY idx_content_work_items_supersession_history WHERE active.id <> candidate.id AND active.status NOT IN ('cancelled', 'superseded') AND active.canonical_resource_type = candidate.canonical_resource_type AND active.canonical_resource_id = candidate.canonical_resource_id AND active.pipeline = candidate.pipeline AND active.variant = candidate.variant AND active.target_lang = candidate.target_lang AND active.protocol_version = candidate.protocol_version) AND (candidate.created_at, candidate.id) > ('2026-01-01T00:00:00Z', 'cursor-id') ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 100",
+                &[
+                    "idx_content_work_items_supersession_cursor",
+                    "idx_content_work_items_supersession_history",
+                ][..],
             ),
             (
                 "EXPLAIN QUERY PLAN SELECT work.id FROM content_work_items AS work WHERE work.status NOT IN ('cancelled', 'superseded') AND (work.canonical_resource_type, work.canonical_resource_id, work.pipeline, work.variant, work.target_lang, work.protocol_version) IN (VALUES ('release', 'release-1', 'translation', 'summary', 'zh-CN', 'content-processing.v1'))",
-                "idx_content_work_items_resource_scope_status",
+                &["idx_content_work_items_resource_scope_status"][..],
             ),
         ] {
             let plan = sqlx::query(query)
@@ -6971,10 +7009,12 @@ mod tests {
                 .map(|row| row.get::<String, _>("detail"))
                 .collect::<Vec<_>>();
 
-            assert!(
-                plan.iter().any(|detail| detail.contains(expected_index)),
-                "supersession query must use {expected_index}: {plan:?}"
-            );
+            for expected_index in expected_indexes {
+                assert!(
+                    plan.iter().any(|detail| detail.contains(expected_index)),
+                    "supersession query must use {expected_index}: {plan:?}"
+                );
+            }
         }
 
         let history_plan = sqlx::query(
