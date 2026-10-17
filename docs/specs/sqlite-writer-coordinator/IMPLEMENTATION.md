@@ -13,6 +13,8 @@
 - 本轮 parent PR 只收敛两个实现缺口：claim lane 的共享 admission/in-flight 合并，以及 Dashboard updates 的轻量 signature 查询。
 - worker 处理并发不等同于 SQLite writer 并发；网络、GitHub 和 LLM 工作继续在 writer permit 外执行，只有 claim 的短写入段受 admission 约束。
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
+- 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
+- migration `0092_content_work_supersession_lookup_index.sql` 增加 candidate cursor、active history 与 resource scope partial indexes；启动时由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
 ## Coverage / rollout summary
 
@@ -73,11 +75,13 @@
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
 - 当前 parent `fa5f72d8` 的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates `48ms`、session save `42ms`、task enqueue `38ms`，最大前台请求 `48ms`，`busy_or_500=0`；social snapshot 15 个分块、最大分块 `111ms`、最大 writer wait `0ms`。
+- 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 54 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
 - 当前 parent PR #326 的最新 GitHub CI runs `39056635621` / `39056635629`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
 
 ## Remaining Gaps
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；已发布版本仍为 `v2.77.0`，目标 SHA 为 `0a6cafbac8bd0e9c4ef35586621ad131ccf5360d`。
+- `0092` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug` 与 `octo_rill::sqlite_write=debug`，并记录 `selected/read_rows/read_pages/largest_read_page/changed`、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
 - 计划要求的完整当前候选 file-backed WAL/HTTP 经验验收（HTTP p95/p99、CPU、writer wait/admission/deadline 汇总）仍未形成可绑定 `fa5f72d8` 的完整证据卡；当前已完成的是上述生产形状并发回归，尚未测量 CPU 五分钟中位数，也未进行合并后的 101 线上 30 分钟观察。仓库中的 `tmp/sqlite_acceptance.py` 仅存在于历史记录，当前工作树没有该 harness。parent PR 可审查且 CI 已通过，但在这两项完成前不应宣称线上性能已验证或生成新 release。
 
 ## Related Changes
