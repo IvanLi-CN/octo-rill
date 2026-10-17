@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use rand::RngExt;
 
@@ -15,6 +21,86 @@ const JITTER_MAX_MS: u64 = 250;
 #[derive(Debug, Default)]
 pub(crate) struct WorkerBackoff {
     consecutive_failures: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ClaimAdmission {
+    in_flight: AtomicBool,
+    retry_at: Mutex<Option<Instant>>,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) enum ClaimAdmissionResult<'a> {
+    Admitted(ClaimAdmissionGuard<'a>),
+    Coalesced,
+    CoolingDown,
+}
+
+pub(crate) struct ClaimAdmissionGuard<'a> {
+    admission: &'a ClaimAdmission,
+}
+
+impl ClaimAdmission {
+    pub(crate) const fn new() -> Self {
+        Self {
+            in_flight: AtomicBool::new(false),
+            retry_at: Mutex::new(None),
+            failures: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn try_admit(&self) -> ClaimAdmissionResult<'_> {
+        let Ok(retry_at) = self.retry_at.lock() else {
+            return ClaimAdmissionResult::Coalesced;
+        };
+        if retry_at.is_some_and(|retry_at| Instant::now() < retry_at) {
+            return ClaimAdmissionResult::CoolingDown;
+        }
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return ClaimAdmissionResult::Coalesced;
+        }
+        ClaimAdmissionResult::Admitted(ClaimAdmissionGuard { admission: self })
+    }
+}
+
+impl ClaimAdmissionGuard<'_> {
+    pub(crate) fn success(&mut self) {
+        if let Ok(mut retry_at) = self.admission.retry_at.lock() {
+            *retry_at = None;
+        }
+        self.admission.failures.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fail(&mut self) {
+        const FLOORS: [Duration; 6] = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(30),
+        ];
+        let index = self
+            .admission
+            .failures
+            .fetch_add(1, Ordering::Relaxed)
+            .min(FLOORS.len() - 1);
+        let delay =
+            FLOORS[index] + Duration::from_millis(rand::rng().random_range(0..=JITTER_MAX_MS));
+        if let Ok(mut retry_at) = self.admission.retry_at.lock() {
+            *retry_at = Some(Instant::now() + delay);
+        }
+    }
+}
+
+impl Drop for ClaimAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.admission.in_flight.store(false, Ordering::Release);
+    }
 }
 
 impl WorkerBackoff {
@@ -69,6 +155,25 @@ mod tests {
             backoff.next_delay_with_jitter(Duration::ZERO),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn claim_admission_coalesces_in_flight_and_cools_down_after_failure() {
+        let admission = ClaimAdmission::new();
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("first claim should be admitted"),
+        };
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::Coalesced
+        ));
+        guard.fail();
+        drop(guard);
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::CoolingDown
+        ));
     }
 
     #[tokio::test(start_paused = true)]
