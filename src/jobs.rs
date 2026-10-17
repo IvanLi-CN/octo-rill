@@ -26,7 +26,7 @@ use crate::{
     sqlite_write::{is_sqlite_background_admission_error, is_sqlite_write_deadline_error},
     state::AppState,
     sync, translations, webhook_push,
-    worker_backoff::WorkerBackoff,
+    worker_backoff::{ClaimAdmission, ClaimAdmissionResult, WorkerBackoff},
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -159,15 +159,13 @@ const RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND: i64 = 100;
 const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
 const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
-static TASK_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static TASK_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
+#[cfg(test)]
+static TASK_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 pub fn is_scheduled_task_type(task_type: &str) -> bool {
     SCHEDULED_TASK_TYPES.contains(&task_type)
-}
-
-fn task_claim_lock() -> &'static tokio::sync::Mutex<()> {
-    TASK_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn task_singleton_enqueue_lock() -> &'static tokio::sync::Mutex<()> {
@@ -219,9 +217,17 @@ pub fn spawn_task_worker(state: Arc<AppState>) {
                 }
                 Err(err) => {
                     let retry_after = claim_backoff.next_delay();
+                    let error_kind = if is_sqlite_write_deadline_error(err.as_ref()) {
+                        "writer_deadline"
+                    } else if is_sqlite_background_admission_error(err.as_ref()) {
+                        "background_admission_denied"
+                    } else {
+                        "database_attempt"
+                    };
                     tracing::warn!(
                         lane = "job_task_claim",
-                        error_kind = "database_attempt",
+                        event = error_kind,
+                        error_kind,
                         failure_count = claim_backoff.failure_count(),
                         ?err,
                         retry_after_ms = retry_after.as_millis(),
@@ -2488,7 +2494,50 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 }
 
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
-    let _claim_guard = task_claim_lock().lock().await;
+    #[cfg(test)]
+    let _test_claim_guard = TASK_CLAIM_TEST_SERIALIZER.lock().await;
+    let mut admission = match TASK_CLAIM_ADMISSION.try_admit() {
+        ClaimAdmissionResult::Admitted(guard) => guard,
+        ClaimAdmissionResult::Coalesced => {
+            tracing::debug!(event = "claim_coalesced", lane = "job_task_claim");
+            return Ok(None);
+        }
+        ClaimAdmissionResult::CoolingDown => {
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "job_task_claim"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::debug!(event = "claim_admitted", lane = "job_task_claim");
+    let result = claim_next_queued_task_admitted(state).await;
+    if result.is_ok() {
+        admission.success();
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::warn!(event = "writer_deadline", lane = "job_task_claim");
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::debug!(
+            event = "background_admission_denied",
+            lane = "job_task_claim"
+        );
+    } else {
+        admission.fail();
+    }
+    result
+}
+
+async fn claim_next_queued_task_admitted(state: &AppState) -> Result<Option<TaskRow>> {
     let (sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "job_task_claim")

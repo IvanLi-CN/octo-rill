@@ -865,12 +865,12 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
     let pool = config.sqlite_pool_max_connections;
     let translation_workers = runtime_settings.translation_general_worker_concurrency
         + runtime_settings.translation_dedicated_worker_concurrency;
-    let background_workers = config.job_worker_concurrency
+    let logical_worker_concurrency = config.job_worker_concurrency
         + runtime_settings.repo_release_worker_concurrency
         + translation_workers;
     if runtime_settings.repo_release_worker_concurrency > pool
         || translation_workers > pool.saturating_mul(2)
-        || background_workers > pool.saturating_mul(4)
+        || logical_worker_concurrency > pool.saturating_mul(4)
     {
         warn!(
             sqlite_pool_max_connections = pool,
@@ -880,8 +880,10 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
                 runtime_settings.translation_general_worker_concurrency,
             translation_dedicated_worker_concurrency =
                 runtime_settings.translation_dedicated_worker_concurrency,
+            logical_worker_concurrency,
+            claim_admission_per_lane = 1,
             llm_max_concurrency = runtime_settings.llm_max_concurrency,
-            "runtime worker concurrency exceeds sqlite pool budget"
+            "logical processing concurrency exceeds sqlite pool size; database claims remain admitted once per lane"
         );
     }
 }

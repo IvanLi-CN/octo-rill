@@ -1,10 +1,12 @@
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
     time::{Duration, Instant},
@@ -26,10 +28,13 @@ use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
     admin_runtime, content_processing, jobs, local_id, runtime,
-    sqlite_write::{SqliteWritePermit, SqliteWritePriority},
+    sqlite_write::{
+        SqliteWritePermit, SqliteWritePriority, is_sqlite_background_admission_error,
+        is_sqlite_write_deadline_error,
+    },
     state::AppState,
     translations,
-    worker_backoff::WorkerBackoff,
+    worker_backoff::{ClaimAdmission, ClaimAdmissionResult, WorkerBackoff},
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
@@ -96,7 +101,7 @@ const SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE: i64 = 2_000;
 const SUBSCRIPTION_PRUNE_WATCHERS_MAX_BATCHES: usize = 20;
 const SUBSCRIPTION_PRUNE_EVENTS_MAX_BATCHES: usize = 8;
 
-static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static REPO_RELEASE_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -394,10 +399,6 @@ pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Va
     })
 }
 
-fn repo_release_claim_lock() -> &'static tokio::sync::Mutex<()> {
-    REPO_RELEASE_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
 pub fn spawn_repo_release_workers(state: Arc<AppState>) {
     for worker_index in 0..REPO_RELEASE_WORKERS_MAX.max(1) {
         let state = state.clone();
@@ -412,9 +413,17 @@ pub fn spawn_repo_release_workers(state: Arc<AppState>) {
                     }
                     Err(err) => {
                         let retry_after = claim_backoff.next_delay();
+                        let error_kind = if is_sqlite_write_deadline_error(err.as_ref()) {
+                            "writer_deadline"
+                        } else if is_sqlite_background_admission_error(err.as_ref()) {
+                            "background_admission_denied"
+                        } else {
+                            "database_attempt"
+                        };
                         tracing::warn!(
                             lane = "repo_release_claim",
-                            error_kind = "database_attempt",
+                            event = error_kind,
+                            error_kind,
                             failure_count = claim_backoff.failure_count(),
                             ?err,
                             retry_after_ms = retry_after.as_millis(),
@@ -8983,7 +8992,50 @@ async fn sync_notifications_for_user(
 async fn claim_next_repo_release_work_item(
     state: &AppState,
 ) -> Result<Option<RepoReleaseWorkItemRow>> {
-    let _claim_guard = repo_release_claim_lock().lock().await;
+    let mut admission = match REPO_RELEASE_CLAIM_ADMISSION.try_admit() {
+        ClaimAdmissionResult::Admitted(guard) => guard,
+        ClaimAdmissionResult::Coalesced => {
+            tracing::debug!(event = "claim_coalesced", lane = "repo_release_claim");
+            return Ok(None);
+        }
+        ClaimAdmissionResult::CoolingDown => {
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "repo_release_claim"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::debug!(event = "claim_admitted", lane = "repo_release_claim");
+    let result = claim_next_repo_release_work_item_admitted(state).await;
+    if result.is_ok() {
+        admission.success();
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::warn!(event = "writer_deadline", lane = "repo_release_claim");
+    } else if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
+    {
+        admission.fail();
+        tracing::debug!(
+            event = "background_admission_denied",
+            lane = "repo_release_claim"
+        );
+    } else {
+        admission.fail();
+    }
+    result
+}
+
+async fn claim_next_repo_release_work_item_admitted(
+    state: &AppState,
+) -> Result<Option<RepoReleaseWorkItemRow>> {
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "repo_release_claim")
