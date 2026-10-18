@@ -1083,6 +1083,16 @@ pub async fn submit_item(
     mode: &str,
     item: &translations::TranslationRequestItemInput,
 ) -> Result<(StatusCode, GlobalSubmissionResponse), ApiError> {
+    submit_item_with_admission(state, user_id, mode, item, &CONTENT_CLAIM_ADMISSION).await
+}
+
+async fn submit_item_with_admission(
+    state: &AppState,
+    user_id: &str,
+    mode: &str,
+    item: &translations::TranslationRequestItemInput,
+    claim_admission: &ClaimAdmission,
+) -> Result<(StatusCode, GlobalSubmissionResponse), ApiError> {
     // This is the scheduler admission transaction. API adapters only provide
     // an already-authorized immutable request; provider calls, attempts and
     // terminal projections remain scheduler-worker responsibilities.
@@ -1468,7 +1478,7 @@ pub async fn submit_item(
     .map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
     if work.status == "queued" {
-        CONTENT_CLAIM_ADMISSION.wake();
+        claim_admission.wake();
     }
     let mut status_code = if existing_work && matches!(work.status.as_str(), "queued" | "running") {
         StatusCode::CONFLICT
@@ -2428,6 +2438,13 @@ async fn load_recovery_batch(state: &AppState, now: &str) -> Result<RecoveryBatc
 }
 
 async fn recover_due(state: &AppState) -> Result<()> {
+    recover_due_with_admission(state, &CONTENT_CLAIM_ADMISSION).await
+}
+
+async fn recover_due_with_admission(
+    state: &AppState,
+    claim_admission: &ClaimAdmission,
+) -> Result<()> {
     let Some(_recovery_guard) = state
         .sqlite_writer
         .try_admit_background_lane("content_processing_recover", GLOBAL_RECOVERY_CADENCE)
@@ -2469,7 +2486,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     tx.commit().await?;
     drop(_lock);
     if batch.wakes_claim_worker() {
-        CONTENT_CLAIM_ADMISSION.wake();
+        claim_admission.wake();
     }
     if supersession_admitted {
         run_supersession_batch(state).await?;
@@ -4752,13 +4769,20 @@ enum GlobalSchedulerAttempt {
 }
 
 async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttempt> {
+    run_once_with_admission(state, &CONTENT_CLAIM_ADMISSION).await
+}
+
+async fn run_once_with_admission(
+    state: &AppState,
+    claim_admission: &ClaimAdmission,
+) -> Result<GlobalSchedulerAttempt> {
     if current_mode(&state.pool).await? != ContentProcessingMode::Global {
         return Ok(GlobalSchedulerAttempt::Idle);
     }
     if !content_identity_upgrade::is_complete(&state.pool).await? {
         return Ok(GlobalSchedulerAttempt::Idle);
     }
-    if let Err(error) = recover_due(state).await {
+    if let Err(error) = recover_due_with_admission(state, claim_admission).await {
         if is_sqlite_background_admission_error(error.as_ref()) {
             return Ok(GlobalSchedulerAttempt::BackgroundAdmissionDenied(error));
         }
@@ -4782,7 +4806,7 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     } else {
         1
     };
-    let Some(work) = (match claim_next(state, manual_limit).await {
+    let Some(work) = (match claim_next_with_admission(state, manual_limit, claim_admission).await {
         Ok(work) => work,
         Err(error) if is_sqlite_background_admission_error(error.as_ref()) => {
             return Ok(GlobalSchedulerAttempt::BackgroundAdmissionDenied(error));
@@ -4793,7 +4817,7 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     };
     let execution =
         crate::metrics::observe_worker("content", "attempt", execute(state, work)).await;
-    CONTENT_CLAIM_ADMISSION.wake();
+    claim_admission.wake();
     match execution {
         Ok(()) => Ok(GlobalSchedulerAttempt::Claimed),
         Err(error) if is_sqlite_database_error(error.as_ref()) => {
@@ -8139,12 +8163,14 @@ mod tests {
         .await
         .expect("coordinated write should observe the external sqlite lock");
 
+        let claim_admission = Arc::new(ClaimAdmission::new());
         let mut background_tasks = Vec::new();
         for _ in 0..8 {
             let worker_state = state.clone();
+            let worker_admission = claim_admission.clone();
             background_tasks.push(tokio::spawn(async move {
                 for _ in 0..16 {
-                    run_once_with_outcome(worker_state.as_ref())
+                    run_once_with_admission(worker_state.as_ref(), worker_admission.as_ref())
                         .await
                         .expect("background scheduler attempt");
                     tokio::task::yield_now().await;
@@ -8161,6 +8187,31 @@ mod tests {
             sqlite_writer.runtime_status().waiting_background,
             0,
             "empty-queue claim probes must not wait for the writer"
+        );
+        assert!(
+            claim_admission.retry_after(Duration::ZERO) > Duration::ZERO,
+            "shared claim admission should install an empty-queue cooldown"
+        );
+        let empty_status = sqlite_writer.runtime_status();
+        assert_eq!(
+            empty_status.background_admitted, 0,
+            "empty claim probes must not enter the background writer: {empty_status:?}"
+        );
+        assert_eq!(
+            empty_status.background_rejected, 0,
+            "empty claim probes must not be rejected after waiting for the writer: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_admitted * 4 < 128,
+            "recovery admission should be materially lower than worker attempts: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_coalesced + empty_status.background_lane_admitted >= 128,
+            "recovery cadence should coalesce repeated worker passes: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_coalesced > 0,
+            "repeated empty recovery passes should be coalesced: {empty_status:?}"
         );
 
         let mut foreground_tasks = Vec::new();
@@ -8204,6 +8255,40 @@ mod tests {
             .await
             .expect("sqlite contention probe should join")
             .expect("sqlite contention probe should succeed after lock release");
+
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "feed.auto_translate:release:shared-admission-wake".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "shared-admission-wake".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "Shared claim admission wake".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let (submit_status, submit_response) =
+            submit_item_with_admission(&state, "user-1", "async", &item, claim_admission.as_ref())
+                .await
+                .expect("foreground submission should wake the shared claim admission");
+        assert_eq!(submit_status, StatusCode::ACCEPTED);
+        assert_eq!(submit_response.status, "queued");
+        sqlx::query(
+            "UPDATE content_work_items SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(&submit_response.work_item_id)
+        .execute(&reader_pool)
+        .await
+        .expect("make the submitted work due for the claim probe");
+        assert!(
+            claim_next_with_admission(&state, 1, claim_admission.as_ref())
+                .await
+                .expect("claim should observe the submission wake")
+                .is_some(),
+            "submission wake should bypass the empty-queue cooldown"
+        );
 
         let error_response = app
             .clone()
@@ -8309,26 +8394,6 @@ mod tests {
         assert!(!status.active, "writer permit must be released after load");
         assert_eq!(status.waiting_foreground, 0);
         assert_eq!(status.waiting_background, 0);
-        assert_eq!(
-            status.background_admitted, 0,
-            "empty claim probes must not enter the background writer: {status:?}"
-        );
-        assert_eq!(
-            status.background_rejected, 0,
-            "empty claim probes must not be rejected after waiting for the writer: {status:?}"
-        );
-        assert!(
-            status.background_lane_admitted * 4 < 128,
-            "recovery admission should be materially lower than worker attempts: {status:?}"
-        );
-        assert!(
-            status.background_lane_coalesced + status.background_lane_admitted >= 128,
-            "recovery cadence should coalesce repeated worker passes: {status:?}"
-        );
-        assert!(
-            status.background_lane_coalesced > 0,
-            "repeated empty recovery passes should be coalesced: {status:?}"
-        );
 
         let cleanup_probe_pool = reader_pool.clone();
         sqlite_writer
@@ -8419,6 +8484,11 @@ mod tests {
         session.save().await.expect("persist recovery session");
         let session_id = session.id().expect("recovery session has an id");
 
+        let external_lock = reader_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold sqlite writer lock while recovery is admitted");
+
         let recovery_task = {
             let state = state.clone();
             tokio::spawn(async move {
@@ -8475,6 +8545,25 @@ mod tests {
                 started.elapsed()
             })
         };
+
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground writes should wait while recovery owns the writer admission");
+        assert!(
+            sqlite_writer.runtime_status().active,
+            "recovery should retain the writer admission while foreground writes wait"
+        );
+        external_lock
+            .rollback()
+            .await
+            .expect("release sqlite writer lock after foreground waiters are observed");
 
         let (recovery_latency, session_latency, enqueue_latency) =
             tokio::join!(recovery_task, session_task, enqueue_task,);
