@@ -7905,7 +7905,7 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn file_backed_scheduler_pressure_preserves_foreground_session_writes() {
         let log_buffer = SharedLogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -8133,13 +8133,29 @@ mod tests {
         assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
 
         let events = log_buffer.json_events();
+        let correlated_request_id = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|request_id| request_id.starts_with("foreground-"))
+                    && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                    && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+            })
+            .and_then(|event| event.get("request_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .expect("a foreground session write should emit correlated SQLite telemetry");
         let correlated_access = events
             .iter()
             .find(|event| {
                 event.get("event") == Some(&Value::String("http.access".to_owned()))
-                    && event.get("request_id") == Some(&Value::String("foreground-0".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String(correlated_request_id.clone()))
             })
-            .expect("foreground request should emit an access log");
+            .expect("the foreground session write should emit an access log");
         assert_eq!(
             correlated_access.get("method"),
             Some(&Value::String("GET".to_owned()))
@@ -8163,7 +8179,8 @@ mod tests {
         assert!(
             events.iter().any(|event| {
                 event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
-                    && event.get("request_id") == Some(&Value::String("foreground-0".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String(correlated_request_id.clone()))
                     && event.get("request_method") == Some(&Value::String("GET".to_owned()))
                     && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
             }),
@@ -8240,6 +8257,184 @@ mod tests {
             })
             .await
             .expect("writer should accept a foreground write after load");
+
+        reader_pool.close().await;
+        writer_pool.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn file_backed_recovery_runs_with_foreground_session_and_enqueue_writes() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-content-recovery-{}.db",
+            crate::local_id::generate_local_id()
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(StdDuration::from_millis(100));
+        let reader_pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options.clone())
+            .await
+            .expect("create file-backed recovery reader pool");
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .connect_with(options)
+            .await
+            .expect("create file-backed recovery writer pool");
+        crate::database_migrations::run(&reader_pool)
+            .await
+            .expect("run production migrations");
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&reader_pool)
+            .await
+            .expect("enable global processing mode");
+        sqlx::query("UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1")
+            .execute(&reader_pool)
+            .await
+            .expect("complete identity upgrade");
+
+        let sqlite_writer =
+            crate::sqlite_write::SqliteWriteCoordinator::with_write_pool(writer_pool.clone());
+        let state = global_state_with_writer(reader_pool.clone(), sqlite_writer.clone());
+        let session_store = Arc::new(CoordinatedSqliteSessionStore::new(
+            tower_sessions_sqlx_store::SqliteStore::new(reader_pool.clone()),
+            reader_pool.clone(),
+            sqlite_writer.clone(),
+        ));
+        session_store
+            .migrate()
+            .await
+            .expect("migrate recovery session store");
+
+        for index in 0..GLOBAL_RECOVERY_BATCH_SIZE {
+            let id = format!("foreground-recovery-{index}");
+            insert_test_work(&reader_pool, &id, "failed", 1, Some("2000-01-01T00:00:00Z")).await;
+            sqlx::query(
+                "UPDATE content_work_items SET canonical_resource_id = ?, created_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            )
+            .bind(format!("foreground-recovery-resource-{index}"))
+            .bind(&id)
+            .execute(&reader_pool)
+            .await
+            .unwrap();
+        }
+
+        let session = Session::new(None, session_store.clone(), None);
+        session
+            .insert("user_id", "foreground-recovery-user".to_owned())
+            .await
+            .expect("seed recovery session");
+        session.save().await.expect("persist recovery session");
+        let session_id = session.id().expect("recovery session has an id");
+
+        let recovery_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                recover_due(state.as_ref())
+                    .await
+                    .expect("recovery should succeed");
+                started.elapsed()
+            })
+        };
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if sqlite_writer.runtime_status().active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery should acquire the writer before foreground work starts");
+        let session_task = {
+            let session_store = session_store.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                crate::session_store::with_session_baseline_scope(async move {
+                    let session = Session::new(Some(session_id), session_store, None);
+                    session.load().await.expect("load recovery session");
+                    session
+                        .insert("foreground_probe", "ready".to_owned())
+                        .await
+                        .expect("update recovery session");
+                    session.save().await.expect("save recovery session");
+                })
+                .await;
+                started.elapsed()
+            })
+        };
+        let enqueue_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                crate::jobs::enqueue_task(
+                    state.as_ref(),
+                    crate::jobs::NewTask {
+                        task_type: crate::jobs::TASK_SYNC_ALL.to_owned(),
+                        payload: json!({"trigger": "foreground-recovery"}),
+                        source: "foreground-recovery-test".to_owned(),
+                        requested_by: None,
+                        parent_task_id: None,
+                    },
+                )
+                .await
+                .expect("enqueue should succeed during recovery");
+                started.elapsed()
+            })
+        };
+
+        let (recovery_latency, session_latency, enqueue_latency) =
+            tokio::join!(recovery_task, session_task, enqueue_task,);
+        let recovery_latency = recovery_latency.expect("join recovery task");
+        let session_latency = session_latency.expect("join session task");
+        let enqueue_latency = enqueue_latency.expect("join enqueue task");
+        let max_latency = [recovery_latency, session_latency, enqueue_latency]
+            .into_iter()
+            .max()
+            .expect("foreground latency samples");
+        eprintln!(
+            "recovery_foreground_production_shape recovery_ms={} session_save_ms={} enqueue_ms={} max_request_ms={}",
+            recovery_latency.as_millis(),
+            session_latency.as_millis(),
+            enqueue_latency.as_millis(),
+            max_latency.as_millis(),
+        );
+        assert!(
+            max_latency < StdDuration::from_secs(2),
+            "foreground writes exceeded the recovery contention budget: {} ms",
+            max_latency.as_millis()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE id LIKE 'foreground-recovery-%' AND status = 'queued'",
+            )
+            .fetch_one(&reader_pool)
+            .await
+            .unwrap(),
+            GLOBAL_RECOVERY_BATCH_SIZE as i64
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE source = 'foreground-recovery-test'",
+            )
+            .fetch_one(&reader_pool)
+            .await
+            .unwrap(),
+            1
+        );
+        let status = sqlite_writer.runtime_status();
+        assert!(
+            !status.active,
+            "recovery writer permit must be released: {status:?}"
+        );
+        assert_eq!(status.waiting_foreground, 0);
 
         reader_pool.close().await;
         writer_pool.close().await;
