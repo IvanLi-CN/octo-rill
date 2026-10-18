@@ -213,7 +213,7 @@ pub fn spawn_task_worker(state: Arc<AppState>) {
                 }
                 Ok(None) => {
                     claim_backoff.reset();
-                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    TASK_CLAIM_ADMISSION.wait(Duration::from_millis(450)).await;
                 }
                 Err(err) => {
                     let retry_after = claim_backoff.next_delay();
@@ -1220,6 +1220,9 @@ async fn insert_task_record(
         })
         .await?;
 
+    if status == STATUS_QUEUED {
+        TASK_CLAIM_ADMISSION.wake();
+    }
     Ok(task_id)
 }
 
@@ -2511,30 +2514,71 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         }
     };
     tracing::debug!(event = "claim_admitted", lane = "job_task_claim");
+    let has_queued = match has_queued_task(state).await {
+        Ok(has_queued) => has_queued,
+        Err(error) => {
+            admission.fail();
+            return Err(error);
+        }
+    };
+    if !has_queued {
+        admission.empty();
+        tracing::debug!(event = "claim_probe_empty", lane = "job_task_claim");
+        return Ok(None);
+    }
     let result = claim_next_queued_task_admitted(state).await;
-    if result.is_ok() {
-        admission.success();
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
-    {
-        admission.fail();
-        tracing::warn!(event = "writer_deadline", lane = "job_task_claim");
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
-    {
-        admission.fail();
-        tracing::debug!(
-            event = "background_admission_denied",
-            lane = "job_task_claim"
-        );
-    } else {
-        admission.fail();
+    match result.as_ref() {
+        Ok(Some(_)) => admission.success(),
+        Ok(None) => {
+            admission.empty();
+            tracing::debug!(event = "claim_probe_empty", lane = "job_task_claim");
+        }
+        Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
+            admission.fail();
+            tracing::warn!(event = "writer_deadline", lane = "job_task_claim");
+        }
+        Err(error) if is_sqlite_background_admission_error(error.as_ref()) => {
+            admission.fail();
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "job_task_claim"
+            );
+        }
+        Err(_) => admission.fail(),
     }
     result
+}
+
+async fn has_queued_task(state: &AppState) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM job_tasks
+            WHERE status = ?
+              AND (available_at IS NULL OR available_at <= ?)
+              AND (
+                task_type NOT IN (?, ?)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM job_tasks running
+                    WHERE running.task_type = job_tasks.task_type
+                      AND running.status = ?
+                )
+              )
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(STATUS_QUEUED)
+    .bind(Utc::now().to_rfc3339())
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(TASK_RETRY_RECENT_FAILURES)
+    .bind(STATUS_RUNNING)
+    .fetch_one(&state.pool)
+    .await
+    .context("probe queued task")?;
+    Ok(exists != 0)
 }
 
 async fn claim_next_queued_task_admitted(state: &AppState) -> Result<Option<TaskRow>> {
