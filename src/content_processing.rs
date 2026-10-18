@@ -704,6 +704,9 @@ pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
                 .await?;
         tx.commit().await?;
         requeued = requeued.saturating_add(batch_requeued);
+        if batch_requeued > 0 {
+            CONTENT_CLAIM_ADMISSION.wake();
+        }
         if !has_more {
             break;
         }
@@ -2485,13 +2488,13 @@ async fn recover_due_batch(
         );
         insert_events
             .push_bind(now)
-            .push(" FROM content_work_items WHERE id IN (");
+            .push(" FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut insert_events, &batch.retryable_ids);
         insert_events.push(") AND status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(").push_bind(now).push(") AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(").push_bind(now).push("))");
         insert_events.build().execute(&mut **tx).await?;
 
         let mut update_items = QueryBuilder::<Sqlite>::new(
-            "UPDATE content_work_items SET status = 'queued', priority = 0, next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ",
+            "UPDATE content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 SET status = 'queued', priority = 0, next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ",
         );
         update_items.push_bind(now).push(" WHERE id IN (");
         push_recovery_ids(&mut update_items, &batch.retryable_ids);
@@ -2501,7 +2504,7 @@ async fn recover_due_batch(
 
     if !batch.provider_expired_ids.is_empty() {
         let mut update_provider = QueryBuilder::<Sqlite>::new(
-            "UPDATE content_work_items SET status = 'failed', failure_class = 'provider_unavailable', next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, updated_at = ",
+            "UPDATE content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 SET status = 'failed', failure_class = 'provider_unavailable', next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, updated_at = ",
         );
         update_provider.push_bind(now).push(" WHERE id IN (");
         push_recovery_ids(&mut update_provider, &batch.provider_expired_ids);
@@ -2512,7 +2515,7 @@ async fn recover_due_batch(
             "UPDATE content_attempt_events SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', failure_class = 'provider_unavailable', retry_eligible = 0, next_retry_at = NULL WHERE event_type = 'attempt_completed' AND result_status = 'deferred_provider' AND work_item_id IN (",
         );
         push_recovery_ids(&mut update_events, &batch.provider_expired_ids);
-        update_events.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_attempt_events.work_item_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
+        update_events.push(") AND EXISTS (SELECT 1 FROM content_work_items w INDEXED BY sqlite_autoindex_content_work_items_1 WHERE w.id = content_attempt_events.work_item_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
         update_events.build().execute(&mut **tx).await?;
 
         let mut insert_completed = QueryBuilder::<Sqlite>::new(
@@ -2520,7 +2523,7 @@ async fn recover_due_batch(
         );
         insert_completed
             .push_bind(now)
-            .push(" FROM content_work_items w WHERE w.id IN (");
+            .push(" FROM content_work_items w INDEXED BY sqlite_autoindex_content_work_items_1 WHERE w.id IN (");
         push_recovery_ids(&mut insert_completed, &batch.provider_expired_ids);
         insert_completed.push(") AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND NOT EXISTS (SELECT 1 FROM content_attempt_events completed WHERE completed.work_item_id = w.id AND completed.event_type = 'attempt_completed')");
         insert_completed.build().execute(&mut **tx).await?;
@@ -2530,7 +2533,7 @@ async fn recover_due_batch(
         );
         update_batch_items
             .push_bind(now)
-            .push(" WHERE result_status = 'deferred_provider' AND (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items WHERE id IN (");
+            .push(" WHERE result_status = 'deferred_provider' AND (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.provider_expired_ids);
         update_batch_items.push(") AND status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL)");
         update_batch_items.build().execute(&mut **tx).await?;
@@ -2542,7 +2545,7 @@ async fn recover_due_batch(
         );
         update_batch_items
             .push_bind(now)
-            .push(" WHERE (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items WHERE id IN (");
+            .push(" WHERE (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.running_expired_ids);
         update_batch_items.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push("))");
         update_batch_items.build().execute(&mut **tx).await?;
@@ -2554,7 +2557,7 @@ async fn recover_due_batch(
             .push_bind(now)
             .push(", updated_at = ")
             .push_bind(now)
-            .push(" WHERE id IN (SELECT batch_id FROM content_work_items WHERE id IN (");
+            .push(" WHERE id IN (SELECT batch_id FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut update_batches, &batch.running_expired_ids);
         update_batches.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push(") AND batch_id IS NOT NULL) AND status = 'running'");
         update_batches.build().execute(&mut **tx).await?;
@@ -2564,7 +2567,7 @@ async fn recover_due_batch(
         );
         insert_completed
             .push_bind(now)
-            .push(" FROM content_work_items WHERE id IN (");
+            .push(" FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut insert_completed, &batch.running_expired_ids);
         insert_completed.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push(")");
         insert_completed.build().execute(&mut **tx).await?;
@@ -2572,7 +2575,7 @@ async fn recover_due_batch(
         let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
         let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
         let mut update_items = QueryBuilder::<Sqlite>::new(
-            "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ",
+            "UPDATE content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ",
         );
         update_items
             .push_bind(&recovery_retry_at)
@@ -2594,7 +2597,7 @@ async fn recover_due_batch(
             .push_bind(&recovery_retry_at)
             .push(", ")
             .push_bind(now)
-            .push(" FROM content_work_items WHERE id IN (");
+            .push(" FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN (");
         push_recovery_ids(&mut insert_queued, &batch.running_expired_ids);
         insert_queued
             .push(") AND status = 'queued' AND next_retry_at = ")
@@ -7889,6 +7892,14 @@ mod tests {
     #[tokio::test]
     async fn recovery_releases_writer_before_supersession_apply() {
         let pool = global_pool().await;
+        insert_test_work(
+            &pool,
+            "recovery-due",
+            "failed",
+            1,
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .await;
         for (id, hash, revision) in [
             ("recovery-old", "recovery-old-hash", "2026-01-01T00:00:00Z"),
             ("recovery-new", "recovery-new-hash", "2026-01-02T00:00:00Z"),
@@ -7936,6 +7947,32 @@ mod tests {
             .await
             .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_candidate_updates_seek_by_primary_key() {
+        let pool = global_pool().await;
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN UPDATE content_batch_items SET result_status = 'failed' WHERE (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items INDEXED BY sqlite_autoindex_content_work_items_1 WHERE id IN ('recovery-plan-a', 'recovery-plan-b') AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday('2026-01-01T00:00:00Z'))",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|detail| detail.contains(
+                "SEARCH content_work_items USING INDEX sqlite_autoindex_content_work_items_1"
+            )),
+            "recovery candidate updates must use the work item primary key: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("idx_content_work_items_retry")),
+            "recovery candidate updates must not scan the retry index: {plan:?}"
         );
     }
 

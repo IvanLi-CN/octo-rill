@@ -4599,7 +4599,7 @@ async fn finalize_task_if_owned(
         .transpose()
         .context("serialize task result")?;
 
-    state
+    let updated = state
         .sqlite_writer
         .write("job_task_finalize_owned", |_| async {
             let updated = sqlx::query(
@@ -4630,7 +4630,11 @@ async fn finalize_task_if_owned(
             .context("failed to finalize owned task")?;
             Ok(updated.rows_affected() > 0)
         })
-        .await
+        .await?;
+    if updated {
+        TASK_CLAIM_ADMISSION.wake();
+    }
+    Ok(updated)
 }
 
 async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {

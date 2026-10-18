@@ -6509,6 +6509,9 @@ async fn retry_subscription_release_watchers(
             Ok::<_, anyhow::Error>(rows)
         })
         .await?;
+    if !rows.is_empty() {
+        REPO_RELEASE_CLAIM_ADMISSION.wake();
+    }
 
     let work_item_ids = rows
         .iter()
