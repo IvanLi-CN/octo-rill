@@ -2072,10 +2072,21 @@ pub async fn retry_request(
 
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
     #[cfg(test)]
-    let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
-    #[cfg(test)]
-    CONTENT_CLAIM_ADMISSION.reset_for_tests();
-    let mut admission = match CONTENT_CLAIM_ADMISSION.try_admit() {
+    {
+        let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
+        let test_admission = ClaimAdmission::new();
+        return claim_next_with_admission(state, manual_limit, &test_admission).await;
+    }
+    #[cfg(not(test))]
+    claim_next_with_admission(state, manual_limit, &CONTENT_CLAIM_ADMISSION).await
+}
+
+async fn claim_next_with_admission(
+    state: &AppState,
+    manual_limit: i64,
+    claim_admission: &ClaimAdmission,
+) -> Result<Option<WorkRow>> {
+    let mut admission = match claim_admission.try_admit() {
         ClaimAdmissionResult::Admitted(guard) => guard,
         ClaimAdmissionResult::Coalesced => {
             tracing::debug!(event = "claim_coalesced", lane = "content_processing_claim");
@@ -2109,11 +2120,12 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     match result.as_ref() {
         Ok(Some(_)) => admission.success(),
         Ok(None) => {
-            admission.empty();
             tracing::debug!(
-                event = "claim_probe_empty",
-                lane = "content_processing_claim"
+                event = "claim_progressed_without_work",
+                lane = "content_processing_claim",
+                "claim precheck found work, but the admitted transaction did not return a work item"
             );
+            admission.success();
         }
         Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
             admission.fail();
@@ -2518,9 +2530,9 @@ async fn recover_due_batch(
         );
         update_batch_items
             .push_bind(now)
-            .push(" WHERE result_status = 'deferred_provider' AND work_item_id IN (");
+            .push(" WHERE result_status = 'deferred_provider' AND (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items WHERE id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.provider_expired_ids);
-        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND content_batch_items.batch_id = w.batch_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
+        update_batch_items.push(") AND status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL)");
         update_batch_items.build().execute(&mut **tx).await?;
     }
 
@@ -2530,9 +2542,9 @@ async fn recover_due_batch(
         );
         update_batch_items
             .push_bind(now)
-            .push(" WHERE work_item_id IN (");
+            .push(" WHERE (batch_id, work_item_id) IN (SELECT batch_id, id FROM content_work_items WHERE id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.running_expired_ids);
-        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND content_batch_items.batch_id = w.batch_id AND w.status = 'running' AND w.lease_expires_at IS NOT NULL AND julianday(w.lease_expires_at) <= julianday(").push_bind(now).push("))");
+        update_batch_items.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push("))");
         update_batch_items.build().execute(&mut **tx).await?;
 
         let mut update_batches = QueryBuilder::<Sqlite>::new(
@@ -7486,6 +7498,40 @@ mod tests {
             current_mode(&pool).await.unwrap(),
             ContentProcessingMode::RollbackFreeze
         );
+    }
+
+    #[tokio::test]
+    async fn superseded_claim_progress_does_not_start_empty_queue_backoff() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "superseded-claim-old", "queued", 0, None).await;
+        sqlx::query(
+            "UPDATE content_work_items SET source_hash = 'old-hash', source_snapshot_json = '{\"source_blocks\":[{\"slot\":\"source_observed_at\",\"text\":\"2000-01-01T00:00:00Z\"}]}', created_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE id = 'superseded-claim-old'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES ('superseded-claim-new', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'new-hash', ?, 'test-model', '{\"source_blocks\":[{\"slot\":\"source_observed_at\",\"text\":\"2000-01-02T00:00:00Z\"}]}', 'config-1', 'queued', 0, 0, 1, 0, '2000-01-02T00:00:00Z', '2000-01-02T00:00:00Z')",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = global_state(pool.clone());
+        let admission = ClaimAdmission::new();
+
+        assert!(
+            claim_next_with_admission(&state, 1, &admission)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let claimed = claim_next_with_admission(&state, 1, &admission)
+            .await
+            .unwrap()
+            .expect("the newer work item should be claimable immediately");
+        assert_eq!(claimed.id, "superseded-claim-new");
+        assert_eq!(admission.retry_after(Duration::ZERO), Duration::ZERO);
     }
 
     #[tokio::test]
