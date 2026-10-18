@@ -1419,6 +1419,7 @@ pub async fn enqueue_singleton_task_for_requester_if_generation_pending(
 
     match inserted {
         Ok(true) => {
+            TASK_CLAIM_ADMISSION.wake();
             let task = EnqueuedTask {
                 task_id,
                 task_type: new_task.task_type.clone(),
@@ -1743,6 +1744,7 @@ async fn reschedule_task_inner(
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
+    TASK_CLAIM_ADMISSION.wake();
     append_task_event(
         state,
         task_id,

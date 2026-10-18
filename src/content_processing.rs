@@ -4788,7 +4788,10 @@ async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttemp
     }) else {
         return Ok(GlobalSchedulerAttempt::Idle);
     };
-    match crate::metrics::observe_worker("content", "attempt", execute(state, work)).await {
+    let execution =
+        crate::metrics::observe_worker("content", "attempt", execute(state, work)).await;
+    CONTENT_CLAIM_ADMISSION.wake();
+    match execution {
         Ok(()) => Ok(GlobalSchedulerAttempt::Claimed),
         Err(error) if is_sqlite_database_error(error.as_ref()) => {
             Ok(GlobalSchedulerAttempt::ClaimedDatabaseFailure(error))
