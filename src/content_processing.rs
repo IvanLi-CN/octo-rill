@@ -2083,6 +2083,7 @@ pub async fn retry_request(
     Ok((StatusCode::ACCEPTED, body))
 }
 
+#[cfg(test)]
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
     #[cfg(test)]
     {
@@ -2437,6 +2438,7 @@ async fn load_recovery_batch(state: &AppState, now: &str) -> Result<RecoveryBatc
     Ok(batch)
 }
 
+#[cfg(test)]
 async fn recover_due(state: &AppState) -> Result<()> {
     recover_due_with_admission(state, &CONTENT_CLAIM_ADMISSION).await
 }
