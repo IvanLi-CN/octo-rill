@@ -3527,6 +3527,7 @@ async fn try_resolve_translation_results_without_write(
         sqlite_background_lane_admitted = sqlite_status.background_lane_admitted,
         sqlite_background_rejected = sqlite_status.background_rejected,
         sqlite_background_lane_coalesced = sqlite_status.background_lane_coalesced,
+        sqlite_background_admission_coalesced = sqlite_status.background_admission_coalesced,
         "translation resolve returned pending snapshot under backpressure"
     );
 
