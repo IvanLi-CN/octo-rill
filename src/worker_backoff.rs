@@ -69,8 +69,6 @@ impl ClaimAdmission {
         {
             return ClaimAdmissionResult::CoolingDown;
         }
-        drop(failure_retry_at);
-        drop(empty_retry_at);
         if self
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

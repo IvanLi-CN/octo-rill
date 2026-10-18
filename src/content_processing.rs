@@ -2520,7 +2520,7 @@ async fn recover_due_batch(
             .push_bind(now)
             .push(" WHERE result_status = 'deferred_provider' AND work_item_id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.provider_expired_ids);
-        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
+        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND content_batch_items.batch_id = w.batch_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
         update_batch_items.build().execute(&mut **tx).await?;
     }
 
@@ -2532,7 +2532,7 @@ async fn recover_due_batch(
             .push_bind(now)
             .push(" WHERE work_item_id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.running_expired_ids);
-        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND w.status = 'running' AND w.lease_expires_at IS NOT NULL AND julianday(w.lease_expires_at) <= julianday(").push_bind(now).push("))");
+        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND content_batch_items.batch_id = w.batch_id AND w.status = 'running' AND w.lease_expires_at IS NOT NULL AND julianday(w.lease_expires_at) <= julianday(").push_bind(now).push("))");
         update_batch_items.build().execute(&mut **tx).await?;
 
         let mut update_batches = QueryBuilder::<Sqlite>::new(
@@ -8417,6 +8417,62 @@ mod tests {
             .await
             .unwrap(),
             "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_only_updates_the_current_batch_projection() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "active-running", "running", 1, None).await;
+        sqlx::query(
+            "INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, status, created_at, updated_at) VALUES ('current-batch', 'test', 'zh-CN', ?, 'test-model', 'test', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('old-batch', 'test', 'zh-CN', ?, 'test-model', 'test', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_work_items SET canonical_resource_id = 'active-running-resource', batch_id = 'current-batch', lease_owner = 'worker', lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'active-running'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_batch_items (id, batch_id, work_item_id, item_index, result_status, created_at, updated_at) VALUES ('current-batch-item', 'current-batch', 'active-running', 0, 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('old-batch-item', 'old-batch', 'active-running', 0, 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let batch = RecoveryBatch {
+            retryable_ids: Vec::new(),
+            provider_expired_ids: Vec::new(),
+            running_expired_ids: vec!["active-running".to_owned()],
+        };
+        let mut tx = pool.begin().await.unwrap();
+        recover_due_batch(&mut tx, &batch, "2026-10-19T00:00:00Z")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_batch_items WHERE id = 'current-batch-item'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_batch_items WHERE id = 'old-batch-item'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "ready"
         );
     }
 
