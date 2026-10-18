@@ -166,6 +166,10 @@ impl ClaimAdmissionGuard<'_> {
     }
 
     pub(crate) fn empty(&mut self) {
+        if let Ok(mut retry_at) = self.admission.failure_retry_at.lock() {
+            *retry_at = None;
+        }
+        self.admission.failures.store(0, Ordering::Relaxed);
         self.admission.schedule_backoff(
             &self.admission.empty_retry_at,
             &self.admission.empty_failures,
@@ -290,6 +294,28 @@ mod tests {
             admission.try_admit(),
             ClaimAdmissionResult::CoolingDown
         ));
+    }
+
+    #[test]
+    fn empty_claim_resets_a_completed_failure_sequence() {
+        let admission = ClaimAdmission::new();
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("first claim should be admitted"),
+        };
+        guard.fail();
+        drop(guard);
+        if let Ok(mut retry_at) = admission.failure_retry_at.lock() {
+            *retry_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("expired failure cooldown should admit the next claim"),
+        };
+        guard.empty();
+
+        assert_eq!(admission.failures.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
