@@ -27,8 +27,10 @@ pub(crate) struct WorkerBackoff {
 #[derive(Debug, Default)]
 pub(crate) struct ClaimAdmission {
     in_flight: AtomicBool,
-    retry_at: Mutex<Option<Instant>>,
+    failure_retry_at: Mutex<Option<Instant>>,
+    empty_retry_at: Mutex<Option<Instant>>,
     failures: std::sync::atomic::AtomicUsize,
+    empty_failures: std::sync::atomic::AtomicUsize,
     notify: Notify,
 }
 
@@ -46,19 +48,29 @@ impl ClaimAdmission {
     pub(crate) const fn new() -> Self {
         Self {
             in_flight: AtomicBool::new(false),
-            retry_at: Mutex::new(None),
+            failure_retry_at: Mutex::new(None),
+            empty_retry_at: Mutex::new(None),
             failures: std::sync::atomic::AtomicUsize::new(0),
+            empty_failures: std::sync::atomic::AtomicUsize::new(0),
             notify: Notify::const_new(),
         }
     }
 
     pub(crate) fn try_admit(&self) -> ClaimAdmissionResult<'_> {
-        let Ok(retry_at) = self.retry_at.lock() else {
+        let Ok(failure_retry_at) = self.failure_retry_at.lock() else {
             return ClaimAdmissionResult::Coalesced;
         };
-        if retry_at.is_some_and(|retry_at| Instant::now() < retry_at) {
+        let Ok(empty_retry_at) = self.empty_retry_at.lock() else {
+            return ClaimAdmissionResult::Coalesced;
+        };
+        let now = Instant::now();
+        if failure_retry_at.is_some_and(|retry_at| now < retry_at)
+            || empty_retry_at.is_some_and(|retry_at| now < retry_at)
+        {
             return ClaimAdmissionResult::CoolingDown;
         }
+        drop(failure_retry_at);
+        drop(empty_retry_at);
         if self
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -70,15 +82,20 @@ impl ClaimAdmission {
     }
 
     pub(crate) fn retry_after(&self, minimum: Duration) -> Duration {
-        let remaining = self
-            .retry_at
+        let now = Instant::now();
+        let failure_remaining = self
+            .failure_retry_at
             .lock()
             .ok()
-            .and_then(|retry_at| {
-                retry_at.map(|retry_at| retry_at.saturating_duration_since(Instant::now()))
-            })
+            .and_then(|retry_at| retry_at.map(|retry_at| retry_at.saturating_duration_since(now)))
             .unwrap_or_default();
-        remaining.max(minimum)
+        let empty_remaining = self
+            .empty_retry_at
+            .lock()
+            .ok()
+            .and_then(|retry_at| retry_at.map(|retry_at| retry_at.saturating_duration_since(now)))
+            .unwrap_or_default();
+        failure_remaining.max(empty_remaining).max(minimum)
     }
 
     pub(crate) async fn wait(&self, minimum: Duration) {
@@ -91,10 +108,10 @@ impl ClaimAdmission {
     }
 
     pub(crate) fn wake(&self) {
-        if let Ok(mut retry_at) = self.retry_at.lock() {
+        if let Ok(mut retry_at) = self.empty_retry_at.lock() {
             *retry_at = None;
         }
-        self.failures.store(0, Ordering::Relaxed);
+        self.empty_failures.store(0, Ordering::Relaxed);
         self.notify_waiters();
     }
 
@@ -105,21 +122,28 @@ impl ClaimAdmission {
     #[cfg(test)]
     pub(crate) fn reset_for_tests(&self) {
         self.in_flight.store(false, Ordering::Release);
-        if let Ok(mut retry_at) = self.retry_at.lock() {
+        if let Ok(mut retry_at) = self.failure_retry_at.lock() {
+            *retry_at = None;
+        }
+        if let Ok(mut retry_at) = self.empty_retry_at.lock() {
             *retry_at = None;
         }
         self.failures.store(0, Ordering::Relaxed);
+        self.empty_failures.store(0, Ordering::Relaxed);
         self.notify_waiters();
     }
 
-    fn schedule_backoff(&self) {
-        let index = self
-            .failures
+    fn schedule_backoff(
+        &self,
+        retry_at: &Mutex<Option<Instant>>,
+        failures: &std::sync::atomic::AtomicUsize,
+    ) {
+        let index = failures
             .fetch_add(1, Ordering::Relaxed)
             .min(BACKOFF_FLOORS.len() - 1);
         let delay = BACKOFF_FLOORS[index]
             + Duration::from_millis(rand::rng().random_range(0..=JITTER_MAX_MS));
-        if let Ok(mut retry_at) = self.retry_at.lock() {
+        if let Ok(mut retry_at) = retry_at.lock() {
             *retry_at = Some(Instant::now() + delay);
         }
     }
@@ -127,19 +151,27 @@ impl ClaimAdmission {
 
 impl ClaimAdmissionGuard<'_> {
     pub(crate) fn success(&mut self) {
-        if let Ok(mut retry_at) = self.admission.retry_at.lock() {
+        if let Ok(mut retry_at) = self.admission.failure_retry_at.lock() {
+            *retry_at = None;
+        }
+        if let Ok(mut retry_at) = self.admission.empty_retry_at.lock() {
             *retry_at = None;
         }
         self.admission.failures.store(0, Ordering::Relaxed);
+        self.admission.empty_failures.store(0, Ordering::Relaxed);
         self.admission.notify_waiters();
     }
 
     pub(crate) fn fail(&mut self) {
-        self.admission.schedule_backoff();
+        self.admission
+            .schedule_backoff(&self.admission.failure_retry_at, &self.admission.failures);
     }
 
     pub(crate) fn empty(&mut self) {
-        self.admission.schedule_backoff();
+        self.admission.schedule_backoff(
+            &self.admission.empty_retry_at,
+            &self.admission.empty_failures,
+        );
     }
 }
 
@@ -241,6 +273,24 @@ mod tests {
         assert!(matches!(
             admission.try_admit(),
             ClaimAdmissionResult::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn ready_signal_does_not_clear_claim_failure_cooldown() {
+        let admission = ClaimAdmission::new();
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("first claim should be admitted"),
+        };
+        guard.fail();
+        drop(guard);
+
+        admission.wake();
+
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::CoolingDown
         ));
     }
 

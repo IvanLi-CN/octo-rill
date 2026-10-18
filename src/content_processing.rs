@@ -2500,7 +2500,7 @@ async fn recover_due_batch(
             "UPDATE content_attempt_events SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', failure_class = 'provider_unavailable', retry_eligible = 0, next_retry_at = NULL WHERE event_type = 'attempt_completed' AND result_status = 'deferred_provider' AND work_item_id IN (",
         );
         push_recovery_ids(&mut update_events, &batch.provider_expired_ids);
-        update_events.push(")");
+        update_events.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_attempt_events.work_item_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
         update_events.build().execute(&mut **tx).await?;
 
         let mut insert_completed = QueryBuilder::<Sqlite>::new(
@@ -2520,7 +2520,7 @@ async fn recover_due_batch(
             .push_bind(now)
             .push(" WHERE result_status = 'deferred_provider' AND work_item_id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.provider_expired_ids);
-        update_batch_items.push(")");
+        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL)");
         update_batch_items.build().execute(&mut **tx).await?;
     }
 
@@ -2532,7 +2532,7 @@ async fn recover_due_batch(
             .push_bind(now)
             .push(" WHERE work_item_id IN (");
         push_recovery_ids(&mut update_batch_items, &batch.running_expired_ids);
-        update_batch_items.push(")");
+        update_batch_items.push(") AND EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = content_batch_items.work_item_id AND w.status = 'running' AND w.lease_expires_at IS NOT NULL AND julianday(w.lease_expires_at) <= julianday(").push_bind(now).push("))");
         update_batch_items.build().execute(&mut **tx).await?;
 
         let mut update_batches = QueryBuilder::<Sqlite>::new(
@@ -8325,6 +8325,98 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_project_stale_candidate_state() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "stale-provider", "queued", 1, None).await;
+        sqlx::query(
+            "UPDATE content_work_items SET canonical_resource_id = 'stale-provider-resource' WHERE id = 'stale-provider'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_work(&pool, "stale-running", "queued", 1, None).await;
+        sqlx::query(
+            "UPDATE content_work_items SET canonical_resource_id = 'stale-running-resource' WHERE id = 'stale-running'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, created_at) VALUES ('stale-provider-event', 'stale-provider', 1, 'initial', 'attempt_completed', 'deferred_provider', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, status, created_at, updated_at) VALUES ('stale-batch', 'test', 'zh-CN', ?, 'test-model', 'test', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_work_items SET batch_id = 'stale-batch' WHERE id = 'stale-running'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_batch_items (id, batch_id, work_item_id, item_index, result_status, created_at, updated_at) VALUES ('stale-provider-item', 'stale-batch', 'stale-provider', 0, 'deferred_provider', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('stale-running-item', 'stale-batch', 'stale-running', 1, 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let batch = RecoveryBatch {
+            retryable_ids: Vec::new(),
+            provider_expired_ids: vec!["stale-provider".to_owned()],
+            running_expired_ids: vec!["stale-running".to_owned()],
+        };
+        let mut tx = pool.begin().await.unwrap();
+        recover_due_batch(&mut tx, &batch, "2026-10-19T00:00:00Z")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_attempt_events WHERE id = 'stale-provider-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "deferred_provider"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_batch_items WHERE id = 'stale-provider-item'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "deferred_provider"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_batch_items WHERE id = 'stale-running-item'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "running"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_batches WHERE id = 'stale-batch'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "running"
         );
     }
 
