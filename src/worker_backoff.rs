@@ -117,20 +117,6 @@ impl ClaimAdmission {
         self.notify.notify_waiters();
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_for_tests(&self) {
-        self.in_flight.store(false, Ordering::Release);
-        if let Ok(mut retry_at) = self.failure_retry_at.lock() {
-            *retry_at = None;
-        }
-        if let Ok(mut retry_at) = self.empty_retry_at.lock() {
-            *retry_at = None;
-        }
-        self.failures.store(0, Ordering::Relaxed);
-        self.empty_failures.store(0, Ordering::Relaxed);
-        self.notify_waiters();
-    }
-
     fn schedule_backoff(
         &self,
         retry_at: &Mutex<Option<Instant>>,
