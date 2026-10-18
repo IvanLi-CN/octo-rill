@@ -7997,7 +7997,12 @@ mod tests {
         assert!(!status.active, "writer permit must be released after load");
         assert_eq!(status.waiting_foreground, 0);
         assert_eq!(status.waiting_background, 0);
-        assert!(status.background_admitted >= status.background_lane_admitted);
+        assert!(
+            status.background_admitted > 0
+                || status.background_rejected > 0
+                || status.background_admission_coalesced > 0,
+            "background writer pressure should expose an attempt or admission decision: {status:?}"
+        );
         assert!(
             status.background_lane_admitted * 4 < 128,
             "recovery admission should be materially lower than worker attempts: {status:?}"

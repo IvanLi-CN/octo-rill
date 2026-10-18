@@ -29,6 +29,7 @@ const BACKGROUND_DEADLINE: Duration = Duration::from_millis(2500);
 const BEST_EFFORT_DEADLINE: Duration = BACKGROUND_DEADLINE;
 const ROLLBACK_CLEANUP_TIMEOUT: Duration = Duration::from_millis(150);
 const BACKGROUND_WRITER_QUEUE_LIMIT: usize = 1;
+const BACKGROUND_ADMISSION_COOLDOWN: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct SqliteWriteCoordinator {
@@ -72,6 +73,8 @@ struct SqliteWriteState {
     background_lane_cursor: HashMap<&'static str, (String, String)>,
     background_lane_in_flight: HashSet<&'static str>,
     background_lane_coalesced: u64,
+    background_admission_cooldown_until: Option<Instant>,
+    background_admission_coalesced: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -83,6 +86,7 @@ pub struct SqliteWriteRuntimeStatus {
     pub background_lane_admitted: u64,
     pub background_rejected: u64,
     pub background_lane_coalesced: u64,
+    pub background_admission_coalesced: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +324,7 @@ impl SqliteWriteCoordinator {
                 background_lane_admitted: state.background_lane_admitted,
                 background_rejected: state.background_rejected,
                 background_lane_coalesced: state.background_lane_coalesced,
+                background_admission_coalesced: state.background_admission_coalesced,
             })
             .unwrap_or_default()
     }
@@ -929,21 +934,49 @@ impl SqliteWriteCoordinator {
                     && (state.waiting_foreground > 0
                         || state.waiting_background >= BACKGROUND_WRITER_QUEUE_LIMIT)
                 {
-                    state.background_rejected = state.background_rejected.saturating_add(1);
-                    warn!(
-                        event = "sqlite.write",
-                        operation = lane,
-                        priority = priority.as_str(),
-                        request_id = %observability::current_request_id(),
-                        request_method = %observability::current_request_method(),
-                        request_route = %observability::current_request_route(),
-                        waiting_foreground = state.waiting_foreground,
-                        waiting_background = state.waiting_background,
-                        queue_limit = BACKGROUND_WRITER_QUEUE_LIMIT,
-                        deadline_ms = deadline.as_millis(),
-                        error_kind = "background_admission",
-                        "sqlite background writer admission denied"
-                    );
+                    let now = Instant::now();
+                    let coalesced = state
+                        .background_admission_cooldown_until
+                        .is_some_and(|until| until > now);
+                    if coalesced {
+                        state.background_admission_coalesced =
+                            state.background_admission_coalesced.saturating_add(1);
+                        debug!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
+                            waiting_foreground = state.waiting_foreground,
+                            waiting_background = state.waiting_background,
+                            queue_limit = BACKGROUND_WRITER_QUEUE_LIMIT,
+                            retry_after_ms = state
+                                .background_admission_cooldown_until
+                                .map(|until| until.saturating_duration_since(now).as_millis())
+                                .unwrap_or_default(),
+                            background_admission = "coalesced",
+                            "sqlite background writer admission coalesced"
+                        );
+                    } else {
+                        state.background_admission_cooldown_until =
+                            Some(now + BACKGROUND_ADMISSION_COOLDOWN);
+                        state.background_rejected = state.background_rejected.saturating_add(1);
+                        warn!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = priority.as_str(),
+                            request_id = %observability::current_request_id(),
+                            request_method = %observability::current_request_method(),
+                            request_route = %observability::current_request_route(),
+                            waiting_foreground = state.waiting_foreground,
+                            waiting_background = state.waiting_background,
+                            queue_limit = BACKGROUND_WRITER_QUEUE_LIMIT,
+                            deadline_ms = deadline.as_millis(),
+                            error_kind = "background_admission",
+                            "sqlite background writer admission denied"
+                        );
+                    }
                     return Err(anyhow::Error::new(SqliteBackgroundAdmissionError {
                         lane,
                         waiting_foreground: state.waiting_foreground,
@@ -2353,7 +2386,7 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn background_writer_admission_is_bounded() {
         let coordinator = SqliteWriteCoordinator::new();
         let held = coordinator
@@ -2379,19 +2412,10 @@ mod tests {
         .await
         .expect("first background waiter should be admitted");
 
-        let mut rejected = Vec::new();
         for _ in 0..7 {
-            let coordinator = coordinator.clone();
-            rejected.push(tokio::spawn(async move {
-                coordinator
-                    .write("background_queue", |_| async { Ok::<_, anyhow::Error>(()) })
-                    .await
-            }));
-        }
-        for task in rejected {
-            let error = task
+            let error = coordinator
+                .write("background_queue", |_| async { Ok::<_, anyhow::Error>(()) })
                 .await
-                .expect("background admission task should join")
                 .expect_err("background queue limit should reject excess waiters");
             assert!(
                 error
@@ -2410,7 +2434,8 @@ mod tests {
         let status = coordinator.runtime_status();
         assert!(!status.active);
         assert_eq!(status.waiting_background, 0);
-        assert_eq!(status.background_rejected, 7);
+        assert_eq!(status.background_rejected, 1);
+        assert_eq!(status.background_admission_coalesced, 6);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -73,6 +73,8 @@ const RELEASE_CONTENT_ENQUEUE_PENDING_ERROR: &str = "content_processing_enqueue_
 const SUBSCRIPTION_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(2);
 const GITHUB_WEB_BASE: &str = "https://github.com";
 const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
+const NOTIFICATION_UPSERT_BATCH_SIZE: usize = 10;
+const FEED_ACTIVITY_EVENT_BATCH_SIZE: usize = 10;
 const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
 const NOTIFICATION_OPEN_URL_REPAIR_KEY: &str = "notifications_open_url_repair_v2";
 const NOTIFICATION_OPEN_URL_REPAIR_PENDING: &str = "pending";
@@ -12340,12 +12342,27 @@ async fn insert_feed_activity_events(
         return Ok(0);
     }
 
+    let now = Utc::now().to_rfc3339();
+    let mut written = 0usize;
+    for batch in events.chunks(FEED_ACTIVITY_EVENT_BATCH_SIZE) {
+        written += insert_feed_activity_events_batch(state, user_id, batch, now.as_str()).await?;
+    }
+    Ok(written)
+}
+
+async fn insert_feed_activity_events_batch(
+    state: &AppState,
+    user_id: &str,
+    events: &[FeedActivityEventSnapshot],
+    now: &str,
+) -> Result<usize> {
+    debug_assert!(!events.is_empty());
+
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "feed_activity_events")
         .await
         .context("begin feed activity events tx")?;
-    let now = Utc::now().to_rfc3339();
     let mut written = 0usize;
     for event in events {
         if event.kind == "announcement"
@@ -12395,7 +12412,7 @@ async fn insert_feed_activity_events(
                 github_event_id: event.github_event_id.as_deref(),
                 actor: &event.actor,
                 occurred_at: event.occurred_at.as_str(),
-                detected_at: now.as_str(),
+                detected_at: now,
             },
         )
         .await?;
@@ -14432,6 +14449,18 @@ async fn upsert_notifications(
     notifications: &[GitHubNotification],
     now: &str,
 ) -> Result<()> {
+    for batch in notifications.chunks(NOTIFICATION_UPSERT_BATCH_SIZE) {
+        upsert_notifications_batch(state, user_id, batch, now).await?;
+    }
+    Ok(())
+}
+
+async fn upsert_notifications_batch(
+    state: &AppState,
+    user_id: &str,
+    notifications: &[GitHubNotification],
+    now: &str,
+) -> Result<()> {
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -15623,6 +15652,49 @@ mod tests {
         .await
         .expect("load busy notification unread");
         assert_eq!(unread, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_splits_large_pages_into_short_writer_transactions() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-batched");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let notifications = (0..50)
+            .map(|index| {
+                mock_notification(
+                    format!("thread-batched-{index}").as_str(),
+                    Some("https://api.github.com/repos/octo/rocket/issues/3"),
+                    Some("octo/rocket"),
+                    Some("Issue"),
+                    "2026-04-13T10:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let admitted_before = state.sqlite_writer.runtime_status().background_admitted;
+
+        upsert_notifications(
+            state.as_ref(),
+            user_id.as_str(),
+            &notifications,
+            "2026-04-13T10:00:00Z",
+        )
+        .await
+        .expect("large notification page should be persisted");
+
+        let admitted_after = state.sqlite_writer.runtime_status().background_admitted;
+        assert_eq!(
+            admitted_after.saturating_sub(admitted_before),
+            5,
+            "large notification pages must use five ten-row writer batches"
+        );
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notifications WHERE user_id = ?")
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count persisted notifications");
+        assert_eq!(count, 50);
     }
 
     #[test]
@@ -20691,6 +20763,48 @@ mod tests {
                     Some("Second announcement body".to_owned()),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_activity_events_splits_large_batches_into_short_writer_transactions() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("feed-large-batch");
+        seed_user(&pool, user_id.as_str()).await;
+        let actor = GitHubActor {
+            id: 502,
+            login: "writer-cat".to_owned(),
+            avatar_url: Some("https://avatars.example/writer-cat.png".to_owned()),
+            html_url: Some("https://github.com/writer-cat".to_owned()),
+        };
+        let events = (0..32)
+            .map(|index| FeedActivityEventSnapshot {
+                kind: "discussion",
+                event_id: format!("feed-large-{index}"),
+                repo_id: Some(42),
+                repo_full_name: Some("octo/alpha".to_owned()),
+                discussion_number: Some(index),
+                title: Some(format!("Discussion {index}")),
+                body: Some("discussion body".to_owned()),
+                html_url: Some(format!("https://github.com/octo/alpha/discussions/{index}")),
+                github_event_id: Some(format!("feed-large-{index}")),
+                actor: actor.clone(),
+                occurred_at: format!("2026-03-06T12:{index:02}:00Z"),
+            })
+            .collect::<Vec<_>>();
+        let admitted_before = state.sqlite_writer.runtime_status().background_admitted;
+
+        let inserted = insert_feed_activity_events(state.as_ref(), user_id.as_str(), &events)
+            .await
+            .expect("large feed event batch should be persisted");
+
+        let admitted_after = state.sqlite_writer.runtime_status().background_admitted;
+        assert_eq!(inserted, 32);
+        assert_eq!(
+            admitted_after.saturating_sub(admitted_before),
+            4,
+            "large feed event batches must use four ten-row writer batches"
         );
     }
 
