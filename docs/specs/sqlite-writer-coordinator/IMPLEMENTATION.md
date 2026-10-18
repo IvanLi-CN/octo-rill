@@ -13,6 +13,7 @@
 - 本轮 parent PR 只收敛两个实现缺口：claim lane 的共享 admission/in-flight 合并，以及 Dashboard updates 的轻量 signature 查询。
 - worker 处理并发不等同于 SQLite writer 并发；网络、GitHub 和 LLM 工作继续在 writer permit 外执行，只有 claim 的短写入段受 admission 约束。
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
+- 当前跟进候选为后台准入拒绝增加 250 ms 共享冷却与 `background_admission_coalesced` 计数，并将通知 upsert 与 feed activity event 写入拆成固定 10 行的幂等短事务；这只降低无效拒绝日志和单次写入持锁时间，尚未代表已发布或完成 101 线上验收。
 - 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
 - migration `0092_content_work_supersession_lookup_index.sql` 增加 candidate cursor、active history 与 resource scope partial indexes；启动时由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
