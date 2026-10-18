@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -27,6 +27,7 @@ pub(crate) struct WorkerBackoff {
 #[derive(Debug, Default)]
 pub(crate) struct ClaimAdmission {
     in_flight: AtomicBool,
+    empty_generation: AtomicU64,
     failure_retry_at: Mutex<Option<Instant>>,
     empty_retry_at: Mutex<Option<Instant>>,
     failures: std::sync::atomic::AtomicUsize,
@@ -42,12 +43,14 @@ pub(crate) enum ClaimAdmissionResult<'a> {
 
 pub(crate) struct ClaimAdmissionGuard<'a> {
     admission: &'a ClaimAdmission,
+    empty_generation: u64,
 }
 
 impl ClaimAdmission {
     pub(crate) const fn new() -> Self {
         Self {
             in_flight: AtomicBool::new(false),
+            empty_generation: AtomicU64::new(0),
             failure_retry_at: Mutex::new(None),
             empty_retry_at: Mutex::new(None),
             failures: std::sync::atomic::AtomicUsize::new(0),
@@ -63,6 +66,7 @@ impl ClaimAdmission {
         let Ok(empty_retry_at) = self.empty_retry_at.lock() else {
             return ClaimAdmissionResult::Coalesced;
         };
+        let empty_generation = self.empty_generation.load(Ordering::Acquire);
         let now = Instant::now();
         if failure_retry_at.is_some_and(|retry_at| now < retry_at)
             || empty_retry_at.is_some_and(|retry_at| now < retry_at)
@@ -76,7 +80,10 @@ impl ClaimAdmission {
         {
             return ClaimAdmissionResult::Coalesced;
         }
-        ClaimAdmissionResult::Admitted(ClaimAdmissionGuard { admission: self })
+        ClaimAdmissionResult::Admitted(ClaimAdmissionGuard {
+            admission: self,
+            empty_generation,
+        })
     }
 
     pub(crate) fn retry_after(&self, minimum: Duration) -> Duration {
@@ -106,6 +113,7 @@ impl ClaimAdmission {
     }
 
     pub(crate) fn wake(&self) {
+        self.empty_generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut retry_at) = self.empty_retry_at.lock() {
             *retry_at = None;
         }
@@ -122,14 +130,21 @@ impl ClaimAdmission {
         retry_at: &Mutex<Option<Instant>>,
         failures: &std::sync::atomic::AtomicUsize,
     ) {
+        if let Ok(mut retry_at) = retry_at.lock() {
+            Self::schedule_backoff_locked(&mut retry_at, failures);
+        }
+    }
+
+    fn schedule_backoff_locked(
+        retry_at: &mut Option<Instant>,
+        failures: &std::sync::atomic::AtomicUsize,
+    ) {
         let index = failures
             .fetch_add(1, Ordering::Relaxed)
             .min(BACKOFF_FLOORS.len() - 1);
         let delay = BACKOFF_FLOORS[index]
             + Duration::from_millis(rand::rng().random_range(0..=JITTER_MAX_MS));
-        if let Ok(mut retry_at) = retry_at.lock() {
-            *retry_at = Some(Instant::now() + delay);
-        }
+        *retry_at = Some(Instant::now() + delay);
     }
 }
 
@@ -156,10 +171,11 @@ impl ClaimAdmissionGuard<'_> {
             *retry_at = None;
         }
         self.admission.failures.store(0, Ordering::Relaxed);
-        self.admission.schedule_backoff(
-            &self.admission.empty_retry_at,
-            &self.admission.empty_failures,
-        );
+        if let Ok(mut retry_at) = self.admission.empty_retry_at.lock()
+            && self.admission.empty_generation.load(Ordering::Acquire) == self.empty_generation
+        {
+            ClaimAdmission::schedule_backoff_locked(&mut retry_at, &self.admission.empty_failures);
+        }
     }
 }
 
@@ -258,6 +274,24 @@ mod tests {
             ClaimAdmissionResult::CoolingDown
         ));
         admission.wake();
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn ready_signal_during_empty_claim_does_not_reinstall_cooldown() {
+        let admission = ClaimAdmission::new();
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("first claim should be admitted"),
+        };
+
+        admission.wake();
+        guard.empty();
+        drop(guard);
+
         assert!(matches!(
             admission.try_admit(),
             ClaimAdmissionResult::Admitted(_)

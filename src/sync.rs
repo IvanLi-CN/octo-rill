@@ -5390,6 +5390,7 @@ async fn attach_release_demand_with_freshness(
     let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
+        let queued_before = result.queued;
         let (_sqlite_write, mut tx) = if let Some(stage_deadline_at) = stage_deadline_at {
             state
                 .sqlite_writer
@@ -5687,11 +5688,10 @@ async fn attach_release_demand_with_freshness(
         };
 
         tx.commit().await.context("commit repo release attach tx")?;
+        if result.queued > queued_before {
+            REPO_RELEASE_CLAIM_ADMISSION.wake();
+        }
         result.work_item_ids.push(work_item_id);
-    }
-
-    if result.queued > 0 {
-        REPO_RELEASE_CLAIM_ADMISSION.wake();
     }
 
     for (work_item_id, actual_success_at) in reused_fresh_system_work_items {
