@@ -394,6 +394,66 @@ impl SqliteWriteCoordinator {
         })
     }
 
+    pub(crate) fn try_admit_background_lane(
+        &self,
+        lane: &'static str,
+        cadence: Duration,
+    ) -> Option<BackgroundLaneGuard<'_>> {
+        let now = Instant::now();
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if state
+            .background_lane_next
+            .get(&lane)
+            .is_some_and(|next_allowed_at| *next_allowed_at > now)
+        {
+            state.background_lane_coalesced = state.background_lane_coalesced.saturating_add(1);
+            debug!(
+                event = "sqlite.write",
+                operation = lane,
+                priority = SqliteWritePriority::Background.as_str(),
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
+                background_admission = "coalesced",
+                "sqlite background lane coalesced by cadence"
+            );
+            return None;
+        }
+        if !state.background_lane_in_flight.insert(lane) {
+            state.background_lane_coalesced = state.background_lane_coalesced.saturating_add(1);
+            debug!(
+                event = "sqlite.write",
+                operation = lane,
+                priority = SqliteWritePriority::Background.as_str(),
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
+                background_admission = "in_flight",
+                "sqlite background lane coalesced while work is in flight"
+            );
+            return None;
+        }
+        state.background_lane_next.insert(lane, now + cadence);
+        state.background_lane_admitted = state.background_lane_admitted.saturating_add(1);
+        debug!(
+            event = "sqlite.write",
+            operation = lane,
+            priority = SqliteWritePriority::Background.as_str(),
+            request_id = %observability::current_request_id(),
+            request_method = %observability::current_request_method(),
+            request_route = %observability::current_request_route(),
+            background_admission = "granted",
+            cadence_ms = cadence.as_millis(),
+            "sqlite background lane admitted with in-flight guard"
+        );
+        Some(BackgroundLaneGuard {
+            coordinator: self,
+            lane,
+        })
+    }
+
     fn finish_background_lane(&self, lane: &'static str) {
         if let Ok(mut state) = self.state.lock() {
             state.background_lane_in_flight.remove(lane);

@@ -7,6 +7,7 @@ use std::{
 };
 
 use rand::RngExt;
+use tokio::sync::Notify;
 
 const BACKOFF_FLOORS: [Duration; 6] = [
     Duration::from_secs(1),
@@ -28,6 +29,7 @@ pub(crate) struct ClaimAdmission {
     in_flight: AtomicBool,
     retry_at: Mutex<Option<Instant>>,
     failures: std::sync::atomic::AtomicUsize,
+    notify: Notify,
 }
 
 pub(crate) enum ClaimAdmissionResult<'a> {
@@ -46,6 +48,7 @@ impl ClaimAdmission {
             in_flight: AtomicBool::new(false),
             retry_at: Mutex::new(None),
             failures: std::sync::atomic::AtomicUsize::new(0),
+            notify: Notify::const_new(),
         }
     }
 
@@ -65,6 +68,61 @@ impl ClaimAdmission {
         }
         ClaimAdmissionResult::Admitted(ClaimAdmissionGuard { admission: self })
     }
+
+    pub(crate) fn retry_after(&self, minimum: Duration) -> Duration {
+        let remaining = self
+            .retry_at
+            .lock()
+            .ok()
+            .and_then(|retry_at| {
+                retry_at.map(|retry_at| retry_at.saturating_duration_since(Instant::now()))
+            })
+            .unwrap_or_default();
+        remaining.max(minimum)
+    }
+
+    pub(crate) async fn wait(&self, minimum: Duration) {
+        let notified = self.notify.notified();
+        let delay = self.retry_after(minimum);
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Ok(mut retry_at) = self.retry_at.lock() {
+            *retry_at = None;
+        }
+        self.failures.store(0, Ordering::Relaxed);
+        self.notify_waiters();
+    }
+
+    fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_tests(&self) {
+        self.in_flight.store(false, Ordering::Release);
+        if let Ok(mut retry_at) = self.retry_at.lock() {
+            *retry_at = None;
+        }
+        self.failures.store(0, Ordering::Relaxed);
+        self.notify_waiters();
+    }
+
+    fn schedule_backoff(&self) {
+        let index = self
+            .failures
+            .fetch_add(1, Ordering::Relaxed)
+            .min(BACKOFF_FLOORS.len() - 1);
+        let delay = BACKOFF_FLOORS[index]
+            + Duration::from_millis(rand::rng().random_range(0..=JITTER_MAX_MS));
+        if let Ok(mut retry_at) = self.retry_at.lock() {
+            *retry_at = Some(Instant::now() + delay);
+        }
+    }
 }
 
 impl ClaimAdmissionGuard<'_> {
@@ -73,33 +131,22 @@ impl ClaimAdmissionGuard<'_> {
             *retry_at = None;
         }
         self.admission.failures.store(0, Ordering::Relaxed);
+        self.admission.notify_waiters();
     }
 
     pub(crate) fn fail(&mut self) {
-        const FLOORS: [Duration; 6] = [
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(16),
-            Duration::from_secs(30),
-        ];
-        let index = self
-            .admission
-            .failures
-            .fetch_add(1, Ordering::Relaxed)
-            .min(FLOORS.len() - 1);
-        let delay =
-            FLOORS[index] + Duration::from_millis(rand::rng().random_range(0..=JITTER_MAX_MS));
-        if let Ok(mut retry_at) = self.admission.retry_at.lock() {
-            *retry_at = Some(Instant::now() + delay);
-        }
+        self.admission.schedule_backoff();
+    }
+
+    pub(crate) fn empty(&mut self) {
+        self.admission.schedule_backoff();
     }
 }
 
 impl Drop for ClaimAdmissionGuard<'_> {
     fn drop(&mut self) {
         self.admission.in_flight.store(false, Ordering::Release);
+        self.admission.notify_waiters();
     }
 }
 
@@ -130,6 +177,7 @@ impl WorkerBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn failure_backoff_uses_required_floors_and_caps() {
@@ -174,6 +222,41 @@ mod tests {
             admission.try_admit(),
             ClaimAdmissionResult::CoolingDown
         ));
+    }
+
+    #[test]
+    fn ready_signal_clears_empty_claim_cooldown() {
+        let admission = ClaimAdmission::new();
+        let mut guard = match admission.try_admit() {
+            ClaimAdmissionResult::Admitted(guard) => guard,
+            _ => panic!("first claim should be admitted"),
+        };
+        guard.empty();
+        drop(guard);
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::CoolingDown
+        ));
+        admission.wake();
+        assert!(matches!(
+            admission.try_admit(),
+            ClaimAdmissionResult::Admitted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ready_signal_interrupts_the_worker_wait() {
+        let admission = Arc::new(ClaimAdmission::new());
+        let waiter_admission = admission.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_admission.wait(Duration::from_secs(30)).await;
+        });
+        tokio::task::yield_now().await;
+        admission.wake();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("ready signal should wake the worker")
+            .expect("worker wait task should join");
     }
 
     #[tokio::test(start_paused = true)]

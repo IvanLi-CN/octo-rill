@@ -13,7 +13,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Error as SqlxError, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::{debug, warn};
 
@@ -549,6 +549,7 @@ struct AttemptRouteSnapshot {
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
 const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
 const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
+const GLOBAL_RECOVERY_BATCH_SIZE: usize = 100;
 const GLOBAL_SUPERSESSION_CADENCE: Duration = Duration::from_secs(60);
 const GLOBAL_SUPERSESSION_LANE: &str = "content_processing_supersession";
 const GLOBAL_SUPERSESSION_BATCH_SIZE: usize = 100;
@@ -1463,6 +1464,9 @@ pub async fn submit_item(
     .await
     .map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
+    if work.status == "queued" {
+        CONTENT_CLAIM_ADMISSION.wake();
+    }
     let mut status_code = if existing_work && matches!(work.status.as_str(), "queued" | "running") {
         StatusCode::CONFLICT
     } else {
@@ -2056,6 +2060,9 @@ pub async fn retry_request(
             .map_err(ApiError::internal)?;
     }
     tx.commit().await.map_err(ApiError::internal)?;
+    if retry_status == "queued" {
+        CONTENT_CLAIM_ADMISSION.wake();
+    }
     let mut body = public_response(&row, &request_id, projection);
     body["status"] = Value::String(retry_status.to_owned());
     body["result"]["status"] = Value::String(retry_status.to_owned());
@@ -2066,6 +2073,8 @@ pub async fn retry_request(
 async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
     #[cfg(test)]
     let _test_claim_guard = CONTENT_CLAIM_TEST_SERIALIZER.lock().await;
+    #[cfg(test)]
+    CONTENT_CLAIM_ADMISSION.reset_for_tests();
     let mut admission = match CONTENT_CLAIM_ADMISSION.try_admit() {
         ClaimAdmissionResult::Admitted(guard) => guard,
         ClaimAdmissionResult::Coalesced => {
@@ -2081,30 +2090,56 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         }
     };
     tracing::debug!(event = "claim_admitted", lane = "content_processing_claim");
-    let result = claim_next_admitted(state, manual_limit).await;
-    if result.is_ok() {
-        admission.success();
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
-    {
-        admission.fail();
-        tracing::warn!(event = "writer_deadline", lane = "content_processing_claim");
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
-    {
-        admission.fail();
+    let has_queued = match has_queued_content_work_item(state, manual_limit).await {
+        Ok(has_queued) => has_queued,
+        Err(error) => {
+            admission.fail();
+            return Err(error);
+        }
+    };
+    if !has_queued {
+        admission.empty();
         tracing::debug!(
-            event = "background_admission_denied",
+            event = "claim_probe_empty",
             lane = "content_processing_claim"
         );
-    } else {
-        admission.fail();
+        return Ok(None);
+    }
+    let result = claim_next_admitted(state, manual_limit).await;
+    match result.as_ref() {
+        Ok(Some(_)) => admission.success(),
+        Ok(None) => {
+            admission.empty();
+            tracing::debug!(
+                event = "claim_probe_empty",
+                lane = "content_processing_claim"
+            );
+        }
+        Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
+            admission.fail();
+            tracing::warn!(event = "writer_deadline", lane = "content_processing_claim");
+        }
+        Err(error) if is_sqlite_background_admission_error(error.as_ref()) => {
+            admission.fail();
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "content_processing_claim"
+            );
+        }
+        Err(_) => admission.fail(),
     }
     result
+}
+
+async fn has_queued_content_work_item(state: &AppState, manual_limit: i64) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) LIMIT 1)",
+    )
+    .bind(manual_limit)
+    .fetch_one(&state.pool)
+    .await
+    .context("probe queued content work item")?;
+    Ok(exists != 0)
 }
 
 async fn claim_next_admitted(state: &AppState, manual_limit: i64) -> Result<Option<WorkRow>> {
@@ -2323,114 +2358,238 @@ async fn renew_global_work_lease(state: &AppState, work: &WorkRow) -> Result<boo
     Ok(updated.rows_affected() == 1)
 }
 
-async fn recover_due(state: &AppState) -> Result<()> {
-    if !state
-        .sqlite_writer
-        .admit_background_lane("content_processing_recover", GLOBAL_RECOVERY_CADENCE)
-    {
-        return Ok(());
+#[derive(Debug, Default)]
+struct RecoveryBatch {
+    retryable_ids: Vec<String>,
+    provider_expired_ids: Vec<String>,
+    running_expired_ids: Vec<String>,
+}
+
+impl RecoveryBatch {
+    fn is_empty(&self) -> bool {
+        self.retryable_ids.is_empty()
+            && self.provider_expired_ids.is_empty()
+            && self.running_expired_ids.is_empty()
     }
+
+    fn wakes_claim_worker(&self) -> bool {
+        !self.retryable_ids.is_empty() || !self.running_expired_ids.is_empty()
+    }
+}
+
+fn push_recovery_ids(query: &mut QueryBuilder<'_, Sqlite>, ids: &[String]) {
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            query.push(", ");
+        }
+        query.push_bind(id.clone());
+    }
+}
+
+async fn load_recovery_batch(state: &AppState, now: &str) -> Result<RecoveryBatch> {
+    let rows = sqlx::query(
+        "SELECT id, recovery_kind FROM (SELECT id, 0 AS recovery_kind FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?)) UNION ALL SELECT id, 1 AS recovery_kind FROM content_work_items WHERE status = 'deferred_provider' AND retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) UNION ALL SELECT id, 2 AS recovery_kind FROM content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)) ORDER BY recovery_kind, id LIMIT ?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(GLOBAL_RECOVERY_BATCH_SIZE as i64)
+    .fetch_all(&state.pool)
+    .await
+    .context("load bounded content recovery batch")?;
+
+    let mut batch = RecoveryBatch::default();
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        match row.try_get::<i64, _>("recovery_kind")? {
+            0 => batch.retryable_ids.push(id),
+            1 => batch.provider_expired_ids.push(id),
+            2 => batch.running_expired_ids.push(id),
+            kind => anyhow::bail!("unknown content recovery kind {kind}"),
+        }
+    }
+    Ok(batch)
+}
+
+async fn recover_due(state: &AppState) -> Result<()> {
+    let Some(_recovery_guard) = state
+        .sqlite_writer
+        .try_admit_background_lane("content_processing_recover", GLOBAL_RECOVERY_CADENCE)
+    else {
+        return Ok(());
+    };
 
     let supersession_admitted = state
         .sqlite_writer
         .admit_background_lane(GLOBAL_SUPERSESSION_LANE, GLOBAL_SUPERSESSION_CADENCE);
 
     let now = Utc::now().to_rfc3339();
+    let batch = load_recovery_batch(state, &now).await?;
+    if batch.is_empty() {
+        if supersession_admitted {
+            run_supersession_batch(state).await?;
+        }
+        return Ok(());
+    }
+
+    tracing::debug!(
+        event = "content_recovery_batch",
+        lane = "content_processing_recover",
+        batch_size = batch.retryable_ids.len()
+            + batch.provider_expired_ids.len()
+            + batch.running_expired_ids.len(),
+        retryable = batch.retryable_ids.len(),
+        provider_expired = batch.provider_expired_ids.len(),
+        running_expired = batch.running_expired_ids.len(),
+        "content recovery batch admitted"
+    );
+
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_recover")
         .await?;
     ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
-    )
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', priority = 0, next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
-    )
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE content_work_items SET status = 'failed', failure_class = 'provider_unavailable', next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, updated_at = ? WHERE status = 'deferred_provider' AND retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE content_attempt_events SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', failure_class = 'provider_unavailable', retry_eligible = 0, next_retry_at = NULL WHERE event_type = 'attempt_completed' AND result_status = 'deferred_provider' AND work_item_id IN (SELECT id FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?)",
-    )
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), w.id, COALESCE((SELECT MAX(pending.attempt_no) FROM content_attempt_events pending WHERE pending.work_item_id = w.id AND pending.event_type = 'attempt_queued'), (SELECT MAX(started.attempt_no) FROM content_attempt_events started WHERE started.work_item_id = w.id AND started.event_type = 'attempt_started'), CASE WHEN w.attempt_count < 1 THEN 1 ELSE w.attempt_count END), 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items w WHERE w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND w.updated_at = ? AND NOT EXISTS (SELECT 1 FROM content_attempt_events completed WHERE completed.work_item_id = w.id AND completed.event_type = 'attempt_completed')",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', updated_at = ? WHERE result_status = 'deferred_provider' AND work_item_id IN (SELECT id FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    let expired_running = "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)";
-    sqlx::query(&format!(
-        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running}) AND batch_id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL)"
-    ))
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(&format!(
-        "UPDATE content_batches SET status = 'failed', error_code = 'runtime_lease_expired', error_summary = 'worker lease expired', finished_at = ?, updated_at = ? WHERE id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL) AND status = 'running'"
-    ))
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(&format!(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_completed', 'failed', 'runtime_lease_expired', 'worker lease expired', 'runtime_lease_expired', 1, ? FROM content_work_items WHERE {expired_running}"
-    ))
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-    let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
-    sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
-    )
-    .bind(&recovery_retry_at)
-    .bind(&recovery_expires_at)
-    .bind(&recovery_retry_at)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count + 1, 'automatic_recovery', 'attempt_queued', 1, ?, ? FROM content_work_items WHERE status = 'queued' AND next_retry_at = ?",
-    )
-    .bind(&recovery_retry_at)
-    .bind(&now)
-    .bind(&recovery_retry_at)
-    .execute(&mut *tx)
-    .await?;
+    recover_due_batch(tx.as_transaction_mut(), &batch, &now).await?;
     tx.commit().await?;
     drop(_lock);
+    if batch.wakes_claim_worker() {
+        CONTENT_CLAIM_ADMISSION.wake();
+    }
     if supersession_admitted {
         run_supersession_batch(state).await?;
     }
+    Ok(())
+}
+
+async fn recover_due_batch(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch: &RecoveryBatch,
+    now: &str,
+) -> Result<()> {
+    if !batch.retryable_ids.is_empty() {
+        let mut insert_events = QueryBuilder::<Sqlite>::new(
+            "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ",
+        );
+        insert_events
+            .push_bind(now)
+            .push(" FROM content_work_items WHERE id IN (");
+        push_recovery_ids(&mut insert_events, &batch.retryable_ids);
+        insert_events.push(") AND status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(").push_bind(now).push(") AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(").push_bind(now).push("))");
+        insert_events.build().execute(&mut **tx).await?;
+
+        let mut update_items = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_work_items SET status = 'queued', priority = 0, next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ",
+        );
+        update_items.push_bind(now).push(" WHERE id IN (");
+        push_recovery_ids(&mut update_items, &batch.retryable_ids);
+        update_items.push(") AND status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(").push_bind(now).push(") AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(").push_bind(now).push("))");
+        update_items.build().execute(&mut **tx).await?;
+    }
+
+    if !batch.provider_expired_ids.is_empty() {
+        let mut update_provider = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_work_items SET status = 'failed', failure_class = 'provider_unavailable', next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, updated_at = ",
+        );
+        update_provider.push_bind(now).push(" WHERE id IN (");
+        push_recovery_ids(&mut update_provider, &batch.provider_expired_ids);
+        update_provider.push(") AND status = 'deferred_provider' AND retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(").push_bind(now).push(")");
+        update_provider.build().execute(&mut **tx).await?;
+
+        let mut update_events = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_attempt_events SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', failure_class = 'provider_unavailable', retry_eligible = 0, next_retry_at = NULL WHERE event_type = 'attempt_completed' AND result_status = 'deferred_provider' AND work_item_id IN (",
+        );
+        push_recovery_ids(&mut update_events, &batch.provider_expired_ids);
+        update_events.push(")");
+        update_events.build().execute(&mut **tx).await?;
+
+        let mut insert_completed = QueryBuilder::<Sqlite>::new(
+            "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), w.id, COALESCE((SELECT MAX(pending.attempt_no) FROM content_attempt_events pending WHERE pending.work_item_id = w.id AND pending.event_type = 'attempt_queued'), (SELECT MAX(started.attempt_no) FROM content_attempt_events started WHERE started.work_item_id = w.id AND started.event_type = 'attempt_started'), CASE WHEN w.attempt_count < 1 THEN 1 ELSE w.attempt_count END), 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ",
+        );
+        insert_completed
+            .push_bind(now)
+            .push(" FROM content_work_items w WHERE w.id IN (");
+        push_recovery_ids(&mut insert_completed, &batch.provider_expired_ids);
+        insert_completed.push(") AND w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND NOT EXISTS (SELECT 1 FROM content_attempt_events completed WHERE completed.work_item_id = w.id AND completed.event_type = 'attempt_completed')");
+        insert_completed.build().execute(&mut **tx).await?;
+
+        let mut update_batch_items = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_batch_items SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', updated_at = ",
+        );
+        update_batch_items
+            .push_bind(now)
+            .push(" WHERE result_status = 'deferred_provider' AND work_item_id IN (");
+        push_recovery_ids(&mut update_batch_items, &batch.provider_expired_ids);
+        update_batch_items.push(")");
+        update_batch_items.build().execute(&mut **tx).await?;
+    }
+
+    if !batch.running_expired_ids.is_empty() {
+        let mut update_batch_items = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ",
+        );
+        update_batch_items
+            .push_bind(now)
+            .push(" WHERE work_item_id IN (");
+        push_recovery_ids(&mut update_batch_items, &batch.running_expired_ids);
+        update_batch_items.push(")");
+        update_batch_items.build().execute(&mut **tx).await?;
+
+        let mut update_batches = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_batches SET status = 'failed', error_code = 'runtime_lease_expired', error_summary = 'worker lease expired', finished_at = ",
+        );
+        update_batches
+            .push_bind(now)
+            .push(", updated_at = ")
+            .push_bind(now)
+            .push(" WHERE id IN (SELECT batch_id FROM content_work_items WHERE id IN (");
+        push_recovery_ids(&mut update_batches, &batch.running_expired_ids);
+        update_batches.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push(") AND batch_id IS NOT NULL) AND status = 'running'");
+        update_batches.build().execute(&mut **tx).await?;
+
+        let mut insert_completed = QueryBuilder::<Sqlite>::new(
+            "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_completed', 'failed', 'runtime_lease_expired', 'worker lease expired', 'runtime_lease_expired', 1, ",
+        );
+        insert_completed
+            .push_bind(now)
+            .push(" FROM content_work_items WHERE id IN (");
+        push_recovery_ids(&mut insert_completed, &batch.running_expired_ids);
+        insert_completed.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push(")");
+        insert_completed.build().execute(&mut **tx).await?;
+
+        let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let mut update_items = QueryBuilder::<Sqlite>::new(
+            "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ",
+        );
+        update_items
+            .push_bind(&recovery_retry_at)
+            .push(", retry_expires_at = COALESCE(retry_expires_at, ")
+            .push_bind(&recovery_expires_at)
+            .push("), retry_after_at = ")
+            .push_bind(&recovery_retry_at)
+            .push(", updated_at = ")
+            .push_bind(now)
+            .push(" WHERE id IN (");
+        push_recovery_ids(&mut update_items, &batch.running_expired_ids);
+        update_items.push(") AND status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(").push_bind(now).push(")");
+        update_items.build().execute(&mut **tx).await?;
+
+        let mut insert_queued = QueryBuilder::<Sqlite>::new(
+            "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count + 1, 'automatic_recovery', 'attempt_queued', 1, ",
+        );
+        insert_queued
+            .push_bind(&recovery_retry_at)
+            .push(", ")
+            .push_bind(now)
+            .push(" FROM content_work_items WHERE id IN (");
+        push_recovery_ids(&mut insert_queued, &batch.running_expired_ids);
+        insert_queued
+            .push(") AND status = 'queued' AND next_retry_at = ")
+            .push_bind(&recovery_retry_at);
+        insert_queued.build().execute(&mut **tx).await?;
+    }
+
     Ok(())
 }
 
@@ -4667,12 +4826,16 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
                                 Ok(GlobalSchedulerAttempt::Idle) => {
                                     claim_backoff.reset();
                                     execution_backoff.reset();
-                                    sleep(Duration::from_millis(250)).await;
+                                    CONTENT_CLAIM_ADMISSION
+                                        .wait(Duration::from_millis(250))
+                                        .await;
                                 }
                                 Ok(GlobalSchedulerAttempt::Claimed) => {
                                     claim_backoff.reset();
                                     execution_backoff.reset();
-                                    sleep(Duration::from_millis(250)).await;
+                                    CONTENT_CLAIM_ADMISSION
+                                        .wait(Duration::from_millis(250))
+                                        .await;
                                 }
                                 Ok(GlobalSchedulerAttempt::ClaimedDatabaseFailure(error)) => {
                                     claim_backoff.reset();
@@ -7626,6 +7789,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_processes_at_most_one_hundred_candidates_per_transaction() {
+        let pool = global_pool().await;
+        for index in 0..=GLOBAL_RECOVERY_BATCH_SIZE {
+            let id = format!("recovery-batch-{index}");
+            insert_test_work(&pool, &id, "failed", 1, Some("2000-01-01T00:00:00Z")).await;
+            sqlx::query(
+                "UPDATE content_work_items SET canonical_resource_id = ?, created_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            )
+            .bind(format!("recovery-resource-{index}"))
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let state = global_state(pool.clone());
+
+        recover_due(&state).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE id LIKE 'recovery-batch-%' AND status = 'queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            GLOBAL_RECOVERY_BATCH_SIZE as i64,
+            "one recovery transaction must process at most the fixed batch size"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE id LIKE 'recovery-batch-%' AND status = 'failed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id LIKE 'recovery-batch-%' AND event_type = 'attempt_queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            GLOBAL_RECOVERY_BATCH_SIZE as i64
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_releases_writer_before_supersession_apply() {
         let pool = global_pool().await;
         for (id, hash, revision) in [
@@ -7853,17 +8065,17 @@ mod tests {
                 }
             }));
         }
-        tokio::time::timeout(StdDuration::from_secs(1), async {
-            loop {
-                let status = sqlite_writer.runtime_status();
-                if status.waiting_background > 0 || status.background_rejected > 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("background writer queue should show a waiter");
+        for task in background_tasks.drain(..) {
+            tokio::time::timeout(StdDuration::from_secs(1), task)
+                .await
+                .expect("empty-queue background scheduler should stay bounded")
+                .expect("background scheduler task should join");
+        }
+        assert_eq!(
+            sqlite_writer.runtime_status().waiting_background,
+            0,
+            "empty-queue claim probes must not wait for the writer"
+        );
 
         let mut foreground_tasks = Vec::new();
         for request_index in 0..32 {
@@ -7901,9 +8113,6 @@ mod tests {
 
         for task in foreground_tasks {
             task.await.expect("foreground request task should join");
-        }
-        for task in background_tasks {
-            task.await.expect("background scheduler task should join");
         }
         contention_probe
             .await
@@ -7997,11 +8206,13 @@ mod tests {
         assert!(!status.active, "writer permit must be released after load");
         assert_eq!(status.waiting_foreground, 0);
         assert_eq!(status.waiting_background, 0);
-        assert!(
-            status.background_admitted > 0
-                || status.background_rejected > 0
-                || status.background_admission_coalesced > 0,
-            "background writer pressure should expose an attempt or admission decision: {status:?}"
+        assert_eq!(
+            status.background_admitted, 0,
+            "empty claim probes must not enter the background writer: {status:?}"
+        );
+        assert_eq!(
+            status.background_rejected, 0,
+            "empty claim probes must not be rejected after waiting for the writer: {status:?}"
         );
         assert!(
             status.background_lane_admitted * 4 < 128,
@@ -8012,8 +8223,8 @@ mod tests {
             "recovery cadence should coalesce repeated worker passes: {status:?}"
         );
         assert!(
-            status.background_rejected > 0 || status.background_lane_coalesced > 0,
-            "background admission or shared claim admission should expose contention under foreground load: {status:?}"
+            status.background_lane_coalesced > 0,
+            "repeated empty recovery passes should be coalesced: {status:?}"
         );
 
         let cleanup_probe_pool = reader_pool.clone();

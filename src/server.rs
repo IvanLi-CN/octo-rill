@@ -883,7 +883,7 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
             logical_worker_concurrency,
             claim_admission_per_lane = 1,
             llm_max_concurrency = runtime_settings.llm_max_concurrency,
-            "logical processing concurrency exceeds sqlite pool size; database claims remain admitted once per lane"
+            "logical processing concurrency is independent from sqlite pool capacity; database claims remain admitted once per lane and foreground writes retain priority"
         );
     }
 }
