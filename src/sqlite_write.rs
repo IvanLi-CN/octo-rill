@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     ops::{Deref, DerefMut},
     sync::{
@@ -69,6 +69,8 @@ struct SqliteWriteState {
     background_lane_admitted: u64,
     background_rejected: u64,
     background_lane_next: HashMap<&'static str, Instant>,
+    background_lane_cursor: HashMap<&'static str, (String, String)>,
+    background_lane_in_flight: HashSet<&'static str>,
     background_lane_coalesced: u64,
 }
 
@@ -111,6 +113,17 @@ struct BackgroundWaiter {
     state: Arc<Mutex<SqliteWriteState>>,
     notify: Arc<Notify>,
     registered: bool,
+}
+
+pub(crate) struct BackgroundLaneGuard<'a> {
+    coordinator: &'a SqliteWriteCoordinator,
+    lane: &'static str,
+}
+
+impl Drop for BackgroundLaneGuard<'_> {
+    fn drop(&mut self) {
+        self.coordinator.finish_background_lane(self.lane);
+    }
 }
 
 impl BackgroundWaiter {
@@ -347,6 +360,60 @@ impl SqliteWriteCoordinator {
             "sqlite background lane admitted"
         );
         true
+    }
+
+    pub(crate) fn try_begin_background_lane(
+        &self,
+        lane: &'static str,
+    ) -> Option<BackgroundLaneGuard<'_>> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if !state.background_lane_in_flight.insert(lane) {
+            state.background_lane_coalesced = state.background_lane_coalesced.saturating_add(1);
+            debug!(
+                event = "sqlite.write",
+                operation = lane,
+                priority = SqliteWritePriority::Background.as_str(),
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
+                background_admission = "in_flight",
+                "sqlite background lane coalesced while work is in flight"
+            );
+            return None;
+        }
+        Some(BackgroundLaneGuard {
+            coordinator: self,
+            lane,
+        })
+    }
+
+    fn finish_background_lane(&self, lane: &'static str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.background_lane_in_flight.remove(lane);
+        }
+    }
+
+    pub(crate) fn background_lane_cursor(&self, lane: &'static str) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.background_lane_cursor.get(lane).cloned())
+    }
+
+    pub(crate) fn set_background_lane_cursor(
+        &self,
+        lane: &'static str,
+        cursor: Option<(String, String)>,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(cursor) = cursor {
+                state.background_lane_cursor.insert(lane, cursor);
+            } else {
+                state.background_lane_cursor.remove(lane);
+            }
+        }
     }
 
     pub async fn write<T, Fut, Op>(&self, lane: &'static str, operation: Op) -> Result<T>

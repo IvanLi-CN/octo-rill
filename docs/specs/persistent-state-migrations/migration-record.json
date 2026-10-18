@@ -5,7 +5,7 @@
     "id": "content-processing-online-v2",
     "supersedes": "content-processing-online-v1",
     "definition_checksum": "cfe818b1c2b5d9259fb75292565f884bf1dcfa6c942e89b5f0f56318756365a5",
-    "description": "Forward repair of online durable-state control and legacy observation migration for global content processing.",
+    "description": "Forward repair of online durable-state control, legacy observation migration, and bounded content supersession lookup state for global content processing.",
     "release_unit_description": "Single-instance Compose/SQLite release with no topology change.",
     "version_impact": "minor"
   },
@@ -13,7 +13,7 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0090",
+      "from_program_versions": "current SQLx history through migration 0092",
       "to_program_version": "content-processing-online-v2",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
@@ -21,6 +21,17 @@
   },
   "database_migration": {
     "applicable": true,
+    "sqlx_pending_migrations": [
+      {
+        "version": 92,
+        "file": "migrations/0092_content_work_supersession_lookup_index.sql",
+        "definition_checksum": "5d64b4bcac3002b13a6f89381c8803e7e463ab23011b2d1bbcc11993917a516c",
+        "description": "Create candidate-cursor, active-history, and resource-scope indexes used by bounded content supersession reconciliation.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      }
+    ],
     "ddl_structural_changes": [
       {
         "id": "ddl-001",
