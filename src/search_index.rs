@@ -13,6 +13,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::task::AbortHandle;
 use tower_sessions::Session;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{api, error::ApiError, sqlite_write::SqliteWritePriority, state::AppState};
 
@@ -20,6 +21,9 @@ const INDEX_BATCH_SIZE: i64 = 25;
 const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(10);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const PROJECTION_POLL_DELAY: Duration = Duration::from_millis(250);
+const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
+const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 const PHASES: &[&str] = &[
     "releases",
@@ -83,6 +87,612 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
         }
     })
     .abort_handle()
+}
+
+pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        loop {
+            match run_projection_once(state.as_ref()).await {
+                Ok(true) => tokio::time::sleep(PROJECTION_POLL_DELAY).await,
+                Ok(false) => tokio::time::sleep(PROJECTION_IDLE_DELAY).await,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        event = "search.projection_outbox.failed",
+                        retry_after_ms = PROJECTION_RETRY_DELAY.as_millis(),
+                        "search projection outbox item failed; source data remains committed"
+                    );
+                    tokio::time::sleep(PROJECTION_RETRY_DELAY).await;
+                }
+            }
+        }
+    })
+    .abort_handle()
+}
+
+#[cfg(test)]
+pub(crate) async fn run_projection_for_test(state: &AppState) -> Result<bool> {
+    run_projection_once(state).await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProjectionOutboxRow {
+    projection_key: String,
+    operation: String,
+    resource_type: String,
+    resource_id: String,
+    canonical_resource_type: Option<String>,
+    user_id: Option<String>,
+    attempt_count: i64,
+}
+
+async fn run_projection_once(state: &AppState) -> Result<bool> {
+    let Some(lane_guard) = state
+        .sqlite_writer
+        .try_admit_background_lane("search_projection_outbox", PROJECTION_POLL_DELAY)
+    else {
+        return Ok(false);
+    };
+    let (permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "search_projection_outbox",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let row = sqlx::query_as::<_, ProjectionOutboxRow>(
+        "SELECT projection_key, operation, resource_type, resource_id, canonical_resource_type, user_id, attempt_count
+         FROM search_projection_outbox
+         WHERE available_at <= CURRENT_TIMESTAMP
+           AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
+         ORDER BY available_at ASC, created_at ASC, projection_key ASC
+         LIMIT 1",
+    )
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?;
+    let Some(row) = row else {
+        tx.rollback().await?;
+        drop(permit);
+        drop(lane_guard);
+        return Ok(false);
+    };
+    let lease_owner = format!("{}:{}", state.runtime_owner_id, Uuid::new_v4());
+    sqlx::query(
+        "UPDATE search_projection_outbox
+         SET lease_owner = ?, lease_expires_at = datetime('now', '+30 seconds'),
+             attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE projection_key = ?",
+    )
+    .bind(&lease_owner)
+    .bind(&row.projection_key)
+    .execute(&mut **tx.as_transaction_mut())
+    .await?;
+    let projection_result = apply_projection_outbox_item(tx.as_transaction_mut(), &row).await;
+    match projection_result {
+        Ok(()) => {
+            sqlx::query("DELETE FROM search_projection_outbox WHERE projection_key = ?")
+                .bind(&row.projection_key)
+                .execute(&mut **tx.as_transaction_mut())
+                .await?;
+            tx.commit().await?;
+            drop(permit);
+            drop(lane_guard);
+            info!(
+                event = "search.projection_outbox.committed",
+                projection_key = %row.projection_key,
+                operation = %row.operation,
+                attempt = row.attempt_count + 1,
+                "search projection outbox item committed"
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            drop(permit);
+            drop(lane_guard);
+            record_projection_failure(state, &row.projection_key, &error).await;
+            Err(error)
+        }
+    }
+}
+
+async fn record_projection_failure(state: &AppState, projection_key: &str, error: &anyhow::Error) {
+    let result = async {
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate_with_priority(
+                &state.pool,
+                "search_projection_outbox_failure",
+                SqliteWritePriority::Background,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE search_projection_outbox
+             SET attempt_count = attempt_count + 1,
+                 available_at = CASE WHEN attempt_count + 1 >= 8
+                                     THEN datetime('now', '+5 minutes')
+                                     ELSE datetime('now', '+5 seconds') END,
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 last_error = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE projection_key = ?",
+        )
+        .bind(redact_search_error_summary(&error.to_string()))
+        .bind(projection_key)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+        tx.commit().await?;
+        drop(permit);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(record_error) = result {
+        warn!(
+            ?record_error,
+            projection_key,
+            event = "search.projection_outbox.failure_record_failed",
+            "failed to persist search projection retry state"
+        );
+    }
+}
+
+async fn apply_projection_outbox_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<()> {
+    if row.operation == "delete" {
+        if row.resource_type == "content" {
+            let canonical_type = row
+                .canonical_resource_type
+                .as_deref()
+                .context("content projection delete is missing canonical resource type")?;
+            refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
+        } else {
+            delete_search_document(tx, &row.projection_key).await?;
+        }
+        return Ok(());
+    }
+
+    match row.resource_type.as_str() {
+        "notification" => apply_notification_projection(tx, row).await,
+        "announcement" => apply_announcement_projection(tx, row).await,
+        "content" => {
+            let canonical_type = row
+                .canonical_resource_type
+                .as_deref()
+                .context("content projection is missing canonical resource type")?;
+            refresh_content_projection(tx, canonical_type, &row.resource_id).await
+        }
+        resource_type => bail!("unsupported search projection resource type {resource_type}"),
+    }
+}
+
+async fn apply_notification_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<()> {
+    let user_id = row
+        .user_id
+        .as_deref()
+        .context("notification projection is missing user id")?;
+    let source = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        ),
+    >(
+        "SELECT user_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, html_url
+         FROM notifications WHERE user_id = ? AND thread_id = ?",
+    )
+    .bind(user_id)
+    .bind(&row.resource_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        source_user_id,
+        repo_full_name,
+        subject_title,
+        subject_type,
+        reason,
+        updated_at,
+        unread,
+        html_url,
+    )) = source
+    else {
+        delete_search_document(tx, &row.projection_key).await?;
+        return Ok(());
+    };
+    let owner_login = repo_full_name.as_deref().map(|name| {
+        name.split_once('/')
+            .map(|(owner, _)| owner)
+            .unwrap_or(name)
+            .to_owned()
+    });
+    remove_conflicting_search_document(
+        tx,
+        &source_user_id,
+        "notification",
+        &row.resource_id,
+        &row.projection_key,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_documents (
+           id, user_id, resource_type, resource_id, repo_full_name, owner_login,
+           title, body, source_time, unread, target_url, created_at, updated_at
+         ) VALUES (?, ?, 'notification', ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+         ON CONFLICT(id) DO UPDATE SET
+           user_id = excluded.user_id,
+           resource_id = excluded.resource_id,
+           repo_full_name = excluded.repo_full_name,
+           owner_login = excluded.owner_login,
+           title = excluded.title,
+           body = excluded.body,
+           source_time = excluded.source_time,
+           unread = excluded.unread,
+           target_url = excluded.target_url,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&row.projection_key)
+    .bind(&source_user_id)
+    .bind(&row.resource_id)
+    .bind(&repo_full_name)
+    .bind(owner_login)
+    .bind(&subject_title)
+    .bind(format!(
+        "{} {}",
+        subject_type.as_deref().unwrap_or_default(),
+        reason.as_deref().unwrap_or_default()
+    ))
+    .bind(&updated_at)
+    .bind(unread)
+    .bind(&html_url)
+    .bind(&updated_at)
+    .bind(&updated_at)
+    .execute(&mut **tx)
+    .await?;
+    refresh_user_lane(
+        tx,
+        &row.projection_key,
+        &source_user_id,
+        "notification",
+        &row.resource_id,
+        &row.resource_id,
+    )
+    .await?;
+    refresh_search_document_fts(tx, &row.projection_key).await
+}
+
+async fn apply_announcement_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<()> {
+    let source = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
+        "SELECT user_id, repo_id, repo_full_name, title, body, occurred_at,
+                discussion_number, html_url, created_at, updated_at
+         FROM social_activity_events
+         WHERE id = ? AND kind = 'announcement'",
+    )
+    .bind(&row.resource_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        user_id,
+        repo_id,
+        repo_full_name,
+        title,
+        body,
+        occurred_at,
+        discussion_number,
+        html_url,
+        created_at,
+        updated_at,
+    )) = source
+    else {
+        delete_search_document(tx, &row.projection_key).await?;
+        return Ok(());
+    };
+    let resource_id = match (&repo_full_name, discussion_number) {
+        (Some(repo), Some(number)) => format!("{}#{}", repo.to_ascii_lowercase(), number),
+        _ => row.resource_id.clone(),
+    };
+    let owner_login = repo_full_name.as_deref().map(|name| {
+        name.split_once('/')
+            .map(|(owner, _)| owner)
+            .unwrap_or(name)
+            .to_owned()
+    });
+    let target_path = repo_full_name
+        .as_deref()
+        .zip(discussion_number)
+        .map(|(repo, number)| format!("/{repo}/discussions/{number}"));
+    remove_conflicting_search_document(
+        tx,
+        &user_id,
+        "announcement",
+        &resource_id,
+        &row.projection_key,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_documents (
+           id, user_id, resource_type, resource_id, repo_id, repo_full_name,
+           owner_login, title, body, source_time, target_path, target_url,
+           created_at, updated_at
+         ) VALUES (?, ?, 'announcement', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           user_id = excluded.user_id,
+           resource_id = excluded.resource_id,
+           repo_id = excluded.repo_id,
+           repo_full_name = excluded.repo_full_name,
+           owner_login = excluded.owner_login,
+           title = excluded.title,
+           body = excluded.body,
+           source_time = excluded.source_time,
+           target_path = excluded.target_path,
+           target_url = excluded.target_url,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&row.projection_key)
+    .bind(&user_id)
+    .bind(&resource_id)
+    .bind(repo_id)
+    .bind(&repo_full_name)
+    .bind(owner_login)
+    .bind(&title)
+    .bind(&body)
+    .bind(&occurred_at)
+    .bind(target_path)
+    .bind(&html_url)
+    .bind(&created_at)
+    .bind(&updated_at)
+    .execute(&mut **tx)
+    .await?;
+    refresh_user_lane(
+        tx,
+        &row.projection_key,
+        &user_id,
+        "announcement",
+        &row.resource_id,
+        &resource_id,
+    )
+    .await?;
+    refresh_search_document_fts(tx, &row.projection_key).await
+}
+
+async fn refresh_user_lane(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: &str,
+    user_id: &str,
+    resource_type: &str,
+    entity_id: &str,
+    alternate_entity_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM search_document_user_lanes_fts WHERE doc_id = ? AND user_id = ?")
+        .bind(document_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?")
+        .bind(document_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    let entity_pattern = format!("{resource_type}%");
+    sqlx::query(
+        "INSERT INTO search_document_user_lanes (
+           document_id, user_id, translated_text, smart_text, updated_at
+         )
+         SELECT ?, ?,
+           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+            FROM ai_translations t
+            WHERE t.user_id = ? AND t.lang = 'zh-CN'
+              AND t.status IN ('ready', 'disabled', 'missing')
+              AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+              AND t.entity_type LIKE ? AND lower(t.entity_type) NOT LIKE '%smart%'
+              AND lower(t.entity_id) IN (lower(?), lower(?))
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+            FROM ai_translations t
+            WHERE t.user_id = ? AND t.lang = 'zh-CN'
+              AND t.status IN ('ready', 'disabled', 'missing')
+              AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+              AND t.entity_type LIKE ? AND lower(t.entity_type) LIKE '%smart%'
+              AND lower(t.entity_id) IN (lower(?), lower(?))
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+           COALESCE((SELECT MAX(t.updated_at) FROM ai_translations t
+                     WHERE t.user_id = ? AND t.lang = 'zh-CN'
+                       AND t.status IN ('ready', 'disabled', 'missing')
+                       AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+                       AND t.entity_type LIKE ?
+                       AND lower(t.entity_id) IN (lower(?), lower(?))), CURRENT_TIMESTAMP)
+         WHERE EXISTS (SELECT 1 FROM search_documents d WHERE d.id = ? AND d.user_id = ?)
+           AND EXISTS (SELECT 1 FROM ai_translations t
+                       WHERE t.user_id = ? AND t.lang = 'zh-CN'
+                         AND t.status IN ('ready', 'disabled', 'missing')
+                         AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+                         AND t.entity_type LIKE ?
+                         AND lower(t.entity_id) IN (lower(?), lower(?)))",
+    )
+    .bind(document_id)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(document_id)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_document_user_lanes_fts (doc_id, user_id, translated_text, smart_text)
+         SELECT document_id, user_id, COALESCE(translated_text, ''), COALESCE(smart_text, '')
+         FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?",
+    )
+    .bind(document_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn remove_conflicting_search_document(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    keep_document_id: &str,
+) -> Result<()> {
+    let conflicting_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM search_documents
+         WHERE user_id = ? AND resource_type = ? AND resource_id = ? AND id <> ?",
+    )
+    .bind(user_id)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(keep_document_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for document_id in conflicting_ids {
+        delete_search_document(tx, &document_id).await?;
+    }
+    Ok(())
+}
+
+async fn refresh_content_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<()> {
+    let identity_upgrade_complete =
+        crate::content_identity_upgrade::is_complete_in_transaction(tx).await?;
+    for (pipeline, column) in [
+        ("translation", "translated_text"),
+        ("polishing", "smart_text"),
+    ] {
+        let projection_text_query = if identity_upgrade_complete {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
+        } else {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
+        };
+        let text = sqlx::query_scalar::<_, Option<String>>(projection_text_query)
+            .bind(resource_type)
+            .bind(resource_id)
+            .bind(pipeline)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        let query = format!(
+            "UPDATE search_documents SET {column} = ?, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE resource_type = ? AND resource_id = ?"
+        );
+        sqlx::query(&query)
+            .bind(text)
+            .bind(resource_type)
+            .bind(resource_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    refresh_search_documents_fts_for_resource(tx, resource_type, resource_id).await
+}
+
+async fn refresh_search_document_fts(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM search_documents_fts WHERE doc_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO search_documents_fts (doc_id, title, body, repo_full_name, translated_text, smart_text)
+         SELECT id, COALESCE(title, ''), COALESCE(body, ''), COALESCE(repo_full_name, ''),
+                COALESCE(translated_text, ''), COALESCE(smart_text, '')
+         FROM search_documents WHERE id = ?",
+    )
+    .bind(document_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn refresh_search_documents_fts_for_resource(
+    tx: &mut Transaction<'_, Sqlite>,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM search_documents_fts
+         WHERE doc_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_documents_fts (doc_id, title, body, repo_full_name, translated_text, smart_text)
+         SELECT id, COALESCE(title, ''), COALESCE(body, ''), COALESCE(repo_full_name, ''),
+                COALESCE(translated_text, ''), COALESCE(smart_text, '')
+         FROM search_documents WHERE resource_type = ? AND resource_id = ?",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_search_document(tx: &mut Transaction<'_, Sqlite>, document_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM search_document_user_lanes_fts WHERE doc_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM search_documents_fts WHERE doc_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM search_documents WHERE id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 async fn run_batch(state: &AppState) -> Result<BatchOutcome> {
