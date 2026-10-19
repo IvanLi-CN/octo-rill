@@ -1590,6 +1590,24 @@ mod tests {
             "release plan: {release_plan_details:?}"
         );
 
+        let resource_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN UPDATE search_documents SET translated_text = NULL WHERE resource_type = 'release' AND resource_id = '4201'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain resource projection lookup");
+        assert!(
+            resource_plan.iter().any(|row| {
+                row.get::<String, _>("detail")
+                    .contains("idx_search_documents_resource_key")
+            }),
+            "resource plan: {:?}",
+            resource_plan
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+        );
+
         let translation_plan = sqlx::query(
             "EXPLAIN QUERY PLAN SELECT user_id FROM ai_translations WHERE lang = 'zh-CN' AND entity_id = '4201' AND status IN ('ready', 'disabled', 'missing') AND lower(entity_type) LIKE 'release%'",
         )
@@ -1901,6 +1919,12 @@ mod tests {
         let pool = setup_pool().await;
         seed_repo_association(&pool).await;
         sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES ('search-announcement-user-2', 39999997, 'search-announcement-user-2', '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed second announcement lane user");
+        sqlx::query(
             r#"
             INSERT INTO social_activity_events (
               id, user_id, kind, repo_id, repo_full_name, discussion_number,
@@ -1933,6 +1957,20 @@ mod tests {
         .await
         .expect("seed announcement translation before key");
         sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              title, summary, created_at, updated_at
+            ) VALUES ('search-announcement-key-translation-2', 'search-announcement-user-2',
+                      'announcement_detail', 'search-announcement-key', 'zh-CN',
+                      'hash-announcement-key-2', 'ready', '第二用户命中', '公告正文二',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed second announcement lane translation before key");
+        sqlx::query(
             "UPDATE social_activity_events SET discussion_number = 9, html_url = 'https://github.com/octo/rill/discussions/9' WHERE id = 'search-announcement-key'",
         )
         .execute(&pool)
@@ -1952,6 +1990,19 @@ mod tests {
         assert_eq!(
             results[0].target.as_ref().unwrap().href,
             "/octo/rill/discussions/9"
+        );
+        let lane_users = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM search_document_user_lanes WHERE document_id = 'announcement:search-announcement-key' ORDER BY user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read rebuilt announcement lane users");
+        assert_eq!(
+            lane_users,
+            vec![
+                "search-announcement-user-2".to_owned(),
+                "search-user".to_owned()
+            ]
         );
     }
 
