@@ -77,7 +77,7 @@
 - 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
 - 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 55 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
-- PR #333 的旧 head `61a492d8` 曾在 GitHub Actions run `39321799615` 的 Backend Tests 失败，失败项是时序敏感的 foreground session telemetry 回归；当前修复候选已在本地全量串行测试中通过 `1090 passed, 0 failed, 2 ignored`，但尚未推送新的 head，不能把旧 CI 结果作为收口依据。
+- PR #333 的旧 head `61a492d8` 曾在 GitHub Actions run `39321799615` 的 Backend Tests 失败，失败项是时序敏感的 foreground session telemetry 回归；修复 head `08d74429` 已在 GitHub Actions run `39329495174` 完成全部主 CI，Backend Tests 通过，本地全量串行测试为 `1090 passed, 0 failed, 2 ignored`。后续正式 review 仍须绑定最新文档同步 head。
 
 ## Remaining Gaps
 
