@@ -451,7 +451,9 @@ pub fn spawn_repo_release_workers(state: Arc<AppState>) {
                     }
                     Ok(None) => {
                         claim_backoff.reset();
-                        tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await;
+                        REPO_RELEASE_CLAIM_ADMISSION
+                            .wait(REPO_RELEASE_QUEUE_POLL_INTERVAL)
+                            .await;
                     }
                     Err(err) => {
                         let retry_after = claim_backoff.next_delay();
@@ -5388,6 +5390,7 @@ async fn attach_release_demand_with_freshness(
     let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
+        let queued_before = result.queued;
         let (_sqlite_write, mut tx) = if let Some(stage_deadline_at) = stage_deadline_at {
             state
                 .sqlite_writer
@@ -5685,6 +5688,9 @@ async fn attach_release_demand_with_freshness(
         };
 
         tx.commit().await.context("commit repo release attach tx")?;
+        if result.queued > queued_before {
+            REPO_RELEASE_CLAIM_ADMISSION.wake();
+        }
         result.work_item_ids.push(work_item_id);
     }
 
@@ -6503,6 +6509,9 @@ async fn retry_subscription_release_watchers(
             Ok::<_, anyhow::Error>(rows)
         })
         .await?;
+    if !rows.is_empty() {
+        REPO_RELEASE_CLAIM_ADMISSION.wake();
+    }
 
     let work_item_ids = rows
         .iter()
@@ -9009,30 +9018,65 @@ async fn claim_next_repo_release_work_item(
         }
     };
     tracing::debug!(event = "claim_admitted", lane = "repo_release_claim");
+    let has_queued = match has_queued_repo_release_work_item(state).await {
+        Ok(has_queued) => has_queued,
+        Err(error) => {
+            admission.fail();
+            return Err(error);
+        }
+    };
+    if !has_queued {
+        admission.empty();
+        tracing::debug!(event = "claim_probe_empty", lane = "repo_release_claim");
+        return Ok(None);
+    }
     let result = claim_next_repo_release_work_item_admitted(state).await;
-    if result.is_ok() {
-        admission.success();
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_write_deadline_error(error.as_ref()))
-    {
-        admission.fail();
-        tracing::warn!(event = "writer_deadline", lane = "repo_release_claim");
-    } else if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_sqlite_background_admission_error(error.as_ref()))
-    {
-        admission.fail();
-        tracing::debug!(
-            event = "background_admission_denied",
-            lane = "repo_release_claim"
-        );
-    } else {
-        admission.fail();
+    match result.as_ref() {
+        Ok(Some(_)) => admission.success(),
+        Ok(None) => {
+            admission.empty();
+            tracing::debug!(event = "claim_probe_empty", lane = "repo_release_claim");
+        }
+        Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
+            admission.fail();
+            tracing::warn!(event = "writer_deadline", lane = "repo_release_claim");
+        }
+        Err(error) if is_sqlite_background_admission_error(error.as_ref()) => {
+            admission.fail();
+            tracing::debug!(
+                event = "background_admission_denied",
+                lane = "repo_release_claim"
+            );
+        }
+        Err(_) => admission.fail(),
     }
     result
+}
+
+async fn has_queued_repo_release_work_item(state: &AppState) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM repo_release_work_items item
+            WHERE item.status = ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM repo_release_sync_state state
+                WHERE state.repo_id = item.repo_id
+                  AND state.backoff_until IS NOT NULL
+                  AND julianday(state.backoff_until) > julianday(?)
+              )
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(jobs::STATUS_QUEUED)
+    .bind(Utc::now().to_rfc3339())
+    .fetch_one(&state.pool)
+    .await
+    .context("probe queued repo release work item")?;
+    Ok(exists != 0)
 }
 
 async fn claim_next_repo_release_work_item_admitted(
