@@ -58,6 +58,24 @@ CREATE TRIGGER search_notifications_outbox_au AFTER UPDATE ON notifications BEGI
     projection_key, operation, resource_type, resource_id, user_id,
     available_at, created_at, updated_at
   ) VALUES (
+    'notification:' || OLD.user_id || ':' || OLD.thread_id,
+    'delete', 'notification', OLD.thread_id, OLD.user_id,
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  ) ON CONFLICT(projection_key) DO UPDATE SET
+    operation = excluded.operation,
+    resource_type = excluded.resource_type,
+    resource_id = excluded.resource_id,
+    user_id = excluded.user_id,
+    available_at = excluded.available_at,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    last_error = NULL,
+    updated_at = excluded.updated_at;
+
+  INSERT INTO search_projection_outbox (
+    projection_key, operation, resource_type, resource_id, user_id,
+    available_at, created_at, updated_at
+  ) VALUES (
     'notification:' || NEW.user_id || ':' || NEW.thread_id,
     'upsert', 'notification', NEW.thread_id, NEW.user_id,
     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP

@@ -152,6 +152,7 @@ struct DueDailySlotUser {
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
 const STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX: &str = "sync.starred.delta";
+const STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX: &str = "sync.starred.reconcile";
 const RETRY_RECENT_FAILURES_SCHEDULE_NAME: &str = "retry.recent_failures";
 const ACCOUNT_PAUSE_SCHEDULE_NAME: &str = "account.pause_inactive";
 const ACCOUNT_PAUSE_LOCAL_TIME: NaiveTime =
@@ -243,12 +244,32 @@ pub fn spawn_task_worker(state: Arc<AppState>) {
     });
 }
 
+fn scheduler_error_kind(error: &anyhow::Error) -> &'static str {
+    if is_sqlite_write_deadline_error(error.as_ref()) {
+        "writer_deadline"
+    } else if is_sqlite_background_admission_error(error.as_ref()) {
+        "background_admission_denied"
+    } else {
+        "dispatch_failed"
+    }
+}
+
+fn log_scheduler_dispatch_error(lane: &'static str, error: &anyhow::Error) {
+    tracing::warn!(
+        event = "scheduler.dispatch_failed",
+        lane,
+        error_kind = scheduler_error_kind(error),
+        ?error,
+        "scheduler dispatch failed"
+    );
+}
+
 pub fn spawn_hourly_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             let now = Utc::now();
             if let Err(err) = enqueue_hour_slot_if_due(state.as_ref(), now).await {
-                tracing::warn!(?err, "hourly scheduler: enqueue due slot failed");
+                log_scheduler_dispatch_error("daily_brief", &err);
             }
             tokio::time::sleep(Duration::from_secs(45)).await;
         }
@@ -260,7 +281,7 @@ pub fn spawn_subscription_scheduler(state: Arc<AppState>) {
         loop {
             let now = Utc::now();
             if let Err(err) = enqueue_subscription_run_if_due(state.as_ref(), now).await {
-                tracing::warn!(?err, "subscription scheduler: enqueue due run failed");
+                log_scheduler_dispatch_error("subscriptions", &err);
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
@@ -271,7 +292,7 @@ pub fn spawn_star_sync_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             if let Err(err) = enqueue_star_sync_runs_if_due(state.as_ref(), Utc::now()).await {
-                tracing::warn!(?err, "star sync scheduler: enqueue due work failed");
+                log_scheduler_dispatch_error("star_sync", &err);
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
@@ -283,10 +304,7 @@ pub fn spawn_recent_failures_retry_scheduler(state: Arc<AppState>) {
         loop {
             let now = Utc::now();
             if let Err(err) = enqueue_recent_failures_retry_if_due(state.as_ref(), now).await {
-                tracing::warn!(
-                    ?err,
-                    "recent failures retry scheduler: enqueue due run failed"
-                );
+                log_scheduler_dispatch_error("recent_failures", &err);
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
@@ -613,7 +631,7 @@ pub async fn enqueue_star_sync_runs_if_due(
             continue;
         }
 
-        if let Some(epoch_id) = sync::ensure_star_reconciliation_epoch_due(
+        if let Some(task_id) = dispatch_star_reconciliation_atomic(
             state,
             connection.user_id.as_str(),
             connection.github_connection_id.as_str(),
@@ -622,23 +640,7 @@ pub async fn enqueue_star_sync_runs_if_due(
         )
         .await?
         {
-            let task = enqueue_task(
-                state,
-                NewTask {
-                    task_type: TASK_SYNC_STARRED_RECONCILE.to_owned(),
-                    payload: json!({
-                        "user_id": connection.user_id,
-                        "github_connection_id": connection.github_connection_id,
-                        "epoch_id": epoch_id,
-                        "trigger": "schedule",
-                    }),
-                    source: "scheduler".to_owned(),
-                    requested_by: None,
-                    parent_task_id: None,
-                },
-            )
-            .await?;
-            task_ids.push(task.task_id);
+            task_ids.push(task_id);
         }
     }
 
@@ -855,6 +857,175 @@ async fn star_sync_connection_task_in_flight(
     Ok(count > 0)
 }
 
+async fn dispatch_star_reconciliation_atomic(
+    state: &AppState,
+    user_id: &str,
+    github_connection_id: &str,
+    full_sweep_interval_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let now_rfc3339 = now.to_rfc3339();
+    let schedule_name =
+        format!("{STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX}:{github_connection_id}");
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "star_reconciliation_dispatch",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin star reconciliation dispatch transaction")?;
+    let Some(dispatch) = sync::ensure_star_reconciliation_epoch_due_in_transaction(
+        tx.as_transaction_mut(),
+        user_id,
+        github_connection_id,
+        full_sweep_interval_minutes,
+        now,
+    )
+    .await?
+    else {
+        tx.commit()
+            .await
+            .context("commit not-due star reconciliation dispatch")?;
+        return Ok(None);
+    };
+
+    let marker = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+    )
+    .bind(&schedule_name)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await
+    .context("load star reconciliation dispatch marker")?;
+    if let Some((Some(last_key), Some(last_task_id))) = marker.as_ref()
+        && last_key == &dispatch.schedule_key
+    {
+        let status =
+            sqlx::query_scalar::<_, Option<String>>("SELECT status FROM job_tasks WHERE id = ?")
+                .bind(last_task_id)
+                .fetch_optional(&mut **tx.as_transaction_mut())
+                .await
+                .context("load star reconciliation dispatch task status")?
+                .flatten();
+        if status
+            .as_deref()
+            .is_some_and(|status| matches!(status, STATUS_QUEUED | STATUS_RUNNING))
+        {
+            tx.commit()
+                .await
+                .context("commit coalesced star reconciliation dispatch")?;
+            tracing::info!(
+                event = "scheduler.dispatch_coalesced",
+                schedule_name = %schedule_name,
+                schedule_key = %dispatch.schedule_key,
+                "star reconciliation dispatch already has an active task"
+            );
+            return Ok(None);
+        }
+    }
+
+    let existing_task_id = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status IN (?, ?)
+          AND json_extract(payload_json, '$.github_connection_id') = ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(TASK_SYNC_STARRED_RECONCILE)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .bind(github_connection_id)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await
+    .context("check active star reconciliation task")?;
+    if let Some(existing_task_id) = existing_task_id {
+        upsert_dispatch_state_in_transaction(
+            tx.as_transaction_mut(),
+            &schedule_name,
+            &dispatch.schedule_key,
+            &existing_task_id,
+            &now_rfc3339,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit linked star reconciliation dispatch")?;
+        tracing::info!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name = %schedule_name,
+            schedule_key = %dispatch.schedule_key,
+            task_id = %existing_task_id,
+            "linked existing star reconciliation task to dispatch marker"
+        );
+        return Ok(None);
+    }
+
+    let task_id = local_id::generate_local_id().to_string();
+    let payload_json = serde_json::to_string(&json!({
+        "user_id": user_id,
+        "github_connection_id": github_connection_id,
+        "epoch_id": dispatch.epoch_id,
+        "trigger": "schedule",
+        "schedule_key": dispatch.schedule_key,
+    }))
+    .context("serialize star reconciliation payload")?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_tasks (
+          id, task_type, status, source, requested_by, parent_task_id,
+          payload_json, log_file_path, created_at, started_at, finished_at,
+          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+        ) VALUES (?, ?, ?, 'scheduler', NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
+        "#,
+    )
+    .bind(&task_id)
+    .bind(TASK_SYNC_STARRED_RECONCILE)
+    .bind(STATUS_QUEUED)
+    .bind(payload_json)
+    .bind(&now_rfc3339)
+    .bind(&now_rfc3339)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    .context("insert atomic star reconciliation task")?;
+    append_task_event_in_transaction(
+        tx.as_transaction_mut(),
+        &task_id,
+        "task.created",
+        json!({
+            "task_id": task_id,
+            "task_type": TASK_SYNC_STARRED_RECONCILE,
+            "status": STATUS_QUEUED,
+            "source": "scheduler",
+        }),
+    )
+    .await?;
+    upsert_dispatch_state_in_transaction(
+        tx.as_transaction_mut(),
+        &schedule_name,
+        &dispatch.schedule_key,
+        &task_id,
+        &now_rfc3339,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit atomic star reconciliation dispatch")?;
+    tracing::info!(
+        event = "scheduler.dispatch_committed",
+        schedule_name = %schedule_name,
+        schedule_key = %dispatch.schedule_key,
+        task_id = %task_id,
+        "star reconciliation task and epoch committed atomically"
+    );
+    TASK_CLAIM_ADMISSION.wake();
+    Ok(Some(task_id))
+}
+
 async fn dispatch_scheduled_task_atomic(
     state: &AppState,
     schedule_name: &str,
@@ -894,7 +1065,7 @@ async fn dispatch_scheduled_task_atomic(
     .flatten();
     if last_dispatch_key.as_deref() == Some(schedule_key) {
         tx.commit().await?;
-        tracing::debug!(
+        tracing::info!(
             event = "scheduler.dispatch_coalesced",
             schedule_name,
             schedule_key,
@@ -915,7 +1086,7 @@ async fn dispatch_scheduled_task_atomic(
             .is_some_and(|value| value.with_timezone(&Utc) > due_at)
         {
             tx.commit().await?;
-            tracing::debug!(
+            tracing::info!(
                 event = "scheduler.dispatch_not_due",
                 schedule_name,
                 schedule_key,
@@ -1037,6 +1208,18 @@ async fn dispatch_scheduled_task_atomic(
     }
 
     tx.commit().await?;
+    tracing::info!(
+        event = "scheduler.dispatch_committed",
+        schedule_name,
+        schedule_key,
+        task_id,
+        status = if skipped {
+            STATUS_SUCCEEDED
+        } else {
+            STATUS_QUEUED
+        },
+        "scheduler task and dispatch marker committed atomically"
+    );
     if !skipped {
         TASK_CLAIM_ADMISSION.wake();
     } else if let Err(error) = append_task_log_entry(
@@ -5241,13 +5424,14 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_CANCELED,
-        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME,
-        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
-        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
-        TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
-        TASK_SYNC_SUBSCRIPTIONS, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
-        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
+        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO,
+        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
+        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
+        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
+        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
+        cancel_task, claim_next_queued_task, complete_task,
         current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
         defer_task_after_sqlite_write_backpressure, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
@@ -5856,13 +6040,30 @@ mod tests {
             .await
             .expect("complete delta task");
 
-        let second = enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20))
-            .await
-            .expect("enqueue reconciliation slice");
-        assert_eq!(second.len(), 1);
+        let (r1, r2, r3, r4, r5, r6, r7, r8) = tokio::join!(
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+            enqueue_star_sync_runs_if_due(state.as_ref(), now + Duration::seconds(20)),
+        );
+        let mut reconciliation_tasks = Vec::new();
+        for result in [r1, r2, r3, r4, r5, r6, r7, r8] {
+            match result {
+                Ok(task_ids) => reconciliation_tasks.extend(task_ids),
+                Err(error) => assert!(
+                    crate::sqlite_write::is_sqlite_background_admission_error(error.as_ref()),
+                    "unexpected reconciliation dispatch error: {error:#}"
+                ),
+            }
+        }
+        assert_eq!(reconciliation_tasks.len(), 1);
         let second_type =
             sqlx::query_scalar::<_, String>("SELECT task_type FROM job_tasks WHERE id = ?")
-                .bind(second[0].as_str())
+                .bind(reconciliation_tasks[0].as_str())
                 .fetch_one(&pool)
                 .await
                 .expect("load reconciliation task type");
@@ -5874,6 +6075,17 @@ mod tests {
         .await
         .expect("count active star epochs");
         assert_eq!(active_epochs, 1);
+        let dispatch_marker = sqlx::query_as::<_, (String, String)>(
+            "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(format!(
+            "{STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX}:star-scheduler-connection"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("load reconciliation dispatch marker");
+        assert!(dispatch_marker.0.starts_with("epoch:"));
+        assert_eq!(dispatch_marker.1, reconciliation_tasks[0]);
     }
 
     #[test]
