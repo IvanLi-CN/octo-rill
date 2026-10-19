@@ -414,6 +414,65 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
+        for version in [93_i64, 94, 95] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("read applied search migration"),
+                1,
+                "migration {version} should be applied",
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Vec<u8>>(
+                    "SELECT checksum FROM _sqlx_migrations WHERE version = ?",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("read applied search migration checksum"),
+                current_checksum(version),
+                "migration {version} checksum should match the checked-in SQL",
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_outbox'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check search projection outbox table"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('search_projection_outbox') WHERE name = 'previous_resource_id'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check announcement key repair column"),
+            1
+        );
+        let announcement_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_announcements_outbox_au'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read announcement projection trigger");
+        assert!(announcement_trigger_sql.contains("previous_resource_id"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_documents_resource_key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check resource-key projection index"),
+            1
+        );
+
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 91 AND success = 1",
@@ -523,7 +582,7 @@ mod tests {
             .await
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92, 93, 94]"));
+        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92, 93, 94, 95]"));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

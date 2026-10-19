@@ -15,7 +15,7 @@
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
 - 当前跟进候选为后台准入拒绝增加 250 ms 共享冷却与 `background_admission_coalesced` 计数，并将通知 upsert 与 feed activity event 写入拆成固定 10 行的幂等短事务；这只降低无效拒绝日志和单次写入持锁时间，尚未代表已发布或完成 101 线上验收。
 - 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
-- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql` 和 `0094_search_projection_resource_key_index.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
+- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql` 和 `0095_search_projection_announcement_key_repair.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
 ## Coverage / rollout summary
 
@@ -82,7 +82,7 @@
 ## Remaining Gaps
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
-- `0092`、`0093` 和 `0094` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
+- `0092`、`0093`、`0094` 和 `0095` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
 - 完整当前 head 的 file-backed WAL/HTTP 经验验收和合并后的 101 线上 30 分钟观察仍是发布后门禁；在这两项完成前不能宣称线上性能已验证或生成新 release。
 
 ## Related Changes

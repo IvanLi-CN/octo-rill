@@ -142,6 +142,7 @@ struct ProjectionOutboxRow {
     operation: String,
     resource_type: String,
     resource_id: String,
+    previous_resource_id: Option<String>,
     canonical_resource_type: Option<String>,
     user_id: Option<String>,
     attempt_count: i64,
@@ -163,7 +164,7 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
         )
         .await?;
     let row = sqlx::query_as::<_, ProjectionOutboxRow>(
-        "SELECT projection_key, operation, resource_type, resource_id, canonical_resource_type, user_id, attempt_count
+        "SELECT projection_key, operation, resource_type, resource_id, previous_resource_id, canonical_resource_type, user_id, attempt_count
          FROM search_projection_outbox
          WHERE available_at <= CURRENT_TIMESTAMP
            AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
@@ -527,7 +528,14 @@ async fn apply_announcement_projection(
     .bind(&updated_at)
     .execute(&mut **tx)
     .await?;
-    refresh_announcement_lanes(tx, &row.projection_key, &row.resource_id, &resource_id).await
+    refresh_announcement_lanes(
+        tx,
+        &row.projection_key,
+        &row.resource_id,
+        &resource_id,
+        row.previous_resource_id.as_deref(),
+    )
+    .await
 }
 
 async fn refresh_user_lane(
@@ -609,6 +617,7 @@ async fn refresh_announcement_lanes(
     document_id: &str,
     event_id: &str,
     resource_id: &str,
+    previous_resource_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
         .bind(document_id)
@@ -630,7 +639,7 @@ async fn refresh_announcement_lanes(
              AND t.status IN ('ready', 'disabled', 'missing')
              AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
              AND lower(t.entity_type) LIKE 'announcement%'
-             AND lower(t.entity_id) IN (lower(?), lower(?))
+             AND lower(t.entity_id) IN (lower(?), lower(?), lower(?))
          ), selected AS (
            SELECT user_id,
                   MAX(CASE WHEN is_smart = 0 AND lane_rank = 1 THEN value END) AS translated_text,
@@ -653,6 +662,7 @@ async fn refresh_announcement_lanes(
     )
     .bind(event_id)
     .bind(resource_id)
+    .bind(previous_resource_id)
     .bind(document_id)
     .execute(&mut **tx)
     .await?;
