@@ -463,8 +463,14 @@ pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
             .await
             .map_err(ApiError::internal)?
             != 0;
+    let projection_pending =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_projection_outbox)")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            != 0;
     Ok(match status.as_deref() {
-        Some("ready") if !metadata_pending => "ready".to_owned(),
+        Some("ready") if !metadata_pending && !projection_pending => "ready".to_owned(),
         Some("paused_low_disk") => "paused_low_disk".to_owned(),
         Some("failed") => "failed".to_owned(),
         _ => "building".to_owned(),
@@ -1761,6 +1767,12 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES ('search-user-2', 39999998, 'search-user-2', '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed notification migration user");
+        sqlx::query(
             "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-notification', 'search-user', 'outbox-thread', 'first title', 'mention', '2026-02-22T00:00:00Z', 1)",
         )
         .execute(&pool)
@@ -1807,6 +1819,32 @@ mod tests {
             1
         );
 
+        sqlx::query(
+            "UPDATE notifications SET user_id = 'search-user-2', thread_id = 'outbox-thread-migrated' WHERE id = 'outbox-notification'",
+        )
+        .execute(&pool)
+        .await
+        .expect("move projected notification identity");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user:outbox-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count old notification projection after identity move"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user-2:outbox-thread-migrated'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count new notification projection after identity move"),
+            1
+        );
+
         sqlx::query("DELETE FROM notifications WHERE id = 'outbox-notification'")
             .execute(&pool)
             .await
@@ -1814,7 +1852,7 @@ mod tests {
         drain_search_projection_outbox(state.as_ref()).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user:outbox-thread'",
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user-2:outbox-thread-migrated'",
             )
             .fetch_one(&pool)
             .await
@@ -1823,7 +1861,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:outbox-thread'",
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user-2:outbox-thread-migrated'",
             )
             .fetch_one(&pool)
             .await

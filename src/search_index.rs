@@ -51,6 +51,13 @@ enum BatchOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProjectionRunOutcome {
+    Committed,
+    Idle,
+    AdmissionDenied,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct BackfillState {
     phase: String,
@@ -94,8 +101,18 @@ pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
             match run_projection_once(state.as_ref()).await {
-                Ok(true) => tokio::time::sleep(PROJECTION_POLL_DELAY).await,
-                Ok(false) => tokio::time::sleep(PROJECTION_IDLE_DELAY).await,
+                Ok(ProjectionRunOutcome::Committed) => {
+                    tokio::time::sleep(PROJECTION_POLL_DELAY).await
+                }
+                Ok(ProjectionRunOutcome::Idle) => tokio::time::sleep(PROJECTION_IDLE_DELAY).await,
+                Ok(ProjectionRunOutcome::AdmissionDenied) => {
+                    warn!(
+                        event = "search.projection_outbox.admission_denied",
+                        retry_after_ms = PROJECTION_POLL_DELAY.as_millis(),
+                        "search projection outbox deferred by background writer admission"
+                    );
+                    tokio::time::sleep(PROJECTION_POLL_DELAY).await
+                }
                 Err(error) => {
                     warn!(
                         ?error,
@@ -113,7 +130,10 @@ pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
 
 #[cfg(test)]
 pub(crate) async fn run_projection_for_test(state: &AppState) -> Result<bool> {
-    run_projection_once(state).await
+    Ok(matches!(
+        run_projection_once(state).await?,
+        ProjectionRunOutcome::Committed
+    ))
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -127,12 +147,12 @@ struct ProjectionOutboxRow {
     attempt_count: i64,
 }
 
-async fn run_projection_once(state: &AppState) -> Result<bool> {
+async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     let Some(lane_guard) = state
         .sqlite_writer
         .try_admit_background_lane("search_projection_outbox", PROJECTION_POLL_DELAY)
     else {
-        return Ok(false);
+        return Ok(ProjectionRunOutcome::AdmissionDenied);
     };
     let (permit, mut tx) = state
         .sqlite_writer
@@ -156,7 +176,7 @@ async fn run_projection_once(state: &AppState) -> Result<bool> {
         tx.rollback().await?;
         drop(permit);
         drop(lane_guard);
-        return Ok(false);
+        return Ok(ProjectionRunOutcome::Idle);
     };
     let lease_owner = format!("{}:{}", state.runtime_owner_id, Uuid::new_v4());
     sqlx::query(
@@ -186,7 +206,7 @@ async fn run_projection_once(state: &AppState) -> Result<bool> {
                 attempt = row.attempt_count + 1,
                 "search projection outbox item committed"
             );
-            Ok(true)
+            Ok(ProjectionRunOutcome::Committed)
         }
         Err(error) => {
             tx.rollback().await?;

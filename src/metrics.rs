@@ -659,7 +659,9 @@ impl Metrics {
         }
         let labels = QueueLabels {
             executor: match executor {
-                "jobs" | "content" | "translation" | "repo_release" => executor.to_owned(),
+                "jobs" | "content" | "translation" | "repo_release" | "search_projection" => {
+                    executor.to_owned()
+                }
                 _ => "other".to_owned(),
             },
         };
@@ -985,10 +987,22 @@ async fn sample_queues(pool: &SqlitePool, metrics: &Metrics) -> Result<()> {
         deadline,
     )
     .await?;
+    let search_projection = sample_queue(
+        &mut connection,
+        "search_projection_outbox",
+        "1 = 1",
+        deadline,
+    )
+    .await?;
     metrics.set_queue("jobs", jobs.0, jobs.1);
     metrics.set_queue("content", content.0, content.1);
     metrics.set_queue("translation", translations.0, translations.1);
     metrics.set_queue("repo_release", repo_release.0, repo_release.1);
+    metrics.set_queue(
+        "search_projection",
+        search_projection.0,
+        search_projection.1,
+    );
     Ok(())
 }
 
