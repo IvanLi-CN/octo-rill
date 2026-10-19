@@ -154,7 +154,7 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     else {
         return Ok(ProjectionRunOutcome::AdmissionDenied);
     };
-    let (permit, mut tx) = state
+    let (claim_permit, mut claim_tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
             &state.pool,
@@ -170,11 +170,11 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
          ORDER BY available_at ASC, created_at ASC, projection_key ASC
          LIMIT 1",
     )
-    .fetch_optional(&mut **tx.as_transaction_mut())
+    .fetch_optional(&mut **claim_tx.as_transaction_mut())
     .await?;
     let Some(row) = row else {
-        tx.rollback().await?;
-        drop(permit);
+        claim_tx.rollback().await?;
+        drop(claim_permit);
         drop(lane_guard);
         return Ok(ProjectionRunOutcome::Idle);
     };
@@ -187,15 +187,43 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     )
     .bind(&lease_owner)
     .bind(&row.projection_key)
-    .execute(&mut **tx.as_transaction_mut())
+    .execute(&mut **claim_tx.as_transaction_mut())
     .await?;
+    claim_tx.commit().await?;
+    drop(claim_permit);
+
+    let (permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "search_projection_outbox_apply",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let current_lease = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT lease_owner FROM search_projection_outbox WHERE projection_key = ?",
+    )
+    .bind(&row.projection_key)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?
+    .flatten();
+    if current_lease.as_deref() != Some(lease_owner.as_str()) {
+        tx.rollback().await?;
+        drop(permit);
+        drop(lane_guard);
+        return Ok(ProjectionRunOutcome::Idle);
+    }
+
     let projection_result = apply_projection_outbox_item(tx.as_transaction_mut(), &row).await;
     match projection_result {
         Ok(()) => {
-            sqlx::query("DELETE FROM search_projection_outbox WHERE projection_key = ?")
-                .bind(&row.projection_key)
-                .execute(&mut **tx.as_transaction_mut())
-                .await?;
+            sqlx::query(
+                "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+            )
+            .bind(&row.projection_key)
+            .bind(&lease_owner)
+            .execute(&mut **tx.as_transaction_mut())
+            .await?;
             tx.commit().await?;
             drop(permit);
             drop(lane_guard);
@@ -212,13 +240,18 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
             tx.rollback().await?;
             drop(permit);
             drop(lane_guard);
-            record_projection_failure(state, &row.projection_key, &error).await;
+            record_projection_failure(state, &row.projection_key, &lease_owner, &error).await;
             Err(error)
         }
     }
 }
 
-async fn record_projection_failure(state: &AppState, projection_key: &str, error: &anyhow::Error) {
+async fn record_projection_failure(
+    state: &AppState,
+    projection_key: &str,
+    lease_owner: &str,
+    error: &anyhow::Error,
+) {
     let result = async {
         let (permit, mut tx) = state
             .sqlite_writer
@@ -228,20 +261,25 @@ async fn record_projection_failure(state: &AppState, projection_key: &str, error
                 SqliteWritePriority::Background,
             )
             .await?;
-        sqlx::query(
+        let update = sqlx::query(
             "UPDATE search_projection_outbox
-             SET attempt_count = attempt_count + 1,
-                 available_at = CASE WHEN attempt_count + 1 >= 8
+             SET available_at = CASE WHEN attempt_count >= 8
                                      THEN datetime('now', '+5 minutes')
                                      ELSE datetime('now', '+5 seconds') END,
                  lease_owner = NULL, lease_expires_at = NULL,
                  last_error = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE projection_key = ?",
+             WHERE projection_key = ? AND lease_owner = ?",
         )
         .bind(redact_search_error_summary(&error.to_string()))
         .bind(projection_key)
+        .bind(lease_owner)
         .execute(&mut **tx.as_transaction_mut())
         .await?;
+        if update.rows_affected() == 0 {
+            tx.rollback().await?;
+            drop(permit);
+            return Ok::<(), anyhow::Error>(());
+        }
         tx.commit().await?;
         drop(permit);
         Ok::<(), anyhow::Error>(())
@@ -387,8 +425,7 @@ async fn apply_notification_projection(
         &row.resource_id,
         &row.resource_id,
     )
-    .await?;
-    refresh_search_document_fts(tx, &row.projection_key).await
+    .await
 }
 
 async fn apply_announcement_projection(
@@ -490,16 +527,7 @@ async fn apply_announcement_projection(
     .bind(&updated_at)
     .execute(&mut **tx)
     .await?;
-    refresh_user_lane(
-        tx,
-        &row.projection_key,
-        &user_id,
-        "announcement",
-        &row.resource_id,
-        &resource_id,
-    )
-    .await?;
-    refresh_search_document_fts(tx, &row.projection_key).await
+    refresh_announcement_lanes(tx, &row.projection_key, &row.resource_id, &resource_id).await
 }
 
 async fn refresh_user_lane(
@@ -510,11 +538,6 @@ async fn refresh_user_lane(
     entity_id: &str,
     alternate_entity_id: &str,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM search_document_user_lanes_fts WHERE doc_id = ? AND user_id = ?")
-        .bind(document_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
     sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?")
         .bind(document_id)
         .bind(user_id)
@@ -578,15 +601,50 @@ async fn refresh_user_lane(
     .bind(alternate_entity_id)
     .execute(&mut **tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO search_document_user_lanes_fts (doc_id, user_id, translated_text, smart_text)
-         SELECT document_id, user_id, COALESCE(translated_text, ''), COALESCE(smart_text, '')
-         FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?",
-    )
-    .bind(document_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
+    Ok(())
+}
+
+async fn refresh_announcement_lanes(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: &str,
+    event_id: &str,
+    resource_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    for (smart, column) in [(false, "translated_text"), (true, "smart_text")] {
+        let entity_filter = if smart {
+            "lower(t.entity_type) LIKE '%smart%'"
+        } else {
+            "lower(t.entity_type) NOT LIKE '%smart%'"
+        };
+        let query = format!(
+            "INSERT INTO search_document_user_lanes (document_id, user_id, {column}, updated_at)
+             SELECT ?, ranked.user_id, ranked.value, ranked.updated_at
+             FROM (
+               SELECT t.user_id,
+                      trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, '')) AS value,
+                      t.updated_at,
+                      ROW_NUMBER() OVER (PARTITION BY t.user_id ORDER BY t.updated_at DESC, t.id DESC) AS lane_rank
+               FROM ai_translations t
+               WHERE t.lang = 'zh-CN'
+                 AND t.status IN ('ready', 'disabled', 'missing')
+                 AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+                 AND lower(t.entity_type) LIKE 'announcement%'
+                 AND {entity_filter}
+                 AND lower(t.entity_id) IN (lower(?), lower(?))
+             ) ranked
+             WHERE ranked.lane_rank = 1"
+        );
+        sqlx::query(&query)
+            .bind(document_id)
+            .bind(event_id)
+            .bind(resource_id)
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -646,65 +704,11 @@ async fn refresh_content_projection(
             .execute(&mut **tx)
             .await?;
     }
-    refresh_search_documents_fts_for_resource(tx, resource_type, resource_id).await
-}
-
-async fn refresh_search_document_fts(
-    tx: &mut Transaction<'_, Sqlite>,
-    document_id: &str,
-) -> Result<()> {
-    sqlx::query("DELETE FROM search_documents_fts WHERE doc_id = ?")
-        .bind(document_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO search_documents_fts (doc_id, title, body, repo_full_name, translated_text, smart_text)
-         SELECT id, COALESCE(title, ''), COALESCE(body, ''), COALESCE(repo_full_name, ''),
-                COALESCE(translated_text, ''), COALESCE(smart_text, '')
-         FROM search_documents WHERE id = ?",
-    )
-    .bind(document_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn refresh_search_documents_fts_for_resource(
-    tx: &mut Transaction<'_, Sqlite>,
-    resource_type: &str,
-    resource_id: &str,
-) -> Result<()> {
-    sqlx::query(
-        "DELETE FROM search_documents_fts
-         WHERE doc_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
-    )
-    .bind(resource_type)
-    .bind(resource_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO search_documents_fts (doc_id, title, body, repo_full_name, translated_text, smart_text)
-         SELECT id, COALESCE(title, ''), COALESCE(body, ''), COALESCE(repo_full_name, ''),
-                COALESCE(translated_text, ''), COALESCE(smart_text, '')
-         FROM search_documents WHERE resource_type = ? AND resource_id = ?",
-    )
-    .bind(resource_type)
-    .bind(resource_id)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 
 async fn delete_search_document(tx: &mut Transaction<'_, Sqlite>, document_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM search_document_user_lanes_fts WHERE doc_id = ?")
-        .bind(document_id)
-        .execute(&mut **tx)
-        .await?;
     sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
-        .bind(document_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM search_documents_fts WHERE doc_id = ?")
         .bind(document_id)
         .execute(&mut **tx)
         .await?;
@@ -986,6 +990,17 @@ async fn status_response(pool: &SqlitePool) -> Result<SearchIndexStatusResponse>
             .await
             .context("check pending search metadata work")?
             != 0;
+    let projection_pending =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_projection_outbox)")
+            .fetch_one(pool)
+            .await
+            .context("check pending realtime search projection work")?
+            != 0;
+    let status = if status == "ready" && (metadata_pending || projection_pending) {
+        "building".to_owned()
+    } else {
+        status
+    };
     Ok(SearchIndexStatusResponse {
         phase,
         cursor,

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{Arc, OnceLock},
@@ -167,6 +167,12 @@ static TASK_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 #[cfg(test)]
 static TASK_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+enum ScheduledDispatchPolicy {
+    SkipActiveSubscription,
+    SkipActiveRecentFailures { interval_minutes: i64 },
+    CoalesceActiveStarConnection(String),
+}
 
 pub fn is_scheduled_task_type(task_type: &str) -> bool {
     SCHEDULED_TASK_TYPES.contains(&task_type)
@@ -529,15 +535,6 @@ pub async fn enqueue_subscription_run_if_due(
         "interval_minutes": interval_minutes,
     });
 
-    let skipped_result = if subscription_run_in_flight(state).await? {
-        Some(sync::skipped_subscription_result(
-            schedule_key.as_str(),
-            "previous_run_active",
-        ))
-    } else {
-        None
-    };
-
     dispatch_scheduled_task_atomic(
         state,
         SUBSCRIPTION_SCHEDULE_NAME,
@@ -549,7 +546,7 @@ pub async fn enqueue_subscription_run_if_due(
             requested_by: None,
             parent_task_id: None,
         },
-        skipped_result,
+        ScheduledDispatchPolicy::SkipActiveSubscription,
         true,
         Some(now),
     )
@@ -580,11 +577,6 @@ pub async fn enqueue_star_sync_runs_if_due(
     let mut task_ids = Vec::new();
 
     for connection in connections {
-        if star_sync_connection_task_in_flight(state, connection.github_connection_id.as_str())
-            .await?
-        {
-            continue;
-        }
         let delta_schedule_name = format!(
             "{STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX}:{}",
             connection.github_connection_id
@@ -620,7 +612,9 @@ pub async fn enqueue_star_sync_runs_if_due(
                     requested_by: None,
                     parent_task_id: None,
                 },
-                None,
+                ScheduledDispatchPolicy::CoalesceActiveStarConnection(
+                    connection.github_connection_id.clone(),
+                ),
                 false,
                 None,
             )
@@ -685,20 +679,6 @@ pub async fn enqueue_recent_failures_retry_if_due(
         "order": "updated_at DESC, created_at DESC, id DESC",
     });
 
-    let skipped_result = if task_type_run_in_flight(state, TASK_RETRY_RECENT_FAILURES).await? {
-        Some(json!({
-            "skipped": true,
-            "skip_reason": "previous_run_active",
-            "schedule_key": schedule_key,
-            "interval_minutes": interval_minutes,
-            "daily_brief": retry_kind_empty_summary("daily_brief"),
-            "polish": retry_kind_empty_summary("polish"),
-            "translation": retry_kind_empty_summary("translation"),
-        }))
-    } else {
-        None
-    };
-
     dispatch_scheduled_task_atomic(
         state,
         RETRY_RECENT_FAILURES_SCHEDULE_NAME,
@@ -710,7 +690,7 @@ pub async fn enqueue_recent_failures_retry_if_due(
             requested_by: None,
             parent_task_id: None,
         },
-        skipped_result,
+        ScheduledDispatchPolicy::SkipActiveRecentFailures { interval_minutes },
         false,
         None,
     )
@@ -795,26 +775,10 @@ pub(crate) fn current_recent_failures_retry_schedule_key(
     format!("interval:{interval_minutes}:{bucket_start}")
 }
 
-async fn subscription_run_in_flight(state: &AppState) -> Result<bool> {
-    let count = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*)
-        FROM job_tasks
-        WHERE task_type = ?
-          AND status IN (?, ?)
-        "#,
-    )
-    .bind(TASK_SYNC_SUBSCRIPTIONS)
-    .bind(STATUS_QUEUED)
-    .bind(STATUS_RUNNING)
-    .fetch_one(&state.pool)
-    .await
-    .context("failed to query in-flight subscription runs")?;
-
-    Ok(count > 0)
-}
-
-async fn task_type_run_in_flight(state: &AppState, task_type: &str) -> Result<bool> {
+async fn task_type_run_in_flight_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_type: &str,
+) -> Result<bool> {
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -826,15 +790,15 @@ async fn task_type_run_in_flight(state: &AppState, task_type: &str) -> Result<bo
     .bind(task_type)
     .bind(STATUS_QUEUED)
     .bind(STATUS_RUNNING)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await
     .with_context(|| format!("failed to query in-flight {task_type} runs"))?;
 
     Ok(count > 0)
 }
 
-async fn star_sync_connection_task_in_flight(
-    state: &AppState,
+async fn star_sync_connection_task_in_flight_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
     github_connection_id: &str,
 ) -> Result<bool> {
     let count = sqlx::query_scalar::<_, i64>(
@@ -851,7 +815,7 @@ async fn star_sync_connection_task_in_flight(
     .bind(STATUS_QUEUED)
     .bind(STATUS_RUNNING)
     .bind(github_connection_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await
     .context("check in-flight star connection task")?;
     Ok(count > 0)
@@ -876,6 +840,22 @@ async fn dispatch_star_reconciliation_atomic(
         )
         .await
         .context("begin star reconciliation dispatch transaction")?;
+    if star_sync_connection_task_in_flight_in_transaction(
+        tx.as_transaction_mut(),
+        github_connection_id,
+    )
+    .await?
+    {
+        tx.commit()
+            .await
+            .context("commit coalesced active star reconciliation dispatch")?;
+        tracing::info!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name = %schedule_name,
+            "star connection already has an active task"
+        );
+        return Ok(None);
+    }
     let Some(dispatch) = sync::ensure_star_reconciliation_epoch_due_in_transaction(
         tx.as_transaction_mut(),
         user_id,
@@ -1031,7 +1011,7 @@ async fn dispatch_scheduled_task_atomic(
     schedule_name: &str,
     schedule_key: &str,
     new_task: NewTask,
-    skipped_result: Option<Value>,
+    dispatch_policy: ScheduledDispatchPolicy,
     clear_sync_effective_at: bool,
     due_at: Option<DateTime<Utc>>,
 ) -> Result<Option<String>> {
@@ -1039,13 +1019,6 @@ async fn dispatch_scheduled_task_atomic(
     let task_id = local_id::generate_local_id().to_string();
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
     let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
-    let skipped = skipped_result.is_some();
-    let started_at = skipped.then_some(now.as_str());
-    let task_status = if skipped {
-        STATUS_RUNNING
-    } else {
-        STATUS_QUEUED
-    };
 
     let (_writer, mut tx) = state
         .sqlite_writer
@@ -1095,6 +1068,64 @@ async fn dispatch_scheduled_task_atomic(
             return Ok(None);
         }
     }
+
+    let skipped_result = match &dispatch_policy {
+        ScheduledDispatchPolicy::SkipActiveSubscription
+            if task_type_run_in_flight_in_transaction(
+                tx.as_transaction_mut(),
+                TASK_SYNC_SUBSCRIPTIONS,
+            )
+            .await? =>
+        {
+            Some(sync::skipped_subscription_result(
+                schedule_key,
+                "previous_run_active",
+            ))
+        }
+        ScheduledDispatchPolicy::SkipActiveRecentFailures { interval_minutes }
+            if task_type_run_in_flight_in_transaction(
+                tx.as_transaction_mut(),
+                TASK_RETRY_RECENT_FAILURES,
+            )
+            .await? =>
+        {
+            Some(json!({
+                "skipped": true,
+                "skip_reason": "previous_run_active",
+                "schedule_key": schedule_key,
+                "interval_minutes": interval_minutes,
+                "daily_brief": retry_kind_empty_summary("daily_brief"),
+                "polish": retry_kind_empty_summary("polish"),
+                "translation": retry_kind_empty_summary("translation"),
+            }))
+        }
+        ScheduledDispatchPolicy::CoalesceActiveStarConnection(github_connection_id)
+            if star_sync_connection_task_in_flight_in_transaction(
+                tx.as_transaction_mut(),
+                github_connection_id,
+            )
+            .await? =>
+        {
+            tx.commit()
+                .await
+                .context("commit coalesced active star dispatch")?;
+            tracing::info!(
+                event = "scheduler.dispatch_coalesced",
+                schedule_name,
+                schedule_key,
+                "star connection already has an active task"
+            );
+            return Ok(None);
+        }
+        _ => None,
+    };
+    let skipped = skipped_result.is_some();
+    let started_at = skipped.then_some(now.as_str());
+    let task_status = if skipped {
+        STATUS_RUNNING
+    } else {
+        STATUS_QUEUED
+    };
 
     sqlx::query(
         r#"
@@ -1501,10 +1532,6 @@ fn build_task_log_path(state: &AppState, task_type: &str, task_id: &str) -> Resu
 
     let relative_path = task_log_relative_path(task_type, task_id, Utc::now());
     let full_path = state.config.task_log_dir.join(relative_path);
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent).context("failed to create task log parent directory")?;
-    }
-    std::fs::File::create(&full_path).context("failed to create task log file")?;
     Ok(Some(full_path.to_string_lossy().into_owned()))
 }
 
@@ -1529,6 +1556,11 @@ pub async fn append_task_log_entry(state: &AppState, task_id: &str, entry: Value
         return Ok(());
     };
     let line = serde_json::to_vec(&entry).context("serialize task log entry")?;
+    if let Some(parent) = Path::new(&log_file_path).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create task log parent directory {parent:?}"))?;
+    }
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
