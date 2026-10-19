@@ -595,7 +595,7 @@ mod tests {
 
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
     use url::Url;
 
@@ -650,7 +650,9 @@ mod tests {
         ));
         let options = SqliteConnectOptions::new()
             .filename(database_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
@@ -1945,8 +1947,8 @@ mod tests {
               title, body, html_url, actor_github_user_id, actor_login,
               occurred_at, detected_at, created_at, updated_at
             ) VALUES ('search-announcement-key', 'search-user', 'announcement', 42,
-                      'octo/rill', NULL, 'Key migration announcement', 'announcement body',
-                      'https://github.com/octo/rill', 99, 'octocat',
+                      'octo/rill', 1, 'Key migration announcement', 'announcement body',
+                      'https://github.com/octo/rill/discussions/1', 99, 'octocat',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -1962,7 +1964,7 @@ mod tests {
               id, user_id, entity_type, entity_id, lang, source_hash, status,
               title, summary, created_at, updated_at
             ) VALUES ('search-announcement-key-translation', 'search-user',
-                      'announcement_detail', 'search-announcement-key', 'zh-CN',
+                      'announcement_detail', 'octo/rill#1', 'zh-CN',
                       'hash-announcement-key', 'ready', '讨论键迁移命中', '公告正文',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -1976,7 +1978,7 @@ mod tests {
               id, user_id, entity_type, entity_id, lang, source_hash, status,
               title, summary, created_at, updated_at
             ) VALUES ('search-announcement-key-smart', 'search-user',
-                      'announcement_smart', 'search-announcement-key', 'zh-CN',
+                      'announcement_smart', 'octo/rill#1', 'zh-CN',
                       'hash-announcement-key-smart', 'ready', '智能摘要命中', '智能公告正文',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -1990,7 +1992,7 @@ mod tests {
               id, user_id, entity_type, entity_id, lang, source_hash, status,
               title, summary, created_at, updated_at
             ) VALUES ('search-announcement-key-translation-2', 'search-announcement-user-2',
-                      'announcement_detail', 'search-announcement-key', 'zh-CN',
+                      'announcement_detail', 'octo/rill#1', 'zh-CN',
                       'hash-announcement-key-2', 'ready', '第二用户命中', '公告正文二',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -2039,6 +2041,30 @@ mod tests {
                     Some("智能摘要命中 智能公告正文".to_owned()),
                 ),
             ]
+        );
+
+        sqlx::query("DELETE FROM social_activity_events WHERE id = 'search-announcement-key'")
+            .execute(&pool)
+            .await
+            .expect("delete projected announcement");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'announcement:search-announcement-key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted announcement document"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'announcement:search-announcement-key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted announcement FTS row"),
+            0
         );
     }
 
@@ -2126,6 +2152,19 @@ mod tests {
         .await
         .expect("read global projection text");
         assert_eq!(projected.as_deref(), Some("new projection text"));
+
+        sqlx::query("DELETE FROM content_result_projections WHERE id = 'search-projection-new'")
+            .execute(&pool)
+            .await
+            .expect("delete newest global projection");
+        drain_search_projection_outbox(state.as_ref()).await;
+        let recovered = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT translated_text FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered global projection text");
+        assert_eq!(recovered.as_deref(), Some("old projection text"));
     }
 
     #[tokio::test]

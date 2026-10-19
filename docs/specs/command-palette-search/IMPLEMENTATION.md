@@ -57,7 +57,7 @@
 - `sync::tests::repeated_social_snapshot_only_updates_association_observation_once`：验证重复 production-shaped owned-repository snapshot 不清除再重建当前 association。
 - `sync::tests::social_snapshot_clears_stale_associations_and_preserves_explicit_unfollow`：验证 NULL-ID/过期 association 清理、空快照和显式取消关注在仓库重新出现时的状态保持。
 - `sync::tests::replace_starred_repos_preserves_explicit_unfollow`：验证完整 starred-repository replacement 路径清理旧 source 时保留显式取消关注。
-- Before the 25-row bound, the ignored synthetic SQLite benchmark on this workspace measured old/new global FTS maintenance at `830.051 ms -> 85.472 ms`, old/new lane maintenance at `110.462 ms -> 81.101 ms`, and one 100-row metadata Background batch at `47.062 ms`. It completed 32 concurrent search tasks, 32 authenticated GET/quota tasks and 32 coordinated session writes. The full run took `125.16 s`; timings vary with host load, it uses a temporary real-schema database, and it is not a production deployment measurement.
+- The ignored synthetic benchmark uses a temporary file-backed WAL database with the production 5-second SQLite busy timeout. The current candidate measured old/new global FTS maintenance at `416.941 ms -> 20.778 ms`, old/new lane maintenance at `12.856 ms -> 10.450 ms`, and one metadata Background batch at `6.035 ms`. It completed 32 concurrent search tasks, 32 authenticated GET/quota tasks and 32 coordinated session writes with no failed foreground operation; timings vary with host load, and this is not a production deployment measurement.
 - `web/src/search/CommandPalette.stories.tsx`：覆盖空态、搜索结果、动作、日报确认、busy 键盘保护、错误、限流、管理员及 393px 视口。
 - `web/src/search/CommandPalette.stories.tsx`：追加 `IndexBuilding` 与 `IndexPausedLowDisk`，验证渐进索引的可见降级提示。
 
