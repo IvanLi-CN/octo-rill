@@ -8305,7 +8305,25 @@ mod tests {
             .expect("fast error response");
         assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
 
-        let events = log_buffer.json_events();
+        let events = tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                let events = log_buffer.json_events();
+                if events.iter().any(|event| {
+                    event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                        && event
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|request_id| request_id.starts_with("foreground-"))
+                        && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                        && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+                }) {
+                    break events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground session telemetry should be emitted within the test budget");
         let correlated_request_id = events
             .iter()
             .find(|event| {

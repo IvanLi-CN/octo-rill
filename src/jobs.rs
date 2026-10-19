@@ -797,17 +797,19 @@ async fn task_type_run_in_flight_in_transaction(
     Ok(count > 0)
 }
 
-async fn star_sync_connection_task_in_flight_in_transaction(
+async fn active_star_sync_connection_task_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     github_connection_id: &str,
-) -> Result<bool> {
-    let count = sqlx::query_scalar::<_, i64>(
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
         r#"
-        SELECT COUNT(*)
+        SELECT id
         FROM job_tasks
         WHERE task_type IN (?, ?)
           AND status IN (?, ?)
           AND json_extract(payload_json, '$.github_connection_id') = ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
         "#,
     )
     .bind(TASK_SYNC_STARRED_DELTA)
@@ -815,10 +817,20 @@ async fn star_sync_connection_task_in_flight_in_transaction(
     .bind(STATUS_QUEUED)
     .bind(STATUS_RUNNING)
     .bind(github_connection_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
-    .context("check in-flight star connection task")?;
-    Ok(count > 0)
+    .context("check in-flight star connection task")
+}
+
+async fn star_sync_connection_task_in_flight_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    github_connection_id: &str,
+) -> Result<bool> {
+    Ok(
+        active_star_sync_connection_task_in_transaction(tx, github_connection_id)
+            .await?
+            .is_some(),
+    )
 }
 
 async fn dispatch_star_reconciliation_atomic(
@@ -1099,23 +1111,34 @@ async fn dispatch_scheduled_task_atomic(
                 "translation": retry_kind_empty_summary("translation"),
             }))
         }
-        ScheduledDispatchPolicy::CoalesceActiveStarConnection(github_connection_id)
-            if star_sync_connection_task_in_flight_in_transaction(
+        ScheduledDispatchPolicy::CoalesceActiveStarConnection(github_connection_id) => {
+            if let Some(active_task_id) = active_star_sync_connection_task_in_transaction(
                 tx.as_transaction_mut(),
                 github_connection_id,
             )
-            .await? =>
-        {
-            tx.commit()
-                .await
-                .context("commit coalesced active star dispatch")?;
-            tracing::info!(
-                event = "scheduler.dispatch_coalesced",
-                schedule_name,
-                schedule_key,
-                "star connection already has an active task"
-            );
-            return Ok(None);
+            .await?
+            {
+                upsert_dispatch_state_in_transaction(
+                    tx.as_transaction_mut(),
+                    schedule_name,
+                    schedule_key,
+                    &active_task_id,
+                    &now,
+                )
+                .await?;
+                tx.commit()
+                    .await
+                    .context("commit coalesced active star dispatch")?;
+                tracing::info!(
+                    event = "scheduler.dispatch_coalesced",
+                    schedule_name,
+                    schedule_key,
+                    task_id = active_task_id,
+                    "star connection already has an active task"
+                );
+                return Ok(None);
+            }
+            None
         }
         _ => None,
     };
@@ -5457,17 +5480,18 @@ mod tests {
 
     use super::{
         NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO,
-        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
-        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
-        cancel_task, claim_next_queued_task, complete_task,
-        current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
-        defer_task_after_sqlite_write_backpressure, enqueue_brief_history_recompute_if_needed,
-        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
+        STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX, STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX,
+        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
+        SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE,
+        TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+        TASK_SYNC_ALL, TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
+        TASK_SYNC_SUBSCRIPTIONS, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
+        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
+        current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
+        current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
+        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
+        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
+        enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
@@ -6118,6 +6142,85 @@ mod tests {
         .expect("load reconciliation dispatch marker");
         assert!(dispatch_marker.0.starts_with("epoch:"));
         assert_eq!(dispatch_marker.1, reconciliation_tasks[0]);
+    }
+
+    #[tokio::test]
+    async fn star_scheduler_links_delta_marker_to_orphaned_active_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 602, "star-orphan-marker").await;
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("test-token")
+            .expect("encrypt github access token");
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id, user_id, github_user_id, login, access_token_ciphertext,
+              access_token_nonce, scopes, linked_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-orphan-connection")
+        .bind("602")
+        .bind(40_602_i64)
+        .bind("star-orphan-marker")
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("read:user")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed orphan marker github connection");
+        seed_task(
+            &pool,
+            "star-orphan-active",
+            TASK_SYNC_STARRED_DELTA,
+            STATUS_QUEUED,
+            1,
+        )
+        .await;
+        sqlx::query("UPDATE job_tasks SET payload_json = ? WHERE id = 'star-orphan-active'")
+            .bind(
+                json!({
+                    "user_id": "602",
+                    "github_connection_id": "star-orphan-connection",
+                    "trigger": "schedule",
+                })
+                .to_string(),
+            )
+            .execute(&pool)
+            .await
+            .expect("attach orphan active task connection");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 10, 0, 0)
+            .single()
+            .expect("valid orphan marker scheduler time");
+        let dispatched = enqueue_star_sync_runs_if_due(state.as_ref(), now)
+            .await
+            .expect("coalesce orphan active star task");
+        assert!(dispatched.is_empty());
+
+        let marker = sqlx::query_as::<_, (String, String)>(
+            "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(format!(
+            "{STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX}:star-orphan-connection"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read linked orphan marker");
+        assert_eq!(marker.0, current_star_sync_delta_schedule_key(now, 30));
+        assert_eq!(marker.1, "star-orphan-active");
+        let task_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE id = 'star-orphan-active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan active task");
+        assert_eq!(task_count, 1);
     }
 
     #[test]
