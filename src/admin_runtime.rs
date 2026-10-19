@@ -826,29 +826,6 @@ pub async fn load_sync_auto_fetch_effective_at(pool: &SqlitePool) -> Result<Opti
     .flatten())
 }
 
-pub async fn clear_sync_auto_fetch_effective_at(
-    pool: &SqlitePool,
-    sqlite_writer: &SqliteWriteCoordinator,
-) -> Result<()> {
-    sqlite_writer
-        .write("sync_runtime_effective_at_clear", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE admin_runtime_settings
-                SET sync_auto_fetch_effective_at = NULL,
-                    updated_at = ?
-                WHERE id = 1
-                "#,
-            )
-            .bind(Utc::now().to_rfc3339())
-            .execute(sqlite_writer.write_pool_or(pool))
-            .await
-            .map_err(anyhow::Error::from)
-        })
-        .await?;
-    Ok(())
-}
-
 pub async fn load_retry_recent_failures_interval_minutes(pool: &SqlitePool) -> Result<i64> {
     let interval = sqlx::query_scalar::<_, i64>(
         r#"

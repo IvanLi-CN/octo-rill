@@ -661,6 +661,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             content_identity_upgrade::spawn_worker(app_state.clone());
         let translation_recovery_abort_handle =
             translations::spawn_translation_recovery_task(app_state.clone());
+        let search_projection_abort_handle =
+            search_index::spawn_realtime_projection_worker(app_state.clone());
 
         info!(%addr, "listening");
 
@@ -676,6 +678,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             global_content_processing_abort_handle,
             content_identity_upgrade_abort_handle,
             search_index_abort_handle,
+            search_projection_abort_handle,
             online_migration_abort_handle,
         ];
         if let Some(handle) = metrics_sampler {

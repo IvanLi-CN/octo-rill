@@ -19,11 +19,14 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::{Sqlite, Transaction};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
     admin_runtime, ai, api, briefs, content_processing, local_id, runtime,
-    sqlite_write::{is_sqlite_background_admission_error, is_sqlite_write_deadline_error},
+    sqlite_write::{
+        SqliteWritePriority, is_sqlite_background_admission_error, is_sqlite_write_deadline_error,
+    },
     state::AppState,
     sync, translations, webhook_push,
     worker_backoff::{ClaimAdmission, ClaimAdmissionResult, WorkerBackoff},
@@ -455,26 +458,15 @@ pub async fn enqueue_hour_slot_if_due(
 
     let due_users = collect_due_daily_slot_user_snapshots(state, now, &hour_key).await?;
 
-    let task = enqueue_task(
-        state,
-        NewTask {
-            task_type: TASK_BRIEF_DAILY_SLOT.to_owned(),
-            payload: json!({
-                "hour_utc": hour_utc,
-                "hour_key": hour_key,
-                "users": due_users,
-            }),
-            source: "scheduler".to_owned(),
-            requested_by: None,
-            parent_task_id: None,
-        },
-    )
-    .await?;
-
     let dispatch_at = now.to_rfc3339();
-    update_daily_brief_hour_slot_dispatch(state, hour_utc, dispatch_at.as_str()).await?;
-
-    Ok(Some(task.task_id))
+    dispatch_daily_brief_slot_atomic(
+        state,
+        hour_utc,
+        hour_key.as_str(),
+        due_users,
+        dispatch_at.as_str(),
+    )
+    .await
 }
 
 pub async fn enqueue_subscription_run_if_due(
@@ -519,31 +511,31 @@ pub async fn enqueue_subscription_run_if_due(
         "interval_minutes": interval_minutes,
     });
 
-    let task = if subscription_run_in_flight(state).await? {
-        record_skipped_subscription_run(state, payload).await?
+    let skipped_result = if subscription_run_in_flight(state).await? {
+        Some(sync::skipped_subscription_result(
+            schedule_key.as_str(),
+            "previous_run_active",
+        ))
     } else {
-        enqueue_task(
-            state,
-            NewTask {
-                task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
-                payload,
-                source: "scheduler".to_owned(),
-                requested_by: None,
-                parent_task_id: None,
-            },
-        )
-        .await?
+        None
     };
 
-    upsert_dispatch_state(
+    dispatch_scheduled_task_atomic(
         state,
         SUBSCRIPTION_SCHEDULE_NAME,
         &schedule_key,
-        &task.task_id,
+        NewTask {
+            task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+            payload,
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+        skipped_result,
+        true,
+        Some(now),
     )
-    .await?;
-    admin_runtime::clear_sync_auto_fetch_effective_at(&state.pool, &state.sqlite_writer).await?;
-    Ok(Some(task.task_id))
+    .await
 }
 
 pub async fn enqueue_star_sync_runs_if_due(
@@ -594,8 +586,10 @@ pub async fn enqueue_star_sync_runs_if_due(
         .context("load star delta dispatch state")?
         .flatten();
         if last_delta_key.as_deref() != Some(delta_schedule_key.as_str()) {
-            let task = enqueue_task(
+            if let Some(task_id) = dispatch_scheduled_task_atomic(
                 state,
+                delta_schedule_name.as_str(),
+                delta_schedule_key.as_str(),
                 NewTask {
                     task_type: TASK_SYNC_STARRED_DELTA.to_owned(),
                     payload: json!({
@@ -608,16 +602,14 @@ pub async fn enqueue_star_sync_runs_if_due(
                     requested_by: None,
                     parent_task_id: None,
                 },
+                None,
+                false,
+                None,
             )
-            .await?;
-            upsert_dispatch_state(
-                state,
-                delta_schedule_name.as_str(),
-                delta_schedule_key.as_str(),
-                task.task_id.as_str(),
-            )
-            .await?;
-            task_ids.push(task.task_id);
+            .await?
+            {
+                task_ids.push(task_id);
+            }
             continue;
         }
 
@@ -691,30 +683,36 @@ pub async fn enqueue_recent_failures_retry_if_due(
         "order": "updated_at DESC, created_at DESC, id DESC",
     });
 
-    let task = if task_type_run_in_flight(state, TASK_RETRY_RECENT_FAILURES).await? {
-        record_skipped_recent_failures_retry(state, payload).await?
+    let skipped_result = if task_type_run_in_flight(state, TASK_RETRY_RECENT_FAILURES).await? {
+        Some(json!({
+            "skipped": true,
+            "skip_reason": "previous_run_active",
+            "schedule_key": schedule_key,
+            "interval_minutes": interval_minutes,
+            "daily_brief": retry_kind_empty_summary("daily_brief"),
+            "polish": retry_kind_empty_summary("polish"),
+            "translation": retry_kind_empty_summary("translation"),
+        }))
     } else {
-        enqueue_task(
-            state,
-            NewTask {
-                task_type: TASK_RETRY_RECENT_FAILURES.to_owned(),
-                payload,
-                source: "scheduler".to_owned(),
-                requested_by: None,
-                parent_task_id: None,
-            },
-        )
-        .await?
+        None
     };
 
-    upsert_dispatch_state(
+    dispatch_scheduled_task_atomic(
         state,
         RETRY_RECENT_FAILURES_SCHEDULE_NAME,
         &schedule_key,
-        &task.task_id,
+        NewTask {
+            task_type: TASK_RETRY_RECENT_FAILURES.to_owned(),
+            payload,
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+        skipped_result,
+        false,
+        None,
     )
-    .await?;
-    Ok(Some(task.task_id))
+    .await
 }
 
 pub async fn enqueue_brief_history_recompute_if_needed(state: &AppState) -> Result<Option<String>> {
@@ -857,6 +855,354 @@ async fn star_sync_connection_task_in_flight(
     Ok(count > 0)
 }
 
+async fn dispatch_scheduled_task_atomic(
+    state: &AppState,
+    schedule_name: &str,
+    schedule_key: &str,
+    new_task: NewTask,
+    skipped_result: Option<Value>,
+    clear_sync_effective_at: bool,
+    due_at: Option<DateTime<Utc>>,
+) -> Result<Option<String>> {
+    let now = Utc::now().to_rfc3339();
+    let task_id = local_id::generate_local_id().to_string();
+    let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
+    let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
+    let skipped = skipped_result.is_some();
+    let started_at = skipped.then_some(now.as_str());
+    let task_status = if skipped {
+        STATUS_RUNNING
+    } else {
+        STATUS_QUEUED
+    };
+
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "scheduled_task_dispatch",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+
+    let last_dispatch_key = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_dispatch_key FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+    )
+    .bind(schedule_name)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?
+    .flatten();
+    if last_dispatch_key.as_deref() == Some(schedule_key) {
+        tx.commit().await?;
+        tracing::debug!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name,
+            schedule_key,
+            "scheduler dispatch already committed"
+        );
+        return Ok(None);
+    }
+    if let Some(due_at) = due_at {
+        let effective_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sync_auto_fetch_effective_at FROM admin_runtime_settings WHERE id = 1",
+        )
+        .fetch_optional(&mut **tx.as_transaction_mut())
+        .await?
+        .flatten();
+        if effective_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) > due_at)
+        {
+            tx.commit().await?;
+            tracing::debug!(
+                event = "scheduler.dispatch_not_due",
+                schedule_name,
+                schedule_key,
+                "scheduler dispatch remained behind its effective boundary"
+            );
+            return Ok(None);
+        }
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_tasks (
+          id, task_type, status, source, requested_by, parent_task_id,
+          payload_json, log_file_path, created_at, started_at, finished_at,
+          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&task_id)
+    .bind(&new_task.task_type)
+    .bind(task_status)
+    .bind(&new_task.source)
+    .bind(new_task.requested_by.as_deref())
+    .bind(new_task.parent_task_id.as_deref())
+    .bind(&payload_json)
+    .bind(log_file_path.as_deref())
+    .bind(&now)
+    .bind(started_at)
+    .bind(skipped.then_some(state.runtime_owner_id.as_str()))
+    .bind(started_at)
+    .bind(&now)
+    .bind(Option::<&str>::None)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    .context("failed to insert scheduled task")?;
+
+    append_task_event_in_transaction(
+        tx.as_transaction_mut(),
+        &task_id,
+        "task.created",
+        json!({
+            "task_id": task_id,
+            "task_type": new_task.task_type,
+            "status": STATUS_QUEUED,
+            "source": new_task.source,
+        }),
+    )
+    .await?;
+
+    if let Some(result) = skipped_result {
+        append_task_event_in_transaction(
+            tx.as_transaction_mut(),
+            &task_id,
+            "task.running",
+            json!({
+                "task_id": task_id,
+                "status": STATUS_RUNNING,
+            }),
+        )
+        .await?;
+        append_task_event_in_transaction(
+            tx.as_transaction_mut(),
+            &task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "skipped",
+                "schedule_key": schedule_key,
+                "skip_reason": "previous_run_active",
+            }),
+        )
+        .await?;
+        let result_json = serde_json::to_string(&result).context("serialize skipped result")?;
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, result_json = ?, finished_at = ?,
+                runtime_owner_id = NULL, lease_heartbeat_at = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(STATUS_SUCCEEDED)
+        .bind(result_json)
+        .bind(&now)
+        .bind(&now)
+        .bind(&task_id)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        .context("finalize skipped scheduled task")?;
+        append_task_event_in_transaction(
+            tx.as_transaction_mut(),
+            &task_id,
+            "task.completed",
+            json!({
+                "task_id": task_id,
+                "status": STATUS_SUCCEEDED,
+                "skipped": true,
+            }),
+        )
+        .await?;
+    }
+
+    upsert_dispatch_state_in_transaction(
+        tx.as_transaction_mut(),
+        schedule_name,
+        schedule_key,
+        &task_id,
+        &now,
+    )
+    .await?;
+    if clear_sync_effective_at {
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = NULL, updated_at = ? WHERE id = 1",
+        )
+        .bind(&now)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        .context("clear sync auto-fetch effective timestamp")?;
+    }
+
+    tx.commit().await?;
+    if !skipped {
+        TASK_CLAIM_ADMISSION.wake();
+    } else if let Err(error) = append_task_log_entry(
+        state,
+        &task_id,
+        json!({
+            "at": now,
+            "level": "warning",
+            "stage": "scheduler",
+            "event_type": "run_skipped",
+            "task_id": task_id,
+            "schedule_key": schedule_key,
+            "message": "scheduled run skipped because a previous run is still active",
+            "skip_reason": "previous_run_active"
+        }),
+    )
+    .await
+    {
+        tracing::warn!(
+            ?error,
+            task_id,
+            "failed to write skipped scheduler task log"
+        );
+    }
+
+    Ok(Some(task_id))
+}
+
+async fn dispatch_daily_brief_slot_atomic(
+    state: &AppState,
+    hour_utc: i64,
+    hour_key: &str,
+    due_users: Vec<DailySlotUserSnapshot>,
+    dispatch_at: &str,
+) -> Result<Option<String>> {
+    let task_id = local_id::generate_local_id().to_string();
+    let payload = json!({
+        "hour_utc": hour_utc,
+        "hour_key": hour_key,
+        "users": due_users,
+    });
+    let payload_json = serde_json::to_string(&payload).context("serialize daily slot payload")?;
+
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "daily_brief_hour_slot_dispatch",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let slot = sqlx::query_as::<_, SlotRow>(
+        "SELECT enabled, last_dispatch_at FROM daily_brief_hour_slots WHERE hour_utc = ? LIMIT 1",
+    )
+    .bind(hour_utc)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?;
+    let Some(slot) = slot else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    if slot.enabled == 0
+        || slot
+            .last_dispatch_at
+            .as_deref()
+            .is_some_and(|value| value.starts_with(hour_key))
+    {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_tasks (
+          id, task_type, status, source, requested_by, parent_task_id,
+          payload_json, log_file_path, created_at, started_at, finished_at,
+          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+        ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
+        "#,
+    )
+    .bind(&task_id)
+    .bind(TASK_BRIEF_DAILY_SLOT)
+    .bind(STATUS_QUEUED)
+    .bind("scheduler")
+    .bind(&payload_json)
+    .bind(dispatch_at)
+    .bind(dispatch_at)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    .context("failed to insert daily brief slot task")?;
+    append_task_event_in_transaction(
+        tx.as_transaction_mut(),
+        &task_id,
+        "task.created",
+        json!({
+            "task_id": task_id,
+            "task_type": TASK_BRIEF_DAILY_SLOT,
+            "status": STATUS_QUEUED,
+            "source": "scheduler",
+        }),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE daily_brief_hour_slots SET last_dispatch_at = ?, updated_at = ? WHERE hour_utc = ?",
+    )
+    .bind(dispatch_at)
+    .bind(dispatch_at)
+    .bind(hour_utc)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    .context("update daily brief hour slot dispatch")?;
+    tx.commit().await?;
+    TASK_CLAIM_ADMISSION.wake();
+    Ok(Some(task_id))
+}
+
+async fn append_task_event_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<()> {
+    let payload_json = serde_json::to_string(&payload).context("serialize task event payload")?;
+    sqlx::query(
+        "INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(local_id::generate_local_id().to_string())
+    .bind(task_id)
+    .bind(event_type)
+    .bind(payload_json)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await
+    .context("failed to insert task event in transaction")?;
+    Ok(())
+}
+
+async fn upsert_dispatch_state_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    schedule_name: &str,
+    schedule_key: &str,
+    task_id: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scheduled_task_dispatch_state (
+          schedule_name, last_dispatch_key, last_task_id, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(schedule_name) DO UPDATE SET
+          last_dispatch_key = excluded.last_dispatch_key,
+          last_task_id = excluded.last_task_id,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(schedule_name)
+    .bind(schedule_key)
+    .bind(task_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .context("failed to update scheduler dispatch state")?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn upsert_dispatch_state(
     state: &AppState,
     schedule_name: &str,
@@ -894,6 +1240,7 @@ async fn upsert_dispatch_state(
     Ok(())
 }
 
+#[cfg(test)]
 async fn update_daily_brief_hour_slot_dispatch(
     state: &AppState,
     hour_utc: i64,
@@ -949,154 +1296,6 @@ async fn mark_brief_generation_source(
         })
         .await?;
     Ok(())
-}
-
-async fn record_skipped_subscription_run(state: &AppState, payload: Value) -> Result<EnqueuedTask> {
-    let schedule_key = payload
-        .get("schedule_key")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let task = start_inline_task(
-        state,
-        NewTask {
-            task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
-            payload,
-            source: "scheduler".to_owned(),
-            requested_by: None,
-            parent_task_id: None,
-        },
-    )
-    .await?;
-
-    append_task_event(
-        state,
-        &task.task_id,
-        "task.progress",
-        json!({
-            "task_id": task.task_id,
-            "stage": "skipped",
-            "schedule_key": schedule_key,
-            "skip_reason": "previous_run_active",
-        }),
-    )
-    .await?;
-    append_task_log_entry(
-        state,
-        &task.task_id,
-        json!({
-            "at": Utc::now().to_rfc3339(),
-            "level": "warning",
-            "stage": "scheduler",
-            "event_type": "run_skipped",
-            "task_id": task.task_id,
-            "schedule_key": schedule_key,
-            "message": "subscription sync run skipped because a previous run is still active",
-            "skip_reason": "previous_run_active"
-        }),
-    )
-    .await?;
-
-    let finalized = complete_task(
-        state,
-        &task.task_id,
-        STATUS_SUCCEEDED,
-        Some(sync::skipped_subscription_result(
-            &schedule_key,
-            "previous_run_active",
-        )),
-        None,
-    )
-    .await?;
-    if !finalized {
-        return Ok(task);
-    }
-    append_task_event(
-        state,
-        &task.task_id,
-        "task.completed",
-        json!({
-            "task_id": task.task_id,
-            "status": STATUS_SUCCEEDED,
-            "skipped": true,
-        }),
-    )
-    .await?;
-
-    Ok(task)
-}
-
-async fn record_skipped_recent_failures_retry(
-    state: &AppState,
-    payload: Value,
-) -> Result<EnqueuedTask> {
-    let schedule_key = payload
-        .get("schedule_key")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let interval_minutes = payload
-        .get("interval_minutes")
-        .and_then(Value::as_i64)
-        .map(admin_runtime::normalize_retry_recent_failures_interval_minutes)
-        .unwrap_or(admin_runtime::DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES);
-    let task = start_inline_task(
-        state,
-        NewTask {
-            task_type: TASK_RETRY_RECENT_FAILURES.to_owned(),
-            payload,
-            source: "scheduler".to_owned(),
-            requested_by: None,
-            parent_task_id: None,
-        },
-    )
-    .await?;
-
-    append_task_event(
-        state,
-        &task.task_id,
-        "task.progress",
-        json!({
-            "task_id": task.task_id,
-            "stage": "skipped",
-            "schedule_key": schedule_key,
-            "skip_reason": "previous_run_active",
-        }),
-    )
-    .await?;
-
-    let finalized = complete_task(
-        state,
-        &task.task_id,
-        STATUS_SUCCEEDED,
-        Some(json!({
-            "skipped": true,
-            "skip_reason": "previous_run_active",
-            "schedule_key": schedule_key,
-            "interval_minutes": interval_minutes,
-            "daily_brief": retry_kind_empty_summary("daily_brief"),
-            "polish": retry_kind_empty_summary("polish"),
-            "translation": retry_kind_empty_summary("translation"),
-        })),
-        None,
-    )
-    .await?;
-    if !finalized {
-        return Ok(task);
-    }
-    append_task_event(
-        state,
-        &task.task_id,
-        "task.completed",
-        json!({
-            "task_id": task.task_id,
-            "status": STATUS_SUCCEEDED,
-            "skipped": true,
-        }),
-    )
-    .await?;
-
-    Ok(task)
 }
 
 fn task_supports_log_file(task_type: &str) -> bool {
@@ -5043,12 +5242,12 @@ mod tests {
 
     use super::{
         NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_CANCELED,
-        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
-        cancel_task, claim_next_queued_task, complete_task,
+        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME,
+        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
+        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
+        TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
+        TASK_SYNC_SUBSCRIPTIONS, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
+        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
         current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
         defer_task_after_sqlite_write_backpressure, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
@@ -5531,6 +5730,68 @@ mod tests {
         .await
         .expect("load cleared effective boundary");
         assert!(effective_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_subscription_ticks_commit_one_task_and_marker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        crate::admin_runtime::update_sync_auto_fetch_interval_minutes(&pool, 30)
+            .await
+            .expect("seed subscription interval");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = ? WHERE id = 1",
+        )
+        .bind("2026-03-06T10:30:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed subscription effective boundary");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 10, 30, 0)
+            .single()
+            .expect("valid scheduler time");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                enqueue_subscription_run_if_due(state.as_ref(), now).await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.expect("join concurrent scheduler tick");
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("background writer admission denied"),
+                    "unexpected scheduler error: {error:#}"
+                );
+            }
+        }
+
+        let task_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
+        )
+        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .fetch_one(&pool)
+        .await
+        .expect("count subscription tasks");
+        assert_eq!(task_count, 1);
+        let marker = sqlx::query_as::<_, (String, String)>(
+            "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(SUBSCRIPTION_SCHEDULE_NAME)
+        .fetch_one(&pool)
+        .await
+        .expect("read subscription dispatch marker");
+        assert_eq!(marker.0, current_subscription_schedule_key(now, 30));
+        let marker_task_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_tasks WHERE id = ?")
+                .bind(marker.1)
+                .fetch_one(&pool)
+                .await
+                .expect("count marker task");
+        assert_eq!(marker_task_count, 1);
     }
 
     #[tokio::test]

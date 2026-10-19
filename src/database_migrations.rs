@@ -523,7 +523,7 @@ mod tests {
             .await
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92]"));
+        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92, 93]"));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
