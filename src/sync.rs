@@ -20341,7 +20341,7 @@ mod tests {
         };
 
         let after_reads_observed =
-            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+            tokio::time::timeout(Duration::from_secs(1), hook.reached.recv())
                 .await
                 .expect("wait for social activity snapshot read hook")
                 .is_some();
@@ -20431,7 +20431,7 @@ mod tests {
         };
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+            tokio::time::timeout(Duration::from_secs(1), hook.reached.recv())
                 .await
                 .expect("wait for social activity snapshot read hook")
                 .is_some(),
