@@ -387,7 +387,7 @@ pub async fn query(
         // Keep the readiness gate in the same snapshot as the FTS match so a
         // concurrent metadata event cannot produce a false negative.
         builder.push(" AND (");
-        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue)) OR ");
+        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
         builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
@@ -1778,6 +1778,20 @@ mod tests {
             .await
             .expect("ready search index");
         assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('content:pending-search-status', 'upsert', 'content', 'pending-search-status', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pending realtime projection");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "building");
+        sqlx::query(
+            "DELETE FROM search_projection_outbox WHERE projection_key = 'content:pending-search-status'",
+        )
+        .execute(&pool)
+        .await
+        .expect("clear pending realtime projection");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
     }
 
     #[tokio::test]
@@ -1961,6 +1975,20 @@ mod tests {
             INSERT INTO ai_translations (
               id, user_id, entity_type, entity_id, lang, source_hash, status,
               title, summary, created_at, updated_at
+            ) VALUES ('search-announcement-key-smart', 'search-user',
+                      'announcement_smart', 'search-announcement-key', 'zh-CN',
+                      'hash-announcement-key-smart', 'ready', '智能摘要命中', '智能公告正文',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed smart announcement translation before key");
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              title, summary, created_at, updated_at
             ) VALUES ('search-announcement-key-translation-2', 'search-announcement-user-2',
                       'announcement_detail', 'search-announcement-key', 'zh-CN',
                       'hash-announcement-key-2', 'ready', '第二用户命中', '公告正文二',
@@ -1991,17 +2019,25 @@ mod tests {
             results[0].target.as_ref().unwrap().href,
             "/octo/rill/discussions/9"
         );
-        let lane_users = sqlx::query_scalar::<_, String>(
-            "SELECT user_id FROM search_document_user_lanes WHERE document_id = 'announcement:search-announcement-key' ORDER BY user_id",
+        let lane_rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT user_id, translated_text, smart_text FROM search_document_user_lanes WHERE document_id = 'announcement:search-announcement-key' ORDER BY user_id",
         )
         .fetch_all(&pool)
         .await
         .expect("read rebuilt announcement lane users");
         assert_eq!(
-            lane_users,
+            lane_rows,
             vec![
-                "search-announcement-user-2".to_owned(),
-                "search-user".to_owned()
+                (
+                    "search-announcement-user-2".to_owned(),
+                    Some("第二用户命中 公告正文二".to_owned()),
+                    None,
+                ),
+                (
+                    "search-user".to_owned(),
+                    Some("讨论键迁移命中 公告正文".to_owned()),
+                    Some("智能摘要命中 智能公告正文".to_owned()),
+                ),
             ]
         );
     }

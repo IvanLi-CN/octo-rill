@@ -614,37 +614,48 @@ async fn refresh_announcement_lanes(
         .bind(document_id)
         .execute(&mut **tx)
         .await?;
-    for (smart, column) in [(false, "translated_text"), (true, "smart_text")] {
-        let entity_filter = if smart {
-            "lower(t.entity_type) LIKE '%smart%'"
-        } else {
-            "lower(t.entity_type) NOT LIKE '%smart%'"
-        };
-        let query = format!(
-            "INSERT INTO search_document_user_lanes (document_id, user_id, {column}, updated_at)
-             SELECT ?, ranked.user_id, ranked.value, ranked.updated_at
-             FROM (
-               SELECT t.user_id,
-                      trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, '')) AS value,
-                      t.updated_at,
-                      ROW_NUMBER() OVER (PARTITION BY t.user_id ORDER BY t.updated_at DESC, t.id DESC) AS lane_rank
-               FROM ai_translations t
-               WHERE t.lang = 'zh-CN'
-                 AND t.status IN ('ready', 'disabled', 'missing')
-                 AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
-                 AND lower(t.entity_type) LIKE 'announcement%'
-                 AND {entity_filter}
-                 AND lower(t.entity_id) IN (lower(?), lower(?))
-             ) ranked
-             WHERE ranked.lane_rank = 1"
-        );
-        sqlx::query(&query)
-            .bind(document_id)
-            .bind(event_id)
-            .bind(resource_id)
-            .execute(&mut **tx)
-            .await?;
-    }
+    sqlx::query(
+        "WITH candidates AS (
+           SELECT t.user_id,
+                  CASE WHEN lower(t.entity_type) LIKE '%smart%' THEN 1 ELSE 0 END AS is_smart,
+                  trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, '')) AS value,
+                  t.updated_at,
+                  t.id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY t.user_id, CASE WHEN lower(t.entity_type) LIKE '%smart%' THEN 1 ELSE 0 END
+                    ORDER BY t.updated_at DESC, t.id DESC
+                  ) AS lane_rank
+           FROM ai_translations t
+           WHERE t.lang = 'zh-CN'
+             AND t.status IN ('ready', 'disabled', 'missing')
+             AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+             AND lower(t.entity_type) LIKE 'announcement%'
+             AND lower(t.entity_id) IN (lower(?), lower(?))
+         ), selected AS (
+           SELECT user_id,
+                  MAX(CASE WHEN is_smart = 0 AND lane_rank = 1 THEN value END) AS translated_text,
+                  MAX(CASE WHEN is_smart = 1 AND lane_rank = 1 THEN value END) AS smart_text,
+                  MAX(CASE WHEN lane_rank = 1 THEN updated_at END) AS updated_at
+           FROM candidates
+           GROUP BY user_id
+         )
+         INSERT INTO search_document_user_lanes (
+           document_id, user_id, translated_text, smart_text, updated_at
+         )
+         SELECT ?, user_id, translated_text, smart_text,
+                COALESCE(updated_at, CURRENT_TIMESTAMP)
+         FROM selected
+         WHERE 1
+         ON CONFLICT(document_id, user_id) DO UPDATE SET
+           translated_text = excluded.translated_text,
+           smart_text = excluded.smart_text,
+           updated_at = excluded.updated_at",
+    )
+    .bind(event_id)
+    .bind(resource_id)
+    .bind(document_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
