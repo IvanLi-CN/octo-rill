@@ -414,7 +414,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95] {
+        for version in [93_i64, 94, 95, 96] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -470,6 +470,15 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("check resource-key projection index"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_projection_outbox_poll'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check outbox poll index"),
             1
         );
 
@@ -582,7 +591,9 @@ mod tests {
             .await
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92, 93, 94, 95]"));
+        assert!(
+            rendered.contains("failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96]")
+        );
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

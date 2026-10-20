@@ -15,7 +15,7 @@
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
 - 当前跟进候选为后台准入拒绝增加 250 ms 共享冷却与 `background_admission_coalesced` 计数，并将通知 upsert 与 feed activity event 写入拆成固定 10 行的幂等短事务；这只降低无效拒绝日志和单次写入持锁时间，尚未代表已发布或完成 101 线上验收。
 - 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
-- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql` 和 `0095_search_projection_announcement_key_repair.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
+- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql`、`0095_search_projection_announcement_key_repair.sql` 和 `0096_search_projection_outbox_poll_index.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
 ## Coverage / rollout summary
 
@@ -74,15 +74,15 @@
 - `bash scripts/check-rust-source-quality.sh`（code candidate `12c8ea90`: source quality scan passed）
 - `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
-- PR #333 当前 head `2f924800` 的本地验证：`cargo fmt --all -- --check`、`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings`、source-quality scan 和全量串行测试均通过；测试结果为 `1090 passed, 0 failed, 2 ignored`。
+- PR #333 代码候选 `5c807950` 的本地验证：`cargo fmt --all -- --check`、`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings`、source-quality scan 和远端全量测试均通过；远端结果为 `1093 tests`，本地定向新增 deferred content projection 测试通过。完整串行结果以最终 head 的本地日志和 CI 为准。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
-- 当前 head `2f924800` 的回归覆盖 supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing、sqlite-writer、scheduler dispatch 和 realtime search outbox；这些证据尚不替代合并后的 101 线上观察。
-- PR #333 当前 head `2f924800` 对应的 GitHub Actions run `39342491330`、`39342491218`、`39342491009` 和 `39342491823` 已分别通过 CI Pipeline、Rust Source Quality、Review Policy 和 release intent label gate；此前同一 head 的 run `39342398896` 出现一次时序敏感的 foreground session telemetry 超时，随后当前 head 的 test budget 修复在 `39342491330` 通过。正式 review 必须继续绑定最新 head。
+- 当前代码候选的回归覆盖 supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing、sqlite-writer、scheduler dispatch、realtime search outbox、content-first deferred projection 和 outbox polling query plan；这些证据尚不替代合并后的 101 线上观察。
+- PR #333 代码候选 `5c807950` 对应的 GitHub Actions run `39351951133`、`39351951126`、`39351951165` 和 `39351948230` 已分别通过 CI Pipeline、Rust Source Quality、Review Policy 和 release intent label gate；后续仅文档或审查元数据变更时，仍必须重新读取最新 head 的 required checks。
 
 ## Remaining Gaps
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
-- `0092`、`0093`、`0094` 和 `0095` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
+- `0092`、`0093`、`0094`、`0095` 和 `0096` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
 - 完整当前 head 的 file-backed WAL/HTTP 经验验收和合并后的 101 线上 30 分钟观察仍是发布后门禁；在这两项完成前不能宣称线上性能已验证或生成新 release。
 
 ## Related Changes

@@ -1610,6 +1610,29 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        let outbox_poll_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT projection_key FROM search_projection_outbox WHERE available_at <= CURRENT_TIMESTAMP AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP) ORDER BY available_at ASC, created_at ASC, projection_key ASC LIMIT 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain projection outbox poll");
+        let outbox_poll_plan_details = outbox_poll_plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            outbox_poll_plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_search_projection_outbox_poll")),
+            "outbox poll plan: {outbox_poll_plan_details:?}"
+        );
+        assert!(
+            outbox_poll_plan_details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "outbox poll should not sort a backlog in a temp B-tree: {outbox_poll_plan_details:?}"
+        );
+
         let translation_plan = sqlx::query(
             "EXPLAIN QUERY PLAN SELECT user_id FROM ai_translations WHERE lang = 'zh-CN' AND entity_id = '4201' AND status IN ('ready', 'disabled', 'missing') AND lower(entity_type) LIKE 'release%'",
         )
