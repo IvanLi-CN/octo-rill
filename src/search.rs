@@ -2095,25 +2095,55 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         sqlx::query(
-            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, canonical_resource_type, attempt_count, available_at, last_error, created_at, updated_at) VALUES ('content:release:retry-reset', 'upsert', 'content', 'retry-reset', 'release', 7, CURRENT_TIMESTAMP, 'old writer deadline', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-retry-reset-work', 'release', 'retry-reset', 'translation', 'summary',
+                      'zh-CN', 'search-retry-reset-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
         )
         .execute(&pool)
         .await
-        .expect("seed coalesced retry projection");
+        .expect("seed retry-reset content work item");
         sqlx::query(
-            "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:retry-reset'",
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-retry-reset-projection', 'release', 'retry-reset', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-retry-reset-hash',
+                      'search-retry-reset-work', 'search-retry-reset-work', '{"title":"initial"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed retry-reset content projection");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET attempt_count = 7, fanout_cursor = 'stale-cursor', last_error = 'old writer deadline', updated_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:retry-reset'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed coalesced retry projection state");
+        sqlx::query(
+            "UPDATE content_result_projections SET payload_json = '{\"title\":\"updated\"}', updated_at = CURRENT_TIMESTAMP WHERE id = 'search-retry-reset-projection'",
         )
         .execute(&pool)
         .await
         .expect("apply source update to projection");
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
+            sqlx::query_as::<_, (i64, Option<String>)>(
+                "SELECT attempt_count, fanout_cursor FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
             )
             .fetch_one(&pool)
             .await
             .expect("read reset source retry budget"),
-            0
+            (0, None)
         );
         assert!(
             crate::search_index::run_projection_for_test(state.as_ref())

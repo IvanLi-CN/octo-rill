@@ -28,7 +28,7 @@ const INDEX_BATCH_SIZE: i64 = 25;
 const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(10);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const PROJECTION_POLL_DELAY: Duration = Duration::from_millis(250);
+const PROJECTION_POLL_DELAY: Duration = Duration::from_millis(50);
 const PROJECTION_PROGRESS_DELAY: Duration = Duration::from_millis(10);
 const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
 const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -102,12 +102,22 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
                     break;
                 }
                 Err(error) => {
-                    warn!(
-                        ?error,
-                        event = "search.index.failed_terminal",
-                        "search projection backfill stopped after a failed batch"
-                    );
-                    break;
+                    if is_transient_backfill_error(&error) {
+                        warn!(
+                            ?error,
+                            event = "search.index.deferred",
+                            retry_after_seconds = RETRY_DELAY.as_secs(),
+                            "search projection backfill deferred by writer admission or deadline"
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    } else {
+                        warn!(
+                            ?error,
+                            event = "search.index.failed_terminal",
+                            "search projection backfill stopped after a failed batch"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1106,16 +1116,26 @@ async fn run_batch(state: &AppState) -> Result<BatchOutcome> {
 
 async fn run_batch_once(state: &AppState) -> Result<BatchOutcome> {
     let result = run_batch(state).await;
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !is_transient_backfill_error(error)
+    {
         record_batch_failure(state, error).await;
     }
     result
 }
 
+fn is_transient_backfill_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        is_sqlite_background_admission_error(cause) || is_sqlite_write_deadline_error(cause)
+    })
+}
+
 #[cfg(test)]
 pub(crate) async fn run_batch_for_test(state: &AppState, free_bytes: u64) -> Result<()> {
     let result = run_batch_with_free_bytes(state, free_bytes, 1).await;
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !is_transient_backfill_error(error)
+    {
         record_batch_failure(state, error).await;
     }
     result.map(|_| ())

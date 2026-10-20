@@ -575,6 +575,7 @@ pub async fn enqueue_star_sync_runs_if_due(
     .await
     .context("load eligible github connections for star scheduler")?;
     let mut task_ids = Vec::new();
+    let mut first_dispatch_error = None;
 
     for connection in connections {
         let delta_schedule_name = format!(
@@ -596,7 +597,7 @@ pub async fn enqueue_star_sync_runs_if_due(
         .context("load star delta dispatch state")?
         .flatten();
         if last_delta_key.as_deref() != Some(delta_schedule_key.as_str()) {
-            if let Some(task_id) = dispatch_scheduled_task_atomic(
+            match dispatch_scheduled_task_atomic(
                 state,
                 delta_schedule_name.as_str(),
                 delta_schedule_key.as_str(),
@@ -618,9 +619,18 @@ pub async fn enqueue_star_sync_runs_if_due(
                 false,
                 None,
             )
-            .await?
+            .await
             {
-                task_ids.push(task_id);
+                Ok(Some(task_id)) => task_ids.push(task_id),
+                Ok(None) => {}
+                Err(error) => {
+                    if first_dispatch_error.is_none() {
+                        first_dispatch_error = Some(error.context(format!(
+                            "dispatch star delta for github connection {}",
+                            connection.github_connection_id
+                        )));
+                    }
+                }
             }
             continue;
         }
@@ -635,19 +645,31 @@ pub async fn enqueue_star_sync_runs_if_due(
         {
             continue;
         }
-        if let Some(task_id) = dispatch_star_reconciliation_atomic(
+        match dispatch_star_reconciliation_atomic(
             state,
             connection.user_id.as_str(),
             connection.github_connection_id.as_str(),
             full_sweep_interval_minutes,
             now,
         )
-        .await?
+        .await
         {
-            task_ids.push(task_id);
+            Ok(Some(task_id)) => task_ids.push(task_id),
+            Ok(None) => {}
+            Err(error) => {
+                if first_dispatch_error.is_none() {
+                    first_dispatch_error = Some(error.context(format!(
+                        "dispatch star reconciliation for github connection {}",
+                        connection.github_connection_id
+                    )));
+                }
+            }
         }
     }
 
+    if let Some(error) = first_dispatch_error {
+        return Err(error);
+    }
     Ok(task_ids)
 }
 
