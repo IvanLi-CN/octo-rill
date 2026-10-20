@@ -1,6 +1,11 @@
 -- Bound announcement lane fanout and preserve a cursor between short writer transactions.
 ALTER TABLE search_projection_outbox ADD COLUMN fanout_cursor TEXT;
 
+-- Realtime projection workers own announcement lane fanout in bounded chunks.
+-- The legacy insert trigger scans every matching translation before the worker
+-- can apply its cursor, defeating the transaction bound on the first chunk.
+DROP TRIGGER IF EXISTS search_documents_ai;
+
 -- Make the scheduler's active star-connection coalescing lookup point-addressable.
 CREATE INDEX IF NOT EXISTS idx_job_tasks_star_connection_active
   ON job_tasks(

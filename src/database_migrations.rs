@@ -414,7 +414,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95, 96, 97] {
+        for version in [93_i64, 94, 95, 96, 97, 98] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -490,6 +490,40 @@ mod tests {
             .expect("check failed projection outbox table"),
             1
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('search_projection_outbox') WHERE name = 'fanout_cursor'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check announcement fanout cursor column"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_star_connection_active'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check active star scheduler index"),
+            1
+        );
+        let scheduler_recovery_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_projection_outbox_reset_source_state'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read scheduler recovery trigger");
+        assert!(scheduler_recovery_trigger_sql.contains("fanout_cursor"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check legacy unbounded document fanout trigger"),
+            0
+        );
         let content_transition_trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_content_projections_outbox_au_old'",
         )
@@ -534,14 +568,15 @@ mod tests {
             .expect("read content work supersession index"),
             3
         );
-        let trigger_sql = sqlx::query_scalar::<_, String>(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read rebuilt search projection trigger");
-        assert!(trigger_sql.contains("ROW_NUMBER"));
-        assert!(trigger_sql.contains("search_document_user_lanes"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check removed unbounded search projection trigger"),
+            0
+        );
 
         let state = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
