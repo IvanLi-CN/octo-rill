@@ -625,6 +625,16 @@ pub async fn enqueue_star_sync_runs_if_due(
             continue;
         }
 
+        if !star_reconciliation_due_in_read_pool(
+            state,
+            connection.github_connection_id.as_str(),
+            full_sweep_interval_minutes,
+            now,
+        )
+        .await?
+        {
+            continue;
+        }
         if let Some(task_id) = dispatch_star_reconciliation_atomic(
             state,
             connection.user_id.as_str(),
@@ -639,6 +649,56 @@ pub async fn enqueue_star_sync_runs_if_due(
     }
 
     Ok(task_ids)
+}
+
+async fn star_reconciliation_due_in_read_pool(
+    state: &AppState,
+    github_connection_id: &str,
+    full_sweep_interval_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let active = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT next_slice_not_before, lease_expires_at
+         FROM star_sync_epochs
+         WHERE github_connection_id = ?
+           AND status IN ('queued', 'running')
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1",
+    )
+    .bind(github_connection_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("load active star reconciliation cadence")?;
+    if let Some((next_slice_not_before, lease_expires_at)) = active {
+        return Ok(
+            star_scheduler_timestamp_due(next_slice_not_before.as_deref(), now)
+                && star_scheduler_timestamp_due(lease_expires_at.as_deref(), now),
+        );
+    }
+    let last_completed_at = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT completed_at
+         FROM star_sync_epochs
+         WHERE github_connection_id = ? AND status = 'succeeded'
+         ORDER BY completed_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(github_connection_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .flatten();
+    let interval =
+        admin_runtime::normalize_star_sync_full_sweep_interval_minutes(full_sweep_interval_minutes);
+    let due_after = now - chrono::Duration::minutes(interval);
+    Ok(last_completed_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|value| value.with_timezone(&Utc) <= due_after))
+}
+
+fn star_scheduler_timestamp_due(value: Option<&str>, now: DateTime<Utc>) -> bool {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|value| value.with_timezone(&Utc) <= now)
 }
 
 pub async fn enqueue_recent_failures_retry_if_due(
@@ -813,7 +873,6 @@ async fn active_star_sync_connection_task_in_transaction(
         WHERE task_type IN (?, ?)
           AND status IN (?, ?)
           AND json_extract(payload_json, '$.github_connection_id') = ?
-        ORDER BY created_at ASC, id ASC
         LIMIT 1
         "#,
     )
@@ -929,7 +988,6 @@ async fn dispatch_star_reconciliation_atomic(
         WHERE task_type = ?
           AND status IN (?, ?)
           AND json_extract(payload_json, '$.github_connection_id') = ?
-        ORDER BY created_at ASC, id ASC
         LIMIT 1
         "#,
     )
