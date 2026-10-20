@@ -15,7 +15,7 @@
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
 - 当前跟进候选为后台准入拒绝增加 250 ms 共享冷却与 `background_admission_coalesced` 计数，并将通知 upsert 与 feed activity event 写入拆成固定 10 行的幂等短事务；这只降低无效拒绝日志和单次写入持锁时间，尚未代表已发布或完成 101 线上验收。
 - 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
-- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql`、`0095_search_projection_announcement_key_repair.sql`、`0096_search_projection_outbox_poll_index.sql`、`0097_search_projection_failure_recovery.sql` 和 `0098_search_projection_scheduler_recovery.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
+- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql`、`0095_search_projection_announcement_key_repair.sql`、`0096_search_projection_outbox_poll_index.sql`、`0097_search_projection_failure_recovery.sql`、`0098_search_projection_scheduler_recovery.sql` 和 `0099_search_projection_scheduler_index_guard.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
 ## Coverage / rollout summary
 
@@ -75,7 +75,7 @@
 - `bash scripts/check-rust-source-quality.sh`（PR #333 current-head required check 通过）
 - file-backed WAL acceptance：`content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（current candidate：passed；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言）
 - 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
-- PR #333 当前代码候选覆盖 0097/0098 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
+- PR #333 当前代码候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
 - 当前代码候选的回归覆盖 supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing、sqlite-writer、scheduler dispatch、realtime search outbox、content-first deferred projection、outbox polling query plan 和 realtime backlog 的 FTS fallback guard；这些证据尚不替代合并后的 101 线上观察。
 - PR #333 的 required checks、正式 review 和生产形态验收必须绑定最终 current head；任何文档或审查元数据变更后都要重新读取最新 head 的 required checks。
@@ -83,7 +83,7 @@
 ## Remaining Gaps
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
-- `0092`、`0093`、`0094`、`0095`、`0096`、`0097` 和 `0098` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、terminal projection failures/recovery、announcement fanout cursor、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
+- `0092`、`0093`、`0094`、`0095`、`0096`、`0097`、`0098` 和 `0099` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、terminal projection failures/recovery、announcement fanout cursor、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
 - 完整当前 head 的 file-backed WAL/HTTP 经验验收和合并后的 101 线上 30 分钟观察仍是发布后门禁；在这两项完成前不能宣称线上性能已验证或生成新 release。
 
 ## Related Changes
