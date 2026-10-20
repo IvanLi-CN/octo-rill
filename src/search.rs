@@ -387,7 +387,7 @@ pub async fn query(
         // Keep the readiness gate in the same snapshot as the FTS match so a
         // concurrent metadata event cannot produce a false negative.
         builder.push(" AND (");
-        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox)) OR ");
+        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox_failed)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
         builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
@@ -469,7 +469,15 @@ pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
             .await
             .map_err(ApiError::internal)?
             != 0;
+    let projection_failed = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM search_projection_outbox_failed)",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        != 0;
     Ok(match status.as_deref() {
+        _ if projection_failed => "failed".to_owned(),
         Some("ready") if !metadata_pending && !projection_pending => "ready".to_owned(),
         Some("paused_low_disk") => "paused_low_disk".to_owned(),
         Some("failed") => "failed".to_owned(),
@@ -1928,6 +1936,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_outbox_claim_has_single_effective_owner() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-race-notification', 'search-user', 'outbox-race-thread', 'race title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed racing notification");
+        let state = setup_state(pool.clone());
+        let (left, right) = tokio::join!(
+            crate::search_index::run_projection_for_test(state.as_ref()),
+            crate::search_index::run_projection_for_test(state.as_ref())
+        );
+        let committed = [
+            left.expect("first projection runner"),
+            right.expect("second projection runner"),
+        ]
+        .into_iter()
+        .filter(|processed| *processed)
+        .count();
+        assert_eq!(
+            committed, 1,
+            "exactly one runner should apply the leased item"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'notification:search-user:outbox-race-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count drained race item"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:outbox-race-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count race FTS rows"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_takes_over_expired_lease() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-expired-notification', 'search-user', 'outbox-expired-thread', 'expired title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed expired-lease notification");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET lease_owner = 'stale-owner', lease_expires_at = '2000-01-01T00:00:00Z', available_at = CURRENT_TIMESTAMP WHERE projection_key = 'notification:search-user:outbox-expired-thread'",
+        )
+        .execute(&pool)
+        .await
+        .expect("expire projection lease");
+        let state = setup_state(pool.clone());
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("expired lease should be reclaimable")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user:outbox-expired-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reclaimed projection"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn realtime_projection_outbox_failure_is_retryable() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -1951,6 +2036,79 @@ mod tests {
         assert_eq!(retry.0, 1);
         assert!(retry.1.is_some());
         assert!(retry.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_moves_terminal_failures_to_recovery_queue() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, canonical_resource_type, available_at, created_at, updated_at) VALUES ('content:release:terminal-missing', 'upsert', 'content', 'terminal-missing', 'release', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection item");
+        for attempt in 1..=8 {
+            assert!(
+                crate::search_index::run_projection_for_test(state.as_ref())
+                    .await
+                    .is_err(),
+                "malformed projection attempt {attempt} should fail"
+            );
+            if attempt < 8 {
+                sqlx::query(
+                    "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
+                )
+                .execute(&pool)
+                .await
+                .expect("make the next projection retry available");
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active terminal projection"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count terminal projection failure"),
+            1
+        );
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "failed");
+
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:terminal-missing', 'release', 'terminal-missing', 'recovered source', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert recovered source document");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reactivated projection"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count cleared terminal projection failure"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2024,6 +2182,86 @@ mod tests {
             .expect("read converged content projection")
             .as_deref(),
             Some("content-first text")
+        );
+    }
+
+    #[tokio::test]
+    async fn content_projection_eligibility_change_refreshes_the_previous_search_key() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-content-transition-work', 'release', 'content-transition', 'translation', 'summary',
+                      'zh-CN', 'search-content-transition-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-content-transition-projection', 'release', 'content-transition', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-content-transition-hash',
+                      'search-content-transition-work', 'search-content-transition-work', '{"title":"transition text"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition projection");
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:content-transition', 'release', 'content-transition', 'source title', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition source document");
+        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read initial transition projection")
+            .as_deref(),
+            Some("transition text")
+        );
+
+        sqlx::query(
+            "UPDATE content_result_projections SET target_lang = 'en', updated_at = CURRENT_TIMESTAMP WHERE id = 'search-content-transition-projection'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make content projection ineligible");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count old-key refresh item"),
+            1
+        );
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read cleared transition projection")
+            .as_deref(),
+            None
         );
     }
 

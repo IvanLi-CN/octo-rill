@@ -8305,9 +8305,112 @@ mod tests {
             .expect("fast error response");
         assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
 
-        // Request completion and the writer status below are the deterministic foreground
-        // admission evidence. Trace output is checked only at the contention probe above because
-        // the synchronous test writer can be delayed by unrelated full-suite load.
+        // The current-thread runtime keeps this subscriber installed while the request futures
+        // flush their synchronous access and writer telemetry, making the correlation assertions
+        // deterministic even when the full suite is running under load.
+        let events = tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                let events = log_buffer.json_events();
+                if events.iter().any(|event| {
+                    event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                        && event
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|request_id| request_id.starts_with("foreground-"))
+                        && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                        && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+                }) {
+                    break events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground session telemetry should be emitted within the test budget");
+        let correlated_request_id = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|request_id| request_id.starts_with("foreground-"))
+                    && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                    && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+            })
+            .and_then(|event| event.get("request_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .expect("a foreground session write should emit correlated SQLite telemetry");
+        let correlated_access = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("http.access".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String(correlated_request_id.clone()))
+            })
+            .expect("the foreground session write should emit an access log");
+        assert_eq!(
+            correlated_access.get("method"),
+            Some(&Value::String("GET".to_owned()))
+        );
+        assert_eq!(
+            correlated_access.get("route"),
+            Some(&Value::String("/probe".to_owned()))
+        );
+        assert_eq!(correlated_access.get("status"), Some(&Value::from(204)));
+        assert!(correlated_access.get("latency_ms").is_some());
+        assert_eq!(correlated_access.get("slow"), Some(&Value::from(false)));
+        assert_eq!(
+            correlated_access.get("threshold_ms"),
+            Some(&Value::from(1000))
+        );
+        assert_eq!(
+            correlated_access.get("level"),
+            Some(&Value::String("INFO".to_owned()))
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String(correlated_request_id.clone()))
+                    && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                    && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+            }),
+            "the request's SQLite writer telemetry should share its correlation fields"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                    && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+            }),
+            "the production-shaped run should observe SQLite busy contention"
+        );
+
+        let error_access = events
+            .iter()
+            .find(|event| {
+                event.get("event") == Some(&Value::String("http.access".to_owned()))
+                    && event.get("request_id")
+                        == Some(&Value::String("fast-error-acceptance".to_owned()))
+            })
+            .expect("fast error request should emit an access log");
+        assert_eq!(
+            error_access.get("method"),
+            Some(&Value::String("GET".to_owned()))
+        );
+        assert_eq!(
+            error_access.get("route"),
+            Some(&Value::String("/missing".to_owned()))
+        );
+        assert_eq!(error_access.get("status"), Some(&Value::from(404)));
+        assert!(error_access.get("latency_ms").is_some());
+        assert_eq!(error_access.get("slow"), Some(&Value::from(false)));
+        assert_eq!(error_access.get("threshold_ms"), Some(&Value::from(1000)));
+        assert_eq!(
+            error_access.get("level"),
+            Some(&Value::String("WARN".to_owned()))
+        );
 
         let status = sqlite_writer.runtime_status();
         assert!(!status.active, "writer permit must be released after load");
