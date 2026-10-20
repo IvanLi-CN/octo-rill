@@ -74,10 +74,10 @@
 - `bash scripts/check-rust-source-quality.sh`（code candidate `12c8ea90`: source quality scan passed）
 - `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
 - 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
-- 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
+- PR #333 当前 head `2f924800` 的本地验证：`cargo fmt --all -- --check`、`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings`、source-quality scan 和全量串行测试均通过；测试结果为 `1090 passed, 0 failed, 2 ignored`。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
-- 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 55 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
-- PR #333 的旧 head `61a492d8` 曾在 GitHub Actions run `39321799615` 的 Backend Tests 失败，失败项是时序敏感的 foreground session telemetry 回归；修复 head `08d74429` 已在 GitHub Actions run `39329495174` 完成全部主 CI，Backend Tests 通过，本地全量串行测试为 `1090 passed, 0 failed, 2 ignored`。后续正式 review 仍须绑定最新文档同步 head。
+- 当前 head `2f924800` 的回归覆盖 supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing、sqlite-writer、scheduler dispatch 和 realtime search outbox；这些证据尚不替代合并后的 101 线上观察。
+- PR #333 当前 head `2f924800` 对应的 GitHub Actions run `39342491330`、`39342491218`、`39342491009` 和 `39342491823` 已分别通过 CI Pipeline、Rust Source Quality、Review Policy 和 release intent label gate；此前同一 head 的 run `39342398896` 出现一次时序敏感的 foreground session telemetry 超时，随后当前 head 的 test budget 修复在 `39342491330` 通过。正式 review 必须继续绑定最新 head。
 
 ## Remaining Gaps
 
