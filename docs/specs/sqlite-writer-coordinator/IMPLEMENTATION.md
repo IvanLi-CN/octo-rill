@@ -69,7 +69,7 @@
 
 - `cargo fmt --all --check`
 - `cargo build --release --locked`（远端 CI 的 Build (Release) required check 通过；本机 macOS target 的 stale dylib linker artifact 使本地 release build 不可作为证据）
-- `cargo test --offline --all-targets --all-features`（当前候选串行套件 1099 passed, 0 failed, 2 ignored；PR #333 required check 以最新 current head 为准）
+- `cargo test --offline --all-targets --all-features -- --test-threads=1`（当前候选串行套件 1101 passed, 0 failed, 2 ignored；PR #333 required check 以最新 current head 为准）
 - `cargo check --offline --all-targets --all-features`
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
 - `bash scripts/check-rust-source-quality.sh`（PR #333 current-head required check 通过）
