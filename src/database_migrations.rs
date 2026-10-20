@@ -379,13 +379,6 @@ mod tests {
             .await
             .expect("apply schema before projection index migration");
 
-        sqlx::query(
-            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) VALUES ('legacy-malformed-payload', 'legacy.task', 'succeeded', 'legacy', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed legacy malformed task payload");
-
         for index in 0..3 {
             let document_id = format!("release:upgrade-{index}");
             sqlx::query(
@@ -421,7 +414,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95, 96, 97, 98] {
+        for version in [93_i64, 94, 95, 96, 97, 98, 99] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -522,6 +515,30 @@ mod tests {
         .await
         .expect("read active star scheduler index");
         assert!(star_scheduler_index_sql.contains("json_valid(payload_json)"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_projection_outbox_failed_poll'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check terminal projection recovery poll index"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) VALUES ('legacy-malformed-payload', 'legacy.task', 'succeeded', 'legacy', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('valid-star-payload', 'sync.starred.delta', 'queued', 'scheduler', '{\"github_connection_id\":\"legacy-connection\"}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed malformed and valid task payloads after guarded index");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM job_tasks WHERE task_type = 'sync.starred.delta' AND status = 'queued' AND json_valid(payload_json) AND json_extract(payload_json, '$.github_connection_id') = 'legacy-connection'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("query valid task payload through guarded index"),
+            "valid-star-payload"
+        );
         let scheduler_recovery_trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_projection_outbox_reset_source_state'",
         )
@@ -653,11 +670,9 @@ mod tests {
             .await
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(
-                "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98]"
-            )
-        );
+        assert!(rendered.contains(
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99]"
+        ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

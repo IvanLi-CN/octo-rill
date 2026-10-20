@@ -1642,6 +1642,29 @@ mod tests {
             "outbox poll should not sort a backlog in a temp B-tree: {outbox_poll_plan_details:?}"
         );
 
+        let failed_outbox_poll_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT projection_key FROM search_projection_outbox_failed WHERE failed_at <= datetime('now', '-30 seconds') ORDER BY failed_at ASC, projection_key ASC LIMIT 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain failed projection outbox poll");
+        let failed_outbox_poll_plan_details = failed_outbox_poll_plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            failed_outbox_poll_plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_search_projection_outbox_failed_poll")),
+            "failed outbox poll plan: {failed_outbox_poll_plan_details:?}"
+        );
+        assert!(
+            failed_outbox_poll_plan_details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "failed outbox poll should not sort a backlog in a temp B-tree: {failed_outbox_poll_plan_details:?}"
+        );
+
         let translation_plan = sqlx::query(
             "EXPLAIN QUERY PLAN SELECT user_id FROM ai_translations WHERE lang = 'zh-CN' AND entity_id = '4201' AND status IN ('ready', 'disabled', 'missing') AND lower(entity_type) LIKE 'release%'",
         )

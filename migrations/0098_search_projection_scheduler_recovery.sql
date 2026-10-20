@@ -75,8 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_job_tasks_star_connection_active
     task_type,
     status,
     json_extract(payload_json, '$.github_connection_id')
-  )
-  WHERE json_valid(payload_json);
+  );
 
 -- A source update starts a fresh projection budget even when an older active row
 -- is coalesced in place. The worker's cursor-advance update changes fanout_cursor,
