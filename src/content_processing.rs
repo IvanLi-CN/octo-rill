@@ -8305,7 +8305,9 @@ mod tests {
             .expect("fast error response");
         assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
 
-        let events = tokio::time::timeout(StdDuration::from_secs(3), async {
+        // The request tasks have already joined; this bounded wait only allows a heavily loaded
+        // CI runner to flush the synchronous tracing writer before correlation assertions run.
+        let events = tokio::time::timeout(StdDuration::from_secs(30), async {
             loop {
                 let events = log_buffer.json_events();
                 if events.iter().any(|event| {
