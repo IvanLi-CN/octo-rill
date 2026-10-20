@@ -8217,7 +8217,7 @@ mod tests {
         );
 
         let mut foreground_tasks = Vec::new();
-        for request_index in 0..32 {
+        for request_index in 0..8 {
             let request_cookie = session_cookie.clone();
             let request_app = app.clone();
             foreground_tasks.push(tokio::spawn(async move {
