@@ -13,7 +13,7 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093, 0094, and 0095 before listener bind",
+      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093, 0094, 0095, and 0096 before listener bind",
       "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
@@ -59,6 +59,16 @@
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 95,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 96,
+        "file": "migrations/0096_search_projection_outbox_poll_index.sql",
+        "definition_checksum": "951a4608c20463985adeab6654cd704bb73523fc045baabbd31c8237d183308b",
+        "description": "Index realtime projection outbox polling by availability and creation order so ready and expired leases avoid a temporary sort.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 96,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],
