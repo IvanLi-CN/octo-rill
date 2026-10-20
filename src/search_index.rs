@@ -24,6 +24,8 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROJECTION_POLL_DELAY: Duration = Duration::from_millis(250);
 const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
 const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const PROJECTION_LEASE_SECONDS: i64 = 5;
+const PROJECTION_MAX_ATTEMPTS: i64 = 8;
 
 const PHASES: &[&str] = &[
     "releases",
@@ -182,32 +184,51 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     let lease_owner = format!("{}:{}", state.runtime_owner_id, Uuid::new_v4());
     sqlx::query(
         "UPDATE search_projection_outbox
-         SET lease_owner = ?, lease_expires_at = datetime('now', '+30 seconds'),
+         SET lease_owner = ?, lease_expires_at = datetime('now', '+' || ? || ' seconds'),
              attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP
          WHERE projection_key = ?",
     )
     .bind(&lease_owner)
+    .bind(PROJECTION_LEASE_SECONDS)
     .bind(&row.projection_key)
     .execute(&mut **claim_tx.as_transaction_mut())
     .await?;
     claim_tx.commit().await?;
     drop(claim_permit);
 
-    let (permit, mut tx) = state
+    let apply_transaction = state
         .sqlite_writer
         .begin_immediate_with_priority(
             &state.pool,
             "search_projection_outbox_apply",
             SqliteWritePriority::Background,
         )
-        .await?;
+        .await;
+    let (permit, mut tx) = match apply_transaction {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            drop(lane_guard);
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    };
     let current_lease = sqlx::query_scalar::<_, Option<String>>(
         "SELECT lease_owner FROM search_projection_outbox WHERE projection_key = ?",
     )
     .bind(&row.projection_key)
     .fetch_optional(&mut **tx.as_transaction_mut())
-    .await?
-    .flatten();
+    .await;
+    let current_lease = match current_lease {
+        Ok(value) => value.flatten(),
+        Err(error) => {
+            let error = anyhow::Error::from(error);
+            let _ = tx.rollback().await;
+            drop(permit);
+            drop(lane_guard);
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    };
     if current_lease.as_deref() != Some(lease_owner.as_str()) {
         tx.rollback().await?;
         drop(permit);
@@ -215,85 +236,166 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
         return Ok(ProjectionRunOutcome::Idle);
     }
 
-    let projection_result = apply_projection_outbox_item(tx.as_transaction_mut(), &row).await;
-    match projection_result {
-        Ok(()) => {
-            sqlx::query(
-                "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
-            )
-            .bind(&row.projection_key)
-            .bind(&lease_owner)
-            .execute(&mut **tx.as_transaction_mut())
-            .await?;
-            tx.commit().await?;
-            drop(permit);
-            drop(lane_guard);
-            info!(
-                event = "search.projection_outbox.committed",
-                projection_key = %row.projection_key,
-                operation = %row.operation,
-                attempt = row.attempt_count + 1,
-                "search projection outbox item committed"
-            );
-            Ok(ProjectionRunOutcome::Committed)
-        }
-        Err(error) => {
-            tx.rollback().await?;
-            drop(permit);
-            drop(lane_guard);
-            record_projection_failure(state, &row.projection_key, &lease_owner, &error).await;
-            Err(error)
-        }
+    if let Err(error) = apply_projection_outbox_item(tx.as_transaction_mut(), &row).await {
+        let _ = tx.rollback().await;
+        drop(permit);
+        drop(lane_guard);
+        recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+        return Err(error);
     }
+
+    if let Err(error) = sqlx::query(
+        "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+    )
+    .bind(&row.projection_key)
+    .bind(&lease_owner)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    {
+        let _ = tx.rollback().await;
+        drop(permit);
+        drop(lane_guard);
+        let error = anyhow::Error::from(error);
+        recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+        return Err(error);
+    }
+    if let Err(error) = tx.commit().await {
+        drop(permit);
+        drop(lane_guard);
+        recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+        return Err(error);
+    }
+    drop(permit);
+    drop(lane_guard);
+    info!(
+        event = "search.projection_outbox.committed",
+        projection_key = %row.projection_key,
+        operation = %row.operation,
+        attempt = row.attempt_count + 1,
+        "search projection outbox item committed"
+    );
+    Ok(ProjectionRunOutcome::Committed)
 }
 
-async fn record_projection_failure(
+async fn recover_projection_claim(
     state: &AppState,
     projection_key: &str,
     lease_owner: &str,
     error: &anyhow::Error,
 ) {
-    let result = async {
-        let (permit, mut tx) = state
-            .sqlite_writer
-            .begin_immediate_with_priority(
-                &state.pool,
-                "search_projection_outbox_failure",
-                SqliteWritePriority::Background,
-            )
-            .await?;
-        let update = sqlx::query(
-            "UPDATE search_projection_outbox
-             SET available_at = CASE WHEN attempt_count >= 8
-                                     THEN datetime('now', '+5 minutes')
-                                     ELSE datetime('now', '+5 seconds') END,
-                 lease_owner = NULL, lease_expires_at = NULL,
-                 last_error = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE projection_key = ? AND lease_owner = ?",
+    if let Err(background_error) = record_projection_failure_with_priority(
+        state,
+        projection_key,
+        lease_owner,
+        error,
+        SqliteWritePriority::Background,
+    )
+    .await
+    {
+        warn!(
+            ?background_error,
+            projection_key,
+            event = "search.projection_outbox.failure_record_deferred",
+            "background projection retry state could not be recorded; escalating cleanup"
+        );
+        if let Err(foreground_error) = record_projection_failure_with_priority(
+            state,
+            projection_key,
+            lease_owner,
+            error,
+            SqliteWritePriority::Foreground,
         )
-        .bind(redact_search_error_summary(&error.to_string()))
+        .await
+        {
+            warn!(
+                ?foreground_error,
+                projection_key,
+                event = "search.projection_outbox.failure_record_failed",
+                "failed to persist search projection retry state"
+            );
+        }
+    }
+}
+
+async fn record_projection_failure_with_priority(
+    state: &AppState,
+    projection_key: &str,
+    lease_owner: &str,
+    error: &anyhow::Error,
+    priority: SqliteWritePriority,
+) -> Result<()> {
+    let (permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(&state.pool, "search_projection_outbox_failure", priority)
+        .await?;
+    let attempt_count = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+    )
+    .bind(projection_key)
+    .bind(lease_owner)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?
+    .flatten();
+    let Some(attempt_count) = attempt_count else {
+        tx.rollback().await?;
+        drop(permit);
+        return Ok(());
+    };
+    let error_summary = redact_search_error_summary(&error.to_string());
+    if attempt_count >= PROJECTION_MAX_ATTEMPTS {
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (
+               projection_key, operation, resource_type, resource_id, previous_resource_id,
+               canonical_resource_type, user_id, attempt_count, last_error,
+               created_at, updated_at, failed_at
+             )
+             SELECT projection_key, operation, resource_type, resource_id, previous_resource_id,
+                    canonical_resource_type, user_id, attempt_count, ?, created_at,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             FROM search_projection_outbox
+             WHERE projection_key = ? AND lease_owner = ?
+             ON CONFLICT(projection_key) DO UPDATE SET
+               operation = excluded.operation,
+               resource_type = excluded.resource_type,
+               resource_id = excluded.resource_id,
+               previous_resource_id = excluded.previous_resource_id,
+               canonical_resource_type = excluded.canonical_resource_type,
+               user_id = excluded.user_id,
+               attempt_count = excluded.attempt_count,
+               last_error = excluded.last_error,
+               updated_at = excluded.updated_at,
+               failed_at = excluded.failed_at",
+        )
+        .bind(&error_summary)
         .bind(projection_key)
         .bind(lease_owner)
         .execute(&mut **tx.as_transaction_mut())
         .await?;
-        if update.rows_affected() == 0 {
-            tx.rollback().await?;
-            drop(permit);
-            return Ok::<(), anyhow::Error>(());
-        }
-        tx.commit().await?;
-        drop(permit);
-        Ok::<(), anyhow::Error>(())
+        sqlx::query(
+            "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+        )
+        .bind(projection_key)
+        .bind(lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE search_projection_outbox
+             SET available_at = datetime('now', '+' || ? || ' seconds'),
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 last_error = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE projection_key = ? AND lease_owner = ?",
+        )
+        .bind(PROJECTION_RETRY_DELAY.as_secs() as i64)
+        .bind(&error_summary)
+        .bind(projection_key)
+        .bind(lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
     }
-    .await;
-    if let Err(record_error) = result {
-        warn!(
-            ?record_error,
-            projection_key,
-            event = "search.projection_outbox.failure_record_failed",
-            "failed to persist search projection retry state"
-        );
-    }
+    tx.commit().await?;
+    drop(permit);
+    Ok(())
 }
 
 async fn apply_projection_outbox_item(
@@ -1027,7 +1129,16 @@ async fn status_response(pool: &SqlitePool) -> Result<SearchIndexStatusResponse>
             .await
             .context("check pending realtime search projection work")?
             != 0;
-    let status = if status == "ready" && (metadata_pending || projection_pending) {
+    let projection_failure = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_error FROM search_projection_outbox_failed ORDER BY failed_at DESC, projection_key DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read terminal realtime search projection failure")?
+    .flatten();
+    let status = if projection_failure.is_some() {
+        "failed".to_owned()
+    } else if status == "ready" && (metadata_pending || projection_pending) {
         "building".to_owned()
     } else {
         status
@@ -1036,7 +1147,9 @@ async fn status_response(pool: &SqlitePool) -> Result<SearchIndexStatusResponse>
         phase,
         cursor,
         status,
-        last_error: last_error.map(|error| redact_search_error_summary(&error)),
+        last_error: last_error
+            .or(projection_failure)
+            .map(|error| redact_search_error_summary(&error)),
         updated_at,
         metadata_pending,
     })
