@@ -515,15 +515,14 @@ mod tests {
         .await
         .expect("read scheduler recovery trigger");
         assert!(scheduler_recovery_trigger_sql.contains("fanout_cursor"));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("check legacy unbounded document fanout trigger"),
-            0
-        );
+        let document_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bounded release document trigger");
+        assert!(document_trigger_sql.contains("NEW.resource_type = 'release'"));
+        assert!(!document_trigger_sql.contains("NEW.resource_type = 'announcement'"));
         let content_transition_trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_content_projections_outbox_au_old'",
         )
@@ -568,15 +567,13 @@ mod tests {
             .expect("read content work supersession index"),
             3
         );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("check removed unbounded search projection trigger"),
-            0
-        );
+        let document_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bounded release document trigger");
+        assert!(document_trigger_sql.contains("NEW.resource_type = 'release'"));
 
         let state = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",

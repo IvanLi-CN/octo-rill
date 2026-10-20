@@ -84,8 +84,8 @@
       {
         "version": 98,
         "file": "migrations/0098_search_projection_scheduler_recovery.sql",
-        "definition_checksum": "aebecf6777cac93206769b110ad0cc0efc9eb5525711ef0361f129e0bb648482",
-        "description": "Remove the legacy unbounded document fanout trigger, bound announcement lane fanout with a durable cursor, reset coalesced source retry budgets, and index active star scheduler lookups.",
+        "definition_checksum": "9111626566bc2480f1b8971254e9808dd90ead6437fc62f675c1eb9c365cbfa4",
+        "description": "Narrow the legacy document fanout trigger to direct release compatibility, bound announcement lane fanout with a durable cursor, reset coalesced source retry budgets, and index active star scheduler lookups.",
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 98,
