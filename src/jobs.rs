@@ -583,7 +583,7 @@ pub async fn enqueue_star_sync_runs_if_due(
             connection.github_connection_id
         );
         let delta_schedule_key = current_star_sync_delta_schedule_key(now, delta_interval_minutes);
-        let last_delta_key = sqlx::query_scalar::<_, Option<String>>(
+        let last_delta_key = match sqlx::query_scalar::<_, Option<String>>(
             r#"
             SELECT last_dispatch_key
             FROM scheduled_task_dispatch_state
@@ -594,8 +594,18 @@ pub async fn enqueue_star_sync_runs_if_due(
         .bind(delta_schedule_name.as_str())
         .fetch_optional(&state.pool)
         .await
-        .context("load star delta dispatch state")?
-        .flatten();
+        {
+            Ok(value) => value.flatten(),
+            Err(error) => {
+                if first_dispatch_error.is_none() {
+                    first_dispatch_error = Some(anyhow!(error).context(format!(
+                        "load star delta dispatch state for github connection {}",
+                        connection.github_connection_id
+                    )));
+                }
+                continue;
+            }
+        };
         if last_delta_key.as_deref() != Some(delta_schedule_key.as_str()) {
             match dispatch_scheduled_task_atomic(
                 state,
@@ -635,14 +645,26 @@ pub async fn enqueue_star_sync_runs_if_due(
             continue;
         }
 
-        if !star_reconciliation_due_in_read_pool(
+        let reconciliation_due = match star_reconciliation_due_in_read_pool(
             state,
             connection.github_connection_id.as_str(),
             full_sweep_interval_minutes,
             now,
         )
-        .await?
+        .await
         {
+            Ok(due) => due,
+            Err(error) => {
+                if first_dispatch_error.is_none() {
+                    first_dispatch_error = Some(anyhow!(error).context(format!(
+                        "load star reconciliation cadence for github connection {}",
+                        connection.github_connection_id
+                    )));
+                }
+                continue;
+            }
+        };
+        if !reconciliation_due {
             continue;
         }
         match dispatch_star_reconciliation_atomic(
@@ -894,6 +916,7 @@ async fn active_star_sync_connection_task_in_transaction(
         FROM job_tasks
         WHERE task_type IN (?, ?)
           AND status IN (?, ?)
+          AND json_valid(payload_json)
           AND json_extract(payload_json, '$.github_connection_id') = ?
         LIMIT 1
         "#,
@@ -1009,6 +1032,7 @@ async fn dispatch_star_reconciliation_atomic(
         FROM job_tasks
         WHERE task_type = ?
           AND status IN (?, ?)
+          AND json_valid(payload_json)
           AND json_extract(payload_json, '$.github_connection_id') = ?
         LIMIT 1
         "#,

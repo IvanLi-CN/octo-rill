@@ -379,6 +379,13 @@ mod tests {
             .await
             .expect("apply schema before projection index migration");
 
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) VALUES ('legacy-malformed-payload', 'legacy.task', 'succeeded', 'legacy', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy malformed task payload");
+
         for index in 0..3 {
             let document_id = format!("release:upgrade-{index}");
             sqlx::query(
@@ -508,6 +515,13 @@ mod tests {
             .expect("check active star scheduler index"),
             1
         );
+        let star_scheduler_index_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_star_connection_active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read active star scheduler index");
+        assert!(star_scheduler_index_sql.contains("json_valid(payload_json)"));
         let scheduler_recovery_trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_projection_outbox_reset_source_state'",
         )
