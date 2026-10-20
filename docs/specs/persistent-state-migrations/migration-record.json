@@ -13,7 +13,7 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0097 before listener bind",
+      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0098 before listener bind",
       "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
@@ -79,6 +79,16 @@
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 97,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 98,
+        "file": "migrations/0098_search_projection_scheduler_recovery.sql",
+        "definition_checksum": "512c302bdd399a07940fc235fad69f337a2173cffd51da0cf69178e0033de2ab",
+        "description": "Bound announcement lane fanout with a durable cursor, reset coalesced source retry budgets, and index active star scheduler lookups.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 98,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],

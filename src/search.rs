@@ -2091,6 +2091,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_source_update_resets_coalesced_retry_budget() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, canonical_resource_type, attempt_count, available_at, last_error, created_at, updated_at) VALUES ('content:release:retry-reset', 'upsert', 'content', 'retry-reset', 'release', 7, CURRENT_TIMESTAMP, 'old writer deadline', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed coalesced retry projection");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:retry-reset'",
+        )
+        .execute(&pool)
+        .await
+        .expect("apply source update to projection");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reset source retry budget"),
+            0
+        );
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read post-update retry budget"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_announcement_lanes_commit_in_bounded_chunks() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        for index in 0..101 {
+            let user_id = format!("fanout-user-{index:03}");
+            sqlx::query(
+                "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(&user_id)
+            .bind(50000000_i64 + index)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fanout user");
+            sqlx::query(
+                "INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, created_at, updated_at) VALUES (?, ?, 'announcement', 'fanout-event', 'zh-CN', ?, 'ready', ?, 'fanout summary', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(format!("fanout-translation-{index:03}"))
+            .bind(&user_id)
+            .bind(format!("fanout-hash-{index:03}"))
+            .bind(format!("fanout title {index:03}"))
+            .execute(&pool)
+            .await
+            .expect("seed fanout translation");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES ('fanout-owner', 59999999, 'fanout-owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement owner");
+        sqlx::query(
+            r#"
+            INSERT INTO social_activity_events (
+              id, user_id, kind, repo_id, repo_full_name, title, body, html_url,
+              actor_github_user_id, actor_login, occurred_at, detected_at, created_at, updated_at
+            ) VALUES (
+              'fanout-event', 'fanout-owner', 'announcement', 42, 'octo/rill',
+              'fanout announcement', 'fanout body', 'https://example.test/fanout',
+              59999999, 'fanout-owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement source");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('announcement:fanout-event', 'upsert', 'announcement', 'fanout-event', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(projection_key) DO UPDATE SET available_at = CURRENT_TIMESTAMP, last_error = NULL, fanout_cursor = NULL, updated_at = CURRENT_TIMESTAMP",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement projection");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("run first announcement fanout chunk")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_document_user_lanes WHERE document_id = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count first fanout chunk"),
+            100
+        );
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT fanout_cursor FROM search_projection_outbox WHERE projection_key = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read announcement fanout cursor")
+            .is_some()
+        );
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_document_user_lanes WHERE document_id = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count completed fanout lanes"),
+            101
+        );
+    }
+
+    #[tokio::test]
     async fn realtime_projection_outbox_moves_terminal_failures_to_recovery_queue() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -2160,6 +2294,52 @@ mod tests {
             .await
             .expect("count cleared terminal projection failure"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_terminal_failure_is_retried_after_backpressure_clears() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (projection_key, operation, resource_type, resource_id, canonical_resource_type, attempt_count, last_error, created_at, updated_at, failed_at) VALUES ('content:release:terminal-retry', 'upsert', 'content', 'terminal-retry', 'release', 8, 'writer deadline', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2000-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stale terminal projection failure");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "reactivated malformed projection should still report its source error"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reactivated retry projection"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count terminal recovery source"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reset retry budget"),
+            1
         );
     }
 
