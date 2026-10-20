@@ -384,10 +384,11 @@ pub async fn query(
     }
 
     if use_fts {
-        // Keep the readiness gate in the same snapshot as the FTS match so a
-        // concurrent metadata event cannot produce a false negative.
+        // Keep the backfill readiness gate in the same snapshot as the FTS
+        // match. Realtime projection rows are eventually consistent and must
+        // not globally force every search through the unindexed fallback.
         builder.push(" AND (");
-        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox) AND NOT EXISTS (SELECT 1 FROM search_projection_outbox_failed)) OR ");
+        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
         builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
@@ -1825,6 +1826,57 @@ mod tests {
         .await
         .expect("clear pending realtime projection");
         assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_backlog_does_not_enable_unindexed_fallback() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET status = 'ready', phase = 'metadata', cursor = 0 WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready");
+        sqlx::query("DELETE FROM search_metadata_backfill_queue")
+            .execute(&pool)
+            .await
+            .expect("clear metadata backlog");
+        sqlx::query(
+            "UPDATE search_documents SET title = 'source ftsneedle', body = 'source body' WHERE id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed source projection text");
+        sqlx::query(
+            "UPDATE search_documents_fts_v2 SET title = '', body = '', repo_full_name = '', translated_text = '', smart_text = '' WHERE doc_id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed indexed-only search term");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('notification:search-user:pending', 'upsert', 'notification', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active projection backlog");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (projection_key, operation, resource_type, resource_id, attempt_count, last_error, created_at, updated_at, failed_at) VALUES ('notification:search-user:failed', 'upsert', 'notification', 'failed', 8, 'terminal failure', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection failure");
+
+        let results = query(&state, "search-user", &parse_query("ftsneedle").unwrap())
+            .await
+            .expect("query while projection backlog exists");
+        assert!(
+            results.is_empty(),
+            "a projection backlog must not globally enable the unindexed LIKE fallback"
+        );
     }
 
     #[tokio::test]

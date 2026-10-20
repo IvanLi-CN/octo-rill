@@ -26,6 +26,7 @@ const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
 const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROJECTION_LEASE_SECONDS: i64 = 5;
 const PROJECTION_MAX_ATTEMPTS: i64 = 8;
+const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
 
 const PHASES: &[&str] = &[
     "releases",
@@ -198,10 +199,11 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
 
     let apply_transaction = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "search_projection_outbox_apply",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + PROJECTION_TRANSACTION_BUDGET,
         )
         .await;
     let (permit, mut tx) = match apply_transaction {
