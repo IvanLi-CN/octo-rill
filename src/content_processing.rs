@@ -8159,7 +8159,7 @@ mod tests {
                 }) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         })
         .await
@@ -8322,7 +8322,7 @@ mod tests {
                 }) {
                     break events;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         })
         .await
@@ -8526,7 +8526,7 @@ mod tests {
                 if sqlite_writer.runtime_status().active {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         })
         .await

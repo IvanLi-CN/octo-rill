@@ -779,6 +779,9 @@ async fn task_type_run_in_flight_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     task_type: &str,
 ) -> Result<bool> {
+    // A stale heartbeat is still active until the recovery worker owns and
+    // transitions the row with its lease CAS. Treating it as inactive here
+    // could dispatch duplicate external work during the recovery window.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -801,6 +804,8 @@ async fn active_star_sync_connection_task_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     github_connection_id: &str,
 ) -> Result<Option<String>> {
+    // Recovery, rather than the scheduler, decides when an expired runtime
+    // lease may be replaced. Keeping the row active prevents duplicate syncs.
     sqlx::query_scalar::<_, String>(
         r#"
         SELECT id
