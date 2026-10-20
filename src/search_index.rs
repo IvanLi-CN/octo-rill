@@ -306,7 +306,7 @@ async fn apply_projection_outbox_item(
                 .canonical_resource_type
                 .as_deref()
                 .context("content projection delete is missing canonical resource type")?;
-            refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
+            let _ = refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
         } else {
             delete_search_document(tx, &row.projection_key).await?;
         }
@@ -321,7 +321,15 @@ async fn apply_projection_outbox_item(
                 .canonical_resource_type
                 .as_deref()
                 .context("content projection is missing canonical resource type")?;
-            refresh_content_projection(tx, canonical_type, &row.resource_id).await
+            if refresh_content_projection(tx, canonical_type, &row.resource_id).await? {
+                Ok(())
+            } else {
+                bail!(
+                    "search document is not materialized for content projection {}:{}",
+                    canonical_type,
+                    row.resource_id
+                )
+            }
         }
         resource_type => bail!("unsupported search projection resource type {resource_type}"),
     }
@@ -696,9 +704,10 @@ async fn refresh_content_projection(
     tx: &mut Transaction<'_, Sqlite>,
     resource_type: &str,
     resource_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let identity_upgrade_complete =
         crate::content_identity_upgrade::is_complete_in_transaction(tx).await?;
+    let mut updated_any = false;
     for (pipeline, column) in [
         ("translation", "translated_text"),
         ("polishing", "smart_text"),
@@ -718,14 +727,15 @@ async fn refresh_content_projection(
         let query = format!(
             "UPDATE search_documents SET {column} = ?, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE resource_type = ? AND resource_id = ?"
         );
-        sqlx::query(&query)
+        let result = sqlx::query(&query)
             .bind(text)
             .bind(resource_type)
             .bind(resource_id)
             .execute(&mut **tx)
             .await?;
+        updated_any |= result.rows_affected() > 0;
     }
-    Ok(())
+    Ok(updated_any)
 }
 
 async fn delete_search_document(tx: &mut Transaction<'_, Sqlite>, document_id: &str) -> Result<()> {

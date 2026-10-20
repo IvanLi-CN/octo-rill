@@ -1931,6 +1931,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_projection_retries_until_search_document_exists() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-content-first-work', 'release', 'content-first', 'translation', 'summary',
+                      'zh-CN', 'search-content-first-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed content-first work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-content-first-projection', 'release', 'content-first', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-content-first-hash',
+                      'search-content-first-work', 'search-content-first-work', '{"title":"content-first text"}',
+                      '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed content-first projection");
+        let state = setup_state(pool.clone());
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "content projection must remain retryable before its source document exists"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:content-first'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deferred content projection"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:content-first', 'release', 'content-first', 'source title', 'source body', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("materialize source search document");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:content-first'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make deferred content projection available");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-first'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read converged content projection")
+            .as_deref(),
+            Some("content-first text")
+        );
+    }
+
+    #[tokio::test]
     async fn announcement_key_change_rebuilds_cached_lanes() {
         let pool = setup_pool().await;
         seed_repo_association(&pool).await;
