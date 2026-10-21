@@ -2056,6 +2056,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_pressure_preserves_foreground_writer() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('projection-pressure-notification', 'search-user', 'projection-pressure-thread', 'pressure title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed projection pressure notification");
+
+        let external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock");
+        let projection_state = state.clone();
+        let projection_task = tokio::spawn(async move {
+            crate::search_index::run_projection_for_test(projection_state.as_ref()).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = state.sqlite_writer.runtime_status();
+                if status.active {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("projection worker should enter the shared writer lane");
+
+        let foreground_pool = pool.clone();
+        let foreground_state = state.clone();
+        let foreground_task = tokio::spawn(async move {
+            foreground_state
+                .sqlite_writer
+                .write_foreground("projection_pressure_foreground", |_| {
+                    let foreground_pool = foreground_pool.clone();
+                    async move {
+                        sqlx::query(
+                            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = 'search-user'",
+                        )
+                        .execute(&foreground_pool)
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground writer should wait behind the external sqlite lock");
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
+        foreground_task
+            .await
+            .expect("join foreground projection pressure task")
+            .expect("foreground writer should succeed after lock release");
+        let first_projection = projection_task
+            .await
+            .expect("join projection pressure task");
+        if let Err(error) = &first_projection {
+            assert!(
+                error
+                    .to_string()
+                    .contains("background writer admission denied")
+                    || error
+                        .to_string()
+                        .contains("retryable sqlite write deadline exceeded"),
+                "projection pressure must defer through the coordinator: {error:#}"
+            );
+        }
+        if matches!(first_projection, Ok(true)) {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:projection-pressure-thread'",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("count committed pressure projection FTS row"),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn realtime_projection_outbox_takes_over_expired_lease() {
         let pool = setup_pool().await;
         sqlx::query(
