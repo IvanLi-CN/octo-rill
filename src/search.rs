@@ -384,8 +384,9 @@ pub async fn query(
     }
 
     if use_fts {
-        // Keep the readiness gate in the same snapshot as the FTS match so a
-        // concurrent metadata event cannot produce a false negative.
+        // Keep the backfill readiness gate in the same snapshot as the FTS
+        // match. Realtime projection rows are eventually consistent and must
+        // not globally force every search through the unindexed fallback.
         builder.push(" AND (");
         builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
@@ -463,8 +464,22 @@ pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
             .await
             .map_err(ApiError::internal)?
             != 0;
+    let projection_pending =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_projection_outbox)")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            != 0;
+    let projection_failed = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM search_projection_outbox_failed)",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        != 0;
     Ok(match status.as_deref() {
-        Some("ready") if !metadata_pending => "ready".to_owned(),
+        _ if projection_failed => "failed".to_owned(),
+        Some("ready") if !metadata_pending && !projection_pending => "ready".to_owned(),
         Some("paused_low_disk") => "paused_low_disk".to_owned(),
         Some("failed") => "failed".to_owned(),
         _ => "building".to_owned(),
@@ -589,7 +604,7 @@ mod tests {
 
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
     use url::Url;
 
@@ -644,7 +659,9 @@ mod tests {
         ));
         let options = SqliteConnectOptions::new()
             .filename(database_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
@@ -746,6 +763,26 @@ mod tests {
             encryption_key,
             runtime_owner_id: "search-test-runtime".to_owned(),
         })
+    }
+
+    async fn drain_search_projection_outbox(state: &AppState) {
+        for _ in 0..64 {
+            let processed = crate::search_index::run_projection_for_test(state)
+                .await
+                .expect("run search projection outbox item");
+            let pending =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_projection_outbox")
+                    .fetch_one(&state.pool)
+                    .await
+                    .expect("count search projection outbox items");
+            if pending == 0 {
+                return;
+            }
+            if !processed {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        panic!("search projection outbox did not drain within test budget");
     }
 
     async fn seed_repo_association(pool: &SqlitePool) {
@@ -974,6 +1011,7 @@ mod tests {
         .expect("seed same-thread notification for second user");
 
         let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
         let parsed = parse_query("needle").expect("parse trigram query");
         let results = query(&state, "search-user", &parsed)
             .await
@@ -1563,6 +1601,70 @@ mod tests {
             "release plan: {release_plan_details:?}"
         );
 
+        let resource_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN UPDATE search_documents SET translated_text = NULL WHERE resource_type = 'release' AND resource_id = '4201'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain resource projection lookup");
+        assert!(
+            resource_plan.iter().any(|row| {
+                row.get::<String, _>("detail")
+                    .contains("idx_search_documents_resource_key")
+            }),
+            "resource plan: {:?}",
+            resource_plan
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+        );
+
+        let outbox_poll_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT projection_key FROM search_projection_outbox WHERE available_at <= CURRENT_TIMESTAMP AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP) ORDER BY available_at ASC, created_at ASC, projection_key ASC LIMIT 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain projection outbox poll");
+        let outbox_poll_plan_details = outbox_poll_plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            outbox_poll_plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_search_projection_outbox_poll")),
+            "outbox poll plan: {outbox_poll_plan_details:?}"
+        );
+        assert!(
+            outbox_poll_plan_details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "outbox poll should not sort a backlog in a temp B-tree: {outbox_poll_plan_details:?}"
+        );
+
+        let failed_outbox_poll_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT projection_key FROM search_projection_outbox_failed WHERE failed_at <= datetime('now', '-30 seconds') ORDER BY failed_at ASC, projection_key ASC LIMIT 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain failed projection outbox poll");
+        let failed_outbox_poll_plan_details = failed_outbox_poll_plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            failed_outbox_poll_plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_search_projection_outbox_failed_poll")),
+            "failed outbox poll plan: {failed_outbox_poll_plan_details:?}"
+        );
+        assert!(
+            failed_outbox_poll_plan_details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "failed outbox poll should not sort a backlog in a temp B-tree: {failed_outbox_poll_plan_details:?}"
+        );
+
         let translation_plan = sqlx::query(
             "EXPLAIN QUERY PLAN SELECT user_id FROM ai_translations WHERE lang = 'zh-CN' AND entity_id = '4201' AND status IN ('ready', 'disabled', 'missing') AND lower(entity_type) LIKE 'release%'",
         )
@@ -1733,6 +1835,719 @@ mod tests {
             .await
             .expect("ready search index");
         assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('content:pending-search-status', 'upsert', 'content', 'pending-search-status', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pending realtime projection");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "building");
+        sqlx::query(
+            "DELETE FROM search_projection_outbox WHERE projection_key = 'content:pending-search-status'",
+        )
+        .execute(&pool)
+        .await
+        .expect("clear pending realtime projection");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_backlog_does_not_enable_unindexed_fallback() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET status = 'ready', phase = 'metadata', cursor = 0 WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready");
+        sqlx::query("DELETE FROM search_metadata_backfill_queue")
+            .execute(&pool)
+            .await
+            .expect("clear metadata backlog");
+        sqlx::query(
+            "UPDATE search_documents SET title = 'source ftsneedle', body = 'source body' WHERE id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed source projection text");
+        sqlx::query(
+            "UPDATE search_documents_fts_v2 SET title = '', body = '', repo_full_name = '', translated_text = '', smart_text = '' WHERE doc_id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed indexed-only search term");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('notification:search-user:pending', 'upsert', 'notification', 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active projection backlog");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (projection_key, operation, resource_type, resource_id, attempt_count, last_error, created_at, updated_at, failed_at) VALUES ('notification:search-user:failed', 'upsert', 'notification', 'failed', 8, 'terminal failure', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection failure");
+
+        let results = query(&state, "search-user", &parse_query("ftsneedle").unwrap())
+            .await
+            .expect("query while projection backlog exists");
+        assert!(
+            results.is_empty(),
+            "a projection backlog must not globally enable the unindexed LIKE fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_coalesces_and_converges() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES ('search-user-2', 39999998, 'search-user-2', '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed notification migration user");
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-notification', 'search-user', 'outbox-thread', 'first title', 'mention', '2026-02-22T00:00:00Z', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed outbox notification");
+        sqlx::query(
+            "UPDATE notifications SET subject_title = 'latest title', updated_at = '2026-02-22T00:00:01Z' WHERE id = 'outbox-notification'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update outbox notification");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'notification:search-user:outbox-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count coalesced outbox item"),
+            1
+        );
+
+        drain_search_projection_outbox(state.as_ref()).await;
+        sqlx::query(
+            "UPDATE notifications SET subject_title = 'latest title after worker', updated_at = '2026-02-22T00:00:02Z' WHERE id = 'outbox-notification'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update projected notification");
+        drain_search_projection_outbox(state.as_ref()).await;
+        let projected_title: String = sqlx::query_scalar(
+            "SELECT title FROM search_documents WHERE id = 'notification:search-user:outbox-thread'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read projected notification");
+        assert_eq!(projected_title, "latest title after worker");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:outbox-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count projected FTS row"),
+            1
+        );
+
+        sqlx::query(
+            "UPDATE notifications SET user_id = 'search-user-2', thread_id = 'outbox-thread-migrated' WHERE id = 'outbox-notification'",
+        )
+        .execute(&pool)
+        .await
+        .expect("move projected notification identity");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user:outbox-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count old notification projection after identity move"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user-2:outbox-thread-migrated'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count new notification projection after identity move"),
+            1
+        );
+
+        sqlx::query("DELETE FROM notifications WHERE id = 'outbox-notification'")
+            .execute(&pool)
+            .await
+            .expect("delete outbox notification");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user-2:outbox-thread-migrated'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted search document"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user-2:outbox-thread-migrated'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted FTS row"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_claim_has_single_effective_owner() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-race-notification', 'search-user', 'outbox-race-thread', 'race title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed racing notification");
+        let state = setup_state(pool.clone());
+        let (left, right) = tokio::join!(
+            crate::search_index::run_projection_for_test(state.as_ref()),
+            crate::search_index::run_projection_for_test(state.as_ref())
+        );
+        let committed = [
+            left.expect("first projection runner"),
+            right.expect("second projection runner"),
+        ]
+        .into_iter()
+        .filter(|processed| *processed)
+        .count();
+        assert_eq!(
+            committed, 1,
+            "exactly one runner should apply the leased item"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'notification:search-user:outbox-race-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count drained race item"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:outbox-race-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count race FTS rows"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_takes_over_expired_lease() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('outbox-expired-notification', 'search-user', 'outbox-expired-thread', 'expired title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed expired-lease notification");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET lease_owner = 'stale-owner', lease_expires_at = '2000-01-01T00:00:00Z', available_at = CURRENT_TIMESTAMP WHERE projection_key = 'notification:search-user:outbox-expired-thread'",
+        )
+        .execute(&pool)
+        .await
+        .expect("expire projection lease");
+        let state = setup_state(pool.clone());
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("expired lease should be reclaimable")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'notification:search-user:outbox-expired-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reclaimed projection"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_failure_is_retryable() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('content:release:missing', 'upsert', 'content', 'missing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed malformed projection item");
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err()
+        );
+        let retry = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
+            "SELECT attempt_count, last_error, lease_owner FROM search_projection_outbox WHERE projection_key = 'content:release:missing'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read projection retry state");
+        assert_eq!(retry.0, 1);
+        assert!(retry.1.is_some());
+        assert!(retry.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_source_update_resets_coalesced_retry_budget() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-retry-reset-work', 'release', 'retry-reset', 'translation', 'summary',
+                      'zh-CN', 'search-retry-reset-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed retry-reset content work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-retry-reset-projection', 'release', 'retry-reset', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-retry-reset-hash',
+                      'search-retry-reset-work', 'search-retry-reset-work', '{"title":"initial"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed retry-reset content projection");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET attempt_count = 7, fanout_cursor = 'stale-cursor', last_error = 'old writer deadline', updated_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:retry-reset'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed coalesced retry projection state");
+        sqlx::query(
+            "UPDATE content_result_projections SET payload_json = '{\"title\":\"updated\"}', updated_at = CURRENT_TIMESTAMP WHERE id = 'search-retry-reset-projection'",
+        )
+        .execute(&pool)
+        .await
+        .expect("apply source update to projection");
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Option<String>)>(
+                "SELECT attempt_count, fanout_cursor FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reset source retry budget"),
+            (0, None)
+        );
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:retry-reset'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read post-update retry budget"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_announcement_lanes_commit_in_bounded_chunks() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        for index in 0..101 {
+            let user_id = format!("fanout-user-{index:03}");
+            sqlx::query(
+                "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(&user_id)
+            .bind(50000000_i64 + index)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fanout user");
+            sqlx::query(
+                "INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, created_at, updated_at) VALUES (?, ?, 'announcement', 'fanout-event', 'zh-CN', ?, 'ready', ?, 'fanout summary', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(format!("fanout-translation-{index:03}"))
+            .bind(&user_id)
+            .bind(format!("fanout-hash-{index:03}"))
+            .bind(format!("fanout title {index:03}"))
+            .execute(&pool)
+            .await
+            .expect("seed fanout translation");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES ('fanout-owner', 59999999, 'fanout-owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement owner");
+        sqlx::query(
+            r#"
+            INSERT INTO social_activity_events (
+              id, user_id, kind, repo_id, repo_full_name, title, body, html_url,
+              actor_github_user_id, actor_login, occurred_at, detected_at, created_at, updated_at
+            ) VALUES (
+              'fanout-event', 'fanout-owner', 'announcement', 42, 'octo/rill',
+              'fanout announcement', 'fanout body', 'https://example.test/fanout',
+              59999999, 'fanout-owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement source");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('announcement:fanout-event', 'upsert', 'announcement', 'fanout-event', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(projection_key) DO UPDATE SET available_at = CURRENT_TIMESTAMP, last_error = NULL, fanout_cursor = NULL, updated_at = CURRENT_TIMESTAMP",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement projection");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("run first announcement fanout chunk")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_document_user_lanes WHERE document_id = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count first fanout chunk"),
+            100
+        );
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT fanout_cursor FROM search_projection_outbox WHERE projection_key = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read announcement fanout cursor")
+            .is_some()
+        );
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_document_user_lanes WHERE document_id = 'announcement:fanout-event'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count completed fanout lanes"),
+            101
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_outbox_moves_terminal_failures_to_recovery_queue() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, canonical_resource_type, available_at, created_at, updated_at) VALUES ('content:release:terminal-missing', 'upsert', 'content', 'terminal-missing', 'release', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection item");
+        for attempt in 1..=8 {
+            assert!(
+                crate::search_index::run_projection_for_test(state.as_ref())
+                    .await
+                    .is_err(),
+                "malformed projection attempt {attempt} should fail"
+            );
+            if attempt < 8 {
+                sqlx::query(
+                    "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
+                )
+                .execute(&pool)
+                .await
+                .expect("make the next projection retry available");
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active terminal projection"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count terminal projection failure"),
+            1
+        );
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "failed");
+
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:terminal-missing', 'release', 'terminal-missing', 'recovered source', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert recovered source document");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reactivated projection"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count cleared terminal projection failure"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_terminal_failure_is_retried_after_backpressure_clears() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (projection_key, operation, resource_type, resource_id, canonical_resource_type, attempt_count, last_error, created_at, updated_at, failed_at) VALUES ('content:release:terminal-retry', 'upsert', 'content', 'terminal-retry', 'release', 8, 'writer deadline', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2000-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stale terminal projection failure");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "reactivated malformed projection should still report its source error"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count reactivated retry projection"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count terminal recovery source"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-retry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read reset retry budget"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn content_projection_retries_until_search_document_exists() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-content-first-work', 'release', 'content-first', 'translation', 'summary',
+                      'zh-CN', 'search-content-first-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed content-first work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-content-first-projection', 'release', 'content-first', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-content-first-hash',
+                      'search-content-first-work', 'search-content-first-work', '{"title":"content-first text"}',
+                      '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed content-first projection");
+        let state = setup_state(pool.clone());
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "content projection must remain retryable before its source document exists"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:content-first'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deferred content projection"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:content-first', 'release', 'content-first', 'source title', 'source body', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("materialize source search document");
+        sqlx::query(
+            "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:content-first'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make deferred content projection available");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-first'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read converged content projection")
+            .as_deref(),
+            Some("content-first text")
+        );
+    }
+
+    #[tokio::test]
+    async fn content_projection_eligibility_change_refreshes_the_previous_search_key() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-content-transition-work', 'release', 'content-transition', 'translation', 'summary',
+                      'zh-CN', 'search-content-transition-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-content-transition-projection', 'release', 'content-transition', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-content-transition-hash',
+                      'search-content-transition-work', 'search-content-transition-work', '{"title":"transition text"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition projection");
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:content-transition', 'release', 'content-transition', 'source title', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed transition source document");
+        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read initial transition projection")
+            .as_deref(),
+            Some("transition text")
+        );
+
+        sqlx::query(
+            "UPDATE content_result_projections SET target_lang = 'en', updated_at = CURRENT_TIMESTAMP WHERE id = 'search-content-transition-projection'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make content projection ineligible");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count old-key refresh item"),
+            1
+        );
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT translated_text FROM search_documents WHERE id = 'release:content-transition'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read cleared transition projection")
+            .as_deref(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1740,14 +2555,20 @@ mod tests {
         let pool = setup_pool().await;
         seed_repo_association(&pool).await;
         sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES ('search-announcement-user-2', 39999997, 'search-announcement-user-2', '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed second announcement lane user");
+        sqlx::query(
             r#"
             INSERT INTO social_activity_events (
               id, user_id, kind, repo_id, repo_full_name, discussion_number,
               title, body, html_url, actor_github_user_id, actor_login,
               occurred_at, detected_at, created_at, updated_at
             ) VALUES ('search-announcement-key', 'search-user', 'announcement', 42,
-                      'octo/rill', NULL, 'Key migration announcement', 'announcement body',
-                      'https://github.com/octo/rill', 99, 'octocat',
+                      'octo/rill', 1, 'Key migration announcement', 'announcement body',
+                      'https://github.com/octo/rill/discussions/1', 99, 'octocat',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -1755,13 +2576,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed announcement without discussion key");
+        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
         sqlx::query(
             r#"
             INSERT INTO ai_translations (
               id, user_id, entity_type, entity_id, lang, source_hash, status,
               title, summary, created_at, updated_at
             ) VALUES ('search-announcement-key-translation', 'search-user',
-                      'announcement_detail', 'search-announcement-key', 'zh-CN',
+                      'announcement_detail', 'octo/rill#1', 'zh-CN',
                       'hash-announcement-key', 'ready', '讨论键迁移命中', '公告正文',
                       '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
             "#,
@@ -1770,13 +2593,41 @@ mod tests {
         .await
         .expect("seed announcement translation before key");
         sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              title, summary, created_at, updated_at
+            ) VALUES ('search-announcement-key-smart', 'search-user',
+                      'announcement_smart', 'octo/rill#1', 'zh-CN',
+                      'hash-announcement-key-smart', 'ready', '智能摘要命中', '智能公告正文',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed smart announcement translation before key");
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              title, summary, created_at, updated_at
+            ) VALUES ('search-announcement-key-translation-2', 'search-announcement-user-2',
+                      'announcement_detail', 'octo/rill#1', 'zh-CN',
+                      'hash-announcement-key-2', 'ready', '第二用户命中', '公告正文二',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed second announcement lane translation before key");
+        sqlx::query(
             "UPDATE social_activity_events SET discussion_number = 9, html_url = 'https://github.com/octo/rill/discussions/9' WHERE id = 'search-announcement-key'",
         )
         .execute(&pool)
         .await
         .expect("promote announcement to discussion key");
 
-        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
         let results = query(
             &state,
             "search-user",
@@ -1789,6 +2640,51 @@ mod tests {
         assert_eq!(
             results[0].target.as_ref().unwrap().href,
             "/octo/rill/discussions/9"
+        );
+        let lane_rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT user_id, translated_text, smart_text FROM search_document_user_lanes WHERE document_id = 'announcement:search-announcement-key' ORDER BY user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read rebuilt announcement lane users");
+        assert_eq!(
+            lane_rows,
+            vec![
+                (
+                    "search-announcement-user-2".to_owned(),
+                    Some("第二用户命中 公告正文二".to_owned()),
+                    None,
+                ),
+                (
+                    "search-user".to_owned(),
+                    Some("讨论键迁移命中 公告正文".to_owned()),
+                    Some("智能摘要命中 智能公告正文".to_owned()),
+                ),
+            ]
+        );
+
+        sqlx::query("DELETE FROM social_activity_events WHERE id = 'search-announcement-key'")
+            .execute(&pool)
+            .await
+            .expect("delete projected announcement");
+        drain_search_projection_outbox(state.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE id = 'announcement:search-announcement-key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted announcement document"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'announcement:search-announcement-key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deleted announcement FTS row"),
+            0
         );
     }
 
@@ -1867,6 +2763,8 @@ mod tests {
             .await
             .expect("seed global projection");
         }
+        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
         let projected = sqlx::query_scalar::<_, Option<String>>(
             "SELECT translated_text FROM search_documents WHERE id = 'release:4201'",
         )
@@ -1874,6 +2772,19 @@ mod tests {
         .await
         .expect("read global projection text");
         assert_eq!(projected.as_deref(), Some("new projection text"));
+
+        sqlx::query("DELETE FROM content_result_projections WHERE id = 'search-projection-new'")
+            .execute(&pool)
+            .await
+            .expect("delete newest global projection");
+        drain_search_projection_outbox(state.as_ref()).await;
+        let recovered = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT translated_text FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered global projection text");
+        assert_eq!(recovered.as_deref(), Some("old projection text"));
     }
 
     #[tokio::test]
