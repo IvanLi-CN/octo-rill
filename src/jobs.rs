@@ -159,6 +159,8 @@ const ACCOUNT_PAUSE_LOCAL_TIME: NaiveTime =
     NaiveTime::from_hms_opt(3, 15, 0).expect("valid fixed local time");
 const ACCOUNT_PAUSE_INACTIVITY_DAYS: i64 = 30;
 const ADMIN_DASHBOARD_ROLLUP_SCHEDULER_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const SCHEDULER_DISPATCH_LANE: &str = "scheduler_dispatch";
+const SCHEDULER_DISPATCH_TRANSACTION_BUDGET: Duration = Duration::from_millis(750);
 const RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND: i64 = 100;
 const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
@@ -952,12 +954,25 @@ async fn dispatch_star_reconciliation_atomic(
     let now_rfc3339 = now.to_rfc3339();
     let schedule_name =
         format!("{STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX}:{github_connection_id}");
+    let Some(_scheduler_guard) = state
+        .sqlite_writer
+        .try_begin_background_lane(SCHEDULER_DISPATCH_LANE)
+    else {
+        tracing::debug!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name = %schedule_name,
+            reason = "scheduler_lane_in_flight",
+            "star reconciliation dispatch deferred while another scheduler dispatch is active"
+        );
+        return Ok(None);
+    };
     let (_writer, mut tx) = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "star_reconciliation_dispatch",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + SCHEDULER_DISPATCH_TRANSACTION_BUDGET,
         )
         .await
         .context("begin star reconciliation dispatch transaction")?;
@@ -1141,12 +1156,26 @@ async fn dispatch_scheduled_task_atomic(
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
     let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
 
+    let Some(_scheduler_guard) = state
+        .sqlite_writer
+        .try_begin_background_lane(SCHEDULER_DISPATCH_LANE)
+    else {
+        tracing::debug!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name,
+            schedule_key,
+            reason = "scheduler_lane_in_flight",
+            "scheduler dispatch deferred while another scheduler dispatch is active"
+        );
+        return Ok(None);
+    };
     let (_writer, mut tx) = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "scheduled_task_dispatch",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + SCHEDULER_DISPATCH_TRANSACTION_BUDGET,
         )
         .await?;
 
@@ -1426,12 +1455,26 @@ async fn dispatch_daily_brief_slot_atomic(
     });
     let payload_json = serde_json::to_string(&payload).context("serialize daily slot payload")?;
 
+    let Some(_scheduler_guard) = state
+        .sqlite_writer
+        .try_begin_background_lane(SCHEDULER_DISPATCH_LANE)
+    else {
+        tracing::debug!(
+            event = "scheduler.dispatch_coalesced",
+            schedule_name = "daily_brief_hour_slot",
+            schedule_key = hour_key,
+            reason = "scheduler_lane_in_flight",
+            "daily brief dispatch deferred while another scheduler dispatch is active"
+        );
+        return Ok(None);
+    };
     let (_writer, mut tx) = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "daily_brief_hour_slot_dispatch",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + SCHEDULER_DISPATCH_TRANSACTION_BUDGET,
         )
         .await?;
     let slot = sqlx::query_as::<_, SlotRow>(
@@ -5588,14 +5631,15 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO,
-        STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX, STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX,
-        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
-        SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE,
-        TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH,
-        TASK_SYNC_ALL, TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
-        TASK_SYNC_SUBSCRIPTIONS, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
-        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
+        NewTask, RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE,
+        SMART_NO_VALUABLE_VERSION_INFO, STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX,
+        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
+        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
+        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
+        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
+        cancel_task, claim_next_queued_task, complete_task,
         current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
         current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
         enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
@@ -6141,6 +6185,187 @@ mod tests {
                 .await
                 .expect("count marker task");
         assert_eq!(marker_task_count, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_coalesces_while_shared_lane_is_in_flight() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        crate::admin_runtime::update_sync_auto_fetch_interval_minutes(&pool, 30)
+            .await
+            .expect("seed subscription interval");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = ? WHERE id = 1",
+        )
+        .bind("2026-03-06T10:30:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed subscription effective boundary");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 10, 30, 0)
+            .single()
+            .expect("valid scheduler time");
+        let held_lane = state
+            .sqlite_writer
+            .try_begin_background_lane(SCHEDULER_DISPATCH_LANE)
+            .expect("reserve shared scheduler lane");
+
+        let deferred = enqueue_subscription_run_if_due(state.as_ref(), now)
+            .await
+            .expect("coalesced scheduler tick");
+        assert!(deferred.is_none());
+        let task_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
+        )
+        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred subscription tasks");
+        assert_eq!(task_count, 0);
+
+        drop(held_lane);
+        let dispatched = enqueue_subscription_run_if_due(state.as_ref(), now)
+            .await
+            .expect("retry scheduler tick")
+            .expect("subscription task after lane release");
+        let marker_task_id = sqlx::query_scalar::<_, String>(
+            "SELECT last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(SUBSCRIPTION_SCHEDULE_NAME)
+        .fetch_one(&pool)
+        .await
+        .expect("load dispatched subscription marker");
+        assert_eq!(marker_task_id, dispatched);
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_pressure_preserves_foreground_writer() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(4, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 902, "scheduler-pressure").await;
+        crate::admin_runtime::update_sync_auto_fetch_interval_minutes(&pool, 30)
+            .await
+            .expect("seed scheduler pressure interval");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 10, 30, 0)
+            .single()
+            .expect("valid scheduler pressure time");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = ? WHERE id = 1",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed scheduler pressure effective boundary");
+
+        let external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock");
+        let scheduler_tasks = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(
+                    async move { enqueue_subscription_run_if_due(state.as_ref(), now).await },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = state.sqlite_writer.runtime_status();
+                if status.background_admitted > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("scheduler dispatch should enter the shared writer lane");
+
+        let foreground_pool = pool.clone();
+        let foreground_state = state.clone();
+        let foreground_task = tokio::spawn(async move {
+            foreground_state
+                .sqlite_writer
+                .write_foreground("scheduler_pressure_foreground", |_| {
+                    let foreground_pool = foreground_pool.clone();
+                    async move {
+                        sqlx::query(
+                            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = '902'",
+                        )
+                        .execute(&foreground_pool)
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground writer should wait behind the external sqlite lock");
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
+        foreground_task
+            .await
+            .expect("join foreground scheduler pressure task")
+            .expect("foreground writer should succeed after lock release");
+
+        let mut committed_dispatches = 0usize;
+        for task in scheduler_tasks {
+            match task.await.expect("join scheduler pressure task") {
+                Ok(Some(_)) => committed_dispatches += 1,
+                Ok(None) => {}
+                Err(error) => {
+                    let error_chain = format!("{error:#}");
+                    assert!(
+                        !error_chain.contains("database is locked"),
+                        "scheduler pressure must not leak raw sqlite lock errors: {error_chain}"
+                    );
+                }
+            }
+        }
+        if committed_dispatches == 0 {
+            let retry_task = enqueue_subscription_run_if_due(state.as_ref(), now)
+                .await
+                .expect("scheduler should retry after foreground pressure clears")
+                .expect("scheduler should eventually commit after pressure clears");
+            committed_dispatches = 1;
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_tasks WHERE id = ?")
+                    .bind(retry_task)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count retried scheduler task"),
+                1
+            );
+        }
+        assert!(
+            committed_dispatches <= 1,
+            "shared scheduler admission must commit at most one task"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
+            )
+            .bind(TASK_SYNC_SUBSCRIPTIONS)
+            .fetch_one(&pool)
+            .await
+            .expect("count scheduler pressure tasks"),
+            i64::try_from(committed_dispatches).expect("dispatch count fits i64")
+        );
     }
 
     #[tokio::test]

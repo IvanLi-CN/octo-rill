@@ -33,6 +33,7 @@ const PROJECTION_PROGRESS_DELAY: Duration = Duration::from_millis(10);
 const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
 const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROJECTION_TERMINAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+const PROJECTION_TERMINAL_RECOVERY_CADENCE: Duration = Duration::from_secs(5);
 const PROJECTION_LEASE_SECONDS: i64 = 5;
 const PROJECTION_MAX_ATTEMPTS: i64 = 8;
 const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
@@ -128,8 +129,15 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
 pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut next_terminal_recovery_at = tokio::time::Instant::now();
         loop {
-            match run_projection_once(state.as_ref()).await {
+            let allow_terminal_recovery = tokio::time::Instant::now() >= next_terminal_recovery_at;
+            let outcome = run_projection_once(state.as_ref(), allow_terminal_recovery).await;
+            if allow_terminal_recovery {
+                next_terminal_recovery_at =
+                    tokio::time::Instant::now() + PROJECTION_TERMINAL_RECOVERY_CADENCE;
+            }
+            match outcome {
                 Ok(ProjectionRunOutcome::Committed) => {
                     tokio::time::sleep(PROJECTION_PROGRESS_DELAY).await
                 }
@@ -167,9 +175,14 @@ pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
 #[cfg(test)]
 pub(crate) async fn run_projection_for_test(state: &AppState) -> Result<bool> {
     Ok(matches!(
-        run_projection_once(state).await?,
+        run_projection_once(state, true).await?,
         ProjectionRunOutcome::Committed
     ))
+}
+
+#[cfg(test)]
+pub(crate) async fn reactivate_terminal_projection_for_test(state: &AppState) -> Result<bool> {
+    reactivate_terminal_projection_once(state).await
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -185,13 +198,12 @@ struct ProjectionOutboxRow {
     fanout_cursor: Option<String>,
 }
 
-async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
-    if let Err(error) = reactivate_terminal_projection_once(state).await {
-        warn!(
-            ?error,
-            event = "search.projection_outbox.terminal_reactivation_failed",
-            "terminal search projection recovery was deferred"
-        );
+async fn run_projection_once(
+    state: &AppState,
+    allow_terminal_recovery: bool,
+) -> Result<ProjectionRunOutcome> {
+    if !projection_work_due(&state.pool).await? {
+        return Ok(ProjectionRunOutcome::Idle);
     }
     let Some(lane_guard) = state
         .sqlite_writer
@@ -199,12 +211,31 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     else {
         return Ok(ProjectionRunOutcome::AdmissionDenied);
     };
+
+    if allow_terminal_recovery {
+        match reactivate_terminal_projection_once(state).await {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    ?error,
+                    event = "search.projection_outbox.terminal_reactivation_failed",
+                    "terminal search projection recovery was deferred"
+                );
+            }
+        }
+    }
+    if !active_projection_work_due(&state.pool).await? {
+        drop(lane_guard);
+        return Ok(ProjectionRunOutcome::Idle);
+    }
     let (claim_permit, mut claim_tx) = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "search_projection_outbox",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + PROJECTION_TRANSACTION_BUDGET,
         )
         .await?;
     let row = sqlx::query_as::<_, ProjectionOutboxRow>(
@@ -346,6 +377,39 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     Ok(ProjectionRunOutcome::Committed)
 }
 
+async fn projection_work_due(pool: &SqlitePool) -> Result<bool> {
+    let due = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM search_projection_outbox
+           WHERE available_at <= CURRENT_TIMESTAMP
+             AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
+         )
+         OR EXISTS(
+           SELECT 1 FROM search_projection_outbox_failed
+           WHERE failed_at <= datetime('now', '-' || ? || ' seconds')
+         )",
+    )
+    .bind(PROJECTION_TERMINAL_RETRY_DELAY.as_secs() as i64)
+    .fetch_one(pool)
+    .await
+    .context("check due search projection work")?;
+    Ok(due != 0)
+}
+
+async fn active_projection_work_due(pool: &SqlitePool) -> Result<bool> {
+    let due = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM search_projection_outbox
+           WHERE available_at <= CURRENT_TIMESTAMP
+             AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .context("check due active search projection work")?;
+    Ok(due != 0)
+}
+
 async fn reactivate_terminal_projection_once(state: &AppState) -> Result<bool> {
     let due = sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(
@@ -361,10 +425,11 @@ async fn reactivate_terminal_projection_once(state: &AppState) -> Result<bool> {
     }
     let (permit, mut tx) = state
         .sqlite_writer
-        .begin_immediate_with_priority(
+        .begin_immediate_with_priority_until(
             &state.pool,
             "search_projection_outbox_terminal_recovery",
             SqliteWritePriority::Background,
+            tokio::time::Instant::now() + PROJECTION_TRANSACTION_BUDGET,
         )
         .await?;
     let failed = sqlx::query_as::<
@@ -2093,6 +2158,49 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn projection_due_probe_only_admits_when_work_is_due() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite test pool");
+        sqlx::query(
+            "CREATE TABLE search_projection_outbox (
+               available_at TEXT NOT NULL,
+               lease_expires_at TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create active projection fixture");
+        sqlx::query(
+            "CREATE TABLE search_projection_outbox_failed (
+               failed_at TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create terminal projection fixture");
+
+        assert!(
+            !projection_work_due(&pool)
+                .await
+                .expect("probe empty projection queues")
+        );
+
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (available_at, lease_expires_at)
+             VALUES (datetime('now', '-1 second'), NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active projection work");
+        assert!(
+            projection_work_due(&pool)
+                .await
+                .expect("probe active projection queue")
+        );
+    }
 
     #[test]
     fn database_directory_handles_sqlite_urls() {

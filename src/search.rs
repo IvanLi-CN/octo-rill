@@ -2056,6 +2056,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_pressure_preserves_foreground_writer() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, subject_title, reason, updated_at, unread) VALUES ('projection-pressure-notification', 'search-user', 'projection-pressure-thread', 'pressure title', 'mention', CURRENT_TIMESTAMP, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed projection pressure notification");
+
+        let external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock");
+        let projection_state = state.clone();
+        let projection_task = tokio::spawn(async move {
+            crate::search_index::run_projection_for_test(projection_state.as_ref()).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = state.sqlite_writer.runtime_status();
+                if status.active {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("projection worker should enter the shared writer lane");
+
+        let foreground_pool = pool.clone();
+        let foreground_state = state.clone();
+        let foreground_task = tokio::spawn(async move {
+            foreground_state
+                .sqlite_writer
+                .write_foreground("projection_pressure_foreground", |_| {
+                    let foreground_pool = foreground_pool.clone();
+                    async move {
+                        sqlx::query(
+                            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = 'search-user'",
+                        )
+                        .execute(&foreground_pool)
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground writer should wait behind the external sqlite lock");
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
+        foreground_task
+            .await
+            .expect("join foreground projection pressure task")
+            .expect("foreground writer should succeed after lock release");
+        let first_projection = projection_task
+            .await
+            .expect("join projection pressure task");
+        if let Err(error) = &first_projection {
+            assert!(
+                error
+                    .to_string()
+                    .contains("background writer admission denied")
+                    || error
+                        .to_string()
+                        .contains("retryable sqlite write deadline exceeded"),
+                "projection pressure must defer through the coordinator: {error:#}"
+            );
+        }
+        if !matches!(first_projection, Ok(true)) {
+            let reset = sqlx::query(
+                "UPDATE search_projection_outbox
+                 SET available_at = CURRENT_TIMESTAMP,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL
+                 WHERE projection_key = 'notification:search-user:projection-pressure-thread'",
+            )
+            .execute(&pool)
+            .await
+            .expect("make deferred projection due for retry");
+            assert_eq!(reset.rows_affected(), 1);
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            assert!(
+                crate::search_index::run_projection_for_test(state.as_ref())
+                    .await
+                    .expect("retry projection after foreground pressure")
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:projection-pressure-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count committed pressure projection FTS row"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn realtime_projection_outbox_takes_over_expired_lease() {
         let pool = setup_pool().await;
         sqlx::query(
@@ -2392,6 +2506,85 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("read reset retry budget"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_terminal_recovery_failure_does_not_block_active_work() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "CREATE TRIGGER force_terminal_recovery_failure
+             BEFORE INSERT ON search_projection_outbox
+             WHEN NEW.projection_key = 'content:release:terminal-blocked'
+             BEGIN
+               SELECT RAISE(ABORT, 'forced terminal recovery failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create terminal recovery failure trigger");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (
+               projection_key, operation, resource_type, resource_id,
+               canonical_resource_type, attempt_count, last_error,
+               created_at, updated_at, failed_at
+             ) VALUES (
+               'content:release:terminal-blocked', 'upsert', 'content',
+               'terminal-blocked', 'release', 8, 'writer deadline',
+               CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '2000-01-01T00:00:00Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection failure");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (
+               projection_key, operation, resource_type, resource_id,
+               available_at, created_at, updated_at
+             ) VALUES (
+               'notification:search-user:active-delete', 'delete', 'notification',
+               'active-delete', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active projection work");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("active projection should continue after recovery failure")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'notification:search-user:active-delete'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active projection work"),
+            0
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(
+            crate::search_index::reactivate_terminal_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "the forced trigger must exercise the terminal recovery error path"
+        );
+        assert!(
+            !crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("terminal recovery failure should be deferred")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-blocked'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deferred terminal projection"),
             1
         );
     }
