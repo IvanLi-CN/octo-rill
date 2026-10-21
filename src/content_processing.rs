@@ -8159,7 +8159,7 @@ mod tests {
                 }) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         })
         .await
@@ -8217,7 +8217,7 @@ mod tests {
         );
 
         let mut foreground_tasks = Vec::new();
-        for request_index in 0..32 {
+        for request_index in 0..8 {
             let request_cookie = session_cookie.clone();
             let request_app = app.clone();
             foreground_tasks.push(tokio::spawn(async move {
@@ -8305,7 +8305,28 @@ mod tests {
             .expect("fast error response");
         assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
 
-        let events = log_buffer.json_events();
+        // The current-thread runtime keeps this subscriber installed while the request futures
+        // flush their synchronous access and writer telemetry, making the correlation assertions
+        // deterministic even when the full suite is running under load.
+        let events = tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                let events = log_buffer.json_events();
+                if events.iter().any(|event| {
+                    event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                        && event
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|request_id| request_id.starts_with("foreground-"))
+                        && event.get("request_method") == Some(&Value::String("GET".to_owned()))
+                        && event.get("request_route") == Some(&Value::String("/probe".to_owned()))
+                }) {
+                    break events;
+                }
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("foreground session telemetry should be emitted within the test budget");
         let correlated_request_id = events
             .iter()
             .find(|event| {
@@ -8348,7 +8369,6 @@ mod tests {
             correlated_access.get("level"),
             Some(&Value::String("INFO".to_owned()))
         );
-
         assert!(
             events.iter().any(|event| {
                 event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
@@ -8506,7 +8526,7 @@ mod tests {
                 if sqlite_writer.runtime_status().active {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         })
         .await

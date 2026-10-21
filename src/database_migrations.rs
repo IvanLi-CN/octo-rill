@@ -7,6 +7,12 @@ use sqlx::{SqlitePool, migrate::Migrator};
 const LEGACY_SEARCH_MIGRATION_VERSION: i64 = 81;
 const LEGACY_SEARCH_MIGRATION_SQL: &[u8] =
     include_bytes!("../migrations/legacy/0081_command_palette_search.sql");
+const SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION: i64 = 98;
+const LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM: &[u8; 48] = &[
+    0x9b, 0xa9, 0xb7, 0x22, 0xed, 0xc0, 0x32, 0x72, 0xb5, 0x43, 0x55, 0xb0, 0xf3, 0x18, 0x1d, 0x1e,
+    0xab, 0x77, 0x42, 0xa2, 0xc1, 0xf5, 0x81, 0xf2, 0x6e, 0xcb, 0xcb, 0xfa, 0xc3, 0x0f, 0xbe, 0xf8,
+    0x6b, 0x7b, 0x03, 0x24, 0x33, 0x49, 0x01, 0xc6, 0x32, 0xaf, 0x04, 0x4e, 0x2a, 0x10, 0x3c, 0x07,
+];
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -35,6 +41,7 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
 }
 
 async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
+    normalize_legacy_migration_checksums(pool).await?;
     let mut migrator = sqlx::migrate!("./migrations");
     // Version 81 is intentionally kept as historical evidence outside the
     // discovered source set. validate_history narrows this exception to that
@@ -44,6 +51,40 @@ async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
         .run(pool)
         .await
         .context("failed to apply database migrations")?;
+    Ok(())
+}
+
+async fn normalize_legacy_migration_checksums(pool: &SqlitePool) -> Result<()> {
+    let table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("check SQLx migration history before checksum repair")?
+        != 0;
+    if !table_exists {
+        return Ok(());
+    }
+
+    let current_checksum = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+        .map(|migration| migration.checksum.to_vec())
+        .context("load current scheduler index migration checksum")?;
+    let updated =
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum = ?")
+            .bind(current_checksum)
+            .bind(SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+            .bind(LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM.as_slice())
+            .execute(pool)
+            .await
+            .context("forward-repair legacy scheduler index migration checksum")?;
+    if updated.rows_affected() != 0 {
+        tracing::warn!(
+            migration_version = SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION,
+            "normalized a known legacy scheduler index migration checksum before forward repair"
+        );
+    }
     Ok(())
 }
 
@@ -123,7 +164,11 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
                 migration.version
             );
         };
-        if migration.checksum.as_slice() != *checksum {
+        let known_legacy_scheduler_index_checksum = migration.version
+            == SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION
+            && migration.checksum.as_slice()
+                == LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM.as_slice();
+        if migration.checksum.as_slice() != *checksum && !known_legacy_scheduler_index_checksum {
             bail!("database migration {} checksum mismatch", migration.version);
         }
     }
@@ -198,6 +243,34 @@ mod tests {
 
         let mut mismatched = history;
         mismatched[0].checksum[0] ^= 1;
+        assert!(validate_history(Some(&mismatched), &MIGRATOR).is_err());
+    }
+
+    #[test]
+    fn legacy_0098_checksum_is_accepted_for_forward_repair() {
+        let mut history = MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+            .map(|migration| AppliedMigration {
+                version: migration.version,
+                checksum: migration.checksum.to_vec(),
+                success: 1,
+            })
+            .collect::<Vec<_>>();
+        history
+            .iter_mut()
+            .find(|migration| migration.version == SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+            .expect("scheduler index migration history")
+            .checksum = LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM.to_vec();
+        validate_history(Some(&history), &MIGRATOR)
+            .expect("known legacy scheduler index checksum is accepted");
+
+        let mut mismatched = history;
+        mismatched
+            .iter_mut()
+            .find(|migration| migration.version == SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+            .expect("scheduler index migration history")
+            .checksum[0] ^= 1;
         assert!(validate_history(Some(&mismatched), &MIGRATOR).is_err());
     }
 
@@ -379,6 +452,13 @@ mod tests {
             .await
             .expect("apply schema before projection index migration");
 
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) VALUES ('legacy-malformed-payload', 'legacy.task', 'succeeded', 'legacy', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy malformed task payload");
+
         for index in 0..3 {
             let document_id = format!("release:upgrade-{index}");
             sqlx::query(
@@ -413,6 +493,154 @@ mod tests {
         run(&pool)
             .await
             .expect("apply pending migration to existing v90 database");
+
+        for version in [93_i64, 94, 95, 96, 97, 98, 99] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("read applied search migration"),
+                1,
+                "migration {version} should be applied",
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Vec<u8>>(
+                    "SELECT checksum FROM _sqlx_migrations WHERE version = ?",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("read applied search migration checksum"),
+                current_checksum(version),
+                "migration {version} checksum should match the checked-in SQL",
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_outbox'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check search projection outbox table"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('search_projection_outbox') WHERE name = 'previous_resource_id'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check announcement key repair column"),
+            1
+        );
+        let announcement_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_announcements_outbox_au'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read announcement projection trigger");
+        assert!(announcement_trigger_sql.contains("previous_resource_id"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_documents_resource_key'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check resource-key projection index"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_projection_outbox_poll'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check outbox poll index"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'search_projection_outbox_failed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check failed projection outbox table"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('search_projection_outbox') WHERE name = 'fanout_cursor'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check announcement fanout cursor column"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_star_connection_active'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check active star scheduler index"),
+            1
+        );
+        let star_scheduler_index_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_star_connection_active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read active star scheduler index");
+        assert!(star_scheduler_index_sql.contains("json_valid(payload_json)"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_search_projection_outbox_failed_poll'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check terminal projection recovery poll index"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) VALUES ('valid-star-payload', 'sync.starred.delta', 'queued', 'scheduler', '{\"github_connection_id\":\"legacy-connection\"}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed valid task payload after guarded index");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM job_tasks WHERE task_type = 'sync.starred.delta' AND status = 'queued' AND json_valid(payload_json) AND json_extract(payload_json, '$.github_connection_id') = 'legacy-connection'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("query valid task payload through guarded index"),
+            "valid-star-payload"
+        );
+        let scheduler_recovery_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_projection_outbox_reset_source_state'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read scheduler recovery trigger");
+        assert!(scheduler_recovery_trigger_sql.contains("fanout_cursor"));
+        let document_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bounded release document trigger");
+        assert!(document_trigger_sql.contains("NEW.resource_type = 'release'"));
+        assert!(!document_trigger_sql.contains("NEW.resource_type = 'announcement'"));
+        let content_transition_trigger_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_content_projections_outbox_au_old'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read content transition trigger");
+        assert!(content_transition_trigger_sql.contains("OLD.target_lang"));
 
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -450,14 +678,13 @@ mod tests {
             .expect("read content work supersession index"),
             3
         );
-        let trigger_sql = sqlx::query_scalar::<_, String>(
+        let document_trigger_sql = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_ai'",
         )
         .fetch_one(&pool)
         .await
-        .expect("read rebuilt search projection trigger");
-        assert!(trigger_sql.contains("ROW_NUMBER"));
-        assert!(trigger_sql.contains("search_document_user_lanes"));
+        .expect("read bounded release document trigger");
+        assert!(document_trigger_sql.contains("NEW.resource_type = 'release'"));
 
         let state = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
@@ -492,6 +719,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_v98_history_applies_forward_scheduler_index_repair() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let pre_0099 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| {
+                        migration.version <= SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0099
+            .run(&pool)
+            .await
+            .expect("apply schema through migration 98");
+        sqlx::query("DROP INDEX idx_job_tasks_star_connection_active")
+            .execute(&pool)
+            .await
+            .expect("remove current scheduler index before legacy fixture");
+        sqlx::query(
+            "CREATE INDEX idx_job_tasks_star_connection_active ON job_tasks(task_type, status, json_extract(payload_json, '$.github_connection_id'))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create the shipped unguarded scheduler index");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+            .bind(LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM.as_slice())
+            .bind(SEARCH_SCHEDULER_INDEX_MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .expect("seed legacy migration checksum");
+
+        run(&pool)
+            .await
+            .expect("apply forward scheduler index repair");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 99 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read forward repair migration history"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 98",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read normalized migration checksum"),
+            current_checksum(98)
+        );
+        let index_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_star_connection_active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired scheduler index");
+        assert!(index_sql.contains("json_valid(payload_json)"));
+    }
+
+    #[tokio::test]
     async fn failed_pending_migration_reports_version_and_rolls_back() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -523,7 +822,9 @@ mod tests {
             .await
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to apply pending SQLx migrations: [91, 92]"));
+        assert!(rendered.contains(
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99]"
+        ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

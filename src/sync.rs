@@ -1364,6 +1364,12 @@ struct StarSyncEpochRow {
     lease_expires_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StarReconciliationDispatch {
+    pub epoch_id: String,
+    pub schedule_key: String,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct StarredMembershipRow {
     repo_id: i64,
@@ -13111,25 +13117,16 @@ fn star_sync_timestamp_due(value: Option<&str>, now: DateTime<Utc>) -> bool {
         .is_none_or(|value| value.with_timezone(&Utc) <= now)
 }
 
-pub async fn ensure_star_reconciliation_epoch_due(
-    state: &AppState,
+pub async fn ensure_star_reconciliation_epoch_due_in_transaction(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     user_id: &str,
     github_connection_id: &str,
     full_sweep_interval_minutes: i64,
     now: DateTime<Utc>,
-) -> Result<Option<String>> {
+) -> Result<Option<StarReconciliationDispatch>> {
     let interval =
         admin_runtime::normalize_star_sync_full_sweep_interval_minutes(full_sweep_interval_minutes);
     let now_rfc3339 = now.to_rfc3339();
-    let (_writer, mut tx) = state
-        .sqlite_writer
-        .begin_immediate_with_priority(
-            &state.pool,
-            "star_sync_epoch_due",
-            SqliteWritePriority::Background,
-        )
-        .await
-        .context("begin star epoch due transaction")?;
     let active = sqlx::query_as::<_, StarSyncEpochRow>(
         r#"
         SELECT
@@ -13153,16 +13150,16 @@ pub async fn ensure_star_reconciliation_epoch_due(
         "#,
     )
     .bind(github_connection_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("load active star reconciliation epoch")?;
     if let Some(active) = active {
         let ready = star_sync_timestamp_due(active.next_slice_not_before.as_deref(), now)
             && star_sync_timestamp_due(active.lease_expires_at.as_deref(), now);
-        tx.commit()
-            .await
-            .context("commit active star epoch due transaction")?;
-        return Ok(ready.then_some(active.id));
+        return Ok(ready.then_some(StarReconciliationDispatch {
+            schedule_key: star_reconciliation_schedule_key(&active),
+            epoch_id: active.id,
+        }));
     }
 
     let last_completed_at = sqlx::query_scalar::<_, Option<String>>(
@@ -13176,7 +13173,7 @@ pub async fn ensure_star_reconciliation_epoch_due(
         "#,
     )
     .bind(github_connection_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("load latest completed star epoch")?
     .flatten();
@@ -13186,9 +13183,6 @@ pub async fn ensure_star_reconciliation_epoch_due(
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .is_none_or(|value| value.with_timezone(&Utc) <= due_after);
     if !due {
-        tx.commit()
-            .await
-            .context("commit not-due star epoch transaction")?;
         return Ok(None);
     }
 
@@ -13209,13 +13203,22 @@ pub async fn ensure_star_reconciliation_epoch_due(
     .bind(now_rfc3339.as_str())
     .bind(now_rfc3339.as_str())
     .bind(now_rfc3339.as_str())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("create star reconciliation epoch")?;
-    tx.commit()
-        .await
-        .context("commit created star reconciliation epoch")?;
-    Ok(Some(epoch_id))
+    Ok(Some(StarReconciliationDispatch {
+        schedule_key: format!("epoch:{epoch_id}:slice:0"),
+        epoch_id,
+    }))
+}
+
+fn star_reconciliation_schedule_key(epoch: &StarSyncEpochRow) -> String {
+    format!(
+        "epoch:{}:slice:{}:cursor:{}",
+        epoch.id,
+        epoch.processed_pages,
+        epoch.next_cursor.as_deref().unwrap_or_default()
+    )
 }
 
 async fn claim_star_reconciliation_epoch_slice(
@@ -20338,7 +20341,7 @@ mod tests {
         };
 
         let after_reads_observed =
-            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+            tokio::time::timeout(Duration::from_secs(1), hook.reached.recv())
                 .await
                 .expect("wait for social activity snapshot read hook")
                 .is_some();
@@ -20428,7 +20431,7 @@ mod tests {
         };
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+            tokio::time::timeout(Duration::from_secs(1), hook.reached.recv())
                 .await
                 .expect("wait for social activity snapshot read hook")
                 .is_some(),

@@ -4,18 +4,18 @@
 
 ## Current Status
 
-- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；parent 性能修复已合入 `th/perf-guarded-write-and-feed`，当前整合 SHA 为 `fa5f72d853eab1807466e5dd4f0e4574cd45e20d`
+- Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
 ## Current performance follow-up
 
-- 本轮 parent PR 只收敛两个实现缺口：claim lane 的共享 admission/in-flight 合并，以及 Dashboard updates 的轻量 signature 查询。
+- 本轮修复候选收敛调度原子性与搜索投影解耦：任务、事件和 dispatch marker 共用同一 writer 事务，搜索核心行先提交、FTS 通过 durable outbox 异步重试；Dashboard signature 查询合同保持不变。
 - worker 处理并发不等同于 SQLite writer 并发；网络、GitHub 和 LLM 工作继续在 writer permit 外执行，只有 claim 的短写入段受 admission 约束。
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
 - 当前跟进候选为后台准入拒绝增加 250 ms 共享冷却与 `background_admission_coalesced` 计数，并将通知 upsert 与 feed activity event 写入拆成固定 10 行的幂等短事务；这只降低无效拒绝日志和单次写入持锁时间，尚未代表已发布或完成 101 线上验收。
 - 当前 content recovery hotfix candidate `74c34a00` 将 supersession reconciliation 拆成 reader 分页与有界 writer apply：候选每批最多 100 项，单个资源历史每页最多 256 行，页间释放 reader 连接并让出执行权；共享 RAII in-flight guard 合并 recovery 与 runtime-reload 的重叠扫描，游标只在 apply 成功后推进。
-- migration `0092_content_work_supersession_lookup_index.sql` 增加 candidate cursor、active history 与 resource scope partial indexes；启动时由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
+- migrations `0092_content_work_supersession_lookup_index.sql`、`0093_search_projection_outbox.sql`、`0094_search_projection_resource_key_index.sql`、`0095_search_projection_announcement_key_repair.sql`、`0096_search_projection_outbox_poll_index.sql`、`0097_search_projection_failure_recovery.sql`、`0098_search_projection_scheduler_recovery.sql` 和 `0099_search_projection_scheduler_index_guard.sql` 均由 SQLx 在 listener bind 前事务性应用，旧程序不支持直接回滚，故发布故障采用 forward repair 或独立 backup restore。
 
 ## Coverage / rollout summary
 
@@ -52,6 +52,7 @@
 - `starred_repos` 的增量 upsert、通知 inbox upsert / open-url repair，以及 `public_repo_release_usage` 元数据刷新也已收回 writer coordinator；其中 notification open-url repair 的 GitHub thread lookup 保持在 writer permit 外，只把最终批量更新放进短事务，避免后台修复路径长时间占住 SQLite writer。
 - notification open-url repair 在短事务里会先按 `thread_id` 重读当前行，再决定是否回写修复结果；这样既保留 lookup 在 permit 外的短锁收益，也不会让较早的 repair lookup 覆盖并发 notification sync 刚写入的更新标题、`updated_at`、`unread` 或目标 URL。若 refresh 拿到的 thread metadata 时间戳更新，则 repair 仍会覆盖旧的标题/类型/reason/目标 URL，避免“当前行非空但已过时”把修复永久卡住。
 - jobs scheduler 的 `daily_brief_hour_slots.last_dispatch_at`、`scheduled_task_dispatch_state` 写入，以及 brief history/content refresh 失败标记也已收回 writer coordinator，避免 20s/45s 周期调度写和失败补偿写继续绕过协调层挤占 task claim / heartbeat。
+- scheduler 的 active-task coalescing 会把 queued/running 行（包括 heartbeat 已过期但尚未被 recovery worker 以 lease CAS 接管的行）继续视为 active；只有 recovery 完成终态转换后才允许重新 dispatch，避免 scheduler 与 recovery 竞态造成重复外部工作。
 - admin runtime settings 的 seed/backfill/update、LLM recovery flags 与 model health、translation runtime settings 均通过共享 `AppState.sqlite_writer` 写入；生产启动和 runtime heartbeat 不再调用 raw pool writer。
 - admin LLM/translation runtime PATCH 由共享 runtime-settings lock 串行化；在 live scheduler 应用失败时，LLM、recovery flags 与 translation worker settings 通过同一个 coordinator transaction 恢复此前持久化快照，再 reconcile 内存 scheduler。scheduler 同步会在修改内存前读取新的 model health，并在 translation slot 持久化失败时恢复 LLM routing/concurrency/health。
 - repo release work item 的成功、失败、deadline recovery 与 stale recovery 会在一个协调器事务中同时提交 work item 终态、pending watcher 状态和 governance attempt；执行 worker 的 deadline failure 还比较 runtime owner 与 started-at 快照，防止旧 worker 终止新 claim。
@@ -67,23 +68,23 @@
 ## Validation
 
 - `cargo fmt --all --check`
-- `cargo build --release --locked`
-- `cargo test --offline --all-targets --all-features`（code candidate `12c8ea90`: 1007 passed, 0 failed, 2 ignored）
+- `cargo build --release --locked`（远端 CI 的 Build (Release) required check 通过；本机 macOS target 的 stale dylib linker artifact 使本地 release build 不可作为证据）
+- `cargo test --offline --all-targets --all-features -- --test-threads=1`（当前候选串行套件 1101 passed, 0 failed, 2 ignored；PR #333 required check 以最新 current head 为准）
 - `cargo check --offline --all-targets --all-features`
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
-- `bash scripts/check-rust-source-quality.sh`（code candidate `12c8ea90`: source quality scan passed）
-- `tmp/sqlite_acceptance.py` file-backed WAL HTTP acceptance（code candidate `12c8ea90`: 21,600 records；baseline/competition/recovery/sustained requests all succeeded；external lock 下 60 个 foreground task enqueue/cancel 按合同返回 `503` + `Retry-After: 1`，无 unexpected failure；task persistence/idempotence、background recovery、WAL integrity 与 post-run counts 通过）
-- 真实 `tower_sessions` statement-interruption probe（code candidate `12c8ea90`: retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
-- 当前 parent `54e00b23` 的本地验证：`cargo fmt --check`、`cargo check`、`git diff --check`；content claim/freeze 与 foreground lock-order 回归 5 项；dashboard signature 回归 10 项；writer admission/foreground priority/recovery coalescing/file-backed scheduler pressure 回归 5 项，全部通过。
-- 当前 parent `fa5f72d8` 的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates `48ms`、session save `42ms`、task enqueue `38ms`，最大前台请求 `48ms`，`busy_or_500=0`；social snapshot 15 个分块、最大分块 `111ms`、最大 writer wait `0ms`。
-- 当前 content recovery hotfix candidate `74c34a00` 的本地回归：supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing 55 项与 sqlite-writer 39 项测试均通过；这些证据尚不替代合并后的 101 线上观察。
-- 当前 parent PR #326 的最新 GitHub CI runs `39056635621` / `39056635629`：Lint & Checks、Review Policy Gate、Release intent label gate、Rust Source Quality、Backend Tests、Frontend E2E、Build (Release)、Ubuntu bootstrap、macOS bootstrap 全部成功。
+- `bash scripts/check-rust-source-quality.sh`（PR #333 current-head required check 通过）
+- file-backed WAL acceptance：`content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（current candidate：passed；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言）
+- 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
+- PR #333 当前代码候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
+- 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
+- 当前代码候选的回归覆盖 supersession 分页/中间页最高 source revision、共享 in-flight coalescing、candidate/history keyset query plan、migration index upgrade、content-processing、sqlite-writer、scheduler dispatch、realtime search outbox、content-first deferred projection、outbox polling query plan 和 realtime backlog 的 FTS fallback guard；这些证据尚不替代合并后的 101 线上观察。
+- PR #333 的 required checks、正式 review 和生产形态验收必须绑定最终 current head；任何文档或审查元数据变更后都要重新读取最新 head 的 required checks。
 
 ## Remaining Gaps
 
-- 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；已发布版本仍为 `v2.77.0`，目标 SHA 为 `0a6cafbac8bd0e9c4ef35586621ad131ccf5360d`。
-- `0092` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug` 与 `octo_rill::sqlite_write=debug`，并记录 `selected/read_rows/read_pages/largest_read_page/changed`、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
-- 计划要求的完整当前候选 file-backed WAL/HTTP 经验验收（HTTP p95/p99、CPU、writer wait/admission/deadline 汇总）仍未形成可绑定 `fa5f72d8` 的完整证据卡；当前已完成的是上述生产形状并发回归，尚未测量 CPU 五分钟中位数，也未进行合并后的 101 线上 30 分钟观察。仓库中的 `tmp/sqlite_acceptance.py` 仅存在于历史记录，当前工作树没有该 harness。parent PR 可审查且 CI 已通过，但在这两项完成前不应宣称线上性能已验证或生成新 release。
+- 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
+- `0092`、`0093`、`0094`、`0095`、`0096`、`0097`、`0098` 和 `0099` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、terminal projection failures/recovery、announcement fanout cursor、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
+- 完整当前 head 的 file-backed WAL/HTTP 经验验收和合并后的 101 线上 30 分钟观察仍是发布后门禁；在这两项完成前不能宣称线上性能已验证或生成新 release。
 
 ## Related Changes
 

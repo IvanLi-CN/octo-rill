@@ -13,8 +13,8 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092",
-      "to_program_version": "content-processing-online-v2",
+      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0099 before listener bind",
+      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
     }
@@ -29,6 +29,76 @@
         "description": "Create candidate-cursor, active-history, and resource-scope indexes used by bounded content supersession reconciliation.",
         "applies_before_listener_bind": true,
         "pauseable": false,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 93,
+        "file": "migrations/0093_search_projection_outbox.sql",
+        "definition_checksum": "13e1065259aaf063d9ee383bd57c1e8a2210e811dc50b87d70bfdf1ca288dc81",
+        "description": "Create the durable search projection outbox and replace announcement, notification, and content source triggers with coalescing outbox writes.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 93,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 94,
+        "file": "migrations/0094_search_projection_resource_key_index.sql",
+        "definition_checksum": "44bdd22907312ab35aa8b8d07ba7edcab6964fa2317c76e44331be8fad323e62",
+        "description": "Index search document resource type and resource id for bounded realtime projection updates and FTS maintenance.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 94,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 95,
+        "file": "migrations/0095_search_projection_announcement_key_repair.sql",
+        "definition_checksum": "0fba6153b4e74dbc3c40ed01cb958243a7b3578d593bfeeb3137586a46eccd6f",
+        "description": "Preserve the previous canonical announcement key in realtime projection outbox updates so cached translations survive discussion identity changes.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 95,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 96,
+        "file": "migrations/0096_search_projection_outbox_poll_index.sql",
+        "definition_checksum": "951a4608c20463985adeab6654cd704bb73523fc045baabbd31c8237d183308b",
+        "description": "Index realtime projection outbox polling by availability and creation order so ready and expired leases avoid a temporary sort.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 96,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 97,
+        "file": "migrations/0097_search_projection_failure_recovery.sql",
+        "definition_checksum": "782ae199e1a18d20eff26c562deec5d48c7a134ed4e968ead813e918878211ef",
+        "description": "Retain terminal realtime projection failures separately, reactivate them on source recovery, and refresh both old and new content identities across eligibility transitions.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 97,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 98,
+        "file": "migrations/0098_search_projection_scheduler_recovery.sql",
+        "definition_checksum": "803ef69611aeac3411e64bc347fdae789328a3016a19cfff5b91c7c8994b9292",
+        "description": "Narrow the legacy document fanout trigger to direct release compatibility, bound announcement lane fanout with a durable cursor, reset coalesced source retry budgets, and guard active star scheduler lookups against malformed JSON.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 98,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 99,
+        "file": "migrations/0099_search_projection_scheduler_index_guard.sql",
+        "definition_checksum": "8b83d8b25c911dd204c898318a1911f99aa2a6d0eecc59337d7296a0c7c92a98",
+        "description": "Forward-repair the active star scheduler lookup for malformed legacy task JSON and index terminal projection recovery polling by failure time.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 99,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],

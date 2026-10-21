@@ -13,13 +13,30 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::task::AbortHandle;
 use tower_sessions::Session;
 use tracing::{info, warn};
+use uuid::Uuid;
 
-use crate::{api, error::ApiError, sqlite_write::SqliteWritePriority, state::AppState};
+use crate::{
+    api,
+    error::ApiError,
+    sqlite_write::{
+        SqliteWritePriority, is_sqlite_background_admission_error, is_sqlite_write_deadline_error,
+    },
+    state::AppState,
+};
 
 const INDEX_BATCH_SIZE: i64 = 25;
 const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(10);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const PROJECTION_POLL_DELAY: Duration = Duration::from_millis(50);
+const PROJECTION_PROGRESS_DELAY: Duration = Duration::from_millis(10);
+const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
+const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const PROJECTION_TERMINAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+const PROJECTION_LEASE_SECONDS: i64 = 5;
+const PROJECTION_MAX_ATTEMPTS: i64 = 8;
+const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
+const PROJECTION_FANOUT_BATCH_SIZE: i64 = 100;
 
 const PHASES: &[&str] = &[
     "releases",
@@ -47,6 +64,19 @@ enum BatchOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProjectionRunOutcome {
+    Committed,
+    Idle,
+    AdmissionDenied,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ProjectionApplyOutcome {
+    Complete,
+    Continue { cursor: String },
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct BackfillState {
     phase: String,
@@ -72,17 +102,1008 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
                     break;
                 }
                 Err(error) => {
-                    warn!(
-                        ?error,
-                        event = "search.index.failed_terminal",
-                        "search projection backfill stopped after a failed batch"
-                    );
-                    break;
+                    if is_transient_backfill_error(&error) {
+                        warn!(
+                            ?error,
+                            event = "search.index.deferred",
+                            retry_after_seconds = RETRY_DELAY.as_secs(),
+                            "search projection backfill deferred by writer admission or deadline"
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    } else {
+                        warn!(
+                            ?error,
+                            event = "search.index.failed_terminal",
+                            "search projection backfill stopped after a failed batch"
+                        );
+                        break;
+                    }
                 }
             }
         }
     })
     .abort_handle()
+}
+
+pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        loop {
+            match run_projection_once(state.as_ref()).await {
+                Ok(ProjectionRunOutcome::Committed) => {
+                    tokio::time::sleep(PROJECTION_PROGRESS_DELAY).await
+                }
+                Ok(ProjectionRunOutcome::Idle) => tokio::time::sleep(PROJECTION_IDLE_DELAY).await,
+                Ok(ProjectionRunOutcome::AdmissionDenied) => {
+                    warn!(
+                        event = "search.projection_outbox.admission_denied",
+                        retry_after_ms = PROJECTION_POLL_DELAY.as_millis(),
+                        "search projection outbox deferred by background writer admission"
+                    );
+                    tokio::time::sleep(PROJECTION_POLL_DELAY).await
+                }
+                Err(error) => {
+                    let retry_after = if is_sqlite_background_admission_error(error.as_ref())
+                        || is_sqlite_write_deadline_error(error.as_ref())
+                    {
+                        PROJECTION_POLL_DELAY
+                    } else {
+                        PROJECTION_RETRY_DELAY
+                    };
+                    warn!(
+                        ?error,
+                        event = "search.projection_outbox.failed",
+                        retry_after_ms = retry_after.as_millis(),
+                        "search projection outbox item failed; source data remains committed"
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
+            }
+        }
+    })
+    .abort_handle()
+}
+
+#[cfg(test)]
+pub(crate) async fn run_projection_for_test(state: &AppState) -> Result<bool> {
+    Ok(matches!(
+        run_projection_once(state).await?,
+        ProjectionRunOutcome::Committed
+    ))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProjectionOutboxRow {
+    projection_key: String,
+    operation: String,
+    resource_type: String,
+    resource_id: String,
+    previous_resource_id: Option<String>,
+    canonical_resource_type: Option<String>,
+    user_id: Option<String>,
+    attempt_count: i64,
+    fanout_cursor: Option<String>,
+}
+
+async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
+    if let Err(error) = reactivate_terminal_projection_once(state).await {
+        warn!(
+            ?error,
+            event = "search.projection_outbox.terminal_reactivation_failed",
+            "terminal search projection recovery was deferred"
+        );
+    }
+    let Some(lane_guard) = state
+        .sqlite_writer
+        .try_admit_background_lane("search_projection_outbox", PROJECTION_POLL_DELAY)
+    else {
+        return Ok(ProjectionRunOutcome::AdmissionDenied);
+    };
+    let (claim_permit, mut claim_tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "search_projection_outbox",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let row = sqlx::query_as::<_, ProjectionOutboxRow>(
+        "SELECT projection_key, operation, resource_type, resource_id, previous_resource_id, canonical_resource_type, user_id, attempt_count, fanout_cursor
+         FROM search_projection_outbox
+         WHERE available_at <= CURRENT_TIMESTAMP
+           AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
+         ORDER BY available_at ASC, created_at ASC, projection_key ASC
+         LIMIT 1",
+    )
+    .fetch_optional(&mut **claim_tx.as_transaction_mut())
+    .await?;
+    let Some(row) = row else {
+        claim_tx.rollback().await?;
+        drop(claim_permit);
+        drop(lane_guard);
+        return Ok(ProjectionRunOutcome::Idle);
+    };
+    let lease_owner = format!("{}:{}", state.runtime_owner_id, Uuid::new_v4());
+    sqlx::query(
+        "UPDATE search_projection_outbox
+         SET lease_owner = ?, lease_expires_at = datetime('now', '+' || ? || ' seconds'),
+             attempt_count = CASE WHEN last_error IS NULL THEN 1 ELSE attempt_count + 1 END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE projection_key = ?",
+    )
+    .bind(&lease_owner)
+    .bind(PROJECTION_LEASE_SECONDS)
+    .bind(&row.projection_key)
+    .execute(&mut **claim_tx.as_transaction_mut())
+    .await?;
+    claim_tx.commit().await?;
+    drop(claim_permit);
+
+    let apply_transaction = state
+        .sqlite_writer
+        .begin_immediate_with_priority_until(
+            &state.pool,
+            "search_projection_outbox_apply",
+            SqliteWritePriority::Background,
+            tokio::time::Instant::now() + PROJECTION_TRANSACTION_BUDGET,
+        )
+        .await;
+    let (permit, mut tx) = match apply_transaction {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            drop(lane_guard);
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    };
+    let current_lease = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT lease_owner FROM search_projection_outbox WHERE projection_key = ?",
+    )
+    .bind(&row.projection_key)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await;
+    let current_lease = match current_lease {
+        Ok(value) => value.flatten(),
+        Err(error) => {
+            let error = anyhow::Error::from(error);
+            let _ = tx.rollback().await;
+            drop(permit);
+            drop(lane_guard);
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    };
+    if current_lease.as_deref() != Some(lease_owner.as_str()) {
+        tx.rollback().await?;
+        drop(permit);
+        drop(lane_guard);
+        return Ok(ProjectionRunOutcome::Idle);
+    }
+
+    let apply_outcome = match apply_projection_outbox_item(tx.as_transaction_mut(), &row).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = tx.rollback().await;
+            drop(permit);
+            drop(lane_guard);
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    };
+
+    if let ProjectionApplyOutcome::Continue { cursor } = apply_outcome {
+        if let Err(error) = sqlx::query(
+            "UPDATE search_projection_outbox
+             SET fanout_cursor = ?, available_at = CURRENT_TIMESTAMP,
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE projection_key = ? AND lease_owner = ?",
+        )
+        .bind(cursor)
+        .bind(&row.projection_key)
+        .bind(&lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        {
+            let _ = tx.rollback().await;
+            drop(permit);
+            drop(lane_guard);
+            let error =
+                anyhow::Error::from(error).context("advance announcement projection fanout cursor");
+            recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+            return Err(error);
+        }
+    } else if let Err(error) = sqlx::query(
+        "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+    )
+    .bind(&row.projection_key)
+    .bind(&lease_owner)
+    .execute(&mut **tx.as_transaction_mut())
+    .await
+    {
+        let _ = tx.rollback().await;
+        drop(permit);
+        drop(lane_guard);
+        let error = anyhow::Error::from(error);
+        recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+        return Err(error);
+    }
+    if let Err(error) = tx.commit().await {
+        drop(permit);
+        drop(lane_guard);
+        recover_projection_claim(state, &row.projection_key, &lease_owner, &error).await;
+        return Err(error);
+    }
+    drop(permit);
+    drop(lane_guard);
+    info!(
+        event = "search.projection_outbox.committed",
+        projection_key = %row.projection_key,
+        operation = %row.operation,
+        attempt = row.attempt_count + 1,
+        "search projection outbox item committed"
+    );
+    Ok(ProjectionRunOutcome::Committed)
+}
+
+async fn reactivate_terminal_projection_once(state: &AppState) -> Result<bool> {
+    let due = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM search_projection_outbox_failed
+           WHERE failed_at <= datetime('now', '-' || ? || ' seconds')
+         )",
+    )
+    .bind(PROJECTION_TERMINAL_RETRY_DELAY.as_secs() as i64)
+    .fetch_one(&state.pool)
+    .await?;
+    if due == 0 {
+        return Ok(false);
+    }
+    let (permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "search_projection_outbox_terminal_recovery",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let failed = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
+        "SELECT projection_key, operation, resource_type, resource_id,
+                previous_resource_id, canonical_resource_type, user_id,
+                created_at, updated_at
+         FROM search_projection_outbox_failed
+         WHERE failed_at <= datetime('now', '-' || ? || ' seconds')
+         ORDER BY failed_at ASC, projection_key ASC
+         LIMIT 1",
+    )
+    .bind(PROJECTION_TERMINAL_RETRY_DELAY.as_secs() as i64)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?;
+    let Some((
+        projection_key,
+        operation,
+        resource_type,
+        resource_id,
+        previous_resource_id,
+        canonical_resource_type,
+        user_id,
+        created_at,
+        updated_at,
+    )) = failed
+    else {
+        tx.rollback().await?;
+        drop(permit);
+        return Ok(false);
+    };
+    sqlx::query(
+        "INSERT INTO search_projection_outbox (
+           projection_key, operation, resource_type, resource_id,
+           previous_resource_id, canonical_resource_type, user_id,
+           attempt_count, available_at, lease_owner, lease_expires_at,
+           last_error, fanout_cursor, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, NULL, NULL, NULL, NULL, ?, ?)
+         ON CONFLICT(projection_key) DO UPDATE SET
+           operation = excluded.operation,
+           resource_type = excluded.resource_type,
+           resource_id = excluded.resource_id,
+           previous_resource_id = excluded.previous_resource_id,
+           canonical_resource_type = excluded.canonical_resource_type,
+           user_id = excluded.user_id,
+           attempt_count = 0,
+           available_at = CURRENT_TIMESTAMP,
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           last_error = NULL,
+           fanout_cursor = NULL,
+           updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&projection_key)
+    .bind(&operation)
+    .bind(&resource_type)
+    .bind(&resource_id)
+    .bind(&previous_resource_id)
+    .bind(&canonical_resource_type)
+    .bind(&user_id)
+    .bind(&created_at)
+    .bind(&updated_at)
+    .execute(&mut **tx.as_transaction_mut())
+    .await?;
+    sqlx::query("DELETE FROM search_projection_outbox_failed WHERE projection_key = ?")
+        .bind(&projection_key)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+    tx.commit().await?;
+    drop(permit);
+    info!(
+        event = "search.projection_outbox.terminal_reactivated",
+        projection_key = %projection_key,
+        "terminal search projection returned to the retryable outbox"
+    );
+    Ok(true)
+}
+
+async fn recover_projection_claim(
+    state: &AppState,
+    projection_key: &str,
+    lease_owner: &str,
+    error: &anyhow::Error,
+) {
+    if let Err(background_error) = record_projection_failure_with_priority(
+        state,
+        projection_key,
+        lease_owner,
+        error,
+        SqliteWritePriority::Background,
+    )
+    .await
+    {
+        warn!(
+            ?background_error,
+            projection_key,
+            event = "search.projection_outbox.failure_record_deferred",
+            "background projection retry state could not be recorded; escalating cleanup"
+        );
+        if let Err(foreground_error) = record_projection_failure_with_priority(
+            state,
+            projection_key,
+            lease_owner,
+            error,
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        {
+            warn!(
+                ?foreground_error,
+                projection_key,
+                event = "search.projection_outbox.failure_record_failed",
+                "failed to persist search projection retry state"
+            );
+        }
+    }
+}
+
+async fn record_projection_failure_with_priority(
+    state: &AppState,
+    projection_key: &str,
+    lease_owner: &str,
+    error: &anyhow::Error,
+    priority: SqliteWritePriority,
+) -> Result<()> {
+    let (permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(&state.pool, "search_projection_outbox_failure", priority)
+        .await?;
+    let attempt_count = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT attempt_count FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+    )
+    .bind(projection_key)
+    .bind(lease_owner)
+    .fetch_optional(&mut **tx.as_transaction_mut())
+    .await?
+    .flatten();
+    let Some(attempt_count) = attempt_count else {
+        tx.rollback().await?;
+        drop(permit);
+        return Ok(());
+    };
+    let error_summary = redact_search_error_summary(&error.to_string());
+    if attempt_count >= PROJECTION_MAX_ATTEMPTS {
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (
+               projection_key, operation, resource_type, resource_id, previous_resource_id,
+               canonical_resource_type, user_id, attempt_count, last_error,
+               created_at, updated_at, failed_at
+             )
+             SELECT projection_key, operation, resource_type, resource_id, previous_resource_id,
+                    canonical_resource_type, user_id, attempt_count, ?, created_at,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             FROM search_projection_outbox
+             WHERE projection_key = ? AND lease_owner = ?
+             ON CONFLICT(projection_key) DO UPDATE SET
+               operation = excluded.operation,
+               resource_type = excluded.resource_type,
+               resource_id = excluded.resource_id,
+               previous_resource_id = excluded.previous_resource_id,
+               canonical_resource_type = excluded.canonical_resource_type,
+               user_id = excluded.user_id,
+               attempt_count = excluded.attempt_count,
+               last_error = excluded.last_error,
+               updated_at = excluded.updated_at,
+               failed_at = excluded.failed_at",
+        )
+        .bind(&error_summary)
+        .bind(projection_key)
+        .bind(lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+        sqlx::query(
+            "DELETE FROM search_projection_outbox WHERE projection_key = ? AND lease_owner = ?",
+        )
+        .bind(projection_key)
+        .bind(lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE search_projection_outbox
+             SET available_at = datetime('now', '+' || ? || ' seconds'),
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 last_error = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE projection_key = ? AND lease_owner = ?",
+        )
+        .bind(PROJECTION_RETRY_DELAY.as_secs() as i64)
+        .bind(&error_summary)
+        .bind(projection_key)
+        .bind(lease_owner)
+        .execute(&mut **tx.as_transaction_mut())
+        .await?;
+    }
+    tx.commit().await?;
+    drop(permit);
+    Ok(())
+}
+
+async fn apply_projection_outbox_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<ProjectionApplyOutcome> {
+    if row.operation == "delete" {
+        if row.resource_type == "content" {
+            let canonical_type = row
+                .canonical_resource_type
+                .as_deref()
+                .context("content projection delete is missing canonical resource type")?;
+            let _ = refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
+        } else {
+            delete_search_document(tx, &row.projection_key).await?;
+        }
+        return Ok(ProjectionApplyOutcome::Complete);
+    }
+
+    match row.resource_type.as_str() {
+        "notification" => {
+            apply_notification_projection(tx, row).await?;
+            Ok(ProjectionApplyOutcome::Complete)
+        }
+        "announcement" => apply_announcement_projection(tx, row).await,
+        "content" => {
+            let canonical_type = row
+                .canonical_resource_type
+                .as_deref()
+                .context("content projection is missing canonical resource type")?;
+            if refresh_content_projection(tx, canonical_type, &row.resource_id).await? {
+                Ok(ProjectionApplyOutcome::Complete)
+            } else {
+                bail!(
+                    "search document is not materialized for content projection {}:{}",
+                    canonical_type,
+                    row.resource_id
+                )
+            }
+        }
+        resource_type => bail!("unsupported search projection resource type {resource_type}"),
+    }
+}
+
+async fn apply_notification_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<()> {
+    let user_id = row
+        .user_id
+        .as_deref()
+        .context("notification projection is missing user id")?;
+    let source = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        ),
+    >(
+        "SELECT user_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, html_url
+         FROM notifications WHERE user_id = ? AND thread_id = ?",
+    )
+    .bind(user_id)
+    .bind(&row.resource_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        source_user_id,
+        repo_full_name,
+        subject_title,
+        subject_type,
+        reason,
+        updated_at,
+        unread,
+        html_url,
+    )) = source
+    else {
+        delete_search_document(tx, &row.projection_key).await?;
+        return Ok(());
+    };
+    let owner_login = repo_full_name.as_deref().map(|name| {
+        name.split_once('/')
+            .map(|(owner, _)| owner)
+            .unwrap_or(name)
+            .to_owned()
+    });
+    remove_conflicting_search_document(
+        tx,
+        &source_user_id,
+        "notification",
+        &row.resource_id,
+        &row.projection_key,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_documents (
+           id, user_id, resource_type, resource_id, repo_full_name, owner_login,
+           title, body, source_time, unread, target_url, created_at, updated_at
+         ) VALUES (?, ?, 'notification', ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+         ON CONFLICT(id) DO UPDATE SET
+           user_id = excluded.user_id,
+           resource_id = excluded.resource_id,
+           repo_full_name = excluded.repo_full_name,
+           owner_login = excluded.owner_login,
+           title = excluded.title,
+           body = excluded.body,
+           source_time = excluded.source_time,
+           unread = excluded.unread,
+           target_url = excluded.target_url,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&row.projection_key)
+    .bind(&source_user_id)
+    .bind(&row.resource_id)
+    .bind(&repo_full_name)
+    .bind(owner_login)
+    .bind(&subject_title)
+    .bind(format!(
+        "{} {}",
+        subject_type.as_deref().unwrap_or_default(),
+        reason.as_deref().unwrap_or_default()
+    ))
+    .bind(&updated_at)
+    .bind(unread)
+    .bind(&html_url)
+    .bind(&updated_at)
+    .bind(&updated_at)
+    .execute(&mut **tx)
+    .await?;
+    refresh_user_lane(
+        tx,
+        &row.projection_key,
+        &source_user_id,
+        "notification",
+        &row.resource_id,
+        &row.resource_id,
+    )
+    .await
+}
+
+async fn apply_announcement_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &ProjectionOutboxRow,
+) -> Result<ProjectionApplyOutcome> {
+    let source = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
+        "SELECT user_id, repo_id, repo_full_name, title, body, occurred_at,
+                discussion_number, html_url, created_at, updated_at
+         FROM social_activity_events
+         WHERE id = ? AND kind = 'announcement'",
+    )
+    .bind(&row.resource_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        user_id,
+        repo_id,
+        repo_full_name,
+        title,
+        body,
+        occurred_at,
+        discussion_number,
+        html_url,
+        created_at,
+        updated_at,
+    )) = source
+    else {
+        delete_search_document(tx, &row.projection_key).await?;
+        return Ok(ProjectionApplyOutcome::Complete);
+    };
+    let resource_id = match (&repo_full_name, discussion_number) {
+        (Some(repo), Some(number)) => format!("{}#{}", repo.to_ascii_lowercase(), number),
+        _ => row.resource_id.clone(),
+    };
+    let owner_login = repo_full_name.as_deref().map(|name| {
+        name.split_once('/')
+            .map(|(owner, _)| owner)
+            .unwrap_or(name)
+            .to_owned()
+    });
+    let target_path = repo_full_name
+        .as_deref()
+        .zip(discussion_number)
+        .map(|(repo, number)| format!("/{repo}/discussions/{number}"));
+    remove_conflicting_search_document(
+        tx,
+        &user_id,
+        "announcement",
+        &resource_id,
+        &row.projection_key,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO search_documents (
+           id, user_id, resource_type, resource_id, repo_id, repo_full_name,
+           owner_login, title, body, source_time, target_path, target_url,
+           created_at, updated_at
+         ) VALUES (?, ?, 'announcement', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           user_id = excluded.user_id,
+           resource_id = excluded.resource_id,
+           repo_id = excluded.repo_id,
+           repo_full_name = excluded.repo_full_name,
+           owner_login = excluded.owner_login,
+           title = excluded.title,
+           body = excluded.body,
+           source_time = excluded.source_time,
+           target_path = excluded.target_path,
+           target_url = excluded.target_url,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&row.projection_key)
+    .bind(&user_id)
+    .bind(&resource_id)
+    .bind(repo_id)
+    .bind(&repo_full_name)
+    .bind(owner_login)
+    .bind(&title)
+    .bind(&body)
+    .bind(&occurred_at)
+    .bind(target_path)
+    .bind(&html_url)
+    .bind(&created_at)
+    .bind(&updated_at)
+    .execute(&mut **tx)
+    .await?;
+    refresh_announcement_lanes_chunk_with_cursor(
+        tx,
+        &row.projection_key,
+        &row.resource_id,
+        &resource_id,
+        row.previous_resource_id.as_deref(),
+        row.fanout_cursor.as_deref(),
+    )
+    .await
+}
+
+async fn refresh_user_lane(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: &str,
+    user_id: &str,
+    resource_type: &str,
+    entity_id: &str,
+    alternate_entity_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?")
+        .bind(document_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    let entity_pattern = format!("{resource_type}%");
+    sqlx::query(
+        "INSERT INTO search_document_user_lanes (
+           document_id, user_id, translated_text, smart_text, updated_at
+         )
+         SELECT ?, ?,
+           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+            FROM ai_translations t
+            WHERE t.user_id = ? AND t.lang = 'zh-CN'
+              AND t.status IN ('ready', 'disabled', 'missing')
+              AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+              AND t.entity_type LIKE ? AND lower(t.entity_type) NOT LIKE '%smart%'
+              AND lower(t.entity_id) IN (lower(?), lower(?))
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+            FROM ai_translations t
+            WHERE t.user_id = ? AND t.lang = 'zh-CN'
+              AND t.status IN ('ready', 'disabled', 'missing')
+              AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+              AND t.entity_type LIKE ? AND lower(t.entity_type) LIKE '%smart%'
+              AND lower(t.entity_id) IN (lower(?), lower(?))
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+           COALESCE((SELECT MAX(t.updated_at) FROM ai_translations t
+                     WHERE t.user_id = ? AND t.lang = 'zh-CN'
+                       AND t.status IN ('ready', 'disabled', 'missing')
+                       AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+                       AND t.entity_type LIKE ?
+                       AND lower(t.entity_id) IN (lower(?), lower(?))), CURRENT_TIMESTAMP)
+         WHERE EXISTS (SELECT 1 FROM search_documents d WHERE d.id = ? AND d.user_id = ?)
+           AND EXISTS (SELECT 1 FROM ai_translations t
+                       WHERE t.user_id = ? AND t.lang = 'zh-CN'
+                         AND t.status IN ('ready', 'disabled', 'missing')
+                         AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+                         AND t.entity_type LIKE ?
+                         AND lower(t.entity_id) IN (lower(?), lower(?)))",
+    )
+    .bind(document_id)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .bind(document_id)
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&entity_pattern)
+    .bind(entity_id)
+    .bind(alternate_entity_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn refresh_announcement_lanes_chunk_with_cursor(
+    tx: &mut Transaction<'_, Sqlite>,
+    document_id: &str,
+    event_id: &str,
+    resource_id: &str,
+    previous_resource_id: Option<&str>,
+    fanout_cursor: Option<&str>,
+) -> Result<ProjectionApplyOutcome> {
+    if fanout_cursor.is_none() {
+        sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
+            .bind(document_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "WITH user_ids AS (
+           SELECT DISTINCT t.user_id
+           FROM ai_translations t
+           WHERE t.lang = 'zh-CN'
+             AND t.status IN ('ready', 'disabled', 'missing')
+             AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+             AND lower(t.entity_type) LIKE 'announcement%'
+             AND lower(t.entity_id) IN (lower(?), lower(?), lower(?))
+             AND (? IS NULL OR t.user_id > ?)
+           ORDER BY t.user_id
+           LIMIT ?
+         ), candidates AS (
+           SELECT t.user_id,
+                  CASE WHEN lower(t.entity_type) LIKE '%smart%' THEN 1 ELSE 0 END AS is_smart,
+                  trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, '')) AS value,
+                  t.updated_at,
+                  t.id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY t.user_id, CASE WHEN lower(t.entity_type) LIKE '%smart%' THEN 1 ELSE 0 END
+                    ORDER BY t.updated_at DESC, t.id DESC
+                  ) AS lane_rank
+           FROM ai_translations t
+           JOIN user_ids u ON u.user_id = t.user_id
+           WHERE t.lang = 'zh-CN'
+             AND t.status IN ('ready', 'disabled', 'missing')
+             AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+             AND lower(t.entity_type) LIKE 'announcement%'
+             AND lower(t.entity_id) IN (lower(?), lower(?), lower(?))
+         ), selected AS (
+           SELECT user_id,
+                  MAX(CASE WHEN is_smart = 0 AND lane_rank = 1 THEN value END) AS translated_text,
+                  MAX(CASE WHEN is_smart = 1 AND lane_rank = 1 THEN value END) AS smart_text,
+                  MAX(CASE WHEN lane_rank = 1 THEN updated_at END) AS updated_at
+           FROM candidates
+           GROUP BY user_id
+         )
+         INSERT INTO search_document_user_lanes (
+           document_id, user_id, translated_text, smart_text, updated_at
+         )
+         SELECT ?, user_id, translated_text, smart_text,
+                COALESCE(updated_at, CURRENT_TIMESTAMP)
+         FROM selected
+         WHERE 1
+         ON CONFLICT(document_id, user_id) DO UPDATE SET
+           translated_text = excluded.translated_text,
+           smart_text = excluded.smart_text,
+           updated_at = excluded.updated_at",
+    )
+    .bind(event_id)
+    .bind(resource_id)
+    .bind(previous_resource_id)
+    .bind(fanout_cursor)
+    .bind(fanout_cursor)
+    .bind(PROJECTION_FANOUT_BATCH_SIZE)
+    .bind(event_id)
+    .bind(resource_id)
+    .bind(previous_resource_id)
+    .bind(document_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let last_cursor = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(user_id) FROM (
+           SELECT DISTINCT t.user_id
+           FROM ai_translations t
+           WHERE t.lang = 'zh-CN'
+             AND t.status IN ('ready', 'disabled', 'missing')
+             AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+             AND lower(t.entity_type) LIKE 'announcement%'
+             AND lower(t.entity_id) IN (lower(?), lower(?), lower(?))
+             AND (? IS NULL OR t.user_id > ?)
+           ORDER BY t.user_id
+           LIMIT ?
+         )",
+    )
+    .bind(event_id)
+    .bind(resource_id)
+    .bind(previous_resource_id)
+    .bind(fanout_cursor)
+    .bind(fanout_cursor)
+    .bind(PROJECTION_FANOUT_BATCH_SIZE)
+    .fetch_one(&mut **tx)
+    .await?;
+    let Some(last_cursor) = last_cursor else {
+        return Ok(ProjectionApplyOutcome::Complete);
+    };
+    let has_more = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM ai_translations t
+           WHERE t.lang = 'zh-CN'
+             AND t.status IN ('ready', 'disabled', 'missing')
+             AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
+             AND lower(t.entity_type) LIKE 'announcement%'
+             AND lower(t.entity_id) IN (lower(?), lower(?), lower(?))
+             AND t.user_id > ?
+         )",
+    )
+    .bind(event_id)
+    .bind(resource_id)
+    .bind(previous_resource_id)
+    .bind(&last_cursor)
+    .fetch_one(&mut **tx)
+    .await?
+        != 0;
+    Ok(if has_more {
+        ProjectionApplyOutcome::Continue {
+            cursor: last_cursor,
+        }
+    } else {
+        ProjectionApplyOutcome::Complete
+    })
+}
+
+async fn remove_conflicting_search_document(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    keep_document_id: &str,
+) -> Result<()> {
+    let conflicting_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM search_documents
+         WHERE user_id = ? AND resource_type = ? AND resource_id = ? AND id <> ?",
+    )
+    .bind(user_id)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(keep_document_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for document_id in conflicting_ids {
+        delete_search_document(tx, &document_id).await?;
+    }
+    Ok(())
+}
+
+async fn refresh_content_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<bool> {
+    let identity_upgrade_complete =
+        crate::content_identity_upgrade::is_complete_in_transaction(tx).await?;
+    let mut updated_any = false;
+    for (pipeline, column) in [
+        ("translation", "translated_text"),
+        ("polishing", "smart_text"),
+    ] {
+        let projection_text_query = if identity_upgrade_complete {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
+        } else {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
+        };
+        let text = sqlx::query_scalar::<_, Option<String>>(projection_text_query)
+            .bind(resource_type)
+            .bind(resource_id)
+            .bind(pipeline)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        let query = format!(
+            "UPDATE search_documents SET {column} = ?, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE resource_type = ? AND resource_id = ?"
+        );
+        let result = sqlx::query(&query)
+            .bind(text)
+            .bind(resource_type)
+            .bind(resource_id)
+            .execute(&mut **tx)
+            .await?;
+        updated_any |= result.rows_affected() > 0;
+    }
+    Ok(updated_any)
+}
+
+async fn delete_search_document(tx: &mut Transaction<'_, Sqlite>, document_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM search_document_user_lanes WHERE document_id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM search_documents WHERE id = ?")
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 async fn run_batch(state: &AppState) -> Result<BatchOutcome> {
@@ -95,16 +1116,26 @@ async fn run_batch(state: &AppState) -> Result<BatchOutcome> {
 
 async fn run_batch_once(state: &AppState) -> Result<BatchOutcome> {
     let result = run_batch(state).await;
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !is_transient_backfill_error(error)
+    {
         record_batch_failure(state, error).await;
     }
     result
 }
 
+fn is_transient_backfill_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        is_sqlite_background_admission_error(cause) || is_sqlite_write_deadline_error(cause)
+    })
+}
+
 #[cfg(test)]
 pub(crate) async fn run_batch_for_test(state: &AppState, free_bytes: u64) -> Result<()> {
     let result = run_batch_with_free_bytes(state, free_bytes, 1).await;
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !is_transient_backfill_error(error)
+    {
         record_batch_failure(state, error).await;
     }
     result.map(|_| ())
@@ -356,11 +1387,33 @@ async fn status_response(pool: &SqlitePool) -> Result<SearchIndexStatusResponse>
             .await
             .context("check pending search metadata work")?
             != 0;
+    let projection_pending =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_projection_outbox)")
+            .fetch_one(pool)
+            .await
+            .context("check pending realtime search projection work")?
+            != 0;
+    let projection_failure = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_error FROM search_projection_outbox_failed ORDER BY failed_at DESC, projection_key DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read terminal realtime search projection failure")?
+    .flatten();
+    let status = if projection_failure.is_some() {
+        "failed".to_owned()
+    } else if status == "ready" && (metadata_pending || projection_pending) {
+        "building".to_owned()
+    } else {
+        status
+    };
     Ok(SearchIndexStatusResponse {
         phase,
         cursor,
         status,
-        last_error: last_error.map(|error| redact_search_error_summary(&error)),
+        last_error: last_error
+            .or(projection_failure)
+            .map(|error| redact_search_error_summary(&error)),
         updated_at,
         metadata_pending,
     })
