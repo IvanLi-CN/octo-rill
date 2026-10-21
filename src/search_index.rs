@@ -196,15 +196,17 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
         return Ok(ProjectionRunOutcome::AdmissionDenied);
     };
 
-    match reactivate_terminal_projection_once(state).await {
-        Ok(true) => {}
-        Ok(false) => {}
-        Err(error) => {
-            warn!(
-                ?error,
-                event = "search.projection_outbox.terminal_reactivation_failed",
-                "terminal search projection recovery was deferred"
-            );
+    if !active_projection_work_due(&state.pool).await? {
+        match reactivate_terminal_projection_once(state).await {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    ?error,
+                    event = "search.projection_outbox.terminal_reactivation_failed",
+                    "terminal search projection recovery was deferred"
+                );
+            }
         }
     }
     if !active_projection_work_due(&state.pool).await? {

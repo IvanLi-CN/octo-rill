@@ -2452,6 +2452,11 @@ mod tests {
             .expect("count active projection work"),
             0
         );
+        assert!(
+            !crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("terminal recovery failure should be deferred")
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-blocked'",
