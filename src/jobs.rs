@@ -6328,11 +6328,29 @@ mod tests {
             match task.await.expect("join scheduler pressure task") {
                 Ok(Some(_)) => committed_dispatches += 1,
                 Ok(None) => {}
-                Err(error) => assert!(
-                    !error.to_string().contains("database is locked"),
-                    "scheduler pressure must not leak raw sqlite lock errors: {error:#}"
-                ),
+                Err(error) => {
+                    let error_chain = format!("{error:#}");
+                    assert!(
+                        !error_chain.contains("database is locked"),
+                        "scheduler pressure must not leak raw sqlite lock errors: {error_chain}"
+                    );
+                }
             }
+        }
+        if committed_dispatches == 0 {
+            let retry_task = enqueue_subscription_run_if_due(state.as_ref(), now)
+                .await
+                .expect("scheduler should retry after foreground pressure clears")
+                .expect("scheduler should eventually commit after pressure clears");
+            committed_dispatches = 1;
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_tasks WHERE id = ?")
+                    .bind(retry_task)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count retried scheduler task"),
+                1
+            );
         }
         assert!(
             committed_dispatches <= 1,

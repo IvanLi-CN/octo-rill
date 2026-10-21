@@ -2139,17 +2139,34 @@ mod tests {
                 "projection pressure must defer through the coordinator: {error:#}"
             );
         }
-        if matches!(first_projection, Ok(true)) {
-            assert_eq!(
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:projection-pressure-thread'",
-                )
-                .fetch_one(&pool)
-                .await
-                .expect("count committed pressure projection FTS row"),
-                1
+        if !matches!(first_projection, Ok(true)) {
+            let reset = sqlx::query(
+                "UPDATE search_projection_outbox
+                 SET available_at = CURRENT_TIMESTAMP,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL
+                 WHERE projection_key = 'notification:search-user:projection-pressure-thread'",
+            )
+            .execute(&pool)
+            .await
+            .expect("make deferred projection due for retry");
+            assert_eq!(reset.rows_affected(), 1);
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            assert!(
+                crate::search_index::run_projection_for_test(state.as_ref())
+                    .await
+                    .expect("retry projection after foreground pressure")
             );
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id = 'notification:search-user:projection-pressure-thread'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count committed pressure projection FTS row"),
+            1
+        );
     }
 
     #[tokio::test]
