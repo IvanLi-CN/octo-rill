@@ -197,10 +197,7 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
     };
 
     match reactivate_terminal_projection_once(state).await {
-        Ok(true) => {
-            drop(lane_guard);
-            return Ok(ProjectionRunOutcome::Committed);
-        }
+        Ok(true) => {}
         Ok(false) => {}
         Err(error) => {
             warn!(
