@@ -205,8 +205,6 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
                 event = "search.projection_outbox.terminal_reactivation_failed",
                 "terminal search projection recovery was deferred"
             );
-            drop(lane_guard);
-            return Err(error);
         }
     }
     if !active_projection_work_due(&state.pool).await? {

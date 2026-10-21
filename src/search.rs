@@ -2397,6 +2397,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_terminal_recovery_failure_does_not_block_active_work() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "CREATE TRIGGER force_terminal_recovery_failure
+             BEFORE INSERT ON search_projection_outbox
+             WHEN NEW.projection_key = 'content:release:terminal-blocked'
+             BEGIN
+               SELECT RAISE(ABORT, 'forced terminal recovery failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create terminal recovery failure trigger");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox_failed (
+               projection_key, operation, resource_type, resource_id,
+               canonical_resource_type, attempt_count, last_error,
+               created_at, updated_at, failed_at
+             ) VALUES (
+               'content:release:terminal-blocked', 'upsert', 'content',
+               'terminal-blocked', 'release', 8, 'writer deadline',
+               CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '2000-01-01T00:00:00Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed terminal projection failure");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (
+               projection_key, operation, resource_type, resource_id,
+               available_at, created_at, updated_at
+             ) VALUES (
+               'notification:search-user:active-delete', 'delete', 'notification',
+               'active-delete', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active projection work");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .expect("active projection should continue after recovery failure")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'notification:search-user:active-delete'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active projection work"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-blocked'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count deferred terminal projection"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn content_projection_retries_until_search_document_exists() {
         let pool = setup_pool().await;
         sqlx::query(
