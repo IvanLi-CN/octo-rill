@@ -33,6 +33,7 @@ const PROJECTION_PROGRESS_DELAY: Duration = Duration::from_millis(10);
 const PROJECTION_IDLE_DELAY: Duration = Duration::from_secs(2);
 const PROJECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROJECTION_TERMINAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+const PROJECTION_TERMINAL_RECOVERY_CADENCE: Duration = Duration::from_secs(5);
 const PROJECTION_LEASE_SECONDS: i64 = 5;
 const PROJECTION_MAX_ATTEMPTS: i64 = 8;
 const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
@@ -128,8 +129,15 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
 pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut next_terminal_recovery_at = tokio::time::Instant::now();
         loop {
-            match run_projection_once(state.as_ref()).await {
+            let allow_terminal_recovery = tokio::time::Instant::now() >= next_terminal_recovery_at;
+            let outcome = run_projection_once(state.as_ref(), allow_terminal_recovery).await;
+            if allow_terminal_recovery {
+                next_terminal_recovery_at =
+                    tokio::time::Instant::now() + PROJECTION_TERMINAL_RECOVERY_CADENCE;
+            }
+            match outcome {
                 Ok(ProjectionRunOutcome::Committed) => {
                     tokio::time::sleep(PROJECTION_PROGRESS_DELAY).await
                 }
@@ -167,9 +175,14 @@ pub fn spawn_realtime_projection_worker(state: Arc<AppState>) -> AbortHandle {
 #[cfg(test)]
 pub(crate) async fn run_projection_for_test(state: &AppState) -> Result<bool> {
     Ok(matches!(
-        run_projection_once(state).await?,
+        run_projection_once(state, true).await?,
         ProjectionRunOutcome::Committed
     ))
+}
+
+#[cfg(test)]
+pub(crate) async fn reactivate_terminal_projection_for_test(state: &AppState) -> Result<bool> {
+    reactivate_terminal_projection_once(state).await
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -185,7 +198,10 @@ struct ProjectionOutboxRow {
     fanout_cursor: Option<String>,
 }
 
-async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
+async fn run_projection_once(
+    state: &AppState,
+    allow_terminal_recovery: bool,
+) -> Result<ProjectionRunOutcome> {
     if !projection_work_due(&state.pool).await? {
         return Ok(ProjectionRunOutcome::Idle);
     }
@@ -196,7 +212,7 @@ async fn run_projection_once(state: &AppState) -> Result<ProjectionRunOutcome> {
         return Ok(ProjectionRunOutcome::AdmissionDenied);
     };
 
-    if !active_projection_work_due(&state.pool).await? {
+    if allow_terminal_recovery {
         match reactivate_terminal_projection_once(state).await {
             Ok(true) => {}
             Ok(false) => {}

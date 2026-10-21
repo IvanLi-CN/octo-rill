@@ -2452,6 +2452,13 @@ mod tests {
             .expect("count active projection work"),
             0
         );
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(
+            crate::search_index::reactivate_terminal_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "the forced trigger must exercise the terminal recovery error path"
+        );
         assert!(
             !crate::search_index::run_projection_for_test(state.as_ref())
                 .await
