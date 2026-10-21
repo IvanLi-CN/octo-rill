@@ -6239,6 +6239,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_dispatch_pressure_preserves_foreground_writer() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(4, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 902, "scheduler-pressure").await;
+        crate::admin_runtime::update_sync_auto_fetch_interval_minutes(&pool, 30)
+            .await
+            .expect("seed scheduler pressure interval");
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 10, 30, 0)
+            .single()
+            .expect("valid scheduler pressure time");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = ? WHERE id = 1",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed scheduler pressure effective boundary");
+
+        let external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock");
+        let scheduler_tasks = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(
+                    async move { enqueue_subscription_run_if_due(state.as_ref(), now).await },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = state.sqlite_writer.runtime_status();
+                if status.background_admitted > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("scheduler dispatch should enter the shared writer lane");
+
+        let foreground_pool = pool.clone();
+        let foreground_state = state.clone();
+        let foreground_task = tokio::spawn(async move {
+            foreground_state
+                .sqlite_writer
+                .write_foreground("scheduler_pressure_foreground", |_| {
+                    let foreground_pool = foreground_pool.clone();
+                    async move {
+                        sqlx::query(
+                            "UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = '902'",
+                        )
+                        .execute(&foreground_pool)
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground writer should wait behind the external sqlite lock");
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
+        foreground_task
+            .await
+            .expect("join foreground scheduler pressure task")
+            .expect("foreground writer should succeed after lock release");
+
+        let mut committed_dispatches = 0usize;
+        for task in scheduler_tasks {
+            match task.await.expect("join scheduler pressure task") {
+                Ok(Some(_)) => committed_dispatches += 1,
+                Ok(None) => {}
+                Err(error) => assert!(
+                    !error.to_string().contains("database is locked"),
+                    "scheduler pressure must not leak raw sqlite lock errors: {error:#}"
+                ),
+            }
+        }
+        assert!(
+            committed_dispatches <= 1,
+            "shared scheduler admission must commit at most one task"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
+            )
+            .bind(TASK_SYNC_SUBSCRIPTIONS)
+            .fetch_one(&pool)
+            .await
+            .expect("count scheduler pressure tasks"),
+            i64::try_from(committed_dispatches).expect("dispatch count fits i64")
+        );
+    }
+
+    #[tokio::test]
     async fn star_scheduler_runs_delta_before_queuing_a_reconciliation_slice() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
