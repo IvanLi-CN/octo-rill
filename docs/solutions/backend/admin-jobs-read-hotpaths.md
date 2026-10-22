@@ -16,6 +16,8 @@ These reads are separate from scheduler writer admission and transaction cleanup
 
 The page, count, diagnostic, root-selection, and chain-rollup phases are observable as low-cardinality route and phase measurements. Production-shaped fixtures must target p95 below one second and p99 below two seconds for both endpoints, with no temporary sort for the bounded page or root-selection paths.
 
+Realtime subscription diagnostics read at most the configured event limit per task through one bounded index-range branch per selected task, using the existing `(task_id, created_at, id)` index and deterministic newest-first ordering. The list and detail paths share this ordering contract, so event history growth does not expand a window-function intermediate result.
+
 Index changes are delivered only through ordered migrations. The request path never creates or rebuilds an index. Any partial index over the JSON skipped predicate must be proven by `EXPLAIN QUERY PLAN` before release.
 
 ## Verification
