@@ -823,7 +823,7 @@ mod tests {
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(
-            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99]"
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100]"
         ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
