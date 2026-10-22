@@ -10,6 +10,7 @@
 
 ## Current performance follow-up
 
+- 本修复候选将调度 active-task 检查改为命中 `idx_job_tasks_status_created_at` 的短路 `EXISTS ... LIMIT 1`，避免在 writer 事务内统计历史 `job_tasks`；subscription、recent-failures、star reconciliation 与 daily brief 调度的查询错误路径会在 writer 释放前显式等待 rollback，保留任务、事件和 dispatch marker 的原子提交语义。回滚成功后连接可继续复用，回滚失败才进入现有不确定连接驱逐兜底。
 - 本轮修复候选收敛调度原子性与搜索投影解耦：任务、事件和 dispatch marker 共用同一 writer 事务，搜索核心行先提交、FTS 通过 durable outbox 异步重试；Dashboard signature 查询合同保持不变。
 - worker 处理并发不等同于 SQLite writer 并发；网络、GitHub 和 LLM 工作继续在 writer permit 外执行，只有 claim 的短写入段受 admission 约束。
 - 搜索 projection 的 `failed` 状态继续保持显式恢复语义；只有 writer 压力稳定并完成线上验收后，才执行既有管理员 resume 操作。
@@ -73,6 +74,7 @@
 - `cargo check --offline --all-targets --all-features`
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
 - `bash scripts/check-rust-source-quality.sh`（PR #333 current-head required check 通过）
+- 当前调度查询/回滚候选的 `jobs::tests::` 67 项全部通过；新增回归锁定 status-first query plan，以及显式 scheduler rollback 后 writer connection 可复用。`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings` 与 source-quality gate 均在候选 head 通过。
 - file-backed WAL acceptance：`content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（current candidate：passed；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言）
 - 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - PR #333 当前代码候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
