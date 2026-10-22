@@ -31709,6 +31709,24 @@ mod tests {
 
         let subscription_task_id =
             seed_admin_realtime_list_subscription_diagnostics(&pool, state.as_ref()).await;
+        for (index, task_id) in [
+            "acceptance-long-subscription-a",
+            "acceptance-long-subscription-b",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_admin_dashboard_task(
+                &pool,
+                task_id,
+                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                jobs::STATUS_SUCCEEDED,
+                &test_user_id(1),
+                &format!("2999-01-01T00:0{index}:00Z"),
+            )
+            .await;
+            seed_subscription_event_history(&pool, task_id, 10_025).await;
+        }
         let job_event_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM job_task_events WHERE task_id = ?")
                 .bind(&subscription_task_id)
@@ -31805,20 +31823,24 @@ mod tests {
             let mut samples = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
                 let started_at = std::time::Instant::now();
-                let outcome = super::load_recent_sync_auto_fetch_tasks(sync_state.as_ref())
-                    .await
-                    .map(|tasks| {
-                        if tasks.len() == 3 && tasks.iter().all(|task| !task.skipped) {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "unexpected recent sync task response: count={} skipped={}",
-                                tasks.len(),
-                                tasks.iter().filter(|task| task.skipped).count()
-                            ))
-                        }
-                    })
-                    .unwrap_or_else(|error| Err(error.to_string()));
+                let outcome = super::admin_get_sync_runtime_config(
+                    State(sync_state.clone()),
+                    setup_session(1).await,
+                )
+                .await
+                .map(|Json(config)| {
+                    let tasks = config.recent_sync_tasks;
+                    if tasks.len() == 3 && tasks.iter().all(|task| !task.skipped) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "unexpected recent sync task response: count={} skipped={}",
+                            tasks.len(),
+                            tasks.iter().filter(|task| task.skipped).count()
+                        ))
+                    }
+                })
+                .unwrap_or_else(|error| Err(error.to_string()));
                 samples.push((started_at.elapsed(), outcome));
             }
             samples
@@ -32104,6 +32126,48 @@ mod tests {
         }
 
         task_id
+    }
+
+    async fn seed_subscription_event_history(pool: &SqlitePool, task_id: &str, event_count: i64) {
+        sqlx::query(
+            r#"
+            WITH RECURSIVE event_rows(n) AS (
+              VALUES (0)
+              UNION ALL
+              SELECT n + 1 FROM event_rows WHERE n + 1 < ?
+            )
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            )
+            SELECT
+              ? || '-event-' || n,
+              ?,
+              'release',
+              'event-' || n,
+              'warning',
+              1,
+              1,
+              ?,
+              9000 + n,
+              'octo/repo-' || n,
+              '{"message":"history"}',
+              printf(
+                '2020-01-01T%02d:%02d:%02dZ',
+                0 + (n / 3600),
+                (n / 60) % 60,
+                n % 60
+              )
+            FROM event_rows
+            "#,
+        )
+        .bind(event_count)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(test_user_id(1))
+        .execute(pool)
+        .await
+        .expect("insert subscription event history");
     }
 
     fn report_empirical_latency_budget(
@@ -35966,45 +36030,7 @@ mod tests {
                 "2026-03-06T14:30:00Z",
             )
             .await;
-            sqlx::query(
-                r#"
-                WITH RECURSIVE event_rows(n) AS (
-                  VALUES (0)
-                  UNION ALL
-                  SELECT n + 1 FROM event_rows WHERE n + 1 < ?
-                )
-                INSERT INTO sync_subscription_events (
-                  id, task_id, stage, event_type, severity, recoverable, attempt,
-                  user_id, repo_id, repo_full_name, payload_json, created_at
-                )
-                SELECT
-                  ? || '-event-' || n,
-                  ?,
-                  'release',
-                  'event-' || n,
-                  'warning',
-                  1,
-                  1,
-                  ?,
-                  9000 + n,
-                  'octo/repo-' || n,
-                  '{"message":"history"}',
-                  printf(
-                    '2026-03-06T%02d:%02d:%02dZ',
-                    14 + (n / 3600),
-                    (n / 60) % 60,
-                    n % 60
-                  )
-                FROM event_rows
-                "#,
-            )
-            .bind(EVENT_COUNT)
-            .bind(task_id)
-            .bind(task_id)
-            .bind(test_user_id(1))
-            .execute(&pool)
-            .await
-            .expect("insert subscription event history");
+            seed_subscription_event_history(&pool, task_id, EVENT_COUNT).await;
         }
 
         let plan_rows = build_recent_sync_subscription_events_for_tasks_query(&task_ids, true)
