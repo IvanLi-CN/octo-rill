@@ -1187,7 +1187,7 @@ async fn load_recent_sync_auto_fetch_tasks(
             created_at,
             started_at,
             finished_at
-          FROM job_tasks
+          FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
           WHERE task_type = 'sync.subscriptions'
             AND CASE
               WHEN json_valid(result_json)
@@ -43181,11 +43181,15 @@ echo should_not_be_in_excerpt
         .await
         .expect("seed running subscription sync child");
 
+        sqlx::query("ANALYZE job_tasks")
+            .execute(&pool)
+            .await
+            .expect("analyze recent sync task fixture");
         let production_query_plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
             r#"
             EXPLAIN QUERY PLAN
             SELECT id
-            FROM job_tasks
+            FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
             WHERE task_type = 'sync.subscriptions'
               AND CASE
                 WHEN json_valid(result_json)
@@ -43203,50 +43207,11 @@ echo should_not_be_in_excerpt
             .iter()
             .map(|(_, _, _, detail)| detail.as_str())
             .collect::<Vec<_>>();
-        println!("production recent sync root query plan: {production_plan_details:?}");
+        println!(
+            "recent sync root query plan with production indexes: {production_plan_details:?}"
+        );
         assert!(
             production_plan_details
-                .iter()
-                .any(|detail| { detail.contains("idx_job_tasks_task_type_created_at_id") })
-        );
-
-        sqlx::query("DROP INDEX idx_job_tasks_task_type_created_at_id")
-            .execute(&pool)
-            .await
-            .expect("remove competing task type index for plan assertion");
-        sqlx::query("DROP INDEX idx_job_tasks_task_type_created_at")
-            .execute(&pool)
-            .await
-            .expect("remove legacy task type index for plan assertion");
-        sqlx::query("ANALYZE job_tasks")
-            .execute(&pool)
-            .await
-            .expect("analyze recent sync task fixture");
-        let query_plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
-            r#"
-            EXPLAIN QUERY PLAN
-            SELECT id
-            FROM job_tasks
-            WHERE task_type = 'sync.subscriptions'
-              AND CASE
-                WHEN json_valid(result_json)
-                  THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
-                ELSE 1
-              END
-            ORDER BY created_at DESC, id DESC
-            LIMIT 3
-            "#,
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("explain recent sync root selection");
-        let query_plan_details = query_plan
-            .iter()
-            .map(|(_, _, _, detail)| detail.as_str())
-            .collect::<Vec<_>>();
-        println!("partial-index candidate query plan: {query_plan_details:?}");
-        assert!(
-            query_plan_details
                 .iter()
                 .any(|detail| { detail.contains("idx_job_tasks_sync_recent_roots") })
         );
