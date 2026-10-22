@@ -1189,7 +1189,11 @@ async fn load_recent_sync_auto_fetch_tasks(
             finished_at
           FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
           WHERE task_type = 'sync.subscriptions'
-            AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+            AND CASE
+              WHEN json_valid(result_json)
+                THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+              ELSE 1
+            END
           ORDER BY created_at DESC, id DESC
           LIMIT 3
         ),
@@ -31934,16 +31938,20 @@ mod tests {
             .collect::<Vec<_>>();
         let mut background_elapsed = background_samples
             .iter()
-            .map(|(duration, _)| *duration)
+            .filter_map(|(duration, result)| result.is_ok().then_some(*duration))
             .collect::<Vec<_>>();
+        assert!(
+            !background_elapsed.is_empty(),
+            "background writer pressure must include at least one admitted write"
+        );
         background_elapsed.sort_unstable();
         eprintln!(
-            "background writer pressure: samples={} admitted={} deferred={} p95_ms={} p99_ms={} unexpected_failures={unexpected_background_failures:?}",
+            "background writer pressure: attempts={} admitted={} deferred={} admitted_p95_ms={} admitted_p99_ms={} unexpected_failures={unexpected_background_failures:?}",
+            background_samples.len(),
             background_elapsed.len(),
-            background_elapsed.len() - background_denials,
             background_denials,
-            background_elapsed[94].as_millis(),
-            background_elapsed[98].as_millis(),
+            background_elapsed[(background_elapsed.len() * 95).div_ceil(100) - 1].as_millis(),
+            background_elapsed[(background_elapsed.len() * 99).div_ceil(100) - 1].as_millis(),
         );
         assert!(
             unexpected_background_failures.is_empty(),
@@ -43017,6 +43025,25 @@ echo should_not_be_in_excerpt
             .expect("seed many skipped subscription sync rows");
         }
 
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, result_json,
+              cancel_requested, created_at, updated_at
+            )
+            VALUES (?, ?, 'failed', 'scheduler', '{}', 'not-json', 0, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::test_local_id(
+            "subscription-history-malformed-result",
+        ))
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind("2026-04-27T07:59:00Z")
+        .bind("2026-04-27T07:59:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed malformed historical subscription result");
+
         for (idx, task_id, started_at, finished_at) in [
             (
                 1,
@@ -43152,7 +43179,11 @@ echo should_not_be_in_excerpt
             SELECT id
             FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
             WHERE task_type = 'sync.subscriptions'
-              AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+              AND CASE
+                WHEN json_valid(result_json)
+                  THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+                ELSE 1
+              END
             ORDER BY created_at DESC, id DESC
             LIMIT 3
             "#,

@@ -813,6 +813,12 @@ mod tests {
             .run(&pool)
             .await
             .expect("apply schema through migration 100");
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, result_json, created_at, updated_at) VALUES ('legacy-malformed-sync-result', 'sync.subscriptions', 'failed', 'scheduler', '{}', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed malformed legacy subscription result");
 
         run(&pool)
             .await
@@ -846,6 +852,7 @@ mod tests {
         .await
         .expect("read recent sync roots index");
         assert!(index_sql.contains("task_type = 'sync.subscriptions'"));
+        assert!(index_sql.contains("json_valid(result_json)"));
         assert!(index_sql.contains("COALESCE(json_extract(result_json, '$.skipped'), 0) != 1"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -856,6 +863,12 @@ mod tests {
             .expect("check subscription child linkage index"),
             1
         );
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, result_json, created_at, updated_at) VALUES ('new-malformed-sync-result', 'sync.subscriptions', 'failed', 'scheduler', '{}', 'still-not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("malformed result remains compatible with partial index maintenance");
     }
 
     #[tokio::test]
