@@ -4365,7 +4365,69 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
         return Ok(HashMap::new());
     }
 
-    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+    let mut query = build_subscription_diagnostic_progress_events_query(task_ids, false);
+
+    let rows = query
+        .build_query_as::<AdminTaskDiagnosticEventRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut candidates = HashMap::<String, Vec<AdminTaskDiagnosticEventRow>>::new();
+    for row in rows {
+        candidates.entry(row.task_id.clone()).or_default().push(row);
+    }
+
+    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    for (task_id, task_candidates) in candidates {
+        let mut seen_summaries = HashSet::new();
+        let mut summaries = Vec::new();
+        let mut recent = Vec::new();
+        for event in task_candidates.into_iter().rev() {
+            let stage = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("stage")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if let Some(stage) = stage.filter(|stage| {
+                matches!(
+                    stage.as_str(),
+                    "collect" | "release_summary" | "social_summary" | "notifications_summary"
+                )
+            }) {
+                if seen_summaries.insert(stage) {
+                    summaries.push(event);
+                }
+            } else {
+                recent.push(event);
+            }
+        }
+        recent.truncate(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize - summaries.len());
+        summaries.extend(recent);
+        summaries.sort_by_key(|event| event.event_rowid);
+        grouped.insert(
+            task_id,
+            summaries
+                .into_iter()
+                .map(AdminTaskEventItem::from)
+                .collect(),
+        );
+    }
+    Ok(grouped)
+}
+
+fn build_subscription_diagnostic_progress_events_query<'a>(
+    task_ids: &'a [String],
+    explain_query_plan: bool,
+) -> QueryBuilder<'a, Sqlite> {
+    let mut query = QueryBuilder::<Sqlite>::new(if explain_query_plan {
+        "EXPLAIN QUERY PLAN "
+    } else {
+        ""
+    });
+    query.push(
         r#"
         WITH task_ids(task_id) AS (
         "#,
@@ -4436,60 +4498,12 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
           event.created_at,
           event.rowid AS event_rowid
         FROM retained_event_rows AS retained
-        JOIN job_task_events AS event ON event.rowid = retained.event_rowid
+        -- Keep the bounded retained set outermost for rowid primary-key seeks.
+        CROSS JOIN job_task_events AS event ON event.rowid = retained.event_rowid
         ORDER BY event.task_id ASC, event.rowid ASC
         "#,
     );
-
-    let rows = query
-        .build_query_as::<AdminTaskDiagnosticEventRow>()
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let mut candidates = HashMap::<String, Vec<AdminTaskDiagnosticEventRow>>::new();
-    for row in rows {
-        candidates.entry(row.task_id.clone()).or_default().push(row);
-    }
-
-    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
-    for (task_id, task_candidates) in candidates {
-        let mut seen_summaries = HashSet::new();
-        let mut summaries = Vec::new();
-        let mut recent = Vec::new();
-        for event in task_candidates.into_iter().rev() {
-            let stage = serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                .ok()
-                .and_then(|payload| {
-                    payload
-                        .get("stage")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                });
-            if let Some(stage) = stage.filter(|stage| {
-                matches!(
-                    stage.as_str(),
-                    "collect" | "release_summary" | "social_summary" | "notifications_summary"
-                )
-            }) {
-                if seen_summaries.insert(stage) {
-                    summaries.push(event);
-                }
-            } else {
-                recent.push(event);
-            }
-        }
-        recent.truncate(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize - summaries.len());
-        summaries.extend(recent);
-        summaries.sort_by_key(|event| event.event_rowid);
-        grouped.insert(
-            task_id,
-            summaries
-                .into_iter()
-                .map(AdminTaskEventItem::from)
-                .collect(),
-        );
-    }
-    Ok(grouped)
+    query
 }
 
 async fn load_recent_sync_subscription_events(
@@ -26497,6 +26511,7 @@ mod tests {
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
         AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        build_subscription_diagnostic_progress_events_query,
         load_subscription_diagnostic_progress_events_for_tasks,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
         DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
@@ -26587,7 +26602,11 @@ mod tests {
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
-    use tower_sessions::{MemoryStore, Session};
+    use tower_sessions::{
+        MemoryStore, Session, SessionStore,
+        session::{Id, Record},
+    };
+    use tower_sessions_sqlx_store::SqliteStore;
     use url::Url;
 
     fn test_user_id(id: i64) -> String {
@@ -31276,6 +31295,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_realtime_list_diagnostic_query_seeks_retained_event_rowids() {
+        let pool = setup_pool().await;
+        seed_admin_dashboard_task(
+            &pool,
+            "unrelated-task",
+            jobs::TASK_SYNC_RELEASES,
+            jobs::STATUS_SUCCEEDED,
+            &test_user_id(1),
+            "2026-03-06T13:59:00Z",
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "target-task",
+            jobs::TASK_SYNC_RELEASES,
+            jobs::STATUS_SUCCEEDED,
+            &test_user_id(1),
+            "2026-03-06T14:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            WITH RECURSIVE unrelated_events(n) AS (
+              VALUES (1)
+              UNION ALL
+              SELECT n + 1 FROM unrelated_events WHERE n < 12000
+            )
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            SELECT
+              printf('unrelated-event-%06d', n),
+              'unrelated-task',
+              'task.progress',
+              '{"stage":"repo_collect","total_repos":1}',
+              printf('2026-03-06T14:%02d:%02dZ', (n / 60) % 60, n % 60)
+            FROM unrelated_events
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated task event history");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES
+              ('target-event-old', 'target-task', 'task.progress', '{"stage":"collect"}', '2026-03-06T14:00:00Z'),
+              ('target-event-new', 'target-task', 'task.progress', '{"stage":"repo_collect"}', '2026-03-06T14:00:01Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed retained target task events");
+
+        let task_ids = vec!["target-task".to_owned()];
+        let plan_rows = build_subscription_diagnostic_progress_events_query(&task_ids, true)
+            .build()
+            .fetch_all(&pool)
+            .await
+            .expect("explain complete diagnostic events query");
+        let plan_details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .expect("read bundled SQLite version");
+        eprintln!(
+            "complete diagnostic event query: sqlite_version={sqlite_version} unrelated_event_rows=12000 plan={plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("SEARCH event USING INTEGER PRIMARY KEY (rowid=?)")),
+            "complete query must fetch retained events by rowid: {plan_details:?}"
+        );
+        assert!(
+            !plan_details.iter().any(|detail| {
+                detail.contains("SCAN event") || detail.contains("SCAN job_task_events AS event")
+            }),
+            "complete query must not scan the global event history: {plan_details:?}"
+        );
+
+        let state = setup_state(pool);
+        let events =
+            load_subscription_diagnostic_progress_events_for_tasks(state.as_ref(), &task_ids)
+                .await
+                .expect("load bounded events using complete diagnostic query");
+        assert_eq!(
+            events
+                .get("target-task")
+                .expect("target task events")
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["target-event-old", "target-event-new"]
+        );
+    }
+
+    #[tokio::test]
     async fn admin_list_realtime_tasks_separates_user_sync_from_general_schedules() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -31497,9 +31615,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "manual 100k-row authenticated endpoint latency and writer-pressure acceptance"]
-    async fn admin_realtime_list_meets_100k_history_latency_under_background_writes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual 100k-row authenticated endpoint and coordinated writer acceptance"]
+    async fn admin_realtime_list_and_foreground_writes_meet_100k_latency_budget() {
+        const SAMPLES: usize = 100;
         let pool = setup_pool_with_max_connections(8).await;
         sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
             .bind(test_user_id(1))
@@ -31538,57 +31657,206 @@ mod tests {
         .expect("seed 100,000 historical job tasks");
 
         let state = setup_state(pool.clone());
-        let pressure_state = state.clone();
-        let writer_pressure = tokio::spawn(async move {
-            for index in 0..200 {
-                sqlx::query("UPDATE users SET last_active_at = ? WHERE id = ?")
-                    .bind(format!("2026-03-06T14:{:02}:00Z", index % 60))
-                    .bind(test_user_id(1))
-                    .execute(
-                        pressure_state
-                            .sqlite_writer
-                            .write_pool_or(&pressure_state.pool),
-                    )
-                    .await
-                    .expect("background writer should complete under read pressure");
-                tokio::task::yield_now().await;
-            }
-        });
+        let session_store = crate::session_store::CoordinatedSqliteSessionStore::new(
+            SqliteStore::new(pool.clone()),
+            pool.clone(),
+            state.sqlite_writer.clone(),
+        );
+        session_store
+            .migrate()
+            .await
+            .expect("migrate coordinated session store");
+        let mut session_record = Record {
+            id: Id::default(),
+            data: std::collections::HashMap::from([("user_id".to_owned(), json!(test_user_id(1)))]),
+            expiry_date: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+        session_store
+            .create(&mut session_record)
+            .await
+            .expect("create coordinated session fixture");
 
-        let mut elapsed = Vec::with_capacity(100);
-        for _ in 0..100 {
-            let started_at = std::time::Instant::now();
-            let response = admin_list_realtime_tasks(
-                State(state.clone()),
-                setup_session(1).await,
-                Query(AdminRealtimeTasksQuery {
-                    status: Some("all".to_owned()),
-                    task_type: None,
-                    exclude_task_type: None,
-                    task_group: None,
-                    page: Some(1),
-                    page_size: Some(100),
-                }),
+        let mut cancel_task_ids = Vec::with_capacity(SAMPLES);
+        for index in 0..SAMPLES {
+            let task = jobs::enqueue_task(
+                state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    payload: json!({"cancel_fixture": index}),
+                    source: "latency-acceptance-fixture".to_owned(),
+                    requested_by: Some(test_user_id(1)),
+                    parent_task_id: None,
+                },
             )
             .await
-            .expect("authenticated endpoint should succeed under writer pressure")
-            .0;
-            assert!(response.total >= 100_000);
-            assert_eq!(response.items.len(), 100);
-            elapsed.push(started_at.elapsed());
+            .expect("enqueue cancel fixture task");
+            cancel_task_ids.push(task.task_id);
         }
-        writer_pressure
+
+        let list_state = state.clone();
+        let list_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let result = admin_list_realtime_tasks(
+                    State(list_state.clone()),
+                    setup_session(1).await,
+                    Query(AdminRealtimeTasksQuery {
+                        status: Some("all".to_owned()),
+                        task_type: None,
+                        exclude_task_type: None,
+                        task_group: None,
+                        page: Some(1),
+                        page_size: Some(100),
+                    }),
+                )
+                .await;
+                let outcome = match result {
+                    Ok(response)
+                        if response.0.total >= 100_000 && response.0.items.len() == 100 =>
+                    {
+                        Ok(())
+                    }
+                    Ok(response) => Err(format!(
+                        "unexpected list response: total={} items={}",
+                        response.0.total,
+                        response.0.items.len()
+                    )),
+                    Err(error) => Err(error.to_string()),
+                };
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
+        let session_store_for_samples = session_store.clone();
+        let session_id = session_record.id;
+        let enqueue_state = state.clone();
+        let cancel_state = state.clone();
+        let mut session_samples = Vec::with_capacity(SAMPLES);
+        let mut enqueue_samples = Vec::with_capacity(SAMPLES);
+        let mut cancel_samples = Vec::with_capacity(SAMPLES);
+        for (index, task_id) in cancel_task_ids.iter().enumerate() {
+            let store = session_store_for_samples.clone();
+            let id = session_id;
+            let sample = crate::session_store::with_session_baseline_scope(async move {
+                let started_at = std::time::Instant::now();
+                let mut record = match store.load(&id).await {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        return (started_at.elapsed(), Err("session disappeared".to_owned()));
+                    }
+                    Err(error) => return (started_at.elapsed(), Err(error.to_string())),
+                };
+                record
+                    .data
+                    .insert("write_sequence".to_owned(), json!(index));
+                let outcome = store.save(&record).await.map_err(|error| error.to_string());
+                (started_at.elapsed(), outcome)
+            })
+            .await;
+            session_samples.push(sample);
+
+            let started_at = std::time::Instant::now();
+            let outcome = jobs::enqueue_task(
+                enqueue_state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    payload: json!({"latency_sample": index}),
+                    source: "latency-acceptance".to_owned(),
+                    requested_by: Some(test_user_id(1)),
+                    parent_task_id: None,
+                },
+            )
             .await
-            .expect("background writer task should not panic");
+            .map(|task| {
+                if task.status == jobs::STATUS_QUEUED {
+                    Ok(())
+                } else {
+                    Err(format!("unexpected enqueue status: {}", task.status))
+                }
+            })
+            .unwrap_or_else(|error| Err(error.to_string()));
+            enqueue_samples.push((started_at.elapsed(), outcome));
+
+            let started_at = std::time::Instant::now();
+            let outcome = jobs::cancel_task(cancel_state.as_ref(), task_id)
+                .await
+                .map(|status| {
+                    if status == jobs::STATUS_CANCELED {
+                        Ok(())
+                    } else {
+                        Err(format!("unexpected cancel status: {status}"))
+                    }
+                })
+                .unwrap_or_else(|error| Err(error.to_string()));
+            cancel_samples.push((started_at.elapsed(), outcome));
+        }
+
+        let list_samples = list_samples.await.expect("list sampler should not panic");
+        let mut budget_failures = Vec::new();
+        budget_failures.extend(report_empirical_latency_budget(
+            "authenticated_admin_list",
+            list_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "coordinated_session_store_roundtrip",
+            session_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "jobs_enqueue_task",
+            enqueue_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "jobs_cancel_task",
+            cancel_samples,
+            SAMPLES,
+        ));
+        assert!(
+            budget_failures.is_empty(),
+            "empirical budget failures: {budget_failures:?}"
+        );
+    }
+
+    fn report_empirical_latency_budget(
+        path: &str,
+        samples: Vec<(std::time::Duration, Result<(), String>)>,
+        expected_samples: usize,
+    ) -> Vec<String> {
+        assert_eq!(samples.len(), expected_samples, "{path} sample count");
+        let success_count = samples.iter().filter(|(_, result)| result.is_ok()).count();
+        let failures = samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut elapsed = samples
+            .into_iter()
+            .map(|(duration, _)| duration)
+            .collect::<Vec<_>>();
         elapsed.sort_unstable();
+        let p50_ms = elapsed[49].as_millis();
         let p95_ms = elapsed[94].as_millis();
         let p99_ms = elapsed[98].as_millis();
         eprintln!(
-            "authenticated admin realtime task list: rows=100000 samples={} p95_ms={p95_ms} p99_ms={p99_ms}",
-            elapsed.len()
+            "foreground path: name={path} samples={} succeeded={success_count} failed={} p50_ms={p50_ms} p95_ms={p95_ms} p99_ms={p99_ms} failures={failures:?}",
+            elapsed.len(),
+            expected_samples - success_count
         );
-        assert!(p95_ms < 1_000, "p95 exceeded 1s: {p95_ms}ms");
-        assert!(p99_ms < 2_000, "p99 exceeded 2s: {p99_ms}ms");
+        let mut budget_failures = failures
+            .into_iter()
+            .map(|failure| format!("{path}: {failure}"))
+            .collect::<Vec<_>>();
+        if p95_ms >= 1_000 {
+            budget_failures.push(format!("{path} p95 exceeded 1s: {p95_ms}ms"));
+        }
+        if p99_ms >= 2_000 {
+            budget_failures.push(format!("{path} p99 exceeded 2s: {p99_ms}ms"));
+        }
+        budget_failures
     }
 
     #[tokio::test]
