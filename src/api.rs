@@ -4374,7 +4374,16 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
             event_type,
             payload_json,
             created_at,
-            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY rowid DESC) AS task_event_rank
+            rowid AS event_rowid,
+            CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END
+              AS is_collect_event,
+            ROW_NUMBER() OVER (
+              PARTITION BY task_id,
+                CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END
+              ORDER BY rowid DESC
+            ) AS task_stage_rank,
+            MAX(CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END)
+              OVER (PARTITION BY task_id) AS has_collect_event
           FROM job_task_events
           WHERE task_id IN (
         "#,
@@ -4402,11 +4411,14 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
             'notifications_summary'
           )
         )
-        WHERE task_event_rank <=
+        WHERE (is_collect_event = 1 AND task_stage_rank = 1)
+           OR (
+             is_collect_event = 0
+             AND task_stage_rank <=
         "#,
     );
     query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
-    query.push(" ORDER BY task_id ASC, task_event_rank DESC");
+    query.push(" - has_collect_event) ORDER BY task_id ASC, event_rowid ASC");
 
     let rows = query
         .build_query_as::<AdminTaskDiagnosticEventRow>()
@@ -31021,6 +31033,19 @@ mod tests {
             "2026-03-06T14:30:00Z",
         )
         .await;
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-collect-event")
+        .bind("task-subscription-event-limit")
+        .bind(r#"{"stage":"collect","total_users":123}"#)
+        .bind(indexed_created_at(0))
+        .execute(&pool)
+        .await
+        .expect("seed subscription collect event");
         for event_index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
             sqlx::query(
                 r#"
@@ -31033,7 +31058,7 @@ mod tests {
             .bind(format!(
                 r#"{{"stage":"repo_collect","total_repos":{event_index}}}"#
             ))
-            .bind(indexed_created_at(event_index as usize))
+            .bind(indexed_created_at(event_index as usize + 1))
             .execute(&pool)
             .await
             .expect("seed subscription progress event");
@@ -31052,10 +31077,17 @@ mod tests {
         assert_eq!(events.len(), ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&events[0].payload_json)
-                .expect("oldest retained event")
+                .expect("collect event")
+                .get("total_users")
+                .and_then(serde_json::Value::as_i64),
+            Some(123)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[1].payload_json)
+                .expect("oldest retained non-collect event")
                 .get("total_repos")
                 .and_then(serde_json::Value::as_i64),
-            Some(5)
+            Some(6)
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&events[events.len() - 1].payload_json)
@@ -31063,6 +31095,23 @@ mod tests {
                 .get("total_repos")
                 .and_then(serde_json::Value::as_i64),
             Some(24)
+        );
+
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777954200"}"#,
+            None,
+            None,
+        );
+        let diagnostics = build_task_diagnostics(&task, events, &[]).expect("diagnostics");
+        assert_eq!(
+            diagnostics
+                .sync_subscriptions
+                .expect("subscription diagnostics")
+                .collect
+                .total_users,
+            123
         );
     }
 
