@@ -26522,6 +26522,7 @@ mod tests {
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
         build_subscription_diagnostic_progress_events_query,
         build_recent_sync_subscription_events_for_tasks_query,
+        load_recent_sync_subscription_events,
         load_recent_sync_subscription_events_for_tasks,
         load_subscription_diagnostic_progress_events_for_tasks,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
@@ -35950,6 +35951,7 @@ mod tests {
     #[tokio::test]
     async fn admin_realtime_list_subscription_events_use_bounded_index_ranges() {
         let pool = setup_pool().await;
+        const EVENT_COUNT: i64 = 10_025;
         let task_ids = vec![
             "task-subscription-events-a".to_owned(),
             "task-subscription-events-b".to_owned(),
@@ -35964,27 +35966,45 @@ mod tests {
                 "2026-03-06T14:30:00Z",
             )
             .await;
-            for index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
-                sqlx::query(
-                    r#"
-                    INSERT INTO sync_subscription_events (
-                      id, task_id, stage, event_type, severity, recoverable, attempt,
-                      user_id, repo_id, repo_full_name, payload_json, created_at
-                    ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
-                    "#,
+            sqlx::query(
+                r#"
+                WITH RECURSIVE event_rows(n) AS (
+                  VALUES (0)
+                  UNION ALL
+                  SELECT n + 1 FROM event_rows WHERE n + 1 < ?
                 )
-                .bind(format!("{task_id}-event-{index}"))
-                .bind(task_id)
-                .bind(format!("event-{index}"))
-                .bind(test_user_id(1))
-                .bind(9000_i64 + index)
-                .bind(format!("octo/repo-{index}"))
-                .bind(format!(r#"{{"message":"event-{index}"}}"#))
-                .bind(indexed_created_at(index as usize))
-                .execute(&pool)
-                .await
-                .expect("insert subscription event history");
-            }
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                )
+                SELECT
+                  ? || '-event-' || n,
+                  ?,
+                  'release',
+                  'event-' || n,
+                  'warning',
+                  1,
+                  1,
+                  ?,
+                  9000 + n,
+                  'octo/repo-' || n,
+                  '{"message":"history"}',
+                  printf(
+                    '2026-03-06T%02d:%02d:%02dZ',
+                    14 + (n / 3600),
+                    (n / 60) % 60,
+                    n % 60
+                  )
+                FROM event_rows
+                "#,
+            )
+            .bind(EVENT_COUNT)
+            .bind(task_id)
+            .bind(task_id)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("insert subscription event history");
         }
 
         let plan_rows = build_recent_sync_subscription_events_for_tasks_query(&task_ids, true)
@@ -36013,10 +36033,30 @@ mod tests {
                 task_events.len(),
                 ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
             );
-            assert_eq!(task_events[0].event_type, "event-24");
+            assert_eq!(
+                task_events[0].event_type,
+                format!("event-{}", EVENT_COUNT - 1)
+            );
             assert_eq!(
                 task_events.last().expect("oldest event").event_type,
-                "event-5"
+                format!(
+                    "event-{}",
+                    EVENT_COUNT - ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT
+                )
+            );
+
+            let detail_events = load_recent_sync_subscription_events(state.as_ref(), &task_id)
+                .await
+                .expect("load detail subscription events");
+            assert_eq!(
+                detail_events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>(),
+                task_events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>()
             );
         }
     }
