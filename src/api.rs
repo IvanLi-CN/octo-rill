@@ -4529,7 +4529,7 @@ async fn load_recent_sync_subscription_events(
           created_at
         FROM sync_subscription_events
         WHERE task_id = ?
-        ORDER BY rowid DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?
         "#,
     )
@@ -4549,55 +4549,7 @@ async fn load_recent_sync_subscription_events_for_tasks(
         return Ok(HashMap::new());
     }
 
-    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
-        r#"
-        SELECT
-          id,
-          task_id,
-          stage,
-          event_type,
-          severity,
-          recoverable,
-          attempt,
-          user_id,
-          repo_id,
-          repo_full_name,
-          payload_json,
-          created_at
-        FROM (
-          SELECT
-            id,
-            task_id,
-            stage,
-            event_type,
-            severity,
-            recoverable,
-            attempt,
-            user_id,
-            repo_id,
-            repo_full_name,
-            payload_json,
-            created_at,
-            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY rowid DESC) AS task_event_rank
-          FROM sync_subscription_events
-          WHERE task_id IN (
-        "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(task_id);
-        }
-    }
-    query.push(
-        r#"
-          )
-        )
-        WHERE task_event_rank <=
-        "#,
-    );
-    query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
-    query.push(" ORDER BY task_id ASC, created_at DESC, id DESC");
+    let mut query = build_recent_sync_subscription_events_for_tasks_query(task_ids, false);
 
     let rows = query
         .build_query_as::<AdminSyncSubscriptionEventRow>()
@@ -4612,6 +4564,61 @@ async fn load_recent_sync_subscription_events_for_tasks(
             .push(map_sync_subscription_event(row));
     }
     Ok(grouped)
+}
+
+fn build_recent_sync_subscription_events_for_tasks_query<'a>(
+    task_ids: &'a [String],
+    explain_query_plan: bool,
+) -> QueryBuilder<'a, sqlx::Sqlite> {
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(if explain_query_plan {
+        "EXPLAIN QUERY PLAN "
+    } else {
+        ""
+    });
+    for (index, task_id) in task_ids.iter().enumerate() {
+        if index > 0 {
+            query.push(" UNION ALL ");
+        }
+        query.push(
+            r#"
+            SELECT
+              id,
+              task_id,
+              stage,
+              event_type,
+              severity,
+              recoverable,
+              attempt,
+              user_id,
+              repo_id,
+              repo_full_name,
+              payload_json,
+              created_at
+            FROM (
+              SELECT
+                id,
+                task_id,
+                stage,
+                event_type,
+                severity,
+                recoverable,
+                attempt,
+                user_id,
+                repo_id,
+                repo_full_name,
+                payload_json,
+                created_at
+              FROM sync_subscription_events
+              WHERE task_id =
+            "#,
+        );
+        query.push_bind(task_id);
+        query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
+        query.push(") AS recent_task_events");
+    }
+    query.push(" ORDER BY task_id ASC, created_at DESC, id DESC");
+    query
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26514,6 +26521,8 @@ mod tests {
         AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
         build_subscription_diagnostic_progress_events_query,
+        build_recent_sync_subscription_events_for_tasks_query,
+        load_recent_sync_subscription_events_for_tasks,
         load_subscription_diagnostic_progress_events_for_tasks,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
         DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
@@ -35936,6 +35945,80 @@ mod tests {
         );
         assert_eq!(sync.social.events, 3);
         assert_eq!(sync.notifications.notifications, 4);
+    }
+
+    #[tokio::test]
+    async fn admin_realtime_list_subscription_events_use_bounded_index_ranges() {
+        let pool = setup_pool().await;
+        let task_ids = vec![
+            "task-subscription-events-a".to_owned(),
+            "task-subscription-events-b".to_owned(),
+        ];
+        for task_id in &task_ids {
+            seed_admin_dashboard_task(
+                &pool,
+                task_id,
+                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                jobs::STATUS_SUCCEEDED,
+                &test_user_id(1),
+                "2026-03-06T14:30:00Z",
+            )
+            .await;
+            for index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO sync_subscription_events (
+                      id, task_id, stage, event_type, severity, recoverable, attempt,
+                      user_id, repo_id, repo_full_name, payload_json, created_at
+                    ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(format!("{task_id}-event-{index}"))
+                .bind(task_id)
+                .bind(format!("event-{index}"))
+                .bind(test_user_id(1))
+                .bind(9000_i64 + index)
+                .bind(format!("octo/repo-{index}"))
+                .bind(format!(r#"{{"message":"event-{index}"}}"#))
+                .bind(indexed_created_at(index as usize))
+                .execute(&pool)
+                .await
+                .expect("insert subscription event history");
+            }
+        }
+
+        let plan_rows = build_recent_sync_subscription_events_for_tasks_query(&task_ids, true)
+            .build()
+            .fetch_all(&pool)
+            .await
+            .expect("load bounded subscription event query plan");
+        let plan_details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_sync_subscription_events_task_id_created_at")),
+            "bounded subscription event query must use the task/time index: {plan_details:?}"
+        );
+
+        let state = setup_state(pool);
+        let events = load_recent_sync_subscription_events_for_tasks(state.as_ref(), &task_ids)
+            .await
+            .expect("load bounded subscription events");
+        for task_id in task_ids {
+            let task_events = events.get(&task_id).expect("task subscription events");
+            assert_eq!(
+                task_events.len(),
+                ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+            );
+            assert_eq!(task_events[0].event_type, "event-24");
+            assert_eq!(
+                task_events.last().expect("oldest event").event_type,
+                "event-5"
+            );
+        }
     }
 
     #[tokio::test]
