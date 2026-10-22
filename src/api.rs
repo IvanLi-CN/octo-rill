@@ -4301,6 +4301,7 @@ struct AdminTaskDiagnosticEventRow {
     event_type: String,
     payload_json: String,
     created_at: String,
+    event_rowid: i64,
 }
 
 impl From<AdminTaskDiagnosticEventRow> for AdminTaskEventItem {
@@ -4366,78 +4367,30 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
 
     let mut query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
-        SELECT task_id, id, event_type, payload_json, created_at
-        FROM (
-          SELECT
-            task_id,
-            id,
-            event_type,
-            payload_json,
-            created_at,
-            event_rowid,
-            stage,
-            summary_rank,
-            retained_group_rank,
-            reserved_count
-          FROM (
-            SELECT
-              task_id,
-              id,
-              event_type,
-              payload_json,
-              created_at,
-              event_rowid,
-              stage,
-              ROW_NUMBER() OVER (
-                PARTITION BY task_id, stage
-                ORDER BY event_rowid DESC
-              ) AS summary_rank,
-              ROW_NUMBER() OVER (
-                PARTITION BY task_id,
-                  CASE WHEN stage IN (
-                    'collect', 'release_summary', 'social_summary', 'notifications_summary'
-                  ) THEN 0 ELSE 1 END
-                ORDER BY event_rowid DESC
-              ) AS retained_group_rank,
-              MAX(CASE WHEN stage = 'collect' THEN 1 ELSE 0 END)
-                OVER (PARTITION BY task_id)
-              + MAX(CASE WHEN stage = 'release_summary' THEN 1 ELSE 0 END)
-                OVER (PARTITION BY task_id)
-              + MAX(CASE WHEN stage = 'social_summary' THEN 1 ELSE 0 END)
-                OVER (PARTITION BY task_id)
-              + MAX(CASE WHEN stage = 'notifications_summary' THEN 1 ELSE 0 END)
-                OVER (PARTITION BY task_id) AS reserved_count
-            FROM (
-              SELECT task_id, id, event_type, payload_json, created_at, event_rowid, stage
-              FROM (
-                SELECT
-                  task_id,
-                  id,
-                  event_type,
-                  payload_json,
-                  created_at,
-                  rowid AS event_rowid,
-                  CASE WHEN json_valid(payload_json)
-                    THEN json_extract(payload_json, '$.stage')
-                    ELSE NULL
-                  END AS stage
-                FROM job_task_events
-                WHERE task_id IN (
+        WITH task_ids(task_id) AS (
         "#,
     );
-    {
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(task_id);
-        }
-    }
+    query.push_values(task_ids, |mut row, task_id| {
+        row.push_bind(task_id);
+    });
     query.push(
         r#"
-                  )
-                  AND event_type = 'task.progress'
-                  AND json_valid(payload_json)
-              )
-              WHERE stage IN (
+        ), summary_stages(stage) AS (
+          VALUES ('collect'), ('release_summary'), ('social_summary'), ('notifications_summary')
+        ), retained_event_rows(task_id, event_rowid) AS (
+          SELECT task.task_id, event.rowid
+          FROM task_ids AS task
+          JOIN job_task_events AS event
+            ON event.rowid IN (
+              SELECT candidate.rowid
+              FROM job_task_events AS candidate
+              WHERE candidate.task_id = task.task_id
+                AND candidate.event_type = 'task.progress'
+                AND json_valid(candidate.payload_json)
+                AND CASE WHEN json_valid(candidate.payload_json)
+                  THEN json_extract(candidate.payload_json, '$.stage')
+                  ELSE NULL
+                END IN (
                 'collect',
                 'repo_collect',
                 'release_attached',
@@ -4448,31 +4401,93 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
                 'notifications_progress',
                 'notifications_summary'
               )
-            )
-          )
-        )
-        WHERE (
-          stage IN ('collect', 'release_summary', 'social_summary', 'notifications_summary')
-          AND summary_rank = 1
-        ) OR (
-          stage NOT IN ('collect', 'release_summary', 'social_summary', 'notifications_summary')
-          AND retained_group_rank <=
+              ORDER BY candidate.rowid DESC
+              LIMIT
         "#,
     );
     query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
-    query.push(" - reserved_count) ORDER BY task_id ASC, event_rowid ASC");
+    query.push(
+        r#"
+            )
+          UNION
+          SELECT task.task_id, event.rowid
+          FROM task_ids AS task
+          CROSS JOIN summary_stages AS summary
+          JOIN job_task_events AS event
+            ON event.rowid = (
+              SELECT candidate.rowid
+              FROM job_task_events AS candidate
+              WHERE candidate.task_id = task.task_id
+                AND candidate.event_type = 'task.progress'
+                AND json_valid(candidate.payload_json)
+                AND CASE WHEN json_valid(candidate.payload_json)
+                  THEN json_extract(candidate.payload_json, '$.stage')
+                  ELSE NULL
+                END = summary.stage
+              ORDER BY candidate.rowid DESC
+              LIMIT 1
+            )
+        )
+        SELECT
+          event.task_id,
+          event.id,
+          event.event_type,
+          event.payload_json,
+          event.created_at,
+          event.rowid AS event_rowid
+        FROM retained_event_rows AS retained
+        JOIN job_task_events AS event ON event.rowid = retained.event_rowid
+        ORDER BY event.task_id ASC, event.rowid ASC
+        "#,
+    );
 
     let rows = query
         .build_query_as::<AdminTaskDiagnosticEventRow>()
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    let mut candidates = HashMap::<String, Vec<AdminTaskDiagnosticEventRow>>::new();
     for row in rows {
-        grouped
-            .entry(row.task_id.clone())
-            .or_default()
-            .push(AdminTaskEventItem::from(row));
+        candidates.entry(row.task_id.clone()).or_default().push(row);
+    }
+
+    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    for (task_id, task_candidates) in candidates {
+        let mut seen_summaries = HashSet::new();
+        let mut summaries = Vec::new();
+        let mut recent = Vec::new();
+        for event in task_candidates.into_iter().rev() {
+            let stage = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("stage")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if let Some(stage) = stage.filter(|stage| {
+                matches!(
+                    stage.as_str(),
+                    "collect" | "release_summary" | "social_summary" | "notifications_summary"
+                )
+            }) {
+                if seen_summaries.insert(stage) {
+                    summaries.push(event);
+                }
+            } else {
+                recent.push(event);
+            }
+        }
+        recent.truncate(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize - summaries.len());
+        summaries.extend(recent);
+        summaries.sort_by_key(|event| event.event_rowid);
+        grouped.insert(
+            task_id,
+            summaries
+                .into_iter()
+                .map(AdminTaskEventItem::from)
+                .collect(),
+        );
     }
     Ok(grouped)
 }
@@ -31146,7 +31161,7 @@ mod tests {
         .await
         .expect("seed malformed subscription progress event");
 
-        let state = setup_state(pool);
+        let state = setup_state(pool.clone());
         let events = load_subscription_diagnostic_progress_events_for_tasks(
             state.as_ref(),
             &["task-subscription-event-limit".to_owned()],
@@ -31184,6 +31199,62 @@ mod tests {
                 .get("total_repos")
                 .and_then(serde_json::Value::as_i64),
             Some(24)
+        );
+
+        let event_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT rowid
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = ?
+            ORDER BY rowid DESC
+            LIMIT ?
+            "#,
+        )
+        .bind("task-subscription-event-limit")
+        .bind("task.progress")
+        .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
+        .fetch_all(&pool)
+        .await
+        .expect("load bounded diagnostic event query plan");
+        let event_plan_details = event_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            event_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_task_events_task_id_event_type") })
+        );
+        let summary_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT rowid
+            FROM job_task_events
+            WHERE task_id = ?
+              AND event_type = ?
+              AND CASE WHEN json_valid(payload_json)
+                THEN json_extract(payload_json, '$.stage')
+                ELSE NULL
+              END = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind("task-subscription-event-limit")
+        .bind("task.progress")
+        .bind("release_summary")
+        .fetch_all(&pool)
+        .await
+        .expect("load bounded summary event query plan");
+        let summary_plan_details = summary_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            summary_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_task_events_task_id_event_type_stage") })
         );
 
         let task = test_task_detail_item(
