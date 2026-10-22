@@ -4128,6 +4128,7 @@ pub async fn admin_list_realtime_tasks(
     let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
     let scheduled_tasks = jobs::SCHEDULED_TASK_TYPES
         .iter()
+        .filter(|task| jobs::is_scheduled_task_type(task))
         .map(|task| (*task).to_owned())
         .collect::<Vec<_>>();
     let user_sync_tasks = [
@@ -4138,18 +4139,26 @@ pub async fn admin_list_realtime_tasks(
         QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
     append_admin_realtime_task_filters(
         &mut total_query,
-        status.clone(),
-        task_type.clone(),
-        exclude_task_type.clone(),
-        task_group.clone(),
+        &status,
+        &task_type,
+        &exclude_task_type,
+        &task_group,
         &scheduled_tasks,
         &user_sync_tasks,
     );
+    let count_started_at = std::time::Instant::now();
     let total = total_query
         .build_query_scalar::<i64>()
         .fetch_one(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "count",
+        elapsed_ms = count_started_at.elapsed().as_millis() as u64,
+        total,
+        "admin realtime task list phase completed"
+    );
 
     let mut items_query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
@@ -4173,10 +4182,10 @@ pub async fn admin_list_realtime_tasks(
     );
     append_admin_realtime_task_filters(
         &mut items_query,
-        status,
-        task_type,
-        exclude_task_type,
-        task_group.clone(),
+        &status,
+        &task_type,
+        &exclude_task_type,
+        &task_group,
         &scheduled_tasks,
         &user_sync_tasks,
     );
@@ -4184,6 +4193,7 @@ pub async fn admin_list_realtime_tasks(
     items_query.push_bind(page_size);
     items_query.push(" OFFSET ");
     items_query.push_bind(offset);
+    let page_started_at = std::time::Instant::now();
     let items = items_query
         .build_query_as::<AdminRealtimeTaskRow>()
         .fetch_all(&state.pool)
@@ -4192,20 +4202,25 @@ pub async fn admin_list_realtime_tasks(
         .into_iter()
         .map(AdminRealtimeTaskItem::from)
         .collect::<Vec<_>>();
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "page",
+        elapsed_ms = page_started_at.elapsed().as_millis() as u64,
+        returned = items.len(),
+        page_size,
+        "admin realtime task list phase completed"
+    );
 
-    let mut items = items
-        .into_iter()
-        .filter(|item| match task_group.as_str() {
-            "scheduled" => {
-                jobs::is_scheduled_task_type(&item.task_type)
-                    && !user_sync_tasks.contains(&item.task_type)
-            }
-            "user_sync" => user_sync_tasks.contains(&item.task_type),
-            "realtime" => !jobs::is_scheduled_task_type(&item.task_type),
-            _ => true,
-        })
-        .collect::<Vec<_>>();
+    let mut items = items;
+    let diagnostics_started_at = std::time::Instant::now();
     attach_subscription_list_diagnostics(state.as_ref(), &mut items).await?;
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "diagnostics",
+        elapsed_ms = diagnostics_started_at.elapsed().as_millis() as u64,
+        task_count = items.len(),
+        "admin realtime task list phase completed"
+    );
 
     Ok(Json(AdminRealtimeTasksResponse {
         items,
@@ -4217,10 +4232,10 @@ pub async fn admin_list_realtime_tasks(
 
 fn append_admin_realtime_task_filters<'a>(
     query: &mut QueryBuilder<'a, sqlx::Sqlite>,
-    status: String,
-    task_type: String,
-    exclude_task_type: String,
-    task_group: String,
+    status: &'a str,
+    task_type: &'a str,
+    exclude_task_type: &'a str,
+    task_group: &'a str,
     scheduled_tasks: &'a [String],
     user_sync_tasks: &'a [String],
 ) {
@@ -4236,7 +4251,7 @@ fn append_admin_realtime_task_filters<'a>(
         query.push(" AND task_type != ");
         query.push_bind(exclude_task_type);
     }
-    match task_group.as_str() {
+    match task_group {
         "scheduled" => {
             query.push(" AND task_type IN (");
             let mut separated = query.separated(", ");
@@ -4352,8 +4367,16 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
     let mut query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT task_id, id, event_type, payload_json, created_at
-        FROM job_task_events
-        WHERE task_id IN (
+        FROM (
+          SELECT
+            task_id,
+            id,
+            event_type,
+            payload_json,
+            created_at,
+            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY rowid DESC) AS task_event_rank
+          FROM job_task_events
+          WHERE task_id IN (
         "#,
     );
     {
@@ -4364,7 +4387,7 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
     }
     query.push(
         r#"
-        )
+          )
           AND event_type = 'task.progress'
           AND json_valid(payload_json)
           AND json_extract(payload_json, '$.stage') IN (
@@ -4378,9 +4401,12 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
             'notifications_progress',
             'notifications_summary'
           )
-        ORDER BY task_id ASC, rowid ASC
+        )
+        WHERE task_event_rank <=
         "#,
     );
+    query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
+    query.push(" ORDER BY task_id ASC, task_event_rank DESC");
 
     let rows = query
         .build_query_as::<AdminTaskDiagnosticEventRow>()
@@ -26402,6 +26428,7 @@ mod tests {
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
         AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        load_subscription_diagnostic_progress_events_for_tasks,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
         DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
         DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest, FeedRow, FeedScope,
@@ -26691,6 +26718,10 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        setup_pool_with_max_connections(1).await
+    }
+
+    async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
@@ -26699,7 +26730,7 @@ mod tests {
             .filename(&database_path)
             .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
@@ -30979,6 +31010,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_realtime_list_progress_events_are_bounded_per_task() {
+        let pool = setup_pool().await;
+        seed_admin_dashboard_task(
+            &pool,
+            "task-subscription-event-limit",
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            &test_user_id(1),
+            "2026-03-06T14:30:00Z",
+        )
+        .await;
+        for event_index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('e', event_index as usize))
+            .bind("task-subscription-event-limit")
+            .bind(format!(
+                r#"{{"stage":"repo_collect","total_repos":{event_index}}}"#
+            ))
+            .bind(indexed_created_at(event_index as usize))
+            .execute(&pool)
+            .await
+            .expect("seed subscription progress event");
+        }
+
+        let state = setup_state(pool);
+        let events = load_subscription_diagnostic_progress_events_for_tasks(
+            state.as_ref(),
+            &["task-subscription-event-limit".to_owned()],
+        )
+        .await
+        .expect("load bounded subscription progress events");
+        let events = events
+            .get("task-subscription-event-limit")
+            .expect("subscription progress events");
+        assert_eq!(events.len(), ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0].payload_json)
+                .expect("oldest retained event")
+                .get("total_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(5)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[events.len() - 1].payload_json)
+                .expect("newest retained event")
+                .get("total_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(24)
+        );
+    }
+
+    #[tokio::test]
     async fn admin_list_realtime_tasks_separates_user_sync_from_general_schedules() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -31061,6 +31149,237 @@ mod tests {
 
         assert_eq!(scheduled.total, 1);
         assert_eq!(scheduled.items[0].id, "task-general-schedule");
+    }
+
+    #[tokio::test]
+    async fn admin_list_realtime_tasks_applies_filters_before_pagination() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+
+        for (id, task_type, status, created_at) in [
+            (
+                "task-list-realtime-old",
+                jobs::TASK_SYNC_RELEASES,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:30:00Z",
+            ),
+            (
+                "task-list-scheduled-new",
+                jobs::TASK_BRIEF_DAILY_SLOT,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:32:00Z",
+            ),
+            (
+                "task-list-scheduled-old",
+                jobs::TASK_BRIEF_DAILY_SLOT,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:29:00Z",
+            ),
+            (
+                "task-list-user-sync",
+                jobs::TASK_SYNC_STARRED_DELTA,
+                jobs::STATUS_RUNNING,
+                "2026-03-06T14:31:00Z",
+            ),
+            (
+                "task-list-realtime-new",
+                jobs::TASK_SYNC_RELEASES,
+                jobs::STATUS_FAILED,
+                "2026-03-06T14:33:00Z",
+            ),
+        ] {
+            seed_admin_dashboard_task(&pool, id, task_type, status, &test_user_id(1), created_at)
+                .await;
+        }
+
+        let state = setup_state(pool);
+        let scheduled_page_1 = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("scheduled".to_owned()),
+                page: Some(1),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("scheduled first page")
+        .0;
+        let scheduled_page_2 = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("scheduled".to_owned()),
+                page: Some(2),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("scheduled second page")
+        .0;
+
+        assert_eq!(scheduled_page_1.total, 2);
+        assert_eq!(scheduled_page_1.items.len(), 1);
+        assert_eq!(scheduled_page_1.items[0].id, "task-list-scheduled-new");
+        assert_eq!(scheduled_page_2.total, 2);
+        assert_eq!(scheduled_page_2.items.len(), 1);
+        assert_eq!(scheduled_page_2.items[0].id, "task-list-scheduled-old");
+
+        let filtered = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some(jobs::STATUS_FAILED.to_owned()),
+                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                exclude_task_type: Some(jobs::TASK_SYNC_ACCESS_REFRESH.to_owned()),
+                task_group: Some("realtime".to_owned()),
+                page: Some(1),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("combined realtime filters")
+        .0;
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].id, "task-list-realtime-new");
+
+        let empty = admin_list_realtime_tasks(
+            State(state),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some(jobs::STATUS_RUNNING.to_owned()),
+                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                exclude_task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                task_group: Some("all".to_owned()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("contradictory filters should return empty response")
+        .0;
+        assert_eq!(empty.total, 0);
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.page, 1);
+        assert_eq!(empty.page_size, 20);
+
+        let response_json = serde_json::to_value(&filtered).expect("serialize response");
+        assert_eq!(
+            response_json
+                .as_object()
+                .expect("response object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["items", "page", "page_size", "total"]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual 100k-row authenticated endpoint latency and writer-pressure acceptance"]
+    async fn admin_realtime_list_meets_100k_history_latency_under_background_writes() {
+        let pool = setup_pool_with_max_connections(8).await;
+        sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        sqlx::query(
+            r#"
+            WITH RECURSIVE historical_task(n) AS (
+              VALUES (1)
+              UNION ALL
+              SELECT n + 1 FROM historical_task WHERE n < 100000
+            )
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, parent_task_id,
+              payload_json, result_json, error_message, cancel_requested,
+              created_at, started_at, finished_at, updated_at
+            )
+            SELECT
+              'historical-task-' || printf('%06d', n),
+              CASE WHEN n % 100 = 0 THEN 'sync.subscriptions' ELSE 'sync.releases' END,
+              CASE n % 4
+                WHEN 0 THEN 'succeeded'
+                WHEN 1 THEN 'failed'
+                WHEN 2 THEN 'running'
+                ELSE 'queued'
+              END,
+              'historical', NULL, NULL, '{}', '{}', NULL, 0,
+              printf('2020-01-01T00:00:%06dZ', n), NULL, NULL,
+              printf('2020-01-01T00:00:%06dZ', n)
+            FROM historical_task
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed 100,000 historical job tasks");
+
+        let state = setup_state(pool.clone());
+        let pressure_state = state.clone();
+        let writer_pressure = tokio::spawn(async move {
+            for index in 0..200 {
+                sqlx::query("UPDATE users SET last_active_at = ? WHERE id = ?")
+                    .bind(format!("2026-03-06T14:{:02}:00Z", index % 60))
+                    .bind(test_user_id(1))
+                    .execute(
+                        pressure_state
+                            .sqlite_writer
+                            .write_pool_or(&pressure_state.pool),
+                    )
+                    .await
+                    .expect("background writer should complete under read pressure");
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut elapsed = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let started_at = std::time::Instant::now();
+            let response = admin_list_realtime_tasks(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(AdminRealtimeTasksQuery {
+                    status: Some("all".to_owned()),
+                    task_type: None,
+                    exclude_task_type: None,
+                    task_group: None,
+                    page: Some(1),
+                    page_size: Some(100),
+                }),
+            )
+            .await
+            .expect("authenticated endpoint should succeed under writer pressure")
+            .0;
+            assert!(response.total >= 100_000);
+            assert_eq!(response.items.len(), 100);
+            elapsed.push(started_at.elapsed());
+        }
+        writer_pressure
+            .await
+            .expect("background writer task should not panic");
+        elapsed.sort_unstable();
+        let p95_ms = elapsed[94].as_millis();
+        let p99_ms = elapsed[98].as_millis();
+        eprintln!(
+            "authenticated admin realtime task list: rows=100000 samples={} p95_ms={p95_ms} p99_ms={p99_ms}",
+            elapsed.len()
+        );
+        assert!(p95_ms < 1_000, "p95 exceeded 1s: {p95_ms}ms");
+        assert!(p99_ms < 2_000, "p99 exceeded 2s: {p99_ms}ms");
     }
 
     #[tokio::test]
@@ -31960,6 +32279,36 @@ mod tests {
         );
         assert!(
             !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
+        );
+
+        let task_type_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id, task_type, status, created_at
+            FROM job_tasks
+            WHERE task_type = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(jobs::TASK_SYNC_RELEASES)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load task type query plan");
+        let task_type_details = task_type_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(task_type_details.iter().any(|detail| {
+            detail.contains("idx_job_tasks_task_type_created_at_id")
+                || detail.contains("idx_job_tasks_realtime_created")
+        }));
+        assert!(
+            !task_type_details
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
         );
