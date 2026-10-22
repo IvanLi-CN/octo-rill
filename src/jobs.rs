@@ -25,7 +25,8 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     admin_runtime, ai, api, briefs, content_processing, local_id, runtime,
     sqlite_write::{
-        SqliteWritePriority, is_sqlite_background_admission_error, is_sqlite_write_deadline_error,
+        SqliteWritePriority, SqliteWriteTransaction, is_sqlite_background_admission_error,
+        is_sqlite_write_deadline_error,
     },
     state::AppState,
     sync, translations, webhook_push,
@@ -888,22 +889,63 @@ async fn task_type_run_in_flight_in_transaction(
     // A stale heartbeat is still active until the recovery worker owns and
     // transitions the row with its lease CAS. Treating it as inactive here
     // could dispatch duplicate external work during the recovery window.
-    let count = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*)
-        FROM job_tasks
-        WHERE task_type = ?
-          AND status IN (?, ?)
-        "#,
-    )
-    .bind(task_type)
-    .bind(STATUS_QUEUED)
-    .bind(STATUS_RUNNING)
-    .fetch_one(&mut **tx)
-    .await
-    .with_context(|| format!("failed to query in-flight {task_type} runs"))?;
+    let exists = sqlx::query_scalar::<_, i64>(TASK_TYPE_RUN_IN_FLIGHT_SQL)
+        .bind(STATUS_QUEUED)
+        .bind(STATUS_RUNNING)
+        .bind(task_type)
+        .fetch_one(&mut **tx)
+        .await
+        .with_context(|| format!("failed to query in-flight {task_type} runs"))?;
 
-    Ok(count > 0)
+    Ok(exists != 0)
+}
+
+const TASK_TYPE_RUN_IN_FLIGHT_SQL: &str = r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM job_tasks INDEXED BY idx_job_tasks_status_created_at
+            WHERE status IN (?, ?)
+              AND task_type = ?
+            LIMIT 1
+        )
+        "#;
+
+async fn rollback_scheduler_dispatch(
+    tx: SqliteWriteTransaction<'_>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match tx.rollback().await {
+        Ok(()) => {
+            tracing::debug!(
+                event = "scheduler.dispatch_rollback",
+                reason = "dispatch_error",
+                "scheduler dispatch transaction rolled back before writer release"
+            );
+            error
+        }
+        Err(rollback_error) => {
+            tracing::error!(
+                event = "scheduler.dispatch_rollback_failed",
+                ?rollback_error,
+                "scheduler dispatch transaction rollback failed before writer release"
+            );
+            error.context(format!(
+                "scheduler dispatch rollback failed: {rollback_error:#}"
+            ))
+        }
+    }
+}
+
+macro_rules! scheduler_try {
+    ($tx:ident, $result:expr) => {{
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                let error: anyhow::Error = error.into();
+                return Err(rollback_scheduler_dispatch($tx, error).await);
+            }
+        }
+    }};
 }
 
 async fn active_star_sync_connection_task_in_transaction(
@@ -976,12 +1018,14 @@ async fn dispatch_star_reconciliation_atomic(
         )
         .await
         .context("begin star reconciliation dispatch transaction")?;
-    if star_sync_connection_task_in_flight_in_transaction(
-        tx.as_transaction_mut(),
-        github_connection_id,
-    )
-    .await?
-    {
+    if scheduler_try!(
+        tx,
+        star_sync_connection_task_in_flight_in_transaction(
+            tx.as_transaction_mut(),
+            github_connection_id,
+        )
+        .await
+    ) {
         tx.commit()
             .await
             .context("commit coalesced active star reconciliation dispatch")?;
@@ -992,38 +1036,45 @@ async fn dispatch_star_reconciliation_atomic(
         );
         return Ok(None);
     }
-    let Some(dispatch) = sync::ensure_star_reconciliation_epoch_due_in_transaction(
-        tx.as_transaction_mut(),
-        user_id,
-        github_connection_id,
-        full_sweep_interval_minutes,
-        now,
-    )
-    .await?
-    else {
+    let Some(dispatch) = scheduler_try!(
+        tx,
+        sync::ensure_star_reconciliation_epoch_due_in_transaction(
+            tx.as_transaction_mut(),
+            user_id,
+            github_connection_id,
+            full_sweep_interval_minutes,
+            now,
+        )
+        .await
+    ) else {
         tx.commit()
             .await
             .context("commit not-due star reconciliation dispatch")?;
         return Ok(None);
     };
 
-    let marker = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
-    )
-    .bind(&schedule_name)
-    .fetch_optional(&mut **tx.as_transaction_mut())
-    .await
-    .context("load star reconciliation dispatch marker")?;
+    let marker = scheduler_try!(
+        tx,
+        sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT last_dispatch_key, last_task_id FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(&schedule_name)
+        .fetch_optional(&mut **tx.as_transaction_mut())
+        .await
+        .context("load star reconciliation dispatch marker")
+    );
     if let Some((Some(last_key), Some(last_task_id))) = marker.as_ref()
         && last_key == &dispatch.schedule_key
     {
-        let status =
+        let status = scheduler_try!(
+            tx,
             sqlx::query_scalar::<_, Option<String>>("SELECT status FROM job_tasks WHERE id = ?")
                 .bind(last_task_id)
                 .fetch_optional(&mut **tx.as_transaction_mut())
                 .await
-                .context("load star reconciliation dispatch task status")?
-                .flatten();
+                .context("load star reconciliation dispatch task status")
+        )
+        .flatten();
         if status
             .as_deref()
             .is_some_and(|status| matches!(status, STATUS_QUEUED | STATUS_RUNNING))
@@ -1041,33 +1092,39 @@ async fn dispatch_star_reconciliation_atomic(
         }
     }
 
-    let existing_task_id = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT id
-        FROM job_tasks
-        WHERE task_type = ?
-          AND status IN (?, ?)
-          AND json_valid(payload_json)
-          AND json_extract(payload_json, '$.github_connection_id') = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(TASK_SYNC_STARRED_RECONCILE)
-    .bind(STATUS_QUEUED)
-    .bind(STATUS_RUNNING)
-    .bind(github_connection_id)
-    .fetch_optional(&mut **tx.as_transaction_mut())
-    .await
-    .context("check active star reconciliation task")?;
-    if let Some(existing_task_id) = existing_task_id {
-        upsert_dispatch_state_in_transaction(
-            tx.as_transaction_mut(),
-            &schedule_name,
-            &dispatch.schedule_key,
-            &existing_task_id,
-            &now_rfc3339,
+    let existing_task_id = scheduler_try!(
+        tx,
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT id
+            FROM job_tasks
+            WHERE task_type = ?
+              AND status IN (?, ?)
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.github_connection_id') = ?
+            LIMIT 1
+            "#,
         )
-        .await?;
+        .bind(TASK_SYNC_STARRED_RECONCILE)
+        .bind(STATUS_QUEUED)
+        .bind(STATUS_RUNNING)
+        .bind(github_connection_id)
+        .fetch_optional(&mut **tx.as_transaction_mut())
+        .await
+        .context("check active star reconciliation task")
+    );
+    if let Some(existing_task_id) = existing_task_id {
+        scheduler_try!(
+            tx,
+            upsert_dispatch_state_in_transaction(
+                tx.as_transaction_mut(),
+                &schedule_name,
+                &dispatch.schedule_key,
+                &existing_task_id,
+                &now_rfc3339,
+            )
+            .await
+        );
         tx.commit()
             .await
             .context("commit linked star reconciliation dispatch")?;
@@ -1082,52 +1139,64 @@ async fn dispatch_star_reconciliation_atomic(
     }
 
     let task_id = local_id::generate_local_id().to_string();
-    let payload_json = serde_json::to_string(&json!({
-        "user_id": user_id,
-        "github_connection_id": github_connection_id,
-        "epoch_id": dispatch.epoch_id,
-        "trigger": "schedule",
-        "schedule_key": dispatch.schedule_key,
-    }))
-    .context("serialize star reconciliation payload")?;
-    sqlx::query(
-        r#"
-        INSERT INTO job_tasks (
-          id, task_type, status, source, requested_by, parent_task_id,
-          payload_json, log_file_path, created_at, started_at, finished_at,
-          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
-        ) VALUES (?, ?, ?, 'scheduler', NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
-        "#,
-    )
-    .bind(&task_id)
-    .bind(TASK_SYNC_STARRED_RECONCILE)
-    .bind(STATUS_QUEUED)
-    .bind(payload_json)
-    .bind(&now_rfc3339)
-    .bind(&now_rfc3339)
-    .execute(&mut **tx.as_transaction_mut())
-    .await
-    .context("insert atomic star reconciliation task")?;
-    append_task_event_in_transaction(
-        tx.as_transaction_mut(),
-        &task_id,
-        "task.created",
-        json!({
-            "task_id": task_id,
-            "task_type": TASK_SYNC_STARRED_RECONCILE,
-            "status": STATUS_QUEUED,
-            "source": "scheduler",
-        }),
-    )
-    .await?;
-    upsert_dispatch_state_in_transaction(
-        tx.as_transaction_mut(),
-        &schedule_name,
-        &dispatch.schedule_key,
-        &task_id,
-        &now_rfc3339,
-    )
-    .await?;
+    let payload_json = scheduler_try!(
+        tx,
+        serde_json::to_string(&json!({
+            "user_id": user_id,
+            "github_connection_id": github_connection_id,
+            "epoch_id": dispatch.epoch_id,
+            "trigger": "schedule",
+            "schedule_key": dispatch.schedule_key,
+        }))
+        .context("serialize star reconciliation payload")
+    );
+    scheduler_try!(
+        tx,
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, parent_task_id,
+              payload_json, log_file_path, created_at, started_at, finished_at,
+              runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+            ) VALUES (?, ?, ?, 'scheduler', NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
+            "#,
+        )
+        .bind(&task_id)
+        .bind(TASK_SYNC_STARRED_RECONCILE)
+        .bind(STATUS_QUEUED)
+        .bind(payload_json)
+        .bind(&now_rfc3339)
+        .bind(&now_rfc3339)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        .context("insert atomic star reconciliation task")
+    );
+    scheduler_try!(
+        tx,
+        append_task_event_in_transaction(
+            tx.as_transaction_mut(),
+            &task_id,
+            "task.created",
+            json!({
+                "task_id": task_id,
+                "task_type": TASK_SYNC_STARRED_RECONCILE,
+                "status": STATUS_QUEUED,
+                "source": "scheduler",
+            }),
+        )
+        .await
+    );
+    scheduler_try!(
+        tx,
+        upsert_dispatch_state_in_transaction(
+            tx.as_transaction_mut(),
+            &schedule_name,
+            &dispatch.schedule_key,
+            &task_id,
+            &now_rfc3339,
+        )
+        .await
+    );
     tx.commit()
         .await
         .context("commit atomic star reconciliation dispatch")?;
@@ -1179,12 +1248,15 @@ async fn dispatch_scheduled_task_atomic(
         )
         .await?;
 
-    let last_dispatch_key = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT last_dispatch_key FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+    let last_dispatch_key = scheduler_try!(
+        tx,
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_dispatch_key FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind(schedule_name)
+        .fetch_optional(&mut **tx.as_transaction_mut())
+        .await
     )
-    .bind(schedule_name)
-    .fetch_optional(&mut **tx.as_transaction_mut())
-    .await?
     .flatten();
     if last_dispatch_key.as_deref() == Some(schedule_key) {
         tx.commit().await?;
@@ -1197,11 +1269,14 @@ async fn dispatch_scheduled_task_atomic(
         return Ok(None);
     }
     if let Some(due_at) = due_at {
-        let effective_at = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sync_auto_fetch_effective_at FROM admin_runtime_settings WHERE id = 1",
+        let effective_at = scheduler_try!(
+            tx,
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT sync_auto_fetch_effective_at FROM admin_runtime_settings WHERE id = 1",
+            )
+            .fetch_optional(&mut **tx.as_transaction_mut())
+            .await
         )
-        .fetch_optional(&mut **tx.as_transaction_mut())
-        .await?
         .flatten();
         if effective_at
             .as_deref()
@@ -1221,11 +1296,14 @@ async fn dispatch_scheduled_task_atomic(
 
     let skipped_result = match &dispatch_policy {
         ScheduledDispatchPolicy::SkipActiveSubscription
-            if task_type_run_in_flight_in_transaction(
-                tx.as_transaction_mut(),
-                TASK_SYNC_SUBSCRIPTIONS,
-            )
-            .await? =>
+            if scheduler_try!(
+                tx,
+                task_type_run_in_flight_in_transaction(
+                    tx.as_transaction_mut(),
+                    TASK_SYNC_SUBSCRIPTIONS,
+                )
+                .await
+            ) =>
         {
             Some(sync::skipped_subscription_result(
                 schedule_key,
@@ -1233,11 +1311,14 @@ async fn dispatch_scheduled_task_atomic(
             ))
         }
         ScheduledDispatchPolicy::SkipActiveRecentFailures { interval_minutes }
-            if task_type_run_in_flight_in_transaction(
-                tx.as_transaction_mut(),
-                TASK_RETRY_RECENT_FAILURES,
-            )
-            .await? =>
+            if scheduler_try!(
+                tx,
+                task_type_run_in_flight_in_transaction(
+                    tx.as_transaction_mut(),
+                    TASK_RETRY_RECENT_FAILURES,
+                )
+                .await
+            ) =>
         {
             Some(json!({
                 "skipped": true,
@@ -1250,20 +1331,25 @@ async fn dispatch_scheduled_task_atomic(
             }))
         }
         ScheduledDispatchPolicy::CoalesceActiveStarConnection(github_connection_id) => {
-            if let Some(active_task_id) = active_star_sync_connection_task_in_transaction(
-                tx.as_transaction_mut(),
-                github_connection_id,
-            )
-            .await?
-            {
-                upsert_dispatch_state_in_transaction(
+            if let Some(active_task_id) = scheduler_try!(
+                tx,
+                active_star_sync_connection_task_in_transaction(
                     tx.as_transaction_mut(),
-                    schedule_name,
-                    schedule_key,
-                    &active_task_id,
-                    &now,
+                    github_connection_id,
                 )
-                .await?;
+                .await
+            ) {
+                scheduler_try!(
+                    tx,
+                    upsert_dispatch_state_in_transaction(
+                        tx.as_transaction_mut(),
+                        schedule_name,
+                        schedule_key,
+                        &active_task_id,
+                        &now,
+                    )
+                    .await
+                );
                 tx.commit()
                     .await
                     .context("commit coalesced active star dispatch")?;
@@ -1288,115 +1374,142 @@ async fn dispatch_scheduled_task_atomic(
         STATUS_QUEUED
     };
 
-    sqlx::query(
-        r#"
-        INSERT INTO job_tasks (
-          id, task_type, status, source, requested_by, parent_task_id,
-          payload_json, log_file_path, created_at, started_at, finished_at,
-          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&task_id)
-    .bind(&new_task.task_type)
-    .bind(task_status)
-    .bind(&new_task.source)
-    .bind(new_task.requested_by.as_deref())
-    .bind(new_task.parent_task_id.as_deref())
-    .bind(&payload_json)
-    .bind(log_file_path.as_deref())
-    .bind(&now)
-    .bind(started_at)
-    .bind(skipped.then_some(state.runtime_owner_id.as_str()))
-    .bind(started_at)
-    .bind(&now)
-    .bind(Option::<&str>::None)
-    .execute(&mut **tx.as_transaction_mut())
-    .await
-    .context("failed to insert scheduled task")?;
-
-    append_task_event_in_transaction(
-        tx.as_transaction_mut(),
-        &task_id,
-        "task.created",
-        json!({
-            "task_id": task_id,
-            "task_type": new_task.task_type,
-            "status": STATUS_QUEUED,
-            "source": new_task.source,
-        }),
-    )
-    .await?;
-
-    if let Some(result) = skipped_result {
-        append_task_event_in_transaction(
-            tx.as_transaction_mut(),
-            &task_id,
-            "task.running",
-            json!({
-                "task_id": task_id,
-                "status": STATUS_RUNNING,
-            }),
-        )
-        .await?;
-        append_task_event_in_transaction(
-            tx.as_transaction_mut(),
-            &task_id,
-            "task.progress",
-            json!({
-                "task_id": task_id,
-                "stage": "skipped",
-                "schedule_key": schedule_key,
-                "skip_reason": "previous_run_active",
-            }),
-        )
-        .await?;
-        let result_json = serde_json::to_string(&result).context("serialize skipped result")?;
+    scheduler_try!(
+        tx,
         sqlx::query(
             r#"
-            UPDATE job_tasks
-            SET status = ?, result_json = ?, finished_at = ?,
-                runtime_owner_id = NULL, lease_heartbeat_at = NULL, updated_at = ?
-            WHERE id = ?
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, parent_task_id,
+              payload_json, log_file_path, created_at, started_at, finished_at,
+              runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
             "#,
         )
-        .bind(STATUS_SUCCEEDED)
-        .bind(result_json)
-        .bind(&now)
-        .bind(&now)
         .bind(&task_id)
+        .bind(&new_task.task_type)
+        .bind(task_status)
+        .bind(&new_task.source)
+        .bind(new_task.requested_by.as_deref())
+        .bind(new_task.parent_task_id.as_deref())
+        .bind(&payload_json)
+        .bind(log_file_path.as_deref())
+        .bind(&now)
+        .bind(started_at)
+        .bind(skipped.then_some(state.runtime_owner_id.as_str()))
+        .bind(started_at)
+        .bind(&now)
+        .bind(Option::<&str>::None)
         .execute(&mut **tx.as_transaction_mut())
         .await
-        .context("finalize skipped scheduled task")?;
+        .context("failed to insert scheduled task")
+    );
+
+    scheduler_try!(
+        tx,
         append_task_event_in_transaction(
             tx.as_transaction_mut(),
             &task_id,
-            "task.completed",
+            "task.created",
             json!({
                 "task_id": task_id,
-                "status": STATUS_SUCCEEDED,
-                "skipped": true,
+                "task_type": new_task.task_type,
+                "status": STATUS_QUEUED,
+                "source": new_task.source,
             }),
         )
-        .await?;
+        .await
+    );
+
+    if let Some(result) = skipped_result {
+        scheduler_try!(
+            tx,
+            append_task_event_in_transaction(
+                tx.as_transaction_mut(),
+                &task_id,
+                "task.running",
+                json!({
+                    "task_id": task_id,
+                    "status": STATUS_RUNNING,
+                }),
+            )
+            .await
+        );
+        scheduler_try!(
+            tx,
+            append_task_event_in_transaction(
+                tx.as_transaction_mut(),
+                &task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "skipped",
+                    "schedule_key": schedule_key,
+                    "skip_reason": "previous_run_active",
+                }),
+            )
+            .await
+        );
+        let result_json = scheduler_try!(
+            tx,
+            serde_json::to_string(&result).context("serialize skipped result")
+        );
+        scheduler_try!(
+            tx,
+            sqlx::query(
+                r#"
+                UPDATE job_tasks
+                SET status = ?, result_json = ?, finished_at = ?,
+                    runtime_owner_id = NULL, lease_heartbeat_at = NULL, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(STATUS_SUCCEEDED)
+            .bind(result_json)
+            .bind(&now)
+            .bind(&now)
+            .bind(&task_id)
+            .execute(&mut **tx.as_transaction_mut())
+            .await
+            .context("finalize skipped scheduled task")
+        );
+        scheduler_try!(
+            tx,
+            append_task_event_in_transaction(
+                tx.as_transaction_mut(),
+                &task_id,
+                "task.completed",
+                json!({
+                    "task_id": task_id,
+                    "status": STATUS_SUCCEEDED,
+                    "skipped": true,
+                }),
+            )
+            .await
+        );
     }
 
-    upsert_dispatch_state_in_transaction(
-        tx.as_transaction_mut(),
-        schedule_name,
-        schedule_key,
-        &task_id,
-        &now,
-    )
-    .await?;
-    if clear_sync_effective_at {
-        sqlx::query(
-            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = NULL, updated_at = ? WHERE id = 1",
+    scheduler_try!(
+        tx,
+        upsert_dispatch_state_in_transaction(
+            tx.as_transaction_mut(),
+            schedule_name,
+            schedule_key,
+            &task_id,
+            &now,
         )
-        .bind(&now)
-        .execute(&mut **tx.as_transaction_mut())
         .await
-        .context("clear sync auto-fetch effective timestamp")?;
+    );
+    if clear_sync_effective_at {
+        scheduler_try!(
+            tx,
+            sqlx::query(
+                "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = NULL, updated_at = ? WHERE id = 1",
+            )
+            .bind(&now)
+            .execute(&mut **tx.as_transaction_mut())
+            .await
+            .context("clear sync auto-fetch effective timestamp")
+        );
     }
 
     tx.commit().await?;
@@ -1477,12 +1590,15 @@ async fn dispatch_daily_brief_slot_atomic(
             tokio::time::Instant::now() + SCHEDULER_DISPATCH_TRANSACTION_BUDGET,
         )
         .await?;
-    let slot = sqlx::query_as::<_, SlotRow>(
-        "SELECT enabled, last_dispatch_at FROM daily_brief_hour_slots WHERE hour_utc = ? LIMIT 1",
-    )
-    .bind(hour_utc)
-    .fetch_optional(&mut **tx.as_transaction_mut())
-    .await?;
+    let slot = scheduler_try!(
+        tx,
+        sqlx::query_as::<_, SlotRow>(
+            "SELECT enabled, last_dispatch_at FROM daily_brief_hour_slots WHERE hour_utc = ? LIMIT 1",
+        )
+        .bind(hour_utc)
+        .fetch_optional(&mut **tx.as_transaction_mut())
+        .await
+    );
     let Some(slot) = slot else {
         tx.commit().await?;
         return Ok(None);
@@ -1497,46 +1613,55 @@ async fn dispatch_daily_brief_slot_atomic(
         return Ok(None);
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO job_tasks (
-          id, task_type, status, source, requested_by, parent_task_id,
-          payload_json, log_file_path, created_at, started_at, finished_at,
-          runtime_owner_id, lease_heartbeat_at, updated_at, result_json
-        ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
-        "#,
-    )
-    .bind(&task_id)
-    .bind(TASK_BRIEF_DAILY_SLOT)
-    .bind(STATUS_QUEUED)
-    .bind("scheduler")
-    .bind(&payload_json)
-    .bind(dispatch_at)
-    .bind(dispatch_at)
-    .execute(&mut **tx.as_transaction_mut())
-    .await
-    .context("failed to insert daily brief slot task")?;
-    append_task_event_in_transaction(
-        tx.as_transaction_mut(),
-        &task_id,
-        "task.created",
-        json!({
-            "task_id": task_id,
-            "task_type": TASK_BRIEF_DAILY_SLOT,
-            "status": STATUS_QUEUED,
-            "source": "scheduler",
-        }),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE daily_brief_hour_slots SET last_dispatch_at = ?, updated_at = ? WHERE hour_utc = ?",
-    )
-    .bind(dispatch_at)
-    .bind(dispatch_at)
-    .bind(hour_utc)
-    .execute(&mut **tx.as_transaction_mut())
-    .await
-    .context("update daily brief hour slot dispatch")?;
+    scheduler_try!(
+        tx,
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, parent_task_id,
+              payload_json, log_file_path, created_at, started_at, finished_at,
+              runtime_owner_id, lease_heartbeat_at, updated_at, result_json
+            ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL)
+            "#,
+        )
+        .bind(&task_id)
+        .bind(TASK_BRIEF_DAILY_SLOT)
+        .bind(STATUS_QUEUED)
+        .bind("scheduler")
+        .bind(&payload_json)
+        .bind(dispatch_at)
+        .bind(dispatch_at)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        .context("failed to insert daily brief slot task")
+    );
+    scheduler_try!(
+        tx,
+        append_task_event_in_transaction(
+            tx.as_transaction_mut(),
+            &task_id,
+            "task.created",
+            json!({
+                "task_id": task_id,
+                "task_type": TASK_BRIEF_DAILY_SLOT,
+                "status": STATUS_QUEUED,
+                "source": "scheduler",
+            }),
+        )
+        .await
+    );
+    scheduler_try!(
+        tx,
+        sqlx::query(
+            "UPDATE daily_brief_hour_slots SET last_dispatch_at = ?, updated_at = ? WHERE hour_utc = ?",
+        )
+        .bind(dispatch_at)
+        .bind(dispatch_at)
+        .bind(hour_utc)
+        .execute(&mut **tx.as_transaction_mut())
+        .await
+        .context("update daily brief hour slot dispatch")
+    );
     tx.commit().await?;
     TASK_CLAIM_ADMISSION.wake();
     Ok(Some(task_id))
@@ -5634,14 +5759,15 @@ mod tests {
         NewTask, RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE,
         SMART_NO_VALUABLE_VERSION_INFO, STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX,
         STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
-        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
-        cancel_task, claim_next_queued_task, complete_task,
-        current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
-        current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
+        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy,
+        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
+        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
+        TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
+        TASK_SYNC_SUBSCRIPTIONS, TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT,
+        TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor, cancel_task,
+        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
+        current_star_sync_delta_schedule_key, current_subscription_schedule_key,
+        defer_task_after_sqlite_write_backpressure, dispatch_scheduled_task_atomic,
         enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
         enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
         enqueue_singleton_task_for_requester,
@@ -5653,7 +5779,8 @@ mod tests {
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
-        retry_candidate_is_retryable, run_account_pause_maintenance_if_due, task_sse_response,
+        retry_candidate_is_retryable, rollback_scheduler_dispatch,
+        run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
     use axum::body::to_bytes;
@@ -6123,6 +6250,229 @@ mod tests {
         .await
         .expect("load cleared effective boundary");
         assert!(effective_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_in_flight_query_uses_status_first_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {TASK_TYPE_RUN_IN_FLIGHT_SQL}"))
+            .bind(STATUS_QUEUED)
+            .bind(STATUS_RUNNING)
+            .bind(TASK_SYNC_SUBSCRIPTIONS)
+            .fetch_all(&pool)
+            .await
+            .expect("load scheduler in-flight query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_job_tasks_status_created_at")),
+            "scheduler in-flight query must use the existing status-first index: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("idx_job_tasks_task_type_created_at")),
+            "scheduler in-flight query must not fall back to the task-type history index: {details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_in_flight_query_stays_bounded_with_historical_tasks() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(4, std::time::Duration::from_millis(25)).await;
+        sqlx::query(
+            r#"
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 0
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < 20_000
+            )
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, created_at, updated_at
+            )
+            SELECT
+              printf('scheduler-fixture-%05d', value),
+              'scheduler.fixture',
+              CASE WHEN value % 2 = 0 THEN 'queued' ELSE 'succeeded' END,
+              'test',
+              '{}',
+              printf('2026-03-06T00:%02d:%02dZ', (value / 60) % 60, value % 60),
+              printf('2026-03-06T00:%02d:%02dZ', (value / 60) % 60, value % 60)
+            FROM sequence
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed historical scheduler tasks");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, created_at, updated_at
+            ) VALUES ('scheduler-fixture-target', ?, ?, 'test', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            "#,
+        )
+        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .bind(STATUS_QUEUED)
+        .execute(&pool)
+        .await
+        .expect("seed target scheduler task");
+
+        let mut samples = Vec::with_capacity(25);
+        for _ in 0..25 {
+            let started = std::time::Instant::now();
+            let exists = sqlx::query_scalar::<_, i64>(TASK_TYPE_RUN_IN_FLIGHT_SQL)
+                .bind(STATUS_QUEUED)
+                .bind(STATUS_RUNNING)
+                .bind(TASK_SYNC_SUBSCRIPTIONS)
+                .fetch_one(&pool)
+                .await
+                .expect("run scheduler in-flight query");
+            assert_eq!(exists, 1);
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        eprintln!("scheduler in-flight query p95: {} ms", p95.as_millis());
+        assert!(
+            p95 <= std::time::Duration::from_millis(250),
+            "scheduler in-flight query p95 exceeded budget: {p95:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rollback_releases_writer_connection_for_reuse() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "CREATE TABLE scheduler_rollback_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create scheduler rollback probe");
+
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&pool, "scheduler_rollback_probe")
+            .await
+            .expect("begin scheduler rollback transaction");
+        sqlx::query("INSERT INTO scheduler_rollback_probe (id, value) VALUES (1, 'rolled back')")
+            .execute(&mut **tx.as_transaction_mut())
+            .await
+            .expect("insert rollback probe row");
+        let query_error = match sqlx::query("SELECT * FROM scheduler_rollback_probe_missing")
+            .fetch_one(&mut **tx.as_transaction_mut())
+            .await
+        {
+            Ok(_) => panic!("missing probe query must fail"),
+            Err(error) => error,
+        };
+        let error = rollback_scheduler_dispatch(
+            tx,
+            anyhow::Error::new(query_error).context("forced scheduler query interruption"),
+        )
+        .await;
+        drop(permit);
+        assert!(
+            error
+                .to_string()
+                .contains("forced scheduler query interruption")
+        );
+
+        let rolled_back_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scheduler_rollback_probe")
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled back probe rows");
+        assert_eq!(rolled_back_count, 0);
+
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&pool, "scheduler_rollback_probe_reuse")
+            .await
+            .expect("reuse writer after scheduler rollback");
+        sqlx::query("INSERT INTO scheduler_rollback_probe (id, value) VALUES (2, 'committed')")
+            .execute(&mut **tx.as_transaction_mut())
+            .await
+            .expect("insert after scheduler rollback");
+        tx.commit().await.expect("commit after scheduler rollback");
+        drop(permit);
+
+        let committed_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scheduler_rollback_probe")
+                .fetch_one(&pool)
+                .await
+                .expect("count committed probe rows");
+        assert_eq!(committed_count, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatch_rolls_back_task_event_and_marker_together() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            CREATE TRIGGER scheduler_rollback_abort_marker
+            BEFORE INSERT ON scheduled_task_dispatch_state
+            BEGIN
+              SELECT RAISE(ABORT, 'forced scheduler marker failure');
+            END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create scheduler marker failure trigger");
+
+        let result = dispatch_scheduled_task_atomic(
+            state.as_ref(),
+            "scheduler-rollback-test",
+            "schedule-key-1",
+            NewTask {
+                task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                payload: json!({"source": "rollback-test"}),
+                source: "scheduler".to_owned(),
+                requested_by: None,
+                parent_task_id: None,
+            },
+            ScheduledDispatchPolicy::SkipActiveSubscription,
+            false,
+            None,
+        )
+        .await;
+        let error = result.expect_err("marker failure must abort scheduler dispatch");
+        assert!(
+            format!("{error:#}").contains("forced scheduler marker failure"),
+            "unexpected scheduler rollback error: {error:#}"
+        );
+
+        let task_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
+        )
+        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled back scheduler tasks");
+        assert_eq!(task_count, 0);
+
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM job_task_events")
+            .fetch_one(&pool)
+            .await
+            .expect("count rolled back scheduler events");
+        assert_eq!(event_count, 0);
+
+        let marker_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+        )
+        .bind("scheduler-rollback-test")
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled back scheduler markers");
+        assert_eq!(marker_count, 0);
     }
 
     #[tokio::test]
