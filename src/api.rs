@@ -31693,7 +31693,32 @@ mod tests {
             cancel_task_ids.push(task.task_id);
         }
 
+        let subscription_task_id =
+            seed_admin_realtime_list_subscription_diagnostics(&pool, state.as_ref()).await;
+        let job_event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_task_events WHERE task_id = ?")
+                .bind(&subscription_task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count subscription task progress events");
+        let subscription_event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_subscription_events WHERE task_id = ?")
+                .bind(&subscription_task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count subscription task events");
+        assert!(job_event_count > 20);
+        assert!(subscription_event_count > 20);
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .expect("read bundled SQLite version");
+        eprintln!(
+            "100k acceptance fixture: historical_tasks=100000 first_page_sync_subscriptions=1 job_task_events={job_event_count} sync_subscription_events={subscription_event_count} sqlite_version={sqlite_version}"
+        );
+
         let list_state = state.clone();
+        let list_subscription_task_id = subscription_task_id.clone();
         let list_samples = tokio::spawn(async move {
             let mut samples = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
@@ -31715,7 +31740,39 @@ mod tests {
                     Ok(response)
                         if response.0.total >= 100_000 && response.0.items.len() == 100 =>
                     {
-                        Ok(())
+                        let loaded_diagnostics = response
+                            .0
+                            .items
+                            .iter()
+                            .find(|item| item.id == list_subscription_task_id)
+                            .and_then(|item| item.diagnostics.as_ref())
+                            .and_then(|diagnostics| diagnostics.sync_subscriptions.as_ref());
+                        match loaded_diagnostics {
+                            Some(diagnostics)
+                                if diagnostics.collect.total_users == 4321
+                                    && diagnostics.release.total_repos == 24
+                                    && diagnostics.social.events == 345
+                                    && diagnostics.notifications.notifications == 456
+                                    && diagnostics.recent_events.len()
+                                        == ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+                                    && diagnostics.recent_events.iter().any(|event| {
+                                        event.event_type == "acceptance_notifications_summary"
+                                    })
+                                    && diagnostics.recent_events.iter().any(|event| {
+                                        event.event_type == "acceptance_repo_progress_19"
+                                    }) =>
+                            {
+                                Ok(())
+                            }
+                            Some(_) => Err(
+                                "subscription diagnostics did not contain the seeded stage history"
+                                    .to_owned(),
+                            ),
+                            None => Err(
+                                "first page did not load diagnostics for the seeded subscription task"
+                                    .to_owned(),
+                            ),
+                        }
                     }
                     Ok(response) => Err(format!(
                         "unexpected list response: total={} items={}",
@@ -31819,6 +31876,116 @@ mod tests {
             budget_failures.is_empty(),
             "empirical budget failures: {budget_failures:?}"
         );
+    }
+
+    async fn seed_admin_realtime_list_subscription_diagnostics(
+        pool: &SqlitePool,
+        state: &AppState,
+    ) -> String {
+        let task_id = crate::local_id::test_local_id("admin-realtime-list-subscription");
+        // Keep the real subscription fixture on page one as measured enqueues arrive.
+        let created_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        seed_admin_dashboard_task(
+            pool,
+            &task_id,
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            &test_user_id(1),
+            &created_at,
+        )
+        .await;
+
+        for index in 0..20 {
+            jobs::append_task_event(
+                state,
+                &task_id,
+                "task.progress",
+                json!({
+                    "stage": "repo_collect",
+                    "total_repos": index + 1,
+                }),
+            )
+            .await
+            .expect("append ordinary subscription progress event");
+        }
+        for (stage, payload) in [
+            ("collect", json!({"stage":"collect","total_users":4321})),
+            (
+                "release_summary",
+                json!({"stage":"release_summary","total_repos":24,"succeeded_repos":23,"failed_repos":1}),
+            ),
+            (
+                "social_summary",
+                json!({"stage":"social_summary","total_users":12,"succeeded_users":11,"failed_users":1,"events":345}),
+            ),
+            (
+                "notifications_summary",
+                json!({"stage":"notifications_summary","total_users":12,"succeeded_users":12,"failed_users":0,"notifications":456}),
+            ),
+        ] {
+            jobs::append_task_event(state, &task_id, "task.progress", payload)
+                .await
+                .unwrap_or_else(|error| panic!("append {stage} subscription summary: {error}"));
+        }
+
+        for index in 0..20 {
+            let payload_json = serde_json::to_string(&json!({
+                "message": format!("acceptance repo progress {index}"),
+            }))
+            .expect("serialize ordinary subscription event payload");
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::generate_local_id())
+            .bind(&task_id)
+            .bind(format!("acceptance_repo_progress_{index:02}"))
+            .bind(test_user_id(1))
+            .bind(1000_i64 + index)
+            .bind(format!("octo/acceptance-{index}"))
+            .bind(payload_json)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert ordinary subscription event");
+        }
+        for (stage, event_type, message) in [
+            ("collect", "acceptance_collect_summary", "collect summary"),
+            ("release", "acceptance_release_summary", "release summary"),
+            ("social", "acceptance_social_summary", "social summary"),
+            (
+                "notifications",
+                "acceptance_notifications_summary",
+                "notifications summary",
+            ),
+        ] {
+            let payload_json = serde_json::to_string(&json!({"message":message}))
+                .expect("serialize subscription summary payload");
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, 'info', 0, 1, ?, NULL, NULL, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::generate_local_id())
+            .bind(&task_id)
+            .bind(stage)
+            .bind(event_type)
+            .bind(test_user_id(1))
+            .bind(payload_json)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert subscription summary event");
+        }
+
+        task_id
     }
 
     fn report_empirical_latency_budget(
