@@ -1184,12 +1184,11 @@ async fn load_recent_sync_auto_fetch_tasks(
             id,
             status,
             source,
-            result_json,
             created_at,
             started_at,
             finished_at
-          FROM job_tasks
-          WHERE task_type = ?
+          FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+          WHERE task_type = 'sync.subscriptions'
             AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
           ORDER BY created_at DESC, id DESC
           LIMIT 3
@@ -1222,7 +1221,7 @@ async fn load_recent_sync_auto_fetch_tasks(
             root.id,
             root.status,
             root.source,
-            COALESCE(json_extract(root.result_json, '$.skipped'), 0) = 1 AS skipped,
+            0 AS skipped,
             CASE
             WHEN rollup.unfinished_count = 0 AND rollup.chain_finished_at IS NOT NULL
               THEN CAST((julianday(rollup.chain_finished_at) - julianday(root.created_at)) * 86400000 AS INTEGER)
@@ -1239,7 +1238,6 @@ async fn load_recent_sync_auto_fetch_tasks(
         ORDER BY root.created_at DESC, root.id DESC
         "#,
     )
-    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
     .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .fetch_all(&state.pool)
@@ -31646,7 +31644,9 @@ mod tests {
                 WHEN 2 THEN 'running'
                 ELSE 'queued'
               END,
-              'historical', NULL, NULL, '{}', '{}', NULL, 0,
+              'historical', NULL, NULL, '{}',
+              CASE WHEN n % 200 = 0 THEN '{"skipped":true}' ELSE '{}' END,
+              NULL, 0,
               printf('2020-01-01T00:00:%06dZ', n), NULL, NULL,
               printf('2020-01-01T00:00:%06dZ', n)
             FROM historical_task
@@ -31786,6 +31786,59 @@ mod tests {
             samples
         });
 
+        let sync_state = state.clone();
+        let sync_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let outcome = super::load_recent_sync_auto_fetch_tasks(sync_state.as_ref())
+                    .await
+                    .map(|tasks| {
+                        if tasks.len() == 3 && tasks.iter().all(|task| !task.skipped) {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "unexpected recent sync task response: count={} skipped={}",
+                                tasks.len(),
+                                tasks.iter().filter(|task| task.skipped).count()
+                            ))
+                        }
+                    })
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
+        let background_state = state.clone();
+        let background_pool = pool.clone();
+        let background_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for index in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let pool = background_pool.clone();
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                let outcome = background_state
+                    .sqlite_writer
+                    .write("admin_read_acceptance_background", move |_| {
+                        let pool = pool.clone();
+                        let updated_at = updated_at.clone();
+                        async move {
+                            sqlx::query("UPDATE job_tasks SET updated_at = ? WHERE id = ?")
+                                .bind(updated_at)
+                                .bind(format!("historical-task-{:06}", index + 1))
+                                .execute(&pool)
+                                .await?;
+                            Ok(())
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.to_string());
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
         let session_store_for_samples = session_store.clone();
         let session_id = session_record.id;
         let enqueue_state = state.clone();
@@ -31851,12 +31904,51 @@ mod tests {
         }
 
         let list_samples = list_samples.await.expect("list sampler should not panic");
+        let sync_samples = sync_samples
+            .await
+            .expect("recent sync task sampler should not panic");
+        let background_samples = background_samples
+            .await
+            .expect("background write sampler should not panic");
         let mut budget_failures = Vec::new();
         budget_failures.extend(report_empirical_latency_budget(
             "authenticated_admin_list",
             list_samples,
             SAMPLES,
         ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "admin_recent_sync_task_chain",
+            sync_samples,
+            SAMPLES,
+        ));
+        let background_denials = background_samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .filter(|error| error.contains("sqlite background writer admission denied"))
+            .count();
+        let unexpected_background_failures = background_samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .filter(|error| !error.contains("sqlite background writer admission denied"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut background_elapsed = background_samples
+            .iter()
+            .map(|(duration, _)| *duration)
+            .collect::<Vec<_>>();
+        background_elapsed.sort_unstable();
+        eprintln!(
+            "background writer pressure: samples={} admitted={} deferred={} p95_ms={} p99_ms={} unexpected_failures={unexpected_background_failures:?}",
+            background_elapsed.len(),
+            background_elapsed.len() - background_denials,
+            background_denials,
+            background_elapsed[94].as_millis(),
+            background_elapsed[98].as_millis(),
+        );
+        assert!(
+            unexpected_background_failures.is_empty(),
+            "unexpected background writer failures: {unexpected_background_failures:?}"
+        );
         budget_failures.extend(report_empirical_latency_budget(
             "coordinated_session_store_roundtrip",
             session_samples,
@@ -42904,6 +42996,27 @@ echo should_not_be_in_excerpt
         .await
         .expect("seed skipped subscription sync history");
 
+        for idx in 0..20 {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id, task_type, status, source, payload_json, result_json,
+                  cancel_requested, created_at, updated_at
+                )
+                VALUES (?, ?, 'succeeded', 'scheduler', '{}', '{"skipped":true}', 0, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::test_local_id(&format!(
+                "subscription-history-skipped-{idx}"
+            )))
+            .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+            .bind(format!("2026-04-27T08:41:{idx:02}Z"))
+            .bind("2026-04-27T08:41:59Z")
+            .execute(&pool)
+            .await
+            .expect("seed many skipped subscription sync rows");
+        }
+
         for (idx, task_id, started_at, finished_at) in [
             (
                 1,
@@ -43012,6 +43125,52 @@ echo should_not_be_in_excerpt
             .expect("seed subscription sync child task");
         }
 
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, parent_task_id, payload_json,
+              result_json, cancel_requested, created_at, started_at, updated_at
+            )
+            VALUES (?, ?, 'running', 'sync.subscriptions', ?, '{}', '{}', 0, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::test_local_id(
+            "subscription-history-3-running-child",
+        ))
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(crate::local_id::test_local_id("subscription-history-3"))
+        .bind("2026-04-27T08:20:10Z")
+        .bind("2026-04-27T08:20:11Z")
+        .bind("2026-04-27T08:20:11Z")
+        .execute(&pool)
+        .await
+        .expect("seed running subscription sync child");
+
+        let query_plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+            WHERE task_type = 'sync.subscriptions'
+              AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 3
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain recent sync root selection");
+        let query_plan_details = query_plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect::<Vec<_>>();
+        println!("recent sync root query plan: {query_plan_details:?}");
+        assert!(
+            query_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_tasks_sync_recent_roots") })
+        );
+
         let settings = super::load_sync_runtime_config(state.as_ref())
             .await
             .expect("load sync settings");
@@ -43036,6 +43195,9 @@ echo should_not_be_in_excerpt
             settings.recent_sync_tasks[2].id,
             crate::local_id::test_local_id("subscription-history-2")
         );
+        assert!(settings.recent_sync_tasks[1].duration_ms.is_none());
+        assert!(settings.recent_sync_tasks[1].finished_at.is_none());
+        assert!(!settings.recent_sync_tasks[1].skipped);
     }
 
     #[tokio::test]
