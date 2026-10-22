@@ -4374,18 +4374,55 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
             event_type,
             payload_json,
             created_at,
-            rowid AS event_rowid,
-            CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END
-              AS is_collect_event,
-            ROW_NUMBER() OVER (
-              PARTITION BY task_id,
-                CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END
-              ORDER BY rowid DESC
-            ) AS task_stage_rank,
-            MAX(CASE WHEN json_extract(payload_json, '$.stage') = 'collect' THEN 1 ELSE 0 END)
-              OVER (PARTITION BY task_id) AS has_collect_event
-          FROM job_task_events
-          WHERE task_id IN (
+            event_rowid,
+            stage,
+            summary_rank,
+            retained_group_rank,
+            reserved_count
+          FROM (
+            SELECT
+              task_id,
+              id,
+              event_type,
+              payload_json,
+              created_at,
+              event_rowid,
+              stage,
+              ROW_NUMBER() OVER (
+                PARTITION BY task_id, stage
+                ORDER BY event_rowid DESC
+              ) AS summary_rank,
+              ROW_NUMBER() OVER (
+                PARTITION BY task_id,
+                  CASE WHEN stage IN (
+                    'collect', 'release_summary', 'social_summary', 'notifications_summary'
+                  ) THEN 0 ELSE 1 END
+                ORDER BY event_rowid DESC
+              ) AS retained_group_rank,
+              MAX(CASE WHEN stage = 'collect' THEN 1 ELSE 0 END)
+                OVER (PARTITION BY task_id)
+              + MAX(CASE WHEN stage = 'release_summary' THEN 1 ELSE 0 END)
+                OVER (PARTITION BY task_id)
+              + MAX(CASE WHEN stage = 'social_summary' THEN 1 ELSE 0 END)
+                OVER (PARTITION BY task_id)
+              + MAX(CASE WHEN stage = 'notifications_summary' THEN 1 ELSE 0 END)
+                OVER (PARTITION BY task_id) AS reserved_count
+            FROM (
+              SELECT task_id, id, event_type, payload_json, created_at, event_rowid, stage
+              FROM (
+                SELECT
+                  task_id,
+                  id,
+                  event_type,
+                  payload_json,
+                  created_at,
+                  rowid AS event_rowid,
+                  CASE WHEN json_valid(payload_json)
+                    THEN json_extract(payload_json, '$.stage')
+                    ELSE NULL
+                  END AS stage
+                FROM job_task_events
+                WHERE task_id IN (
         "#,
     );
     {
@@ -4396,29 +4433,34 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
     }
     query.push(
         r#"
-          )
-          AND event_type = 'task.progress'
-          AND json_valid(payload_json)
-          AND json_extract(payload_json, '$.stage') IN (
-            'collect',
-            'repo_collect',
-            'release_attached',
-            'release_progress',
-            'release_summary',
-            'social_progress',
-            'social_summary',
-            'notifications_progress',
-            'notifications_summary'
+                  )
+                  AND event_type = 'task.progress'
+                  AND json_valid(payload_json)
+              )
+              WHERE stage IN (
+                'collect',
+                'repo_collect',
+                'release_attached',
+                'release_progress',
+                'release_summary',
+                'social_progress',
+                'social_summary',
+                'notifications_progress',
+                'notifications_summary'
+              )
+            )
           )
         )
-        WHERE (is_collect_event = 1 AND task_stage_rank = 1)
-           OR (
-             is_collect_event = 0
-             AND task_stage_rank <=
+        WHERE (
+          stage IN ('collect', 'release_summary', 'social_summary', 'notifications_summary')
+          AND summary_rank = 1
+        ) OR (
+          stage NOT IN ('collect', 'release_summary', 'social_summary', 'notifications_summary')
+          AND retained_group_rank <=
         "#,
     );
     query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
-    query.push(" - has_collect_event) ORDER BY task_id ASC, event_rowid ASC");
+    query.push(" - reserved_count) ORDER BY task_id ASC, event_rowid ASC");
 
     let rows = query
         .build_query_as::<AdminTaskDiagnosticEventRow>()
@@ -31046,6 +31088,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed subscription collect event");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-release-summary-event")
+        .bind("task-subscription-event-limit")
+        .bind(r#"{"stage":"release_summary","succeeded_repos":17}"#)
+        .bind(indexed_created_at(1))
+        .execute(&pool)
+        .await
+        .expect("seed subscription release summary event");
         for event_index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
             sqlx::query(
                 r#"
@@ -31058,11 +31113,38 @@ mod tests {
             .bind(format!(
                 r#"{{"stage":"repo_collect","total_repos":{event_index}}}"#
             ))
-            .bind(indexed_created_at(event_index as usize + 1))
+            .bind(indexed_created_at(event_index as usize + 2))
             .execute(&pool)
             .await
             .expect("seed subscription progress event");
         }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("task-subscription-non-progress-event")
+        .bind("task-subscription-event-limit")
+        .bind("task.running")
+        .bind("not json")
+        .bind(indexed_created_at(100))
+        .execute(&pool)
+        .await
+        .expect("seed subscription non-progress event");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-malformed-progress-event")
+        .bind("task-subscription-event-limit")
+        .bind("not json")
+        .bind(indexed_created_at(101))
+        .execute(&pool)
+        .await
+        .expect("seed malformed subscription progress event");
 
         let state = setup_state(pool);
         let events = load_subscription_diagnostic_progress_events_for_tasks(
@@ -31084,10 +31166,17 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&events[1].payload_json)
-                .expect("oldest retained non-collect event")
+                .expect("release summary event")
+                .get("succeeded_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(17)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[2].payload_json)
+                .expect("oldest retained non-summary event")
                 .get("total_repos")
                 .and_then(serde_json::Value::as_i64),
-            Some(6)
+            Some(7)
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&events[events.len() - 1].payload_json)
@@ -32352,10 +32441,11 @@ mod tests {
             .iter()
             .map(|row| row.get::<String, _>(3))
             .collect::<Vec<_>>();
-        assert!(task_type_details.iter().any(|detail| {
-            detail.contains("idx_job_tasks_task_type_created_at_id")
-                || detail.contains("idx_job_tasks_realtime_created")
-        }));
+        assert!(
+            task_type_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_tasks_task_type_created_at_id") })
+        );
         assert!(
             !task_type_details
                 .iter()
