@@ -1187,7 +1187,7 @@ async fn load_recent_sync_auto_fetch_tasks(
             created_at,
             started_at,
             finished_at
-          FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+          FROM job_tasks
           WHERE task_type = 'sync.subscriptions'
             AND CASE
               WHEN json_valid(result_json)
@@ -31945,13 +31945,21 @@ mod tests {
             "background writer pressure must include at least one admitted write"
         );
         background_elapsed.sort_unstable();
+        let background_p95_ms =
+            background_elapsed[(background_elapsed.len() * 95).div_ceil(100) - 1].as_millis();
+        let background_p99_ms =
+            background_elapsed[(background_elapsed.len() * 99).div_ceil(100) - 1].as_millis();
         eprintln!(
             "background writer pressure: attempts={} admitted={} deferred={} admitted_p95_ms={} admitted_p99_ms={} unexpected_failures={unexpected_background_failures:?}",
             background_samples.len(),
             background_elapsed.len(),
             background_denials,
-            background_elapsed[(background_elapsed.len() * 95).div_ceil(100) - 1].as_millis(),
-            background_elapsed[(background_elapsed.len() * 99).div_ceil(100) - 1].as_millis(),
+            background_p95_ms,
+            background_p99_ms,
+        );
+        assert!(
+            background_p95_ms < 1_000 && background_p99_ms < 2_000,
+            "background writer latency budget exceeded: p95={background_p95_ms}ms p99={background_p99_ms}ms"
         );
         assert!(
             unexpected_background_failures.is_empty(),
@@ -43004,7 +43012,7 @@ echo should_not_be_in_excerpt
         .await
         .expect("seed skipped subscription sync history");
 
-        for idx in 0..20 {
+        for idx in 0..1_000 {
             sqlx::query(
                 r#"
                 INSERT INTO job_tasks (
@@ -43038,8 +43046,8 @@ echo should_not_be_in_excerpt
             "subscription-history-malformed-result",
         ))
         .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
-        .bind("2026-04-27T07:59:00Z")
-        .bind("2026-04-27T07:59:00Z")
+        .bind("2026-04-27T08:35:00Z")
+        .bind("2026-04-27T08:35:00Z")
         .execute(&pool)
         .await
         .expect("seed malformed historical subscription result");
@@ -43173,11 +43181,23 @@ echo should_not_be_in_excerpt
         .await
         .expect("seed running subscription sync child");
 
+        sqlx::query("DROP INDEX idx_job_tasks_task_type_created_at_id")
+            .execute(&pool)
+            .await
+            .expect("remove competing task type index for plan assertion");
+        sqlx::query("DROP INDEX idx_job_tasks_task_type_created_at")
+            .execute(&pool)
+            .await
+            .expect("remove legacy task type index for plan assertion");
+        sqlx::query("ANALYZE job_tasks")
+            .execute(&pool)
+            .await
+            .expect("analyze recent sync task fixture");
         let query_plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
             r#"
             EXPLAIN QUERY PLAN
             SELECT id
-            FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+            FROM job_tasks
             WHERE task_type = 'sync.subscriptions'
               AND CASE
                 WHEN json_valid(result_json)
@@ -43215,19 +43235,24 @@ echo should_not_be_in_excerpt
                 .all(|task| task.id != skipped_task_id)
         );
         assert!(settings.recent_sync_tasks.iter().all(|task| !task.skipped));
-        assert_eq!(settings.recent_sync_tasks[0].id, newest_task_id);
-        let duration_ms = settings.recent_sync_tasks[0].duration_ms.expect("duration");
+        let malformed_task_id =
+            crate::local_id::test_local_id("subscription-history-malformed-result");
+        assert_eq!(settings.recent_sync_tasks[0].id, malformed_task_id);
+        assert!(settings.recent_sync_tasks[0].duration_ms.is_none());
+        assert!(settings.recent_sync_tasks[0].finished_at.is_none());
+        assert_eq!(settings.recent_sync_tasks[1].id, newest_task_id);
+        let duration_ms = settings.recent_sync_tasks[1].duration_ms.expect("duration");
         assert!((399_999..=400_000).contains(&duration_ms));
         assert_eq!(
-            settings.recent_sync_tasks[0].finished_at.as_deref(),
+            settings.recent_sync_tasks[1].finished_at.as_deref(),
             Some("2026-04-27T08:36:40Z")
         );
         assert_eq!(
             settings.recent_sync_tasks[2].id,
-            crate::local_id::test_local_id("subscription-history-2")
+            crate::local_id::test_local_id("subscription-history-3")
         );
-        assert!(settings.recent_sync_tasks[1].duration_ms.is_none());
-        assert!(settings.recent_sync_tasks[1].finished_at.is_none());
+        assert!(settings.recent_sync_tasks[2].duration_ms.is_none());
+        assert!(settings.recent_sync_tasks[2].finished_at.is_none());
         assert!(!settings.recent_sync_tasks[1].skipped);
     }
 
