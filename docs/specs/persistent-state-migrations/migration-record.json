@@ -13,8 +13,8 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0099 before listener bind",
-      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox",
+      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0100 before listener bind",
+      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox and admin realtime task query indexes",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
     }
@@ -99,6 +99,16 @@
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 99,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 100,
+        "file": "migrations/0100_admin_realtime_task_query_indexes.sql",
+        "definition_checksum": "8f946105177e05109602d2368ae1562b68684dd60921dedfb21043b2031490f1",
+        "description": "Add task-type ordering and bounded task-event lookup indexes for the admin realtime task list and subscription diagnostics.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 100,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],
