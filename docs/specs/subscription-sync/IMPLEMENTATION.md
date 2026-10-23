@@ -14,6 +14,7 @@
 - Mixed Social upstream-plus-SQLite failures preserve typed `source_errors` through the `anyhow` context chain, so a later SQLite write denial cannot downgrade a genuine upstream failure to recoverable backpressure.
 - Access-refresh Social failure handling is dependency-injected in tests; the regression verifies `social_error` preservation and that Notifications still completes after Social source errors.
 - The dependency seam is private test wiring grouped in a dependency struct; the production wrapper retains the real Social/Notifications calls and no lint suppression is required.
+- The file-backed WAL scheduler/session acceptance keeps the external lock held only through the foreground contention probe; it releases that lock before joining empty-queue background workers so host scheduling jitter cannot consume the production foreground deadline.
 - Lifecycle: active
 - Implementation: 已交付
 - Last: 2026-09-23

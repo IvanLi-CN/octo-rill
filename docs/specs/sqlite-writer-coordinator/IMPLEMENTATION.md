@@ -81,7 +81,7 @@
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
 - `bash scripts/check-rust-source-quality.sh`（PR #333 current-head required check 通过）
 - 当前调度查询/回滚候选的 `jobs::tests::` 67 项全部通过；新增回归锁定 status-first query plan，以及显式 scheduler rollback 后 writer connection 可复用。`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings` 与 source-quality gate 均在候选 head 通过。
-- file-backed WAL acceptance：`content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（current candidate：passed；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言）
+- file-backed WAL acceptance：`content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（current candidate：passed；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言；测试先启动后台压力并在外部锁释放后回收后台任务，避免测试调度抖动消耗生产 foreground deadline）
 - 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - PR #333 当前代码候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #333 当前 CI 与本地 acceptance 输出为准。
