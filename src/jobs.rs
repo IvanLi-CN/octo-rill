@@ -1851,16 +1851,21 @@ pub async fn load_task_log_path(state: &AppState, task_id: &str) -> Result<Optio
     Ok(log_file_path.flatten())
 }
 
+pub async fn ensure_task_log_parent(log_file_path: &Path) -> Result<()> {
+    if let Some(parent) = log_file_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create task log parent directory {parent:?}"))?;
+    }
+    Ok(())
+}
+
 pub async fn append_task_log_entry(state: &AppState, task_id: &str, entry: Value) -> Result<()> {
     let Some(log_file_path) = load_task_log_path(state, task_id).await? else {
         return Ok(());
     };
     let line = serde_json::to_vec(&entry).context("serialize task log entry")?;
-    if let Some(parent) = Path::new(&log_file_path).parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create task log parent directory {parent:?}"))?;
-    }
+    ensure_task_log_parent(Path::new(&log_file_path)).await?;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)

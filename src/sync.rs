@@ -4,6 +4,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     future::Future,
+    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -1574,6 +1575,7 @@ impl SubscriptionRunLogger {
         let path = jobs::load_task_log_path(state, task_id)
             .await?
             .ok_or_else(|| anyhow!("subscription sync log path missing"))?;
+        jobs::ensure_task_log_parent(Path::new(&path)).await?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -15070,6 +15072,7 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         net::SocketAddr,
+        path::Path as FsPath,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering as AtomicTestOrdering},
@@ -15101,7 +15104,7 @@ mod tests {
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
         StaleRepoReleaseWorkRow, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
         SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
-        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        SubscriptionRunLogger, SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
         announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options,
@@ -23954,6 +23957,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn subscription_run_logger_creates_missing_utc_date_directory() {
+        let pool = setup_pool().await;
+        let base_state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-subscription-log-directory");
+        let task_log_dir = std::env::temp_dir().join(format!(
+            "octo-rill-subscription-log-{}",
+            local_id::generate_local_id()
+        ));
+        assert!(!task_log_dir.exists());
+
+        let state = Arc::new(AppState {
+            config: AppConfig {
+                task_log_dir: task_log_dir.clone(),
+                ..base_state.config.clone()
+            },
+            ..base_state.as_ref().clone()
+        });
+        let log_path = task_log_dir
+            .join("sync-subscriptions")
+            .join(Utc::now().format("%Y-%m-%d").to_string())
+            .join(format!("{task_id}.ndjson"));
+        seed_realtime_task_with_log_path(
+            &state,
+            task_id.as_str(),
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            &log_path,
+        )
+        .await;
+
+        let logger = SubscriptionRunLogger::open(state.as_ref(), task_id.as_str())
+            .await
+            .expect("open subscription logger in a missing date directory");
+        logger
+            .write(
+                "info",
+                "collect",
+                "test",
+                task_id.as_str(),
+                "subscription log opened",
+                json!({"source": "regression-test"}),
+            )
+            .await
+            .expect("write subscription log entry");
+
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("read subscription log entry");
+        let entry: Value = serde_json::from_str(log.trim()).expect("parse subscription log entry");
+        assert_eq!(entry.get("task_id"), Some(&json!(task_id)));
+        assert_eq!(
+            entry.get("message"),
+            Some(&json!("subscription log opened"))
+        );
+        assert!(log_path.parent().expect("subscription log parent").is_dir());
+
+        tokio::fs::remove_dir_all(&task_log_dir)
+            .await
+            .expect("remove temporary subscription log root");
+    }
+
     struct RepoReleaseWorkSeed<'a> {
         id: &'a str,
         repo_id: i64,
@@ -24140,6 +24204,15 @@ mod tests {
     async fn seed_realtime_task(state: &Arc<AppState>, task_id: &str, task_type: &str) {
         fs::create_dir_all(&state.config.task_log_dir).expect("create task log dir");
         let log_path = state.config.task_log_dir.join(format!("{task_id}.ndjson"));
+        seed_realtime_task_with_log_path(state, task_id, task_type, &log_path).await;
+    }
+
+    async fn seed_realtime_task_with_log_path(
+        state: &Arc<AppState>,
+        task_id: &str,
+        task_type: &str,
+        log_path: &FsPath,
+    ) {
         let now = "2026-03-06T00:00:00Z";
         sqlx::query(
             r#"
@@ -24176,7 +24249,7 @@ mod tests {
         .bind(Some(now))
         .bind(Option::<String>::None)
         .bind(now)
-        .bind(log_path.to_string_lossy().to_string())
+        .bind(log_path.to_string_lossy().into_owned())
         .execute(&state.pool)
         .await
         .expect("seed realtime task");
