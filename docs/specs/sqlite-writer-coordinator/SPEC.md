@@ -25,7 +25,7 @@
 - coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
 - 生产高竞争写入必须通过共享 `SqliteWriteCoordinator` 或明确的内部协调 facade；运行时配置、LLM health/recovery、translation worker runtime slot、jobs lifecycle、repo release sync state 与高频 sync metadata 不得保留直接池写入或可选 writer fallback。
 - 源代码质量检查必须在已审计生产模块中拒绝绕过 coordinator 的 `SqlitePool::execute` 与 raw `BEGIN IMMEDIATE`；测试专用、迁移/bootstrap 与纯读代码不属于该写入守门范围，coordinator facade callback 只有在声明 marker 且实现被 AST 验证确实调用 coordinator 时才可放行。
-- SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
+- SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败；包装写入错误时不得丢失调用方携带的 typed upstream/source diagnostics。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
 - 对已有 pending 合同的读取接口，若结果表已经存在当前 source hash 的 `queued/running` 状态，则允许在 writer 压力下直接复用该快照，不得为了重复 resolve 再强制进入新的写事务。
 

@@ -6,6 +6,7 @@
 
 - 2026-10-23 candidate: background admission denial now uses the existing coordinator deadline and 25/50/100ms capped backoff without increasing the one-waiter queue; Social SQLite exhaustion is classified as recoverable warning metadata while preserving failed-user accounting.
 - Subscription key events write the run log before the event table; retryable SQLite append pressure is retained in that durable log fallback and does not abort a Social worker or the remaining subscription phases.
+- Social write failures retain typed upstream/source diagnostics when SQLite backpressure is layered on top, keeping genuine upstream failures non-recoverable.
 - Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator

@@ -11,6 +11,7 @@
 
 - 2026-10-23 candidate: Social persistence shares bounded background admission retry with heartbeat/finalize paths; exhausted SQLite pressure remains a partial failed user with `warning`/`recoverable=true` and `error_kind=sqlite_write_backpressure`, while upstream failures remain critical.
 - Social `source_errors` now remain non-recoverable across subscription, access-refresh, and sync-all result paths; failure events include source details, and retryable SQLite event-table pressure falls back to the already-written run log without aborting the remaining phases.
+- Mixed Social upstream-plus-SQLite failures preserve typed `source_errors` through the `anyhow` context chain, so a later SQLite write denial cannot downgrade a genuine upstream failure to recoverable backpressure.
 - Lifecycle: active
 - Implementation: 已交付
 - Last: 2026-09-23
