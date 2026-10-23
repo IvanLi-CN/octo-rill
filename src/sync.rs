@@ -2726,6 +2726,10 @@ type AccessRefreshStarFuture<'a> = Pin<
 >;
 
 type AccessRefreshVisibilityFuture<'a> = Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+type AccessRefreshSocialFuture<'a> =
+    Pin<Box<dyn Future<Output = (SyncSocialActivityResult, Option<String>)> + Send + 'a>>;
+type AccessRefreshNotificationsFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SyncNotificationsResult>> + Send + 'a>>;
 
 async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
     state: &AppState,
@@ -2760,6 +2764,46 @@ async fn sync_access_refresh_with_freshness<SyncStarred, RefreshVisibility>(
 where
     SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
     RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+{
+    sync_access_refresh_with_freshness_and_dependencies(
+        state,
+        task_id,
+        user_id,
+        freshness_profile,
+        sync_starred,
+        refresh_visibility,
+        |state, user_id| {
+            Box::pin(sync_social_activity_best_effort(
+                state,
+                user_id,
+                "sync.access_refresh",
+            ))
+        },
+        |state, user_id| Box::pin(sync_notifications(state, user_id)),
+    )
+    .await
+}
+
+async fn sync_access_refresh_with_freshness_and_dependencies<
+    SyncStarred,
+    RefreshVisibility,
+    SyncSocial,
+    SyncNotifications,
+>(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+    freshness_profile: &str,
+    sync_starred: SyncStarred,
+    refresh_visibility: RefreshVisibility,
+    sync_social: SyncSocial,
+    sync_notifications_fn: SyncNotifications,
+) -> Result<SyncAccessRefreshResult>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
+    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+    SyncSocial: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshSocialFuture<'a>,
+    SyncNotifications: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshNotificationsFuture<'a>,
 {
     let before_repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let before_repo_ids = before_repos
@@ -2873,8 +2917,7 @@ where
     )
     .await;
 
-    let (social, social_error) =
-        sync_social_activity_best_effort(state, user_id, "sync.access_refresh").await;
+    let (social, social_error) = sync_social(state, user_id).await;
     let social_payload = json!({
         "task_id": task_id,
         "stage": "social_summary",
@@ -2899,7 +2942,7 @@ where
     )
     .await;
 
-    let (notifications, notifications_error) = match sync_notifications(state, user_id).await {
+    let (notifications, notifications_error) = match sync_notifications_fn(state, user_id).await {
         Ok(result) => (result, None),
         Err(err) => {
             tracing::warn!(
@@ -24364,6 +24407,66 @@ mod tests {
             log.contains("\"operation\":\"refresh owned repo visibility\""),
             "unexpected log: {log}"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_preserves_social_source_errors_and_runs_notifications() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-social-source-error");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-social-source-error");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+        let source_error = "followers(conn:github, http_500): GitHub returned 500".to_owned();
+
+        let result = super::sync_access_refresh_with_freshness_and_dependencies(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            "",
+            |_state, _user_id| Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) }),
+            |_state, _user_id| Box::pin(async { Ok(true) }),
+            {
+                let source_error = source_error.clone();
+                move |_state, _user_id| {
+                    let source_error = source_error.clone();
+                    Box::pin(async move {
+                        (
+                            super::SyncSocialActivityResult::default(),
+                            Some(source_error),
+                        )
+                    })
+                }
+            },
+            |_state, _user_id| {
+                Box::pin(async {
+                    Ok(super::SyncNotificationsResult {
+                        notifications: 3,
+                        since: None,
+                    })
+                })
+            },
+        )
+        .await
+        .expect("access refresh should complete with partial social data");
+
+        assert_eq!(result.social_error.as_deref(), Some(source_error.as_str()));
+        assert_eq!(result.notifications.notifications, 3);
+
+        let stages = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT json_extract(payload_json, '$.stage')
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load access refresh stages");
+        assert!(stages.contains(&"social_summary".to_owned()));
+        assert!(stages.contains(&"notifications_summary".to_owned()));
     }
 
     #[tokio::test]
