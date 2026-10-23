@@ -494,7 +494,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95, 96, 97, 98, 99] {
+        for version in [93_i64, 94, 95, 96, 97, 98, 99, 100, 101] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -791,6 +791,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_v100_history_applies_and_reenters_recent_sync_task_index_migration() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let pre_0101 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 100)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0101
+            .run(&pool)
+            .await
+            .expect("apply schema through migration 100");
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, result_json, created_at, updated_at) VALUES ('legacy-malformed-sync-result', 'sync.subscriptions', 'failed', 'scheduler', '{}', 'not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed malformed legacy subscription result");
+
+        run(&pool)
+            .await
+            .expect("apply pending recent sync task index migration");
+        run(&pool)
+            .await
+            .expect("re-enter startup migration validation after 0101");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 101 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read applied migration 101"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 101",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 101 checksum"),
+            current_checksum(101)
+        );
+        let index_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_sync_recent_roots'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recent sync roots index");
+        assert!(index_sql.contains("task_type = 'sync.subscriptions'"));
+        assert!(index_sql.contains("json_valid(result_json)"));
+        assert!(index_sql.contains("COALESCE(json_extract(result_json, '$.skipped'), 0) != 1"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_job_tasks_subscription_chain'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("check subscription child linkage index"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, status, source, payload_json, result_json, created_at, updated_at) VALUES ('new-malformed-sync-result', 'sync.subscriptions', 'failed', 'scheduler', '{}', 'still-not-json', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("malformed result remains compatible with partial index maintenance");
+    }
+
+    #[tokio::test]
     async fn failed_pending_migration_reports_version_and_rolls_back() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -823,7 +904,7 @@ mod tests {
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(
-            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99]"
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]"
         ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(
