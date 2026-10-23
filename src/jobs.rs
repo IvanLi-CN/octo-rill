@@ -5814,7 +5814,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_owner_heartbeat_recovers_after_writer_pressure() {
-        let pool = setup_pool().await;
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let old_heartbeat = "2026-03-06T00:00:00Z";
         crate::runtime::upsert_runtime_owner_for_tests(
@@ -5868,7 +5869,8 @@ mod tests {
 
     #[tokio::test]
     async fn job_task_heartbeat_recovers_after_writer_pressure() {
-        let pool = setup_pool().await;
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let task_id = "heartbeat-pressure-task";
         let old_heartbeat = "2026-03-06T00:00:00Z";
@@ -5924,7 +5926,8 @@ mod tests {
 
     #[tokio::test]
     async fn job_task_reschedule_keeps_foreground_priority_under_writer_pressure() {
-        let pool = setup_pool().await;
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let task_id = "foreground-reschedule-pressure-task";
         seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
@@ -6020,7 +6023,8 @@ mod tests {
 
     #[tokio::test]
     async fn job_task_finalize_keeps_foreground_priority_under_writer_pressure() {
-        let pool = setup_pool().await;
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let task_id = "foreground-finalize-pressure-task";
         seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;

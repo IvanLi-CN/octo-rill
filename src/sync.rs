@@ -8746,6 +8746,15 @@ async fn sync_social_for_user(
     )
     .await;
 
+    finish_social_sync_for_user(&context, user_id.as_str(), result, error).await
+}
+
+async fn finish_social_sync_for_user(
+    context: &SubscriptionRunContext,
+    user_id: &str,
+    result: SyncSocialActivityResult,
+    error: Option<SocialSyncFailure>,
+) -> Result<Option<SyncSocialActivityResult>> {
     if let Some(error) = error {
         let (severity, recoverable, error_kind, retry_after) =
             social_sync_failure_metadata(error.sqlite_backpressure);
@@ -8758,11 +8767,11 @@ async fn sync_social_for_user(
                     severity,
                     recoverable,
                     attempt: 1,
-                    user_id: Some(user_id.as_str()),
+                    user_id: Some(user_id),
                     repo_id: None,
                     repo_full_name: None,
                     payload: json!({
-                        "user_id": user_id.as_str(),
+                        "user_id": user_id,
                         "error": error.message,
                         "error_kind": error_kind,
                         "retryable": recoverable,
@@ -8774,26 +8783,34 @@ async fn sync_social_for_user(
         return Ok(None);
     }
 
-    for source_error in &result.source_errors {
+    if !result.source_errors.is_empty() {
+        let source_errors = result.source_errors.clone();
+        let source_error_message = source_errors.join("; ");
+        let (severity, recoverable, error_kind, retry_after) = social_sync_failure_metadata(false);
         context
             .key_event(
-                format!("social sync degraded for user #{}", user_id),
+                format!("failed to refresh social activity for user #{}", user_id),
                 SubscriptionEventRecord {
                     stage: "social",
-                    event_type: "social_source_degraded",
-                    severity: "warning",
-                    recoverable: true,
+                    event_type: "social_sync_failed",
+                    severity,
+                    recoverable,
                     attempt: 1,
-                    user_id: Some(user_id.as_str()),
+                    user_id: Some(user_id),
                     repo_id: None,
                     repo_full_name: None,
                     payload: json!({
-                        "user_id": user_id.as_str(),
-                        "error": source_error,
+                        "user_id": user_id,
+                        "error": source_error_message,
+                        "error_kind": error_kind,
+                        "retryable": recoverable,
+                        "retry_after": retry_after,
+                        "source_errors": source_errors,
                     }),
                 },
             )
             .await?;
+        return Ok(None);
     }
 
     if !result.failed_repos.is_empty() {
@@ -8809,11 +8826,11 @@ async fn sync_social_for_user(
                     severity: "warning",
                     recoverable: true,
                     attempt: 1,
-                    user_id: Some(user_id.as_str()),
+                    user_id: Some(user_id),
                     repo_id: None,
                     repo_full_name: None,
                     payload: json!({
-                        "user_id": user_id.as_str(),
+                        "user_id": user_id,
                         "failed_repos": result.failed_repos.clone(),
                     }),
                 },
@@ -15150,20 +15167,21 @@ mod tests {
         ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate, RepoReleaseFetchOutcome,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StaleRepoReleaseWorkRow, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
-        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
-        SubscriptionRunLogger, SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        SocialSyncFailure, StaleRepoReleaseWorkRow, StarPhaseSuccess, StarredFetchResult,
+        StarredRepoSnapshot, SubscriptionEventRecord, SubscriptionPrunePhaseOutcome,
+        SubscriptionRunContext, SubscriptionRunLogger, SyncRequestError, SyncSocialActivityResult,
+        SyncSubscriptionSocialSummary, aggregate_release_visible_repos, aggregate_repos,
         announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options,
         attach_and_wait_for_user_release_demand_with_freshness, attach_release_demand,
         attach_release_demand_with_freshness, claim_next_repo_release_work_item,
         classify_github_http_error, cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, execute_repo_release_work_item,
+        collect_social_result, discussion_announcement_from_node, execute_repo_release_work_item,
         execute_subscription_prune_phases, expire_repo_release_deadlines,
         fail_repo_release_work_item, fail_repo_release_work_item_if_stale,
         feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        github_http_outcome, github_http_outcome_with_context,
+        finish_social_sync_for_user, github_http_outcome, github_http_outcome_with_context,
         heartbeat_repo_release_work_item_lease, hydrate_repo_refresh_candidates,
         insert_feed_activity_events, insert_social_activity_event_tx,
         install_social_activity_snapshot_after_first_chunk_hook,
@@ -15185,6 +15203,7 @@ mod tests {
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         jobs, local_id, runtime,
+        sqlite_write::{SqliteWritePriority, is_sqlite_retryable_write_error},
         state::{AppState, build_oauth_client},
     };
     use axum::{
@@ -17335,6 +17354,168 @@ mod tests {
             upstream_metadata,
             ("error", false, "social_sync_failed", None)
         );
+    }
+
+    #[tokio::test]
+    async fn social_sync_sqlite_backpressure_emits_recoverable_event_and_counts_user_failed() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-sync-sqlite-backpressure");
+        let task_id = local_id::test_local_id("social-sync-sqlite-backpressure-task");
+        seed_user(&pool, user_id.as_str()).await;
+        seed_sync_task(&state, task_id.as_str()).await;
+        let context = SubscriptionRunContext::new(state.as_ref(), task_id.as_str())
+            .await
+            .expect("open social sync test context");
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/backpressure".to_owned(),
+            is_private: false,
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+            repo_stargazer_count: Some(0),
+        };
+        let repo_members = vec![(repo.clone(), Vec::new())];
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "social_sync_backpressure_hold",
+                SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let snapshot_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                apply_social_activity_snapshot_partial(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    Some(std::slice::from_ref(&repo)),
+                    Some(repo_members.as_slice()),
+                    None,
+                )
+                .await
+            })
+        };
+        let error = tokio::time::timeout(Duration::from_secs(4), snapshot_task)
+            .await
+            .expect("social snapshot should reach its writer deadline")
+            .expect("join social snapshot")
+            .expect_err("social snapshot should expose writer backpressure");
+        assert!(is_sqlite_retryable_write_error(error.as_ref()));
+        drop(held);
+
+        let outcome = finish_social_sync_for_user(
+            &context,
+            user_id.as_str(),
+            SyncSocialActivityResult::default(),
+            Some(SocialSyncFailure {
+                message: error.to_string(),
+                sqlite_backpressure: true,
+            }),
+        )
+        .await
+        .expect("record recoverable social writer pressure");
+        assert!(outcome.is_none());
+
+        let (severity, recoverable, payload_json): (String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT severity, recoverable, payload_json
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = 'social_sync_failed'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recoverable social writer event");
+        assert_eq!(severity, "warning");
+        assert_eq!(recoverable, 1);
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse event payload");
+        assert_eq!(
+            payload.get("error_kind"),
+            Some(&json!("sqlite_write_backpressure"))
+        );
+        assert_eq!(payload.get("retryable"), Some(&json!(true)));
+        assert_eq!(
+            payload.get("retry_after"),
+            Some(&json!("next_sync_subscriptions_run"))
+        );
+        assert_eq!(context.critical_events.load(AtomicTestOrdering::Relaxed), 0);
+
+        let mut summary = SyncSubscriptionSocialSummary {
+            total_users: 1,
+            ..Default::default()
+        };
+        collect_social_result(Some(Ok(Ok(None))), &mut summary).expect("count failed social user");
+        assert_eq!(summary.succeeded_users, 0);
+        assert_eq!(summary.failed_users, 1);
+    }
+
+    #[tokio::test]
+    async fn social_upstream_source_error_is_nonrecoverable_and_counts_user_failed() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-source-error");
+        let task_id = local_id::test_local_id("social-source-error-task");
+        seed_user(&pool, user_id.as_str()).await;
+        seed_sync_task(&state, task_id.as_str()).await;
+        let context = SubscriptionRunContext::new(state.as_ref(), task_id.as_str())
+            .await
+            .expect("open social source error test context");
+
+        let outcome = finish_social_sync_for_user(
+            &context,
+            user_id.as_str(),
+            SyncSocialActivityResult {
+                source_errors: vec![
+                    "owned_repos(conn:github, http_500): github returned 500".to_owned(),
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("record upstream social failure");
+        assert!(outcome.is_none());
+
+        let (severity, recoverable, payload_json): (String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT severity, recoverable, payload_json
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = 'social_sync_failed'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load upstream social failure event");
+        assert_eq!(severity, "error");
+        assert_eq!(recoverable, 0);
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse event payload");
+        assert_eq!(
+            payload.get("error_kind"),
+            Some(&json!("social_sync_failed"))
+        );
+        assert_eq!(payload.get("retryable"), Some(&json!(false)));
+        assert_eq!(payload.get("retry_after"), Some(&Value::Null));
+        assert_eq!(context.critical_events.load(AtomicTestOrdering::Relaxed), 1);
+
+        let mut summary = SyncSubscriptionSocialSummary {
+            total_users: 1,
+            ..Default::default()
+        };
+        collect_social_result(Some(Ok(Ok(None))), &mut summary)
+            .expect("count failed upstream social user");
+        assert_eq!(summary.succeeded_users, 0);
+        assert_eq!(summary.failed_users, 1);
     }
 
     #[test]
