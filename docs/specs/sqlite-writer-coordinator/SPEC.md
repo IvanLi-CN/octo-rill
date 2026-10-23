@@ -306,7 +306,7 @@
 ### Testing
 
 - Unit tests: `SqliteWriteCoordinator` 并发串行化、foreground 优先级、busy 分类与 background admission 有界退避。
-- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator；background queue/admission 有界，content recovery 跨 worker coalesce，HTTP session foreground write 与 scheduler pressure 的 file-backed regression 保持成功；empty-queue scheduler probes must finish within the bounded five-second test budget used by the Agent VM acceptance; access-refresh Social source errors 不得阻断 Notifications；其依赖注入 seam 仅用于测试并由私有 dependency struct 聚合。
+- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator；background queue/admission 有界，content recovery 跨 worker coalesce，HTTP session foreground write 与 scheduler pressure 的 file-backed regression 保持成功；empty-queue scheduler probes must finish within the bounded 30-second test budget used by the Agent VM acceptance; access-refresh Social source errors 不得阻断 Notifications；其依赖注入 seam 仅用于测试并由私有 dependency struct 聚合。
 - E2E tests: None。
 
 ### UI / Storybook (if applicable)

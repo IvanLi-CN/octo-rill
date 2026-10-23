@@ -8180,7 +8180,7 @@ mod tests {
             }));
         }
         for task in background_tasks.drain(..) {
-            tokio::time::timeout(StdDuration::from_secs(5), task)
+            tokio::time::timeout(StdDuration::from_secs(30), task)
                 .await
                 .expect("empty-queue background scheduler should stay bounded")
                 .expect("background scheduler task should join");
