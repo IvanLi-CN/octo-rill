@@ -514,7 +514,7 @@ target_selector=[data-visual-evidence-target="admin-jobs-social-writer-pressure"
 requested_viewport=1440x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=Admin/Task Type Detail/SyncSubscriptionsRecoverableSocialWriterPressure
 state=recoverable-social-writer-pressure
 evidence_note=验证 Social SQLite writer 背压保持 partial/warning 可恢复语义，failed 用户仍被计数且关键事件计数不增加。
