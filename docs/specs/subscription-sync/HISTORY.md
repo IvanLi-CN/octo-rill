@@ -14,6 +14,7 @@
 - 2026-10-23: The access-refresh regression seam remains private test wiring grouped in a dependency struct, leaving production Social and Notifications implementations unchanged without a lint suppression.
 - 2026-10-24: Access-refresh Social failure metadata now survives the private dependency seam into progress/log payloads; upstream failures remain error/non-recoverable and SQLite writer pressure is warning/recoverable with retry metadata.
 - 2026-10-24: Legacy `sync.all` now preserves completed Notifications data while finalizing Social business failures as failed tasks with explicit completion classification, avoiding false success.
+- 2026-10-24: Owner approval recorded for the mock-only Storybook evidence covering recoverable Social SQLite writer pressure.
 - 2026-10-23: The file-backed WAL scheduler/session acceptance now releases its external SQLite lock before joining empty-queue workers, keeping the pressure proof faithful to the production foreground deadline under slow test scheduling.
 - 2026-09-23: Admin Jobs 订阅同步运行时配置 PATCH 改为经 SQLite foreground writer coordinator 在单一事务中原子保存，并从同一事务快照返回设置值；`BUSY/LOCKED` 重试耗尽时返回带 `Retry-After: 1` 的 `503 database_busy`，并覆盖写锁竞争、后续写失败回滚及成功回填回归测试。
 - 2026-09-07: 订阅同步间隔成为 Release 治理窗口的唯一长度；保存后按 UTC 对齐边界生效，活动周期冻结实际 `N+B`，任务间隔弹窗改为只读摘要，管理员重试限定为原任务失败或未完成 watcher 范围。

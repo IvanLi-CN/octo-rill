@@ -395,7 +395,7 @@ source_type=ui_demo
 target_program=mock-only
 capture_scope=element
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish AccessSyncEmptyState
 state=auto-sync-empty-state
 evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
