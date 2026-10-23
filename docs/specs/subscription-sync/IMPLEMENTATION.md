@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- 2026-10-23 candidate: Social persistence shares bounded background admission retry with heartbeat/finalize paths; exhausted SQLite pressure remains a partial failed user with `warning`/`recoverable=true` and `error_kind=sqlite_write_backpressure`, while upstream failures remain critical.
 - Lifecycle: active
 - Implementation: 已交付
 - Last: 2026-09-23

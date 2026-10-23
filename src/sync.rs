@@ -31,7 +31,7 @@ use crate::{
     admin_runtime, content_processing, jobs, local_id, runtime,
     sqlite_write::{
         SqliteWritePermit, SqliteWritePriority, is_sqlite_background_admission_error,
-        is_sqlite_write_deadline_error,
+        is_sqlite_retryable_write_error, is_sqlite_write_deadline_error,
     },
     state::AppState,
     translations,
@@ -1514,6 +1514,21 @@ fn subscription_event_counts_as_critical(severity: &str) -> bool {
     severity == "error"
 }
 
+fn social_sync_failure_metadata(
+    sqlite_backpressure: bool,
+) -> (&'static str, bool, &'static str, Option<&'static str>) {
+    if sqlite_backpressure {
+        (
+            "warning",
+            true,
+            "sqlite_write_backpressure",
+            Some("next_sync_subscriptions_run"),
+        )
+    } else {
+        ("error", false, "social_sync_failed", None)
+    }
+}
+
 fn subscription_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(
         SUBSCRIPTION_RETRY_BACKOFF_MS
@@ -2351,16 +2366,44 @@ pub async fn sync_social_activity_best_effort(
     user_id: &str,
     context: &'static str,
 ) -> (SyncSocialActivityResult, Option<String>) {
+    let (result, error) =
+        sync_social_activity_best_effort_with_failure(state, user_id, context).await;
+    (result, error.map(|error| error.message))
+}
+
+#[derive(Debug)]
+struct SocialSyncFailure {
+    message: String,
+    sqlite_backpressure: bool,
+}
+
+async fn sync_social_activity_best_effort_with_failure(
+    state: &AppState,
+    user_id: &str,
+    context: &'static str,
+) -> (SyncSocialActivityResult, Option<SocialSyncFailure>) {
     match sync_social_activity(state, user_id).await {
         Ok(result) => (result, None),
         Err(err) => {
+            let sqlite_backpressure = is_sqlite_retryable_write_error(err.as_ref());
             tracing::warn!(
                 ?err,
                 user_id,
                 context,
+                error_kind = if sqlite_backpressure {
+                    "sqlite_write_backpressure"
+                } else {
+                    "social_sync_failed"
+                },
                 "social activity sync failed, continuing"
             );
-            (SyncSocialActivityResult::default(), Some(err.to_string()))
+            (
+                SyncSocialActivityResult::default(),
+                Some(SocialSyncFailure {
+                    message: err.to_string(),
+                    sqlite_backpressure,
+                }),
+            )
         }
     }
 }
@@ -8696,7 +8739,7 @@ async fn sync_social_for_user(
         return Ok(None);
     }
 
-    let (result, error) = sync_social_activity_best_effort(
+    let (result, error) = sync_social_activity_best_effort_with_failure(
         context.state.as_ref(),
         user_id.as_str(),
         "sync.subscriptions",
@@ -8704,21 +8747,26 @@ async fn sync_social_for_user(
     .await;
 
     if let Some(error) = error {
+        let (severity, recoverable, error_kind, retry_after) =
+            social_sync_failure_metadata(error.sqlite_backpressure);
         context
             .key_event(
                 format!("failed to refresh social activity for user #{}", user_id),
                 SubscriptionEventRecord {
                     stage: "social",
                     event_type: "social_sync_failed",
-                    severity: "error",
-                    recoverable: false,
+                    severity,
+                    recoverable,
                     attempt: 1,
                     user_id: Some(user_id.as_str()),
                     repo_id: None,
                     repo_full_name: None,
                     payload: json!({
                         "user_id": user_id.as_str(),
-                        "error": error,
+                        "error": error.message,
+                        "error_kind": error_kind,
+                        "retryable": recoverable,
+                        "retry_after": retry_after,
                     }),
                 },
             )
@@ -15115,7 +15163,8 @@ mod tests {
         execute_subscription_prune_phases, expire_repo_release_deadlines,
         fail_repo_release_work_item, fail_repo_release_work_item_if_stale,
         feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        github_http_outcome, github_http_outcome_with_context, hydrate_repo_refresh_candidates,
+        github_http_outcome, github_http_outcome_with_context,
+        heartbeat_repo_release_work_item_lease, hydrate_repo_refresh_candidates,
         insert_feed_activity_events, insert_social_activity_event_tx,
         install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
@@ -15127,7 +15176,8 @@ mod tests {
         recover_repo_release_runtime_state_on_startup, refresh_public_repo_release_if_stale,
         replace_starred_repos, repo_release_deadline_at, repo_release_timestamp_is_fresh,
         resolve_notification_open_url, social_activity_snapshot_hook_test_lock,
-        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
+        social_sync_failure_metadata, store_sync_state_value,
+        subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
@@ -17254,6 +17304,37 @@ mod tests {
         assert!(subscription_event_counts_as_critical("error"));
         assert!(!subscription_event_counts_as_critical("warning"));
         assert!(!subscription_event_counts_as_critical("info"));
+    }
+
+    #[test]
+    fn social_sqlite_backpressure_is_recoverable_but_upstream_failure_is_not() {
+        let sqlite_error = anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
+            lane: "social_activity_snapshot",
+            priority: "background",
+            phase: "writer_queue",
+            deadline_ms: 2_500,
+        });
+        let sqlite_metadata = social_sync_failure_metadata(
+            crate::sqlite_write::is_sqlite_retryable_write_error(sqlite_error.as_ref()),
+        );
+        assert_eq!(
+            sqlite_metadata,
+            (
+                "warning",
+                true,
+                "sqlite_write_backpressure",
+                Some("next_sync_subscriptions_run")
+            )
+        );
+
+        let upstream_error = anyhow::anyhow!("GitHub returned an invalid response");
+        let upstream_metadata = social_sync_failure_metadata(
+            crate::sqlite_write::is_sqlite_retryable_write_error(upstream_error.as_ref()),
+        );
+        assert_eq!(
+            upstream_metadata,
+            ("error", false, "social_sync_failed", None)
+        );
     }
 
     #[test]
@@ -24896,6 +24977,72 @@ mod tests {
         .await
         .expect("load sync state");
         assert_eq!(stored_value, "2026-03-07T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn repo_release_heartbeat_recovers_after_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let work_item_id = "repo-release-heartbeat-pressure";
+        let old_heartbeat = "2026-03-06T00:00:00Z";
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: work_item_id,
+                repo_id: 701,
+                repo_full_name: "octo/heartbeat-pressure",
+                status: crate::jobs::STATUS_RUNNING,
+                deadline_at: "2026-03-07T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
+                runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+                lease_heartbeat_at: Some(old_heartbeat),
+            },
+        )
+        .await;
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "repo_release_heartbeat_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let heartbeat = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                heartbeat_repo_release_work_item_lease(state.as_ref(), work_item_id).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("repo release heartbeat should wait behind writer pressure");
+        drop(held);
+        heartbeat
+            .await
+            .expect("join repo release heartbeat")
+            .expect("repo release heartbeat should recover");
+
+        let (status, runtime_owner_id, updated_heartbeat): (String, String, String) =
+            sqlx::query_as(
+                "SELECT status, runtime_owner_id, lease_heartbeat_at FROM repo_release_work_items WHERE id = ?",
+            )
+            .bind(work_item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load repo release heartbeat");
+        assert_eq!(status, crate::jobs::STATUS_RUNNING);
+        assert_eq!(runtime_owner_id, state.runtime_owner_id);
+        assert_ne!(updated_heartbeat, old_heartbeat);
+        assert_eq!(state.sqlite_writer.runtime_status().waiting_background, 0);
     }
 
     #[tokio::test]

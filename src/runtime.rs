@@ -263,3 +263,8 @@ pub async fn upsert_runtime_owner_for_tests(
     .context("failed to upsert runtime owner for tests")?;
     Ok(())
 }
+
+#[cfg(test)]
+pub async fn touch_runtime_owner_lease_for_tests(state: &AppState) -> Result<()> {
+    touch_runtime_owner_lease(state).await
+}

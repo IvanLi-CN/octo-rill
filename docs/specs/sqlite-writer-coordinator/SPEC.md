@@ -111,7 +111,7 @@
 
 - deadline 到期必须按 lane 语义处理：foreground 返回可识别的 retryable 503；background 将工作延后或持久化重试后结束本次尝试，不得立即自旋；best-effort 跳过写入且不得改变主要用户请求结果。
 - content processing recovery/claim、普通 job claim 与 repo release claim worker 在数据库尝试失败时必须使用有界内存退避，基础等待依次为 1/2/4/8/16/30 秒并封顶 30 秒；抖动只能增加当次等待。每个 worker 同时最多执行一笔同类 claim，成功完成对应 recovery/claim DB 尝试后复位退避；等待期间不得由 tick、notify 或其他循环信号提前绕过。
-- 结构化 `sqlite.write` telemetry 必须包含 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms`，并可区分 `writer_queue_timeout`、`write_pool_timeout` 与 `sqlite_busy`。
+- 结构化 `sqlite.write` telemetry 必须包含 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms`，并可区分 `writer_queue_timeout`、`write_pool_timeout`、`background_admission_retry` 与 `sqlite_busy`。
 
 ### REQ-SQLITE-WRITER-013
 
@@ -123,7 +123,7 @@
 ### REQ-SQLITE-WRITER-014
 
 - background writer admission 必须有共享的有界等待预算；默认最多保留一个等待中的 background writer。已有 background waiter 不得被新的 background 请求无限堆积，超出预算时必须返回 typed admission error 并记录 `waiting_foreground`、`waiting_background`、`queue_limit` 与 `request_id`。
-- foreground waiter 出现后不得再接纳新的 background waiter；已经取得 permit 或已经进入有界等待的 background 写可以完成，但后续 background 尝试必须结束本轮并由 worker backoff 处理，不得立即自旋。
+- foreground waiter 出现后不得再接纳新的 background waiter；后续 background admission denial 在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，不新增 waiter 或重置 deadline，预算耗尽后返回 typed retryable deadline 并由 worker backoff 处理，不得立即自旋。
 - per-lane background work 可以通过共享 coordinator 的 cadence admission 合并同一时间窗口内的重复执行。content processing recovery 的所有 worker 必须共享 cadence 状态，重复 tick 只增加 coalesced telemetry，不得重复开始 recovery transaction。
 - HTTP access telemetry 必须覆盖正常成功请求以及慢请求和错误请求，并至少包含 `request_id`、method、route、status、latency 与 slow 标记；同一请求上下文内的 `sqlite.write` telemetry 必须带 request correlation 字段。
 
@@ -141,7 +141,7 @@
 ### Core flows
 
 - 后台 worker 可以继续高并发执行网络/AI 阶段；进入 SQLite 写入时通过 coordinator 排队。
-- 登录/session、手动触发任务、job enqueue 与取消任务走 foreground lane；后台 claim/heartbeat/finalize/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
+- 登录/session、手动触发任务、job enqueue、任务终态 finalize 与取消任务走 foreground lane；后台 claim/heartbeat/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
 - translation batch 的启动状态切换必须在单个短事务内完成：`translation_batches` 的 `queued -> running`、关联 `translation_work_items` 的 `running` 标记与 lease 元数据更新都要在 writer permit 内提交，AI 调用与后续长计算继续留在 permit 外。
 - feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
 - repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
@@ -153,7 +153,7 @@
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 - foreground 与 background 使用各自有界总 deadline；deadline 限制 writer permit、专用 write pool 获取、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试开始。已经启动的 callback 可以完成在 deadline 之后；COMMIT 一旦派发，deadline 不再中断它。
 - 专用 write pool 只供协调写入使用，普通读请求继续共享多连接 reader pool；因 reader pool 耗尽不应阻塞 writer pool 获取。
-- background recovery/claim 使用共享 coordinator admission：recovery lane 以 cadence 合并同一窗口内的重复 worker pass，普通 background writer 遵循有界等待预算；admission denial 由 worker backoff 消化，不改变前台 session、enqueue 或其他用户可见写入的 foreground lane。
+- background recovery/claim 使用共享 coordinator admission：recovery lane 以 cadence 合并同一窗口内的重复 worker pass，普通 background writer 遵循有界等待预算；admission denial 由 worker backoff 消化，不改变前台 session、enqueue、task finalize 或其他用户可见写入的 foreground lane。
 - HTTP middleware 在 task-local request context 中保留 request ID、method 和 route；正常请求也写入 `http.access`，writer transaction end、session writer 与 admission telemetry 复用这些字段完成前后台关联。
 
 ### Edge cases / errors
@@ -236,6 +236,10 @@
   When 查看结构化 `sqlite.write` telemetry
   Then `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms` 可用，且 writer 队列超时、write-pool 耗尽与 SQLite busy 使用不同原因字段。
 
+- Given 一个 background waiter 与一个 foreground waiter 已经占用 admission 预算
+  When 另一个 background writer 反复遇到 admission denial
+  Then 它使用同一个单调 deadline 做 25/50/100ms 封顶退避，waiting background 始终不超过一个，foreground 继续优先；预算耗尽后返回 typed retryable deadline 并交回调用方 backoff。
+
 - Given content processing recovery/claim、job claim 或 repo release claim 连续遇到 deadline、busy 或连接状态错误
   When worker 进入下一次 claim loop
   Then 同类 claim 使用 1/2/4/8/16/30 秒基础退避和不提前的抖动等待；成功 DB 尝试后退避复位，故障解除后任务继续领取且 lease/幂等状态保持正确。
@@ -286,7 +290,7 @@
 
 ### VER-SQLITE-WRITER-006
 
-- Method: `sqlite_write::tests::background_writer_admission_is_bounded`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
+- Method: `sqlite_write::tests::background_writer_admission_retries_without_growing_waiter_queue`, `sqlite_write::tests::background_writer_admission_recovers_after_capacity_clears`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `jobs::tests::runtime_owner_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_reschedule_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::job_task_finalize_keeps_foreground_priority_under_writer_pressure`, `sync::tests::repo_release_heartbeat_recovers_after_writer_pressure`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
 - covers: REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013, REQ-SQLITE-WRITER-014
 - Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under a real external SQLite writer lock, writer state is reusable after the run, and a request's `http.access` and `sqlite.write` events carry matching request ID, method, and route fields; fast 4xx access logs carry the complete field set at `warn` level.
 
@@ -301,13 +305,13 @@
 
 ### Testing
 
-- Unit tests: `SqliteWriteCoordinator` 并发串行化、foreground 优先级与 busy 分类。
+- Unit tests: `SqliteWriteCoordinator` 并发串行化、foreground 优先级、busy 分类与 background admission 有界退避。
 - Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator；background queue/admission 有界，content recovery 跨 worker coalesce，HTTP session foreground write 与 scheduler pressure 的 file-backed regression 保持成功。
 - E2E tests: None。
 
 ### UI / Storybook (if applicable)
 
-- Not applicable。
+- Mock-only Storybook canvas covers Admin Jobs `sync.subscriptions` with recoverable Social SQLite writer pressure and preserves the partial outcome without a critical event。
 
 ### Quality checks
 
@@ -319,9 +323,22 @@
 
 ## Visual Evidence
 
-- None
+- source_type=storybook_canvas
+- target_program=mock-only
+- capture_scope=element
+- margin_policy=require_margin
+- evidence_surface=component
+- surface_selector=[data-visual-evidence-surface="admin-jobs-social-writer-pressure"]
+- target_selector=[data-visual-evidence-target="admin-jobs-social-writer-pressure"]
+- requested_viewport=1440x900
+- viewport_strategy=storybook-viewport
+- sensitive_exclusion=N/A
+- submission_gate=pending-owner-approval
+- story_id_or_title=Admin/Task Type Detail/SyncSubscriptionsRecoverableSocialWriterPressure
+- state=recoverable-social-writer-pressure
+- evidence_note=验证 Social SQLite 背压显示为 warning/recoverable 的部分成功结果，failed 用户仍计数且 critical_events 保持为 0。
 
-Not applicable。
+![Recoverable Social SQLite writer pressure](./assets/admin-jobs-social-writer-pressure.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
@@ -330,7 +347,7 @@ Not applicable。
 
 ## Related ADRs
 
-None
+- [ADR 0021: SQLite background admission bounded retry](../../adr/0021-sqlite-background-admission-retry.md)
 
 ## 参考（References）
 

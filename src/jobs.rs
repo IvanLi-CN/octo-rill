@@ -5320,7 +5320,7 @@ async fn finalize_task_if_owned(
 
     let updated = state
         .sqlite_writer
-        .write("job_task_finalize_owned", |_| async {
+        .write_foreground("job_task_finalize_owned", |_| async {
             let updated = sqlx::query(
                 r#"
 				UPDATE job_tasks
@@ -5779,12 +5779,13 @@ mod tests {
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
-        load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
-        load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
+        finalize_task_if_owned, heartbeat_task_lease, is_scheduled_task_type,
+        load_due_daily_slot_users, load_recent_failed_brief_retry_candidates,
+        load_recent_failed_translation_retry_candidates, load_translation_stream_cursor,
+        load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
-        retry_candidate_is_retryable, rollback_scheduler_dispatch,
+        reschedule_task, retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
@@ -5809,6 +5810,322 @@ mod tests {
         body.lines()
             .filter_map(|line| line.strip_prefix("id: "))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn runtime_owner_heartbeat_recovers_after_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let old_heartbeat = "2026-03-06T00:00:00Z";
+        crate::runtime::upsert_runtime_owner_for_tests(
+            state.as_ref(),
+            state.runtime_owner_id.as_str(),
+            old_heartbeat,
+        )
+        .await
+        .expect("seed runtime owner");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "runtime_owner_heartbeat_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let heartbeat = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::runtime::touch_runtime_owner_lease_for_tests(state.as_ref()).await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime owner heartbeat should wait behind writer pressure");
+        drop(held);
+        heartbeat
+            .await
+            .expect("join runtime owner heartbeat")
+            .expect("runtime owner heartbeat should recover");
+
+        let updated = sqlx::query_scalar::<_, String>(
+            "SELECT lease_heartbeat_at FROM runtime_owners WHERE runtime_owner_id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load runtime owner heartbeat");
+        assert_ne!(updated, old_heartbeat);
+        assert_eq!(state.sqlite_writer.runtime_status().waiting_background, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_heartbeat_recovers_after_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "heartbeat-pressure-task";
+        let old_heartbeat = "2026-03-06T00:00:00Z";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(old_heartbeat)
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed task lease");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_heartbeat_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let heartbeat = {
+            let state = state.clone();
+            tokio::spawn(async move { heartbeat_task_lease(state.as_ref(), task_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task heartbeat should wait behind writer pressure");
+        drop(held);
+        heartbeat
+            .await
+            .expect("join task heartbeat")
+            .expect("task heartbeat should recover");
+
+        let updated = sqlx::query_scalar::<_, String>(
+            "SELECT lease_heartbeat_at FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load task heartbeat");
+        assert_ne!(updated, old_heartbeat);
+        assert_eq!(state.sqlite_writer.runtime_status().waiting_background, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_reschedule_keeps_foreground_priority_under_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "foreground-reschedule-pressure-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_reschedule_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let background = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .sqlite_writer
+                    .write("job_task_heartbeat", move |_| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background heartbeat should wait behind writer pressure");
+
+        let reschedule = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                reschedule_task(
+                    state.as_ref(),
+                    task_id,
+                    Utc::now() + Duration::minutes(1),
+                    json!({"reason": "writer_pressure"}),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground reschedule should be registered");
+        drop(held);
+        assert!(
+            reschedule
+                .await
+                .expect("join foreground reschedule")
+                .expect("foreground reschedule should recover")
+        );
+        background
+            .await
+            .expect("join background heartbeat")
+            .expect("background heartbeat should finish");
+
+        let (status, runtime_owner_id, lease_heartbeat_at): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, runtime_owner_id, lease_heartbeat_at FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load rescheduled task");
+        assert_eq!(status, STATUS_QUEUED);
+        assert_eq!(runtime_owner_id, None);
+        assert_eq!(lease_heartbeat_at, None);
+        let stale_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.recovered_failed'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stale transitions");
+        assert_eq!(stale_transition_count, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_finalize_keeps_foreground_priority_under_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "foreground-finalize-pressure-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed task owner");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_finalize_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let background = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .sqlite_writer
+                    .write("job_task_heartbeat", move |_| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background heartbeat should wait behind writer pressure");
+
+        let finalize = {
+            let state = state.clone();
+            let runtime_owner_id = state.runtime_owner_id.clone();
+            tokio::spawn(async move {
+                finalize_task_if_owned(
+                    state.as_ref(),
+                    task_id,
+                    STATUS_SUCCEEDED,
+                    Some(json!({"ok": true})),
+                    None,
+                    runtime_owner_id.as_str(),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground finalize should be registered");
+        drop(held);
+        assert!(
+            finalize
+                .await
+                .expect("join foreground finalize")
+                .expect("foreground finalize should recover")
+        );
+        background
+            .await
+            .expect("join background heartbeat")
+            .expect("background heartbeat should finish");
+
+        let (status, runtime_owner_id, lease_heartbeat_at, result_json): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, runtime_owner_id, lease_heartbeat_at, result_json FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load finalized task");
+        assert_eq!(status, STATUS_SUCCEEDED);
+        assert_eq!(runtime_owner_id, None);
+        assert_eq!(lease_heartbeat_at, None);
+        assert_eq!(result_json.as_deref(), Some(r#"{"ok":true}"#));
+        let stale_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.recovered_failed'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stale transitions");
+        assert_eq!(stale_transition_count, 0);
     }
 
     #[tokio::test]

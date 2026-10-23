@@ -4,6 +4,7 @@
 
 ## Current Status
 
+- 2026-10-23 candidate: background admission denial now uses the existing coordinator deadline and 25/50/100ms capped backoff without increasing the one-waiter queue; Social SQLite exhaustion is classified as recoverable warning metadata while preserving failed-user accounting.
 - Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
@@ -33,7 +34,7 @@
 - HTTP access middleware 现在为正常成功请求也写入 `http.access`，并在 task-local request context 中保留 request ID、method、route；SQLite transaction-end、session write 与 background admission telemetry 复用这些字段完成 request-to-writer correlation。
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
-- `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel 使用 foreground lane。
+- `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel/finalize 使用 foreground lane，claim/heartbeat 继续使用 background admission retry。
 - session load 使用 reader pool；create/save/delete 使用独立 writer pool 上的 direct SQL、foreground lane 与统一单调 deadline/短 busy retry；过期 session 清理使用 best-effort lane。Session middleware 对 activity-only refresh pressure 保留原业务响应并省略新 cookie，对 critical/mixed save failure 返回可识别的 retryable 503。
 - repo release attach/claim/finalize/watchers/heartbeat/fail/upsert/sync-state 已接入 writer coordinator。
 - social activity snapshot 与 feed activity event 持久化已接入 writer coordinator；social snapshot 先在 permit 外读取 current-member、history、stale association 与 stale repo/member 候选，再按固定 64 行 chunk 分阶段执行 `BEGIN IMMEDIATE`，chunk 之间释放 permit。current-member/history materialization、baseline、stale cleanup 与 association source 清理保持幂等和可中断恢复，并记录候选读取、writer wait、query elapsed、chunk elapsed 与 chunk count。

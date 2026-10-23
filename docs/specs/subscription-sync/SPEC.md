@@ -225,6 +225,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - owned repo stargazers 默认 `per_page=50`、每 repo 最多 1 页；
   - 达到页预算的 partial snapshot 不能删除本地未出现在浅窗口里的旧成员；全量成员修正交给低频 reconciliation。
 - social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
+- Social 持久化遇到 SQLite busy、writer deadline 或 background admission 耗尽时，`social_sync_failed` 事件类型保持不变，但必须使用 `severity=warning`、`recoverable=true`，payload 增加 `error_kind=sqlite_write_backpressure`、`retryable=true` 与 `retry_after=next_sync_subscriptions_run`；用户仍计入当前轮 failed，不得伪装成成功。GitHub/upstream 错误继续使用 error/non-recoverable。
 - social feed 中的 GitHub `ReleaseEvent` 写为 `release_update`，不得复用 `announcement`；Discussions Announcements 继续使用 `announcement`。
 - `release_update` 命中的 repo 会以 interactive 优先级挂入共享 repo release queue，用于加速发现，但不得替代定时同步中的全量 repo demand。
 
@@ -318,6 +319,10 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When `sync.subscriptions` 结束
   Then 整轮任务仍可完成，但 Admin Jobs 详情页会展示 partial outcome，并能从 `recent_events` 看到对应失败线索。
 
+- Given Social 持久化在本轮耗尽 SQLite background admission、busy 或 writer deadline
+  When `sync.subscriptions` 写入诊断事件
+  Then `social_sync_failed` 保持当前轮 failed 计数但使用 `warning`/`recoverable=true`，payload 标记 `sqlite_write_backpressure` 与下一轮重试范围，`critical_events` 不增加；真实 GitHub/upstream 错误仍为 `error`/`recoverable=false`。
+
 - Given 管理员把 Release worker 数量从 5 调整到 16
   When 保存设置
   Then `GET /api/admin/jobs/sync/runtime-config` 返回 `repo_release_worker_concurrency=16`，后续 repo release worker 按 16 个活跃槽位 claim。
@@ -347,6 +352,10 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 source_type=storybook_canvas
 target_program=mock-only
 capture_scope=element
+margin_policy=require_margin
+evidence_surface=component
+surface_selector=[data-visual-evidence-surface="admin-jobs-social-writer-pressure"]
+target_selector=[data-visual-evidence-target="admin-jobs-social-writer-pressure"]
 requested_viewport=1440x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
@@ -474,6 +483,19 @@ evidence_note=验证订阅同步列表中底层 succeeded 但 `skipped=true` 的
 source_type=storybook_canvas
 target_program=mock-only
 capture_scope=element
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Admin/Task Type Detail/SyncSubscriptionsRecoverableSocialWriterPressure
+state=recoverable-social-writer-pressure
+evidence_note=验证 Social SQLite writer 背压保持 partial/warning 可恢复语义，failed 用户仍被计数且关键事件计数不增加。
+
+![Recoverable Social SQLite writer pressure](./assets/admin-jobs-social-writer-pressure.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
 requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
@@ -584,6 +606,7 @@ evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法
 ## Related ADRs
 
 - [ADR 0006: Decouple Star Synchronization from Subscription Governance](../../adr/0006-decouple-star-sync-schedules.md)
+- [ADR 0021: SQLite background admission bounded retry](../../adr/0021-sqlite-background-admission-retry.md)
 
 ## Verification
 
