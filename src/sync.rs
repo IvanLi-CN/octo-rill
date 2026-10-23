@@ -2784,6 +2784,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_access_refresh_with_freshness_and_dependencies<
     SyncStarred,
     RefreshVisibility,
