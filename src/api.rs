@@ -1184,13 +1184,16 @@ async fn load_recent_sync_auto_fetch_tasks(
             id,
             status,
             source,
-            result_json,
             created_at,
             started_at,
             finished_at
-          FROM job_tasks
-          WHERE task_type = ?
-            AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+          FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+          WHERE task_type = 'sync.subscriptions'
+            AND CASE
+              WHEN json_valid(result_json)
+                THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+              ELSE 1
+            END
           ORDER BY created_at DESC, id DESC
           LIMIT 3
         ),
@@ -1222,7 +1225,7 @@ async fn load_recent_sync_auto_fetch_tasks(
             root.id,
             root.status,
             root.source,
-            COALESCE(json_extract(root.result_json, '$.skipped'), 0) = 1 AS skipped,
+            0 AS skipped,
             CASE
             WHEN rollup.unfinished_count = 0 AND rollup.chain_finished_at IS NOT NULL
               THEN CAST((julianday(rollup.chain_finished_at) - julianday(root.created_at)) * 86400000 AS INTEGER)
@@ -1239,7 +1242,6 @@ async fn load_recent_sync_auto_fetch_tasks(
         ORDER BY root.created_at DESC, root.id DESC
         "#,
     )
-    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
     .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .fetch_all(&state.pool)
@@ -4128,6 +4130,7 @@ pub async fn admin_list_realtime_tasks(
     let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
     let scheduled_tasks = jobs::SCHEDULED_TASK_TYPES
         .iter()
+        .filter(|task| jobs::is_scheduled_task_type(task))
         .map(|task| (*task).to_owned())
         .collect::<Vec<_>>();
     let user_sync_tasks = [
@@ -4138,18 +4141,26 @@ pub async fn admin_list_realtime_tasks(
         QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
     append_admin_realtime_task_filters(
         &mut total_query,
-        status.clone(),
-        task_type.clone(),
-        exclude_task_type.clone(),
-        task_group.clone(),
+        &status,
+        &task_type,
+        &exclude_task_type,
+        &task_group,
         &scheduled_tasks,
         &user_sync_tasks,
     );
+    let count_started_at = std::time::Instant::now();
     let total = total_query
         .build_query_scalar::<i64>()
         .fetch_one(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "count",
+        elapsed_ms = count_started_at.elapsed().as_millis() as u64,
+        total,
+        "admin realtime task list phase completed"
+    );
 
     let mut items_query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
@@ -4173,10 +4184,10 @@ pub async fn admin_list_realtime_tasks(
     );
     append_admin_realtime_task_filters(
         &mut items_query,
-        status,
-        task_type,
-        exclude_task_type,
-        task_group.clone(),
+        &status,
+        &task_type,
+        &exclude_task_type,
+        &task_group,
         &scheduled_tasks,
         &user_sync_tasks,
     );
@@ -4184,6 +4195,7 @@ pub async fn admin_list_realtime_tasks(
     items_query.push_bind(page_size);
     items_query.push(" OFFSET ");
     items_query.push_bind(offset);
+    let page_started_at = std::time::Instant::now();
     let items = items_query
         .build_query_as::<AdminRealtimeTaskRow>()
         .fetch_all(&state.pool)
@@ -4192,20 +4204,25 @@ pub async fn admin_list_realtime_tasks(
         .into_iter()
         .map(AdminRealtimeTaskItem::from)
         .collect::<Vec<_>>();
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "page",
+        elapsed_ms = page_started_at.elapsed().as_millis() as u64,
+        returned = items.len(),
+        page_size,
+        "admin realtime task list phase completed"
+    );
 
-    let mut items = items
-        .into_iter()
-        .filter(|item| match task_group.as_str() {
-            "scheduled" => {
-                jobs::is_scheduled_task_type(&item.task_type)
-                    && !user_sync_tasks.contains(&item.task_type)
-            }
-            "user_sync" => user_sync_tasks.contains(&item.task_type),
-            "realtime" => !jobs::is_scheduled_task_type(&item.task_type),
-            _ => true,
-        })
-        .collect::<Vec<_>>();
+    let mut items = items;
+    let diagnostics_started_at = std::time::Instant::now();
     attach_subscription_list_diagnostics(state.as_ref(), &mut items).await?;
+    tracing::debug!(
+        target: "admin.jobs.realtime",
+        phase = "diagnostics",
+        elapsed_ms = diagnostics_started_at.elapsed().as_millis() as u64,
+        task_count = items.len(),
+        "admin realtime task list phase completed"
+    );
 
     Ok(Json(AdminRealtimeTasksResponse {
         items,
@@ -4217,10 +4234,10 @@ pub async fn admin_list_realtime_tasks(
 
 fn append_admin_realtime_task_filters<'a>(
     query: &mut QueryBuilder<'a, sqlx::Sqlite>,
-    status: String,
-    task_type: String,
-    exclude_task_type: String,
-    task_group: String,
+    status: &'a str,
+    task_type: &'a str,
+    exclude_task_type: &'a str,
+    task_group: &'a str,
     scheduled_tasks: &'a [String],
     user_sync_tasks: &'a [String],
 ) {
@@ -4236,7 +4253,7 @@ fn append_admin_realtime_task_filters<'a>(
         query.push(" AND task_type != ");
         query.push_bind(exclude_task_type);
     }
-    match task_group.as_str() {
+    match task_group {
         "scheduled" => {
             query.push(" AND task_type IN (");
             let mut separated = query.separated(", ");
@@ -4286,6 +4303,7 @@ struct AdminTaskDiagnosticEventRow {
     event_type: String,
     payload_json: String,
     created_at: String,
+    event_rowid: i64,
 }
 
 impl From<AdminTaskDiagnosticEventRow> for AdminTaskEventItem {
@@ -4349,52 +4367,145 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
         return Ok(HashMap::new());
     }
 
-    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
-        r#"
-        SELECT task_id, id, event_type, payload_json, created_at
-        FROM job_task_events
-        WHERE task_id IN (
-        "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(task_id);
-        }
-    }
-    query.push(
-        r#"
-        )
-          AND event_type = 'task.progress'
-          AND json_valid(payload_json)
-          AND json_extract(payload_json, '$.stage') IN (
-            'collect',
-            'repo_collect',
-            'release_attached',
-            'release_progress',
-            'release_summary',
-            'social_progress',
-            'social_summary',
-            'notifications_progress',
-            'notifications_summary'
-          )
-        ORDER BY task_id ASC, rowid ASC
-        "#,
-    );
+    let mut query = build_subscription_diagnostic_progress_events_query(task_ids, false);
 
     let rows = query
         .build_query_as::<AdminTaskDiagnosticEventRow>()
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    let mut candidates = HashMap::<String, Vec<AdminTaskDiagnosticEventRow>>::new();
     for row in rows {
-        grouped
-            .entry(row.task_id.clone())
-            .or_default()
-            .push(AdminTaskEventItem::from(row));
+        candidates.entry(row.task_id.clone()).or_default().push(row);
+    }
+
+    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    for (task_id, task_candidates) in candidates {
+        let mut seen_summaries = HashSet::new();
+        let mut summaries = Vec::new();
+        let mut recent = Vec::new();
+        for event in task_candidates.into_iter().rev() {
+            let stage = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("stage")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if let Some(stage) = stage.filter(|stage| {
+                matches!(
+                    stage.as_str(),
+                    "collect" | "release_summary" | "social_summary" | "notifications_summary"
+                )
+            }) {
+                if seen_summaries.insert(stage) {
+                    summaries.push(event);
+                }
+            } else {
+                recent.push(event);
+            }
+        }
+        recent.truncate(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize - summaries.len());
+        summaries.extend(recent);
+        summaries.sort_by_key(|event| event.event_rowid);
+        grouped.insert(
+            task_id,
+            summaries
+                .into_iter()
+                .map(AdminTaskEventItem::from)
+                .collect(),
+        );
     }
     Ok(grouped)
+}
+
+fn build_subscription_diagnostic_progress_events_query<'a>(
+    task_ids: &'a [String],
+    explain_query_plan: bool,
+) -> QueryBuilder<'a, Sqlite> {
+    let mut query = QueryBuilder::<Sqlite>::new(if explain_query_plan {
+        "EXPLAIN QUERY PLAN "
+    } else {
+        ""
+    });
+    query.push(
+        r#"
+        WITH task_ids(task_id) AS (
+        "#,
+    );
+    query.push_values(task_ids, |mut row, task_id| {
+        row.push_bind(task_id);
+    });
+    query.push(
+        r#"
+        ), summary_stages(stage) AS (
+          VALUES ('collect'), ('release_summary'), ('social_summary'), ('notifications_summary')
+        ), retained_event_rows(task_id, event_rowid) AS (
+          SELECT task.task_id, event.rowid
+          FROM task_ids AS task
+          JOIN job_task_events AS event
+            ON event.rowid IN (
+              SELECT candidate.rowid
+              FROM job_task_events AS candidate
+              WHERE candidate.task_id = task.task_id
+                AND candidate.event_type = 'task.progress'
+                AND json_valid(candidate.payload_json)
+                AND CASE WHEN json_valid(candidate.payload_json)
+                  THEN json_extract(candidate.payload_json, '$.stage')
+                  ELSE NULL
+                END IN (
+                'collect',
+                'repo_collect',
+                'release_attached',
+                'release_progress',
+                'release_summary',
+                'social_progress',
+                'social_summary',
+                'notifications_progress',
+                'notifications_summary'
+              )
+              ORDER BY candidate.rowid DESC
+              LIMIT
+        "#,
+    );
+    query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
+    query.push(
+        r#"
+            )
+          UNION
+          SELECT task.task_id, event.rowid
+          FROM task_ids AS task
+          CROSS JOIN summary_stages AS summary
+          JOIN job_task_events AS event
+            ON event.rowid = (
+              SELECT candidate.rowid
+              FROM job_task_events AS candidate
+              WHERE candidate.task_id = task.task_id
+                AND candidate.event_type = 'task.progress'
+                AND json_valid(candidate.payload_json)
+                AND CASE WHEN json_valid(candidate.payload_json)
+                  THEN json_extract(candidate.payload_json, '$.stage')
+                  ELSE NULL
+                END = summary.stage
+              ORDER BY candidate.rowid DESC
+              LIMIT 1
+            )
+        )
+        SELECT
+          event.task_id,
+          event.id,
+          event.event_type,
+          event.payload_json,
+          event.created_at,
+          event.rowid AS event_rowid
+        FROM retained_event_rows AS retained
+        -- Keep the bounded retained set outermost for rowid primary-key seeks.
+        CROSS JOIN job_task_events AS event ON event.rowid = retained.event_rowid
+        ORDER BY event.task_id ASC, event.rowid ASC
+        "#,
+    );
+    query
 }
 
 async fn load_recent_sync_subscription_events(
@@ -4418,7 +4529,7 @@ async fn load_recent_sync_subscription_events(
           created_at
         FROM sync_subscription_events
         WHERE task_id = ?
-        ORDER BY rowid DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?
         "#,
     )
@@ -4438,55 +4549,7 @@ async fn load_recent_sync_subscription_events_for_tasks(
         return Ok(HashMap::new());
     }
 
-    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
-        r#"
-        SELECT
-          id,
-          task_id,
-          stage,
-          event_type,
-          severity,
-          recoverable,
-          attempt,
-          user_id,
-          repo_id,
-          repo_full_name,
-          payload_json,
-          created_at
-        FROM (
-          SELECT
-            id,
-            task_id,
-            stage,
-            event_type,
-            severity,
-            recoverable,
-            attempt,
-            user_id,
-            repo_id,
-            repo_full_name,
-            payload_json,
-            created_at,
-            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY rowid DESC) AS task_event_rank
-          FROM sync_subscription_events
-          WHERE task_id IN (
-        "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(task_id);
-        }
-    }
-    query.push(
-        r#"
-          )
-        )
-        WHERE task_event_rank <=
-        "#,
-    );
-    query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
-    query.push(" ORDER BY task_id ASC, created_at DESC, id DESC");
+    let mut query = build_recent_sync_subscription_events_for_tasks_query(task_ids, false);
 
     let rows = query
         .build_query_as::<AdminSyncSubscriptionEventRow>()
@@ -4501,6 +4564,61 @@ async fn load_recent_sync_subscription_events_for_tasks(
             .push(map_sync_subscription_event(row));
     }
     Ok(grouped)
+}
+
+fn build_recent_sync_subscription_events_for_tasks_query<'a>(
+    task_ids: &'a [String],
+    explain_query_plan: bool,
+) -> QueryBuilder<'a, sqlx::Sqlite> {
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(if explain_query_plan {
+        "EXPLAIN QUERY PLAN "
+    } else {
+        ""
+    });
+    for (index, task_id) in task_ids.iter().enumerate() {
+        if index > 0 {
+            query.push(" UNION ALL ");
+        }
+        query.push(
+            r#"
+            SELECT
+              id,
+              task_id,
+              stage,
+              event_type,
+              severity,
+              recoverable,
+              attempt,
+              user_id,
+              repo_id,
+              repo_full_name,
+              payload_json,
+              created_at
+            FROM (
+              SELECT
+                id,
+                task_id,
+                stage,
+                event_type,
+                severity,
+                recoverable,
+                attempt,
+                user_id,
+                repo_id,
+                repo_full_name,
+                payload_json,
+                created_at
+              FROM sync_subscription_events
+              WHERE task_id =
+            "#,
+        );
+        query.push_bind(task_id);
+        query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
+        query.push(") AS recent_task_events");
+    }
+    query.push(" ORDER BY task_id ASC, created_at DESC, id DESC");
+    query
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26402,6 +26520,11 @@ mod tests {
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
         AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        build_subscription_diagnostic_progress_events_query,
+        build_recent_sync_subscription_events_for_tasks_query,
+        load_recent_sync_subscription_events,
+        load_recent_sync_subscription_events_for_tasks,
+        load_subscription_diagnostic_progress_events_for_tasks,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
         DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
         DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest, FeedRow, FeedScope,
@@ -26491,7 +26614,11 @@ mod tests {
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
-    use tower_sessions::{MemoryStore, Session};
+    use tower_sessions::{
+        MemoryStore, Session, SessionStore,
+        session::{Id, Record},
+    };
+    use tower_sessions_sqlx_store::SqliteStore;
     use url::Url;
 
     fn test_user_id(id: i64) -> String {
@@ -26691,6 +26818,10 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        setup_pool_with_max_connections(1).await
+    }
+
+    async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
@@ -26699,7 +26830,7 @@ mod tests {
             .filename(&database_path)
             .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
@@ -30979,6 +31110,302 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_realtime_list_progress_events_are_bounded_per_task() {
+        let pool = setup_pool().await;
+        seed_admin_dashboard_task(
+            &pool,
+            "task-subscription-event-limit",
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            &test_user_id(1),
+            "2026-03-06T14:30:00Z",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-collect-event")
+        .bind("task-subscription-event-limit")
+        .bind(r#"{"stage":"collect","total_users":123}"#)
+        .bind(indexed_created_at(0))
+        .execute(&pool)
+        .await
+        .expect("seed subscription collect event");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-release-summary-event")
+        .bind("task-subscription-event-limit")
+        .bind(r#"{"stage":"release_summary","succeeded_repos":17}"#)
+        .bind(indexed_created_at(1))
+        .execute(&pool)
+        .await
+        .expect("seed subscription release summary event");
+        for event_index in 0..(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT + 5) {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('e', event_index as usize))
+            .bind("task-subscription-event-limit")
+            .bind(format!(
+                r#"{{"stage":"repo_collect","total_repos":{event_index}}}"#
+            ))
+            .bind(indexed_created_at(event_index as usize + 2))
+            .execute(&pool)
+            .await
+            .expect("seed subscription progress event");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("task-subscription-non-progress-event")
+        .bind("task-subscription-event-limit")
+        .bind("task.running")
+        .bind("not json")
+        .bind(indexed_created_at(100))
+        .execute(&pool)
+        .await
+        .expect("seed subscription non-progress event");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("task-subscription-malformed-progress-event")
+        .bind("task-subscription-event-limit")
+        .bind("not json")
+        .bind(indexed_created_at(101))
+        .execute(&pool)
+        .await
+        .expect("seed malformed subscription progress event");
+
+        let state = setup_state(pool.clone());
+        let events = load_subscription_diagnostic_progress_events_for_tasks(
+            state.as_ref(),
+            &["task-subscription-event-limit".to_owned()],
+        )
+        .await
+        .expect("load bounded subscription progress events");
+        let events = events
+            .get("task-subscription-event-limit")
+            .expect("subscription progress events");
+        assert_eq!(events.len(), ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0].payload_json)
+                .expect("collect event")
+                .get("total_users")
+                .and_then(serde_json::Value::as_i64),
+            Some(123)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[1].payload_json)
+                .expect("release summary event")
+                .get("succeeded_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(17)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[2].payload_json)
+                .expect("oldest retained non-summary event")
+                .get("total_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[events.len() - 1].payload_json)
+                .expect("newest retained event")
+                .get("total_repos")
+                .and_then(serde_json::Value::as_i64),
+            Some(24)
+        );
+
+        let event_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT rowid
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = ?
+            ORDER BY rowid DESC
+            LIMIT ?
+            "#,
+        )
+        .bind("task-subscription-event-limit")
+        .bind("task.progress")
+        .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
+        .fetch_all(&pool)
+        .await
+        .expect("load bounded diagnostic event query plan");
+        let event_plan_details = event_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            event_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_task_events_task_id_event_type") })
+        );
+        let summary_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT rowid
+            FROM job_task_events
+            WHERE task_id = ?
+              AND event_type = ?
+              AND CASE WHEN json_valid(payload_json)
+                THEN json_extract(payload_json, '$.stage')
+                ELSE NULL
+              END = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind("task-subscription-event-limit")
+        .bind("task.progress")
+        .bind("release_summary")
+        .fetch_all(&pool)
+        .await
+        .expect("load bounded summary event query plan");
+        let summary_plan_details = summary_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            summary_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_task_events_task_id_event_type_stage") })
+        );
+
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777954200"}"#,
+            None,
+            None,
+        );
+        let diagnostics = build_task_diagnostics(&task, events, &[]).expect("diagnostics");
+        assert_eq!(
+            diagnostics
+                .sync_subscriptions
+                .expect("subscription diagnostics")
+                .collect
+                .total_users,
+            123
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_realtime_list_diagnostic_query_seeks_retained_event_rowids() {
+        let pool = setup_pool().await;
+        seed_admin_dashboard_task(
+            &pool,
+            "unrelated-task",
+            jobs::TASK_SYNC_RELEASES,
+            jobs::STATUS_SUCCEEDED,
+            &test_user_id(1),
+            "2026-03-06T13:59:00Z",
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "target-task",
+            jobs::TASK_SYNC_RELEASES,
+            jobs::STATUS_SUCCEEDED,
+            &test_user_id(1),
+            "2026-03-06T14:00:00Z",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            WITH RECURSIVE unrelated_events(n) AS (
+              VALUES (1)
+              UNION ALL
+              SELECT n + 1 FROM unrelated_events WHERE n < 12000
+            )
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            SELECT
+              printf('unrelated-event-%06d', n),
+              'unrelated-task',
+              'task.progress',
+              '{"stage":"repo_collect","total_repos":1}',
+              printf('2026-03-06T14:%02d:%02dZ', (n / 60) % 60, n % 60)
+            FROM unrelated_events
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated task event history");
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES
+              ('target-event-old', 'target-task', 'task.progress', '{"stage":"collect"}', '2026-03-06T14:00:00Z'),
+              ('target-event-new', 'target-task', 'task.progress', '{"stage":"repo_collect"}', '2026-03-06T14:00:01Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed retained target task events");
+
+        let task_ids = vec!["target-task".to_owned()];
+        let plan_rows = build_subscription_diagnostic_progress_events_query(&task_ids, true)
+            .build()
+            .fetch_all(&pool)
+            .await
+            .expect("explain complete diagnostic events query");
+        let plan_details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .expect("read bundled SQLite version");
+        eprintln!(
+            "complete diagnostic event query: sqlite_version={sqlite_version} unrelated_event_rows=12000 plan={plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("SEARCH event USING INTEGER PRIMARY KEY (rowid=?)")),
+            "complete query must fetch retained events by rowid: {plan_details:?}"
+        );
+        assert!(
+            !plan_details.iter().any(|detail| {
+                detail.contains("SCAN event") || detail.contains("SCAN job_task_events AS event")
+            }),
+            "complete query must not scan the global event history: {plan_details:?}"
+        );
+
+        let state = setup_state(pool);
+        let events =
+            load_subscription_diagnostic_progress_events_for_tasks(state.as_ref(), &task_ids)
+                .await
+                .expect("load bounded events using complete diagnostic query");
+        assert_eq!(
+            events
+                .get("target-task")
+                .expect("target task events")
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["target-event-old", "target-event-new"]
+        );
+    }
+
+    #[tokio::test]
     async fn admin_list_realtime_tasks_separates_user_sync_from_general_schedules() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -31061,6 +31488,724 @@ mod tests {
 
         assert_eq!(scheduled.total, 1);
         assert_eq!(scheduled.items[0].id, "task-general-schedule");
+    }
+
+    #[tokio::test]
+    async fn admin_list_realtime_tasks_applies_filters_before_pagination() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+
+        for (id, task_type, status, created_at) in [
+            (
+                "task-list-realtime-old",
+                jobs::TASK_SYNC_RELEASES,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:30:00Z",
+            ),
+            (
+                "task-list-scheduled-new",
+                jobs::TASK_BRIEF_DAILY_SLOT,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:32:00Z",
+            ),
+            (
+                "task-list-scheduled-old",
+                jobs::TASK_BRIEF_DAILY_SLOT,
+                jobs::STATUS_SUCCEEDED,
+                "2026-03-06T14:29:00Z",
+            ),
+            (
+                "task-list-user-sync",
+                jobs::TASK_SYNC_STARRED_DELTA,
+                jobs::STATUS_RUNNING,
+                "2026-03-06T14:31:00Z",
+            ),
+            (
+                "task-list-realtime-new",
+                jobs::TASK_SYNC_RELEASES,
+                jobs::STATUS_FAILED,
+                "2026-03-06T14:33:00Z",
+            ),
+        ] {
+            seed_admin_dashboard_task(&pool, id, task_type, status, &test_user_id(1), created_at)
+                .await;
+        }
+
+        let state = setup_state(pool);
+        let scheduled_page_1 = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("scheduled".to_owned()),
+                page: Some(1),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("scheduled first page")
+        .0;
+        let scheduled_page_2 = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("scheduled".to_owned()),
+                page: Some(2),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("scheduled second page")
+        .0;
+
+        assert_eq!(scheduled_page_1.total, 2);
+        assert_eq!(scheduled_page_1.items.len(), 1);
+        assert_eq!(scheduled_page_1.items[0].id, "task-list-scheduled-new");
+        assert_eq!(scheduled_page_2.total, 2);
+        assert_eq!(scheduled_page_2.items.len(), 1);
+        assert_eq!(scheduled_page_2.items[0].id, "task-list-scheduled-old");
+
+        let filtered = admin_list_realtime_tasks(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some(jobs::STATUS_FAILED.to_owned()),
+                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                exclude_task_type: Some(jobs::TASK_SYNC_ACCESS_REFRESH.to_owned()),
+                task_group: Some("realtime".to_owned()),
+                page: Some(1),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("combined realtime filters")
+        .0;
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].id, "task-list-realtime-new");
+
+        let empty = admin_list_realtime_tasks(
+            State(state),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some(jobs::STATUS_RUNNING.to_owned()),
+                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                exclude_task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                task_group: Some("all".to_owned()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("contradictory filters should return empty response")
+        .0;
+        assert_eq!(empty.total, 0);
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.page, 1);
+        assert_eq!(empty.page_size, 20);
+
+        let response_json = serde_json::to_value(&filtered).expect("serialize response");
+        assert_eq!(
+            response_json
+                .as_object()
+                .expect("response object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["items", "page", "page_size", "total"]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual 100k-row authenticated endpoint and coordinated writer acceptance"]
+    async fn admin_realtime_list_and_foreground_writes_meet_100k_latency_budget() {
+        const SAMPLES: usize = 100;
+        let pool = setup_pool_with_max_connections(8).await;
+        sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        sqlx::query(
+            r#"
+            WITH RECURSIVE historical_task(n) AS (
+              VALUES (1)
+              UNION ALL
+              SELECT n + 1 FROM historical_task WHERE n < 100000
+            )
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, parent_task_id,
+              payload_json, result_json, error_message, cancel_requested,
+              created_at, started_at, finished_at, updated_at
+            )
+            SELECT
+              'historical-task-' || printf('%06d', n),
+              CASE WHEN n % 100 = 0 THEN 'sync.subscriptions' ELSE 'sync.releases' END,
+              CASE n % 4
+                WHEN 0 THEN 'succeeded'
+                WHEN 1 THEN 'failed'
+                WHEN 2 THEN 'running'
+                ELSE 'queued'
+              END,
+              'historical', NULL, NULL, '{}',
+              CASE WHEN n % 200 = 0 THEN '{"skipped":true}' ELSE '{}' END,
+              NULL, 0,
+              printf('2020-01-01T00:00:%06dZ', n), NULL, NULL,
+              printf('2020-01-01T00:00:%06dZ', n)
+            FROM historical_task
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed 100,000 historical job tasks");
+
+        let state = setup_state(pool.clone());
+        let session_store = crate::session_store::CoordinatedSqliteSessionStore::new(
+            SqliteStore::new(pool.clone()),
+            pool.clone(),
+            state.sqlite_writer.clone(),
+        );
+        session_store
+            .migrate()
+            .await
+            .expect("migrate coordinated session store");
+        let mut session_record = Record {
+            id: Id::default(),
+            data: std::collections::HashMap::from([("user_id".to_owned(), json!(test_user_id(1)))]),
+            expiry_date: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+        session_store
+            .create(&mut session_record)
+            .await
+            .expect("create coordinated session fixture");
+
+        let mut cancel_task_ids = Vec::with_capacity(SAMPLES);
+        for index in 0..SAMPLES {
+            let task = jobs::enqueue_task(
+                state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    payload: json!({"cancel_fixture": index}),
+                    source: "latency-acceptance-fixture".to_owned(),
+                    requested_by: Some(test_user_id(1)),
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .expect("enqueue cancel fixture task");
+            cancel_task_ids.push(task.task_id);
+        }
+
+        let subscription_task_id =
+            seed_admin_realtime_list_subscription_diagnostics(&pool, state.as_ref()).await;
+        for (index, task_id) in [
+            "acceptance-long-subscription-a",
+            "acceptance-long-subscription-b",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_admin_dashboard_task(
+                &pool,
+                task_id,
+                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                jobs::STATUS_SUCCEEDED,
+                &test_user_id(1),
+                &format!("2999-01-01T00:0{index}:00Z"),
+            )
+            .await;
+            seed_subscription_event_history(&pool, task_id, 10_025).await;
+        }
+        let job_event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_task_events WHERE task_id = ?")
+                .bind(&subscription_task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count subscription task progress events");
+        let subscription_event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_subscription_events WHERE task_id = ?")
+                .bind(&subscription_task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count subscription task events");
+        assert!(job_event_count > 20);
+        assert!(subscription_event_count > 20);
+        let sqlite_version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .expect("read bundled SQLite version");
+        eprintln!(
+            "100k acceptance fixture: historical_tasks=100000 first_page_sync_subscriptions=1 job_task_events={job_event_count} sync_subscription_events={subscription_event_count} sqlite_version={sqlite_version}"
+        );
+
+        let list_state = state.clone();
+        let list_subscription_task_id = subscription_task_id.clone();
+        let list_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let result = admin_list_realtime_tasks(
+                    State(list_state.clone()),
+                    setup_session(1).await,
+                    Query(AdminRealtimeTasksQuery {
+                        status: Some("all".to_owned()),
+                        task_type: None,
+                        exclude_task_type: None,
+                        task_group: None,
+                        page: Some(1),
+                        page_size: Some(100),
+                    }),
+                )
+                .await;
+                let outcome = match result {
+                    Ok(response)
+                        if response.0.total >= 100_000 && response.0.items.len() == 100 =>
+                    {
+                        let loaded_diagnostics = response
+                            .0
+                            .items
+                            .iter()
+                            .find(|item| item.id == list_subscription_task_id)
+                            .and_then(|item| item.diagnostics.as_ref())
+                            .and_then(|diagnostics| diagnostics.sync_subscriptions.as_ref());
+                        match loaded_diagnostics {
+                            Some(diagnostics)
+                                if diagnostics.collect.total_users == 4321
+                                    && diagnostics.release.total_repos == 24
+                                    && diagnostics.social.events == 345
+                                    && diagnostics.notifications.notifications == 456
+                                    && diagnostics.recent_events.len()
+                                        == ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+                                    && diagnostics.recent_events.iter().any(|event| {
+                                        event.event_type == "acceptance_notifications_summary"
+                                    })
+                                    && diagnostics.recent_events.iter().any(|event| {
+                                        event.event_type == "acceptance_repo_progress_19"
+                                    }) =>
+                            {
+                                Ok(())
+                            }
+                            Some(_) => Err(
+                                "subscription diagnostics did not contain the seeded stage history"
+                                    .to_owned(),
+                            ),
+                            None => Err(
+                                "first page did not load diagnostics for the seeded subscription task"
+                                    .to_owned(),
+                            ),
+                        }
+                    }
+                    Ok(response) => Err(format!(
+                        "unexpected list response: total={} items={}",
+                        response.0.total,
+                        response.0.items.len()
+                    )),
+                    Err(error) => Err(error.to_string()),
+                };
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
+        let sync_state = state.clone();
+        let sync_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let outcome = super::admin_get_sync_runtime_config(
+                    State(sync_state.clone()),
+                    setup_session(1).await,
+                )
+                .await
+                .map(|Json(config)| {
+                    let tasks = config.recent_sync_tasks;
+                    if tasks.len() == 3 && tasks.iter().all(|task| !task.skipped) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "unexpected recent sync task response: count={} skipped={}",
+                            tasks.len(),
+                            tasks.iter().filter(|task| task.skipped).count()
+                        ))
+                    }
+                })
+                .unwrap_or_else(|error| Err(error.to_string()));
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
+        let background_state = state.clone();
+        let background_pool = pool.clone();
+        let background_samples = tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for index in 0..SAMPLES {
+                let started_at = std::time::Instant::now();
+                let pool = background_pool.clone();
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                let outcome = background_state
+                    .sqlite_writer
+                    .write("admin_read_acceptance_background", move |_| {
+                        let pool = pool.clone();
+                        let updated_at = updated_at.clone();
+                        async move {
+                            sqlx::query("UPDATE job_tasks SET updated_at = ? WHERE id = ?")
+                                .bind(updated_at)
+                                .bind(format!("historical-task-{:06}", index + 1))
+                                .execute(&pool)
+                                .await?;
+                            Ok(())
+                        }
+                    })
+                    .await
+                    .map_err(|error| error.to_string());
+                samples.push((started_at.elapsed(), outcome));
+            }
+            samples
+        });
+
+        let session_store_for_samples = session_store.clone();
+        let session_id = session_record.id;
+        let enqueue_state = state.clone();
+        let cancel_state = state.clone();
+        let mut session_samples = Vec::with_capacity(SAMPLES);
+        let mut enqueue_samples = Vec::with_capacity(SAMPLES);
+        let mut cancel_samples = Vec::with_capacity(SAMPLES);
+        for (index, task_id) in cancel_task_ids.iter().enumerate() {
+            let store = session_store_for_samples.clone();
+            let id = session_id;
+            let sample = crate::session_store::with_session_baseline_scope(async move {
+                let started_at = std::time::Instant::now();
+                let mut record = match store.load(&id).await {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        return (started_at.elapsed(), Err("session disappeared".to_owned()));
+                    }
+                    Err(error) => return (started_at.elapsed(), Err(error.to_string())),
+                };
+                record
+                    .data
+                    .insert("write_sequence".to_owned(), json!(index));
+                let outcome = store.save(&record).await.map_err(|error| error.to_string());
+                (started_at.elapsed(), outcome)
+            })
+            .await;
+            session_samples.push(sample);
+
+            let started_at = std::time::Instant::now();
+            let outcome = jobs::enqueue_task(
+                enqueue_state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    payload: json!({"latency_sample": index}),
+                    source: "latency-acceptance".to_owned(),
+                    requested_by: Some(test_user_id(1)),
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .map(|task| {
+                if task.status == jobs::STATUS_QUEUED {
+                    Ok(())
+                } else {
+                    Err(format!("unexpected enqueue status: {}", task.status))
+                }
+            })
+            .unwrap_or_else(|error| Err(error.to_string()));
+            enqueue_samples.push((started_at.elapsed(), outcome));
+
+            let started_at = std::time::Instant::now();
+            let outcome = jobs::cancel_task(cancel_state.as_ref(), task_id)
+                .await
+                .map(|status| {
+                    if status == jobs::STATUS_CANCELED {
+                        Ok(())
+                    } else {
+                        Err(format!("unexpected cancel status: {status}"))
+                    }
+                })
+                .unwrap_or_else(|error| Err(error.to_string()));
+            cancel_samples.push((started_at.elapsed(), outcome));
+        }
+
+        let list_samples = list_samples.await.expect("list sampler should not panic");
+        let sync_samples = sync_samples
+            .await
+            .expect("recent sync task sampler should not panic");
+        let background_samples = background_samples
+            .await
+            .expect("background write sampler should not panic");
+        let mut budget_failures = Vec::new();
+        budget_failures.extend(report_empirical_latency_budget(
+            "authenticated_admin_list",
+            list_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "admin_recent_sync_task_chain",
+            sync_samples,
+            SAMPLES,
+        ));
+        let background_denials = background_samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .filter(|error| error.contains("sqlite background writer admission denied"))
+            .count();
+        let unexpected_background_failures = background_samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .filter(|error| !error.contains("sqlite background writer admission denied"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut background_elapsed = background_samples
+            .iter()
+            .filter_map(|(duration, result)| result.is_ok().then_some(*duration))
+            .collect::<Vec<_>>();
+        assert!(
+            !background_elapsed.is_empty(),
+            "background writer pressure must include at least one admitted write"
+        );
+        background_elapsed.sort_unstable();
+        let background_p95_ms =
+            background_elapsed[(background_elapsed.len() * 95).div_ceil(100) - 1].as_millis();
+        let background_p99_ms =
+            background_elapsed[(background_elapsed.len() * 99).div_ceil(100) - 1].as_millis();
+        eprintln!(
+            "background writer pressure: attempts={} admitted={} deferred={} admitted_p95_ms={} admitted_p99_ms={} unexpected_failures={unexpected_background_failures:?}",
+            background_samples.len(),
+            background_elapsed.len(),
+            background_denials,
+            background_p95_ms,
+            background_p99_ms,
+        );
+        assert!(
+            background_p95_ms < 1_000 && background_p99_ms < 2_000,
+            "background writer latency budget exceeded: p95={background_p95_ms}ms p99={background_p99_ms}ms"
+        );
+        assert!(
+            unexpected_background_failures.is_empty(),
+            "unexpected background writer failures: {unexpected_background_failures:?}"
+        );
+        budget_failures.extend(report_empirical_latency_budget(
+            "coordinated_session_store_roundtrip",
+            session_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "jobs_enqueue_task",
+            enqueue_samples,
+            SAMPLES,
+        ));
+        budget_failures.extend(report_empirical_latency_budget(
+            "jobs_cancel_task",
+            cancel_samples,
+            SAMPLES,
+        ));
+        assert!(
+            budget_failures.is_empty(),
+            "empirical budget failures: {budget_failures:?}"
+        );
+    }
+
+    async fn seed_admin_realtime_list_subscription_diagnostics(
+        pool: &SqlitePool,
+        state: &AppState,
+    ) -> String {
+        let task_id = crate::local_id::test_local_id("admin-realtime-list-subscription");
+        // Keep the real subscription fixture on page one as measured enqueues arrive.
+        let created_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        seed_admin_dashboard_task(
+            pool,
+            &task_id,
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            &test_user_id(1),
+            &created_at,
+        )
+        .await;
+
+        for index in 0..20 {
+            jobs::append_task_event(
+                state,
+                &task_id,
+                "task.progress",
+                json!({
+                    "stage": "repo_collect",
+                    "total_repos": index + 1,
+                }),
+            )
+            .await
+            .expect("append ordinary subscription progress event");
+        }
+        for (stage, payload) in [
+            ("collect", json!({"stage":"collect","total_users":4321})),
+            (
+                "release_summary",
+                json!({"stage":"release_summary","total_repos":24,"succeeded_repos":23,"failed_repos":1}),
+            ),
+            (
+                "social_summary",
+                json!({"stage":"social_summary","total_users":12,"succeeded_users":11,"failed_users":1,"events":345}),
+            ),
+            (
+                "notifications_summary",
+                json!({"stage":"notifications_summary","total_users":12,"succeeded_users":12,"failed_users":0,"notifications":456}),
+            ),
+        ] {
+            jobs::append_task_event(state, &task_id, "task.progress", payload)
+                .await
+                .unwrap_or_else(|error| panic!("append {stage} subscription summary: {error}"));
+        }
+
+        for index in 0..20 {
+            let payload_json = serde_json::to_string(&json!({
+                "message": format!("acceptance repo progress {index}"),
+            }))
+            .expect("serialize ordinary subscription event payload");
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::generate_local_id())
+            .bind(&task_id)
+            .bind(format!("acceptance_repo_progress_{index:02}"))
+            .bind(test_user_id(1))
+            .bind(1000_i64 + index)
+            .bind(format!("octo/acceptance-{index}"))
+            .bind(payload_json)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert ordinary subscription event");
+        }
+        for (stage, event_type, message) in [
+            ("collect", "acceptance_collect_summary", "collect summary"),
+            ("release", "acceptance_release_summary", "release summary"),
+            ("social", "acceptance_social_summary", "social summary"),
+            (
+                "notifications",
+                "acceptance_notifications_summary",
+                "notifications summary",
+            ),
+        ] {
+            let payload_json = serde_json::to_string(&json!({"message":message}))
+                .expect("serialize subscription summary payload");
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, 'info', 0, 1, ?, NULL, NULL, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::generate_local_id())
+            .bind(&task_id)
+            .bind(stage)
+            .bind(event_type)
+            .bind(test_user_id(1))
+            .bind(payload_json)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert subscription summary event");
+        }
+
+        task_id
+    }
+
+    async fn seed_subscription_event_history(pool: &SqlitePool, task_id: &str, event_count: i64) {
+        sqlx::query(
+            r#"
+            WITH RECURSIVE event_rows(n) AS (
+              VALUES (0)
+              UNION ALL
+              SELECT n + 1 FROM event_rows WHERE n + 1 < ?
+            )
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            )
+            SELECT
+              ? || '-event-' || n,
+              ?,
+              'release',
+              'event-' || n,
+              'warning',
+              1,
+              1,
+              ?,
+              9000 + n,
+              'octo/repo-' || n,
+              '{"message":"history"}',
+              printf(
+                '2020-01-01T%02d:%02d:%02dZ',
+                0 + (n / 3600),
+                (n / 60) % 60,
+                n % 60
+              )
+            FROM event_rows
+            "#,
+        )
+        .bind(event_count)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(test_user_id(1))
+        .execute(pool)
+        .await
+        .expect("insert subscription event history");
+    }
+
+    fn report_empirical_latency_budget(
+        path: &str,
+        samples: Vec<(std::time::Duration, Result<(), String>)>,
+        expected_samples: usize,
+    ) -> Vec<String> {
+        assert_eq!(samples.len(), expected_samples, "{path} sample count");
+        let success_count = samples.iter().filter(|(_, result)| result.is_ok()).count();
+        let failures = samples
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut elapsed = samples
+            .into_iter()
+            .map(|(duration, _)| duration)
+            .collect::<Vec<_>>();
+        elapsed.sort_unstable();
+        let p50_ms = elapsed[49].as_millis();
+        let p95_ms = elapsed[94].as_millis();
+        let p99_ms = elapsed[98].as_millis();
+        eprintln!(
+            "foreground path: name={path} samples={} succeeded={success_count} failed={} p50_ms={p50_ms} p95_ms={p95_ms} p99_ms={p99_ms} failures={failures:?}",
+            elapsed.len(),
+            expected_samples - success_count
+        );
+        let mut budget_failures = failures
+            .into_iter()
+            .map(|failure| format!("{path}: {failure}"))
+            .collect::<Vec<_>>();
+        if p95_ms >= 1_000 {
+            budget_failures.push(format!("{path} p95 exceeded 1s: {p95_ms}ms"));
+        }
+        if p99_ms >= 2_000 {
+            budget_failures.push(format!("{path} p99 exceeded 2s: {p99_ms}ms"));
+        }
+        budget_failures
     }
 
     #[tokio::test]
@@ -31960,6 +33105,37 @@ mod tests {
         );
         assert!(
             !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
+        );
+
+        let task_type_plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id, task_type, status, created_at
+            FROM job_tasks
+            WHERE task_type = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(jobs::TASK_SYNC_RELEASES)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load task type query plan");
+        let task_type_details = task_type_plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            task_type_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_tasks_task_type_created_at_id") })
+        );
+        assert!(
+            !task_type_details
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
         );
@@ -34834,6 +36010,81 @@ mod tests {
         );
         assert_eq!(sync.social.events, 3);
         assert_eq!(sync.notifications.notifications, 4);
+    }
+
+    #[tokio::test]
+    async fn admin_realtime_list_subscription_events_use_bounded_index_ranges() {
+        let pool = setup_pool().await;
+        const EVENT_COUNT: i64 = 10_025;
+        let task_ids = vec![
+            "task-subscription-events-a".to_owned(),
+            "task-subscription-events-b".to_owned(),
+        ];
+        for task_id in &task_ids {
+            seed_admin_dashboard_task(
+                &pool,
+                task_id,
+                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                jobs::STATUS_SUCCEEDED,
+                &test_user_id(1),
+                "2026-03-06T14:30:00Z",
+            )
+            .await;
+            seed_subscription_event_history(&pool, task_id, EVENT_COUNT).await;
+        }
+
+        let plan_rows = build_recent_sync_subscription_events_for_tasks_query(&task_ids, true)
+            .build()
+            .fetch_all(&pool)
+            .await
+            .expect("load bounded subscription event query plan");
+        let plan_details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_sync_subscription_events_task_id_created_at")),
+            "bounded subscription event query must use the task/time index: {plan_details:?}"
+        );
+
+        let state = setup_state(pool);
+        let events = load_recent_sync_subscription_events_for_tasks(state.as_ref(), &task_ids)
+            .await
+            .expect("load bounded subscription events");
+        for task_id in task_ids {
+            let task_events = events.get(&task_id).expect("task subscription events");
+            assert_eq!(
+                task_events.len(),
+                ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+            );
+            assert_eq!(
+                task_events[0].event_type,
+                format!("event-{}", EVENT_COUNT - 1)
+            );
+            assert_eq!(
+                task_events.last().expect("oldest event").event_type,
+                format!(
+                    "event-{}",
+                    EVENT_COUNT - ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT
+                )
+            );
+
+            let detail_events = load_recent_sync_subscription_events(state.as_ref(), &task_id)
+                .await
+                .expect("load detail subscription events");
+            assert_eq!(
+                detail_events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>(),
+                task_events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
@@ -41910,6 +43161,46 @@ echo should_not_be_in_excerpt
         .await
         .expect("seed skipped subscription sync history");
 
+        for idx in 0..1_000 {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id, task_type, status, source, payload_json, result_json,
+                  cancel_requested, created_at, updated_at
+                )
+                VALUES (?, ?, 'succeeded', 'scheduler', '{}', '{"skipped":true}', 0, ?, ?)
+                "#,
+            )
+            .bind(crate::local_id::test_local_id(&format!(
+                "subscription-history-skipped-{idx}"
+            )))
+            .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+            .bind(format!("2026-04-27T08:41:{idx:02}Z"))
+            .bind("2026-04-27T08:41:59Z")
+            .execute(&pool)
+            .await
+            .expect("seed many skipped subscription sync rows");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, result_json,
+              cancel_requested, created_at, updated_at
+            )
+            VALUES (?, ?, 'failed', 'scheduler', '{}', 'not-json', 0, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::test_local_id(
+            "subscription-history-malformed-result",
+        ))
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind("2026-04-27T08:35:00Z")
+        .bind("2026-04-27T08:35:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed malformed historical subscription result");
+
         for (idx, task_id, started_at, finished_at) in [
             (
                 1,
@@ -42018,6 +43309,62 @@ echo should_not_be_in_excerpt
             .expect("seed subscription sync child task");
         }
 
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, parent_task_id, payload_json,
+              result_json, cancel_requested, created_at, started_at, updated_at
+            )
+            VALUES (?, ?, 'running', 'sync.subscriptions', ?, '{}', '{}', 0, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::test_local_id(
+            "subscription-history-3-running-child",
+        ))
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(crate::local_id::test_local_id("subscription-history-3"))
+        .bind("2026-04-27T08:20:10Z")
+        .bind("2026-04-27T08:20:11Z")
+        .bind("2026-04-27T08:20:11Z")
+        .execute(&pool)
+        .await
+        .expect("seed running subscription sync child");
+
+        sqlx::query("ANALYZE job_tasks")
+            .execute(&pool)
+            .await
+            .expect("analyze recent sync task fixture");
+        let production_query_plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM job_tasks INDEXED BY idx_job_tasks_sync_recent_roots
+            WHERE task_type = 'sync.subscriptions'
+              AND CASE
+                WHEN json_valid(result_json)
+                  THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
+                ELSE 1
+              END
+            ORDER BY created_at DESC, id DESC
+            LIMIT 3
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain recent sync root selection with production indexes");
+        let production_plan_details = production_query_plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect::<Vec<_>>();
+        println!(
+            "recent sync root query plan with production indexes: {production_plan_details:?}"
+        );
+        assert!(
+            production_plan_details
+                .iter()
+                .any(|detail| { detail.contains("idx_job_tasks_sync_recent_roots") })
+        );
+
         let settings = super::load_sync_runtime_config(state.as_ref())
             .await
             .expect("load sync settings");
@@ -42031,17 +43378,25 @@ echo should_not_be_in_excerpt
                 .all(|task| task.id != skipped_task_id)
         );
         assert!(settings.recent_sync_tasks.iter().all(|task| !task.skipped));
-        assert_eq!(settings.recent_sync_tasks[0].id, newest_task_id);
-        let duration_ms = settings.recent_sync_tasks[0].duration_ms.expect("duration");
+        let malformed_task_id =
+            crate::local_id::test_local_id("subscription-history-malformed-result");
+        assert_eq!(settings.recent_sync_tasks[0].id, malformed_task_id);
+        assert!(settings.recent_sync_tasks[0].duration_ms.is_none());
+        assert!(settings.recent_sync_tasks[0].finished_at.is_none());
+        assert_eq!(settings.recent_sync_tasks[1].id, newest_task_id);
+        let duration_ms = settings.recent_sync_tasks[1].duration_ms.expect("duration");
         assert!((399_999..=400_000).contains(&duration_ms));
         assert_eq!(
-            settings.recent_sync_tasks[0].finished_at.as_deref(),
+            settings.recent_sync_tasks[1].finished_at.as_deref(),
             Some("2026-04-27T08:36:40Z")
         );
         assert_eq!(
             settings.recent_sync_tasks[2].id,
-            crate::local_id::test_local_id("subscription-history-2")
+            crate::local_id::test_local_id("subscription-history-3")
         );
+        assert!(settings.recent_sync_tasks[2].duration_ms.is_none());
+        assert!(settings.recent_sync_tasks[2].finished_at.is_none());
+        assert!(!settings.recent_sync_tasks[1].skipped);
     }
 
     #[tokio::test]
