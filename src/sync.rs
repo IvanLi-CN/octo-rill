@@ -1470,7 +1470,10 @@ impl SubscriptionRunContext {
                 event_payload.clone(),
             )
             .await?;
-        append_subscription_event(
+        if counts_as_critical {
+            self.critical_events.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let append_result = append_subscription_event(
             self.state.as_ref(),
             &self.task_id,
             SubscriptionEventRecord {
@@ -1485,9 +1488,20 @@ impl SubscriptionRunContext {
                 payload: event_payload,
             },
         )
-        .await?;
-        if counts_as_critical {
-            self.critical_events.fetch_add(1, AtomicOrdering::Relaxed);
+        .await;
+        if let Err(error) = append_result {
+            if is_sqlite_retryable_write_error(error.as_ref()) {
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    stage = event.stage,
+                    event_type = event.event_type,
+                    error_kind = "sqlite_write_backpressure",
+                    error = %error,
+                    "subscription key event persisted to the run log only"
+                );
+            } else {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -2279,33 +2293,59 @@ pub async fn sync_social_activity(
         (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
         (!followers.is_empty()).then_some(followers.as_slice()),
     ) {
-        (Some(owned_repos), Some(followers)) => {
-            apply_social_activity_snapshot_with_options(
-                state,
-                user_id,
-                Some(owned_repos),
-                Some(repo_collection.repo_members.as_slice()),
-                Some(followers),
-                repo_collection.partial_repos.is_empty(),
-                !followers_partial,
+        (Some(owned_repos), Some(followers)) => apply_social_activity_snapshot_with_options(
+            state,
+            user_id,
+            Some(owned_repos),
+            Some(repo_collection.repo_members.as_slice()),
+            Some(followers),
+            repo_collection.partial_repos.is_empty(),
+            !followers_partial,
+        )
+        .await
+        .map_err(|error| {
+            with_social_source_errors(
+                error,
+                "apply social activity snapshot",
+                source_errors.as_slice(),
             )
-            .await?
-        }
-        _ => {
-            apply_social_activity_snapshot_with_options(
-                state,
-                user_id,
-                (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
-                (!owned_repos.is_empty()).then_some(repo_collection.repo_members.as_slice()),
-                (!followers.is_empty()).then_some(followers.as_slice()),
-                repo_collection.partial_repos.is_empty(),
-                !followers_partial,
+        })?,
+        _ => apply_social_activity_snapshot_with_options(
+            state,
+            user_id,
+            (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
+            (!owned_repos.is_empty()).then_some(repo_collection.repo_members.as_slice()),
+            (!followers.is_empty()).then_some(followers.as_slice()),
+            repo_collection.partial_repos.is_empty(),
+            !followers_partial,
+        )
+        .await
+        .map_err(|error| {
+            with_social_source_errors(
+                error,
+                "apply social activity snapshot",
+                source_errors.as_slice(),
             )
-            .await?
-        }
+        })?,
     };
-    events += insert_feed_activity_events(state, user_id, feed_events.as_slice()).await?;
-    enqueue_global_announcement_work(state, user_id, feed_events.as_slice()).await?;
+    events += insert_feed_activity_events(state, user_id, feed_events.as_slice())
+        .await
+        .map_err(|error| {
+            with_social_source_errors(
+                error,
+                "insert social feed activity events",
+                source_errors.as_slice(),
+            )
+        })?;
+    enqueue_global_announcement_work(state, user_id, feed_events.as_slice())
+        .await
+        .map_err(|error| {
+            with_social_source_errors(
+                error,
+                "enqueue social announcement work",
+                source_errors.as_slice(),
+            )
+        })?;
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
@@ -2375,6 +2415,50 @@ pub async fn sync_social_activity_best_effort(
 struct SocialSyncFailure {
     message: String,
     sqlite_backpressure: bool,
+    source_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SocialUpstreamSourceErrors {
+    details: Vec<String>,
+}
+
+impl std::fmt::Display for SocialUpstreamSourceErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "social upstream source errors: {}",
+            self.details.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for SocialUpstreamSourceErrors {}
+
+fn with_social_source_errors(
+    error: anyhow::Error,
+    operation: &'static str,
+    source_errors: &[String],
+) -> anyhow::Error {
+    let error = error.context(operation);
+    if source_errors.is_empty() {
+        error
+    } else {
+        error.context(SocialUpstreamSourceErrors {
+            details: source_errors.to_vec(),
+        })
+    }
+}
+
+fn social_source_errors_from_error(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(source_errors) = error.downcast_ref::<SocialUpstreamSourceErrors>() {
+            return source_errors.details.clone();
+        }
+        current = error.source();
+    }
+    Vec::new()
 }
 
 async fn sync_social_activity_best_effort_with_failure(
@@ -2383,9 +2467,30 @@ async fn sync_social_activity_best_effort_with_failure(
     context: &'static str,
 ) -> (SyncSocialActivityResult, Option<SocialSyncFailure>) {
     match sync_social_activity(state, user_id).await {
+        Ok(result) if !result.source_errors.is_empty() => {
+            let source_errors = result.source_errors.clone();
+            let message = source_errors.join("; ");
+            tracing::warn!(
+                user_id,
+                context,
+                error_kind = "social_sync_failed",
+                source_errors = ?source_errors,
+                "social activity sync completed with upstream source errors"
+            );
+            (
+                result,
+                Some(SocialSyncFailure {
+                    message,
+                    sqlite_backpressure: false,
+                    source_errors,
+                }),
+            )
+        }
         Ok(result) => (result, None),
         Err(err) => {
-            let sqlite_backpressure = is_sqlite_retryable_write_error(err.as_ref());
+            let source_errors = social_source_errors_from_error(err.as_ref());
+            let sqlite_backpressure =
+                source_errors.is_empty() && is_sqlite_retryable_write_error(err.as_ref());
             tracing::warn!(
                 ?err,
                 user_id,
@@ -2402,6 +2507,7 @@ async fn sync_social_activity_best_effort_with_failure(
                 Some(SocialSyncFailure {
                     message: err.to_string(),
                     sqlite_backpressure,
+                    source_errors,
                 }),
             )
         }
@@ -8776,6 +8882,7 @@ async fn finish_social_sync_for_user(
                         "error_kind": error_kind,
                         "retryable": recoverable,
                         "retry_after": retry_after,
+                        "source_errors": error.source_errors,
                     }),
                 },
             )
@@ -15194,16 +15301,17 @@ mod tests {
         recover_repo_release_runtime_state_on_startup, refresh_public_repo_release_if_stale,
         replace_starred_repos, repo_release_deadline_at, repo_release_timestamp_is_fresh,
         resolve_notification_open_url, social_activity_snapshot_hook_test_lock,
-        social_sync_failure_metadata, store_sync_state_value,
+        social_source_errors_from_error, social_sync_failure_metadata, store_sync_state_value,
         subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
+        with_social_source_errors,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         jobs, local_id, runtime,
-        sqlite_write::{SqliteWritePriority, is_sqlite_retryable_write_error},
+        sqlite_write::is_sqlite_retryable_write_error,
         state::{AppState, build_oauth_client},
     };
     use axum::{
@@ -17354,6 +17462,28 @@ mod tests {
             upstream_metadata,
             ("error", false, "social_sync_failed", None)
         );
+
+        let source_errors =
+            vec!["followers(conn:github, http_500): GitHub returned 500".to_owned()];
+        let combined_error = with_social_source_errors(
+            anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
+                lane: "social_activity_snapshot",
+                priority: "background",
+                phase: "writer_queue",
+                deadline_ms: 2_500,
+            }),
+            "apply social activity snapshot",
+            source_errors.as_slice(),
+        );
+        assert_eq!(
+            social_source_errors_from_error(combined_error.as_ref()),
+            source_errors
+        );
+        assert!(is_sqlite_retryable_write_error(combined_error.as_ref()));
+        assert_eq!(
+            social_sync_failure_metadata(false),
+            ("error", false, "social_sync_failed", None)
+        );
     }
 
     #[tokio::test]
@@ -17378,14 +17508,16 @@ mod tests {
         };
         let repo_members = vec![(repo.clone(), Vec::new())];
 
-        let held = state
-            .sqlite_writer
-            .acquire_with_priority(
-                "social_sync_backpressure_hold",
-                SqliteWritePriority::Foreground,
-            )
+        let mut external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .expect("hold sqlite writer");
+            .expect("hold external sqlite writer lock");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *external_lock)
+            .await
+            .expect("seed external sqlite writer lock");
         let snapshot_task = {
             let state = state.clone();
             let user_id = user_id.clone();
@@ -17406,7 +17538,10 @@ mod tests {
             .expect("join social snapshot")
             .expect_err("social snapshot should expose writer backpressure");
         assert!(is_sqlite_retryable_write_error(error.as_ref()));
-        drop(held);
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
 
         let outcome = finish_social_sync_for_user(
             &context,
@@ -17415,6 +17550,7 @@ mod tests {
             Some(SocialSyncFailure {
                 message: error.to_string(),
                 sqlite_backpressure: true,
+                source_errors: Vec::new(),
             }),
         )
         .await
@@ -17516,6 +17652,68 @@ mod tests {
             .expect("count failed upstream social user");
         assert_eq!(summary.succeeded_users, 0);
         assert_eq!(summary.failed_users, 1);
+    }
+
+    #[tokio::test]
+    async fn social_failure_event_falls_back_to_run_log_when_sqlite_is_busy() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-failure-event-fallback");
+        let task_id = local_id::test_local_id("social-failure-event-fallback-task");
+        seed_user(&pool, user_id.as_str()).await;
+        seed_sync_task(&state, task_id.as_str()).await;
+        let context = SubscriptionRunContext::new(state.as_ref(), task_id.as_str())
+            .await
+            .expect("open social failure fallback context");
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "social_failure_event_fallback_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer for event fallback");
+
+        let outcome = finish_social_sync_for_user(
+            &context,
+            user_id.as_str(),
+            SyncSocialActivityResult::default(),
+            Some(SocialSyncFailure {
+                message: "retryable writer pressure".to_owned(),
+                sqlite_backpressure: true,
+                source_errors: Vec::new(),
+            }),
+        )
+        .await
+        .expect("social failure should fall back to the run log");
+        assert!(outcome.is_none());
+        drop(held);
+
+        let event_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = 'social_sync_failed'
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count persisted social failure events");
+        assert_eq!(event_count, 0);
+
+        let log_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
+            .await
+            .expect("load social failure fallback log path")
+            .expect("social failure fallback log path should exist");
+        let log = tokio::fs::read_to_string(log_path)
+            .await
+            .expect("read social failure fallback run log");
+        assert!(log.contains("social_sync_failed"), "unexpected log: {log}");
+        assert!(
+            log.contains("sqlite_write_backpressure"),
+            "unexpected log: {log}"
+        );
     }
 
     #[test]

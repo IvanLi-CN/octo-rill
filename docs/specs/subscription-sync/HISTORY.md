@@ -8,6 +8,7 @@
 ## 历史摘要
 
 - 2026-10-23: Social SQLite writer backpressure now uses shared same-deadline admission retry and records exhausted pressure as a recoverable `social_sync_failed` warning with explicit retry metadata; upstream failures retain error/non-recoverable semantics.
+- 2026-10-23: Social upstream `source_errors` now keep subscription, access-refresh, and sync-all results non-successful with preserved details; retryable failure-event persistence pressure falls back to the durable run log so the remaining sync phases continue.
 - 2026-09-23: Admin Jobs 订阅同步运行时配置 PATCH 改为经 SQLite foreground writer coordinator 在单一事务中原子保存，并从同一事务快照返回设置值；`BUSY/LOCKED` 重试耗尽时返回带 `Retry-After: 1` 的 `503 database_busy`，并覆盖写锁竞争、后续写失败回滚及成功回填回归测试。
 - 2026-09-07: 订阅同步间隔成为 Release 治理窗口的唯一长度；保存后按 UTC 对齐边界生效，活动周期冻结实际 `N+B`，任务间隔弹窗改为只读摘要，管理员重试限定为原任务失败或未完成 watcher 范围。
 

@@ -3842,6 +3842,16 @@ where
     }
 
     let (social, social_error) = match sync_social(state, user_id).await {
+        Ok(result) if !result.source_errors.is_empty() => {
+            let social_error = result.source_errors.join("; ");
+            tracing::warn!(
+                user_id,
+                error_kind = "social_sync_failed",
+                error = %social_error,
+                "task sync_all: social activity sync completed with upstream source errors"
+            );
+            (result, Some(social_error))
+        }
         Ok(result) => (result, None),
         Err(err) => {
             tracing::warn!(
@@ -8423,6 +8433,61 @@ mod tests {
         assert_eq!(result["social"]["events"], json!(0));
         assert_eq!(result["notifications"]["notifications"], json!(7));
         assert_eq!(result["social_error"], json!("social unavailable"));
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_task_marks_social_source_errors_without_false_success() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "task-sync-all-social-source-error",
+            TASK_SYNC_ALL,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let result = execute_sync_all_task_with(
+            state.as_ref(),
+            "task-sync-all-social-source-error",
+            "1",
+            |_, _| Box::pin(async { Ok(sync::SyncStarredResult { repos: 4 }) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 2,
+                        releases: 5,
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncSocialActivityResult {
+                        source_errors: vec![
+                            "followers(conn:github, http_500): GitHub returned 500".to_owned(),
+                        ],
+                        ..Default::default()
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-03-07T00:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect("sync_all result");
+
+        assert_eq!(result["notifications"]["notifications"], json!(7));
+        assert_eq!(
+            result["social_error"],
+            json!("followers(conn:github, http_500): GitHub returned 500")
+        );
     }
 
     async fn setup_pool() -> SqlitePool {

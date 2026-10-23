@@ -2611,6 +2611,107 @@ mod tests {
         assert!(status.background_admission_coalesced >= 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_writer_succeeds_after_background_admission_denial() {
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(20),
+            ),
+        );
+        let held = coordinator
+            .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
+            .await
+            .expect("acquire foreground hold");
+        let first_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_waiter", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background waiter should be registered");
+
+        let foreground = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write_foreground("foreground_after_denial", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground waiter should be registered");
+
+        let second_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_denied_then_retried", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().background_rejected >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second background writer should be denied without a second waiter");
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), foreground)
+            .await
+            .expect("foreground writer should complete after capacity clears")
+            .expect("join foreground writer")
+            .expect("foreground writer should succeed after background denial");
+        tokio::time::timeout(Duration::from_secs(1), first_background)
+            .await
+            .expect("first background writer should complete")
+            .expect("join first background writer")
+            .expect("first background writer should succeed");
+        tokio::time::timeout(Duration::from_secs(1), second_background)
+            .await
+            .expect("retried background writer should complete")
+            .expect("join retried background writer")
+            .expect("retried background writer should succeed");
+
+        let status = coordinator.runtime_status();
+        assert!(!status.active);
+        assert_eq!(status.waiting_background, 0);
+        assert_eq!(status.waiting_foreground, 0);
+        assert!(status.background_rejected >= 1);
+    }
+
     #[test]
     fn background_admission_retry_delay_is_25_50_100ms_capped() {
         let coordinator = SqliteWriteCoordinator::new();
