@@ -331,7 +331,15 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 
 - Given `sync.access_refresh` 的 Social 阶段返回上游 `source_errors`
   When Social 阶段完成
-  Then `social_error` 保留完整错误详情，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
+  Then `social_error` 保留完整错误详情，Social progress/log payload 使用 `error_kind=social_sync_failed`、`severity=error`、`retryable=false`、`recoverable=false`，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
+
+- Given `sync.access_refresh` 的 Social 持久化耗尽 SQLite 背压预算
+  When Social 阶段完成
+  Then progress/log payload 使用 `error_kind=sqlite_write_backpressure`、`severity=warning`、`retryable=true`、`recoverable=true` 和 `retry_after=next_sync_subscriptions_run`，Notifications 阶段仍执行。
+
+- Given `sync.all` 的 Social 阶段返回上游错误或 SQLite 背压
+  When Notifications 阶段已经完成
+  Then task result 保留 Notifications 结果但任务终态为 `failed`，`task.completed` 保留 `error_kind` 与 `recoverable`，不得把含 `social_error` 的本轮结果标记为成功。
 
 - The access-refresh dependency seam used by this regression is private test wiring grouped in a dependency struct; production execution continues to call the real Social and Notifications implementations.
 

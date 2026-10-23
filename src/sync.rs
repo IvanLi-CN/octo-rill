@@ -2411,11 +2411,11 @@ pub async fn sync_social_activity_best_effort(
     (result, error.map(|error| error.message))
 }
 
-#[derive(Debug)]
-struct SocialSyncFailure {
-    message: String,
-    sqlite_backpressure: bool,
-    source_errors: Vec<String>,
+#[derive(Debug, Clone)]
+pub(crate) struct SocialSyncFailure {
+    pub(crate) message: String,
+    pub(crate) sqlite_backpressure: bool,
+    pub(crate) source_errors: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2457,55 +2457,64 @@ fn social_source_errors_from_error(error: &anyhow::Error) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub(crate) fn social_sync_failure_from_result(
+    result: &SyncSocialActivityResult,
+) -> Option<SocialSyncFailure> {
+    if result.source_errors.is_empty() {
+        return None;
+    }
+
+    Some(SocialSyncFailure {
+        message: result.source_errors.join("; "),
+        sqlite_backpressure: false,
+        source_errors: result.source_errors.clone(),
+    })
+}
+
+pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyncFailure {
+    let source_errors = social_source_errors_from_error(error);
+    SocialSyncFailure {
+        message: error.to_string(),
+        sqlite_backpressure: source_errors.is_empty()
+            && is_sqlite_retryable_write_error(error.as_ref()),
+        source_errors,
+    }
+}
+
 async fn sync_social_activity_best_effort_with_failure(
     state: &AppState,
     user_id: &str,
     context: &'static str,
 ) -> (SyncSocialActivityResult, Option<SocialSyncFailure>) {
     match sync_social_activity(state, user_id).await {
-        Ok(result) if !result.source_errors.is_empty() => {
-            let source_errors = result.source_errors.clone();
-            let message = source_errors.join("; ");
-            tracing::warn!(
-                user_id,
-                context,
-                error_kind = "social_sync_failed",
-                source_errors = ?source_errors,
-                "social activity sync completed with upstream source errors"
-            );
-            (
-                result,
-                Some(SocialSyncFailure {
-                    message,
-                    sqlite_backpressure: false,
-                    source_errors,
-                }),
-            )
+        Ok(result) => {
+            if let Some(failure) = social_sync_failure_from_result(&result) {
+                tracing::warn!(
+                    user_id,
+                    context,
+                    error_kind = "social_sync_failed",
+                    source_errors = ?failure.source_errors,
+                    "social activity sync completed with upstream source errors"
+                );
+                (result, Some(failure))
+            } else {
+                (result, None)
+            }
         }
-        Ok(result) => (result, None),
         Err(err) => {
-            let source_errors = social_source_errors_from_error(&err);
-            let sqlite_backpressure =
-                source_errors.is_empty() && is_sqlite_retryable_write_error(err.as_ref());
+            let failure = social_sync_failure_from_error(&err);
             tracing::warn!(
                 ?err,
                 user_id,
                 context,
-                error_kind = if sqlite_backpressure {
+                error_kind = if failure.sqlite_backpressure {
                     "sqlite_write_backpressure"
                 } else {
                     "social_sync_failed"
                 },
                 "social activity sync failed, continuing"
             );
-            (
-                SyncSocialActivityResult::default(),
-                Some(SocialSyncFailure {
-                    message: err.to_string(),
-                    sqlite_backpressure,
-                    source_errors,
-                }),
-            )
+            (SyncSocialActivityResult::default(), Some(failure))
         }
     }
 }
@@ -2726,8 +2735,9 @@ type AccessRefreshStarFuture<'a> = Pin<
 >;
 
 type AccessRefreshVisibilityFuture<'a> = Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
-type AccessRefreshSocialFuture<'a> =
-    Pin<Box<dyn Future<Output = (SyncSocialActivityResult, Option<String>)> + Send + 'a>>;
+type AccessRefreshSocialFuture<'a> = Pin<
+    Box<dyn Future<Output = (SyncSocialActivityResult, Option<SocialSyncFailure>)> + Send + 'a>,
+>;
 type AccessRefreshNotificationsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SyncNotificationsResult>> + Send + 'a>>;
 
@@ -2799,7 +2809,7 @@ where
             sync_starred: Box::new(sync_starred),
             refresh_visibility: Box::new(refresh_visibility),
             sync_social: Box::new(|state, user_id| -> AccessRefreshSocialFuture<'_> {
-                Box::pin(sync_social_activity_best_effort(
+                Box::pin(sync_social_activity_best_effort_with_failure(
                     state,
                     user_id,
                     "sync.access_refresh",
@@ -2935,8 +2945,11 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
     )
     .await;
 
-    let (social, social_error) = (dependencies.sync_social)(state, user_id).await;
-    let social_payload = json!({
+    let (social, social_failure) = (dependencies.sync_social)(state, user_id).await;
+    let social_error = social_failure
+        .as_ref()
+        .map(|failure| failure.message.clone());
+    let mut social_payload = json!({
         "task_id": task_id,
         "stage": "social_summary",
         "repo_stars": social.repo_stars,
@@ -2945,15 +2958,34 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
         "failed_repos": social.failed_repos.clone(),
         "error": social_error.clone(),
     });
+    if let Some(failure) = social_failure.as_ref() {
+        let (severity, recoverable, error_kind, retry_after) =
+            social_sync_failure_metadata(failure.sqlite_backpressure);
+        social_payload["severity"] = Value::String(severity.to_owned());
+        social_payload["recoverable"] = Value::Bool(recoverable);
+        social_payload["retryable"] = Value::Bool(recoverable);
+        social_payload["error_kind"] = Value::String(error_kind.to_owned());
+        social_payload["retry_after"] = retry_after
+            .map(|value| Value::String(value.to_owned()))
+            .unwrap_or(Value::Null);
+        social_payload["source_errors"] = Value::Array(
+            failure
+                .source_errors
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        );
+    }
+    let social_log_level = social_failure
+        .as_ref()
+        .map(|failure| social_sync_failure_metadata(failure.sqlite_backpressure).0)
+        .unwrap_or("info");
     jobs::append_task_event(state, task_id, "task.progress", social_payload.clone()).await?;
     append_access_refresh_log_entry(
         state,
         task_id,
-        if social_error.is_some() {
-            "warning"
-        } else {
-            "info"
-        },
+        social_log_level,
         "social",
         "social sync completed",
         social_payload,
@@ -24460,7 +24492,11 @@ mod tests {
                             Box::pin(async move {
                                 (
                                     super::SyncSocialActivityResult::default(),
-                                    Some(source_error),
+                                    Some(super::SocialSyncFailure {
+                                        message: source_error.clone(),
+                                        sqlite_backpressure: false,
+                                        source_errors: vec![source_error],
+                                    }),
                                 )
                             })
                         },
@@ -24498,6 +24534,118 @@ mod tests {
         .expect("load access refresh stages");
         assert!(stages.contains(&"social_summary".to_owned()));
         assert!(stages.contains(&"notifications_summary".to_owned()));
+
+        let social_payload: String = sqlx::query_scalar(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'social_summary'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load access refresh social progress event");
+        let social_payload: Value =
+            serde_json::from_str(&social_payload).expect("parse social progress payload");
+        assert_eq!(social_payload.get("severity"), Some(&json!("error")));
+        assert_eq!(
+            social_payload.get("error_kind"),
+            Some(&json!("social_sync_failed"))
+        );
+        assert_eq!(social_payload.get("retryable"), Some(&json!(false)));
+        assert_eq!(social_payload.get("recoverable"), Some(&json!(false)));
+        assert_eq!(social_payload.get("retry_after"), Some(&Value::Null));
+        assert_eq!(
+            social_payload.get("source_errors"),
+            Some(&json!([source_error]))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_records_recoverable_social_writer_pressure() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-social-writer-pressure");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-social-writer-pressure");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+
+        let result = super::sync_access_refresh_with_freshness_and_dependencies(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            "",
+            super::AccessRefreshDependencies {
+                sync_starred: Box::new(|_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
+                    Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
+                }),
+                refresh_visibility: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
+                        Box::pin(async { Ok(true) })
+                    },
+                ),
+                sync_social: Box::new(|_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
+                    Box::pin(async {
+                        (
+                            super::SyncSocialActivityResult::default(),
+                            Some(super::SocialSyncFailure {
+                                message: "writer pressure".to_owned(),
+                                sqlite_backpressure: true,
+                                source_errors: Vec::new(),
+                            }),
+                        )
+                    })
+                }),
+                sync_notifications: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
+                        Box::pin(async {
+                            Ok(super::SyncNotificationsResult {
+                                notifications: 2,
+                                since: None,
+                            })
+                        })
+                    },
+                ),
+            },
+        )
+        .await
+        .expect("access refresh should continue after recoverable social pressure");
+
+        assert_eq!(result.social_error.as_deref(), Some("writer pressure"));
+        assert_eq!(result.notifications.notifications, 2);
+
+        let social_payload: String = sqlx::query_scalar(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'social_summary'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recoverable social progress event");
+        let social_payload: Value =
+            serde_json::from_str(&social_payload).expect("parse recoverable social payload");
+        assert_eq!(social_payload.get("severity"), Some(&json!("warning")));
+        assert_eq!(
+            social_payload.get("error_kind"),
+            Some(&json!("sqlite_write_backpressure"))
+        );
+        assert_eq!(social_payload.get("retryable"), Some(&json!(true)));
+        assert_eq!(social_payload.get("recoverable"), Some(&json!(true)));
+        assert_eq!(
+            social_payload.get("retry_after"),
+            Some(&json!("next_sync_subscriptions_run"))
+        );
+        assert_eq!(social_payload.get("source_errors"), Some(&json!([])));
     }
 
     #[tokio::test]

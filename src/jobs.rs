@@ -3535,6 +3535,18 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             }
         }
         Err(err) => {
+            if let Some(failure) = err.downcast_ref::<SyncAllSocialBusinessFailure>() {
+                finalize_sync_all_social_failure(
+                    state.as_ref(),
+                    &task.id,
+                    failure,
+                    state.runtime_owner_id.as_str(),
+                )
+                .await?;
+                heartbeat.stop().await;
+                return Ok(());
+            }
+
             if is_sqlite_write_deadline_error(err.as_ref())
                 || is_sqlite_background_admission_error(err.as_ref())
             {
@@ -3580,6 +3592,56 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct SyncAllSocialBusinessFailure {
+    result: Value,
+    message: String,
+    error_kind: &'static str,
+    recoverable: bool,
+}
+
+impl std::fmt::Display for SyncAllSocialBusinessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SyncAllSocialBusinessFailure {}
+
+async fn finalize_sync_all_social_failure(
+    state: &AppState,
+    task_id: &str,
+    failure: &SyncAllSocialBusinessFailure,
+    runtime_owner_id: &str,
+) -> Result<bool> {
+    let finalized = finalize_task_if_owned(
+        state,
+        task_id,
+        STATUS_FAILED,
+        Some(failure.result.clone()),
+        Some(failure.message.clone()),
+        runtime_owner_id,
+    )
+    .await?;
+    if !finalized {
+        return Ok(false);
+    }
+    append_task_event(
+        state,
+        task_id,
+        "task.completed",
+        json!({
+            "task_id": task_id,
+            "status": STATUS_FAILED,
+            "error": failure.message,
+            "error_kind": failure.error_kind,
+            "recoverable": failure.recoverable,
+        }),
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn defer_task_after_sqlite_write_backpressure(
@@ -3808,6 +3870,14 @@ async fn user_is_background_eligible(state: &AppState, user_id: &str) -> Result<
 
 type TaskStepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+fn sync_all_social_failure_kind(failure: &sync::SocialSyncFailure) -> &'static str {
+    if failure.sqlite_backpressure {
+        "sqlite_write_backpressure"
+    } else {
+        "social_sync_failed"
+    }
+}
+
 async fn execute_sync_all_task_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
     state: &AppState,
     task_id: &str,
@@ -3841,28 +3911,33 @@ where
         return Ok(json!({"canceled": true}));
     }
 
-    let (social, social_error) = match sync_social(state, user_id).await {
-        Ok(result) if !result.source_errors.is_empty() => {
-            let social_error = result.source_errors.join("; ");
-            tracing::warn!(
-                user_id,
-                error_kind = "social_sync_failed",
-                error = %social_error,
-                "task sync_all: social activity sync completed with upstream source errors"
-            );
-            (result, Some(social_error))
+    let (social, social_failure) = match sync_social(state, user_id).await {
+        Ok(result) => {
+            if let Some(failure) = sync::social_sync_failure_from_result(&result) {
+                tracing::warn!(
+                    user_id,
+                    error_kind = "social_sync_failed",
+                    error = %failure.message,
+                    "task sync_all: social activity sync completed with upstream source errors"
+                );
+                (result, Some(failure))
+            } else {
+                (result, None)
+            }
         }
-        Ok(result) => (result, None),
         Err(err) => {
+            let failure = sync::social_sync_failure_from_error(&err);
             tracing::warn!(
                 ?err,
                 user_id,
+                error_kind = sync_all_social_failure_kind(&failure),
                 "task sync_all: social activity sync failed, continuing with notifications"
             );
-            (
-                sync::SyncSocialActivityResult::default(),
-                Some(err.to_string()),
-            )
+            let social = sync::SyncSocialActivityResult {
+                source_errors: failure.source_errors.clone(),
+                ..Default::default()
+            };
+            (social, Some(failure))
         }
     };
     if is_task_cancel_requested(state, task_id)
@@ -3879,8 +3954,16 @@ where
         "social": social,
         "notifications": notifications,
     });
-    if let Some(error) = social_error {
-        result["social_error"] = Value::String(error);
+    if let Some(failure) = social_failure {
+        result["social_error"] = Value::String(failure.message.clone());
+        let error_kind = sync_all_social_failure_kind(&failure);
+        let recoverable = failure.sqlite_backpressure;
+        return Err(anyhow::Error::new(SyncAllSocialBusinessFailure {
+            result,
+            message: failure.message,
+            error_kind,
+            recoverable,
+        }));
     }
     Ok(result)
 }
@@ -5789,10 +5872,10 @@ mod tests {
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        finalize_task_if_owned, heartbeat_task_lease, is_scheduled_task_type,
-        load_due_daily_slot_users, load_recent_failed_brief_retry_candidates,
-        load_recent_failed_translation_retry_candidates, load_translation_stream_cursor,
-        load_translation_stream_rows, mark_brief_generation_source,
+        finalize_sync_all_social_failure, finalize_task_if_owned, heartbeat_task_lease,
+        is_scheduled_task_type, load_due_daily_slot_users,
+        load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
+        load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
         reschedule_task, retry_candidate_is_retryable, rollback_scheduler_dispatch,
@@ -8402,7 +8485,7 @@ mod tests {
         )
         .await;
 
-        let result = execute_sync_all_task_with(
+        let error = execute_sync_all_task_with(
             state.as_ref(),
             "task-sync-all-social-fail",
             "1",
@@ -8426,13 +8509,18 @@ mod tests {
             },
         )
         .await
-        .expect("sync_all result");
+        .expect_err("sync_all should preserve a nonrecoverable social failure");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed sync_all social failure");
 
-        assert_eq!(result["starred"]["repos"], json!(4));
-        assert_eq!(result["releases"]["releases"], json!(5));
-        assert_eq!(result["social"]["events"], json!(0));
-        assert_eq!(result["notifications"]["notifications"], json!(7));
-        assert_eq!(result["social_error"], json!("social unavailable"));
+        assert_eq!(failure.result["starred"]["repos"], json!(4));
+        assert_eq!(failure.result["releases"]["releases"], json!(5));
+        assert_eq!(failure.result["social"]["events"], json!(0));
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
+        assert_eq!(failure.result["social_error"], json!("social unavailable"));
+        assert_eq!(failure.error_kind, "social_sync_failed");
+        assert!(!failure.recoverable);
     }
 
     #[tokio::test]
@@ -8448,7 +8536,7 @@ mod tests {
         )
         .await;
 
-        let result = execute_sync_all_task_with(
+        let error = execute_sync_all_task_with(
             state.as_ref(),
             "task-sync-all-social-source-error",
             "1",
@@ -8481,13 +8569,142 @@ mod tests {
             },
         )
         .await
-        .expect("sync_all result");
+        .expect_err("sync_all should preserve a nonrecoverable social source error");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed sync_all social source failure");
 
-        assert_eq!(result["notifications"]["notifications"], json!(7));
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
         assert_eq!(
-            result["social_error"],
+            failure.result["social_error"],
             json!("followers(conn:github, http_500): GitHub returned 500")
         );
+        assert_eq!(failure.error_kind, "social_sync_failed");
+        assert!(!failure.recoverable);
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_task_classifies_social_writer_pressure_as_recoverable() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "task-sync-all-social-writer-pressure",
+            TASK_SYNC_ALL,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let error = execute_sync_all_task_with(
+            state.as_ref(),
+            "task-sync-all-social-writer-pressure",
+            "1",
+            |_, _| Box::pin(async { Ok(sync::SyncStarredResult { repos: 4 }) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 2,
+                        releases: 5,
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Err::<sync::SyncSocialActivityResult, _>(anyhow::Error::new(
+                        crate::sqlite_write::SqliteWriteDeadlineError {
+                            lane: "background",
+                            priority: "background",
+                            phase: "writer_admission",
+                            deadline_ms: 2500,
+                        },
+                    ))
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-03-07T00:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect_err("sync_all should preserve recoverable social writer pressure");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed recoverable sync_all social failure");
+
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
+        assert_eq!(failure.error_kind, "sqlite_write_backpressure");
+        assert!(failure.recoverable);
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_failure_finalizes_task_failed_with_partial_result() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-terminal-failure";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "starred": {"repos": 4},
+                "releases": {"repos": 2, "releases": 5},
+                "social": {"events": 0},
+                "notifications": {"notifications": 7},
+                "social_error": "social unavailable",
+            }),
+            message: "social unavailable".to_owned(),
+            error_kind: "social_sync_failed",
+            recoverable: false,
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize sync_all social failure")
+        );
+
+        let (status, error_message, result_json): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_message, result_json FROM job_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load finalized sync_all task");
+        assert_eq!(status, STATUS_FAILED);
+        assert_eq!(error_message.as_deref(), Some("social unavailable"));
+        let result: Value = serde_json::from_str(
+            result_json
+                .as_deref()
+                .expect("sync_all partial result should be retained"),
+        )
+        .expect("parse retained sync_all result");
+        assert_eq!(result["notifications"]["notifications"], json!(7));
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load sync_all failure completion event");
+        let event: Value = serde_json::from_str(&event_payload).expect("parse completion event");
+        assert_eq!(event["status"], json!(STATUS_FAILED));
+        assert_eq!(event["error_kind"], json!("social_sync_failed"));
+        assert_eq!(event["recoverable"], json!(false));
     }
 
     async fn setup_pool() -> SqlitePool {

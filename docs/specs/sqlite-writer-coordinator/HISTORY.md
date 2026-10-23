@@ -8,6 +8,7 @@
 - 2026-10-23：Social 失败事件先落 run log；SQLite 可恢复背压耗尽时事件表追加降级为 durable fallback，且真实上游 source errors 在订阅、访问刷新与 sync-all 路径保持不可恢复语义。
 - 2026-10-23：混合 Social 上游错误与 SQLite 背压现在通过 typed `anyhow` context 保留上游详情，避免把真实上游失败误归类为可恢复 SQLite 背压。
 - 2026-10-23：补充 access-refresh Social source-error 与 Notifications 继续执行的回归，依赖通过私有 dependency struct 聚合，覆盖共享 writer 背压修复的另一条兼容结果路径。
+- 2026-10-24：access-refresh 的 Social progress/log 现在保留上游错误与 SQLite 背压的结构化分类；legacy `sync.all` 保留 Notifications 部分结果但以失败终态记录 Social 业务失败，避免 `social_error` 形成假成功。
 - 2026-10-23：文件型 WAL scheduler/session 压力回归的 empty-queue worker join 改用 30 秒测试预算，以覆盖 Agent VM 的冷/热调度抖动；生产 admission 与 writer deadline 不变。
 - 2026-10-23：文件型 WAL scheduler/session 压力回归先在外部锁释放后回收 empty-queue worker，避免测试夹具在生产 foreground deadline 内人为保持 SQLite 锁；生产 admission、writer deadline 与后台并发不变。
 - 2026-10-23：确认 access-refresh 的依赖注入只存在于私有测试 seam，不改变生产 Social/Notifications 调用。
