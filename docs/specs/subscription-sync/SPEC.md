@@ -333,7 +333,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When Social 阶段完成
   Then `social_error` 保留完整错误详情，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
 
-- The access-refresh dependency seam used by this regression is internal test wiring only; production execution continues to call the real Social and Notifications implementations.
+- The access-refresh dependency seam used by this regression is private test wiring grouped in a dependency struct; production execution continues to call the real Social and Notifications implementations.
 
 - Given Social 失败事件的 `sync_subscription_events` 写入耗尽 SQLite 背压预算
   When run log 已经写入该失败事件

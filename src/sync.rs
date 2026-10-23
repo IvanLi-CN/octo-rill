@@ -2731,6 +2731,23 @@ type AccessRefreshSocialFuture<'a> =
 type AccessRefreshNotificationsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SyncNotificationsResult>> + Send + 'a>>;
 
+type AccessRefreshStarredFn =
+    Box<dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a> + Send + Sync>;
+type AccessRefreshVisibilityFn =
+    Box<dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a> + Send + Sync>;
+type AccessRefreshSocialFn =
+    Box<dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshSocialFuture<'a> + Send + Sync>;
+type AccessRefreshNotificationsFn = Box<
+    dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshNotificationsFuture<'a> + Send + Sync,
+>;
+
+struct AccessRefreshDependencies {
+    sync_starred: AccessRefreshStarredFn,
+    refresh_visibility: AccessRefreshVisibilityFn,
+    sync_social: AccessRefreshSocialFn,
+    sync_notifications: AccessRefreshNotificationsFn,
+}
+
 async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
     state: &AppState,
     task_id: &str,
@@ -2739,8 +2756,12 @@ async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
     refresh_visibility: RefreshVisibility,
 ) -> Result<SyncAccessRefreshResult>
 where
-    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
-    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+    SyncStarred:
+        for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a> + Send + Sync + 'static,
+    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>
+        + Send
+        + Sync
+        + 'static,
 {
     sync_access_refresh_with_freshness(
         state,
@@ -2762,50 +2783,45 @@ async fn sync_access_refresh_with_freshness<SyncStarred, RefreshVisibility>(
     refresh_visibility: RefreshVisibility,
 ) -> Result<SyncAccessRefreshResult>
 where
-    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
-    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+    SyncStarred:
+        for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a> + Send + Sync + 'static,
+    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>
+        + Send
+        + Sync
+        + 'static,
 {
     sync_access_refresh_with_freshness_and_dependencies(
         state,
         task_id,
         user_id,
         freshness_profile,
-        sync_starred,
-        refresh_visibility,
-        |state, user_id| {
-            Box::pin(sync_social_activity_best_effort(
-                state,
-                user_id,
-                "sync.access_refresh",
-            ))
+        AccessRefreshDependencies {
+            sync_starred: Box::new(sync_starred),
+            refresh_visibility: Box::new(refresh_visibility),
+            sync_social: Box::new(|state, user_id| -> AccessRefreshSocialFuture<'_> {
+                Box::pin(sync_social_activity_best_effort(
+                    state,
+                    user_id,
+                    "sync.access_refresh",
+                ))
+            }),
+            sync_notifications: Box::new(
+                |state, user_id| -> AccessRefreshNotificationsFuture<'_> {
+                    Box::pin(sync_notifications(state, user_id))
+                },
+            ),
         },
-        |state, user_id| Box::pin(sync_notifications(state, user_id)),
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn sync_access_refresh_with_freshness_and_dependencies<
-    SyncStarred,
-    RefreshVisibility,
-    SyncSocial,
-    SyncNotifications,
->(
+async fn sync_access_refresh_with_freshness_and_dependencies(
     state: &AppState,
     task_id: &str,
     user_id: &str,
     freshness_profile: &str,
-    sync_starred: SyncStarred,
-    refresh_visibility: RefreshVisibility,
-    sync_social: SyncSocial,
-    sync_notifications_fn: SyncNotifications,
-) -> Result<SyncAccessRefreshResult>
-where
-    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
-    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
-    SyncSocial: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshSocialFuture<'a>,
-    SyncNotifications: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshNotificationsFuture<'a>,
-{
+    dependencies: AccessRefreshDependencies,
+) -> Result<SyncAccessRefreshResult> {
     let before_repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let before_repo_ids = before_repos
         .iter()
@@ -2823,7 +2839,7 @@ where
         }),
     )
     .await;
-    let starred = match sync_starred(state, user_id).await {
+    let starred = match (dependencies.sync_starred)(state, user_id).await {
         Ok(result) => result,
         Err(SyncStarredExecutionError::Upstream(diagnostic)) => {
             let error_chain = diagnostic.error_chain.clone();
@@ -2850,27 +2866,28 @@ where
             return Err(err);
         }
     };
-    let _owned_release_visibility_refreshed = match refresh_visibility(state, user_id).await {
-        Ok(result) => result,
-        Err(err) => {
-            let payload = json!({
-                "task_id": task_id,
-                "stage": "star_failed",
-                "operation": "refresh owned repo visibility",
-                "error_kind": "local_error",
-                "error_stage": "local",
-                "retryable": false,
-                "http_status": null,
-                "timeout_ms": null,
-                "elapsed_ms": null,
-                "attempts": null,
-                "retry_limit": null,
-                "error_chain": err.to_string(),
-            });
-            append_access_refresh_failure_diagnostic(state, task_id, payload).await;
-            return Err(err);
-        }
-    };
+    let _owned_release_visibility_refreshed =
+        match (dependencies.refresh_visibility)(state, user_id).await {
+            Ok(result) => result,
+            Err(err) => {
+                let payload = json!({
+                    "task_id": task_id,
+                    "stage": "star_failed",
+                    "operation": "refresh owned repo visibility",
+                    "error_kind": "local_error",
+                    "error_stage": "local",
+                    "retryable": false,
+                    "http_status": null,
+                    "timeout_ms": null,
+                    "elapsed_ms": null,
+                    "attempts": null,
+                    "retry_limit": null,
+                    "error_chain": err.to_string(),
+                });
+                append_access_refresh_failure_diagnostic(state, task_id, payload).await;
+                return Err(err);
+            }
+        };
     let star_payload = json!({
         "task_id": task_id,
         "stage": "star_refreshed",
@@ -2918,7 +2935,7 @@ where
     )
     .await;
 
-    let (social, social_error) = sync_social(state, user_id).await;
+    let (social, social_error) = (dependencies.sync_social)(state, user_id).await;
     let social_payload = json!({
         "task_id": task_id,
         "stage": "social_summary",
@@ -2943,23 +2960,24 @@ where
     )
     .await;
 
-    let (notifications, notifications_error) = match sync_notifications_fn(state, user_id).await {
-        Ok(result) => (result, None),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                user_id,
-                "sync.access_refresh: notifications sync failed, completing with partial data"
-            );
-            (
-                SyncNotificationsResult {
-                    notifications: 0,
-                    since: None,
-                },
-                Some(err.to_string()),
-            )
-        }
-    };
+    let (notifications, notifications_error) =
+        match (dependencies.sync_notifications)(state, user_id).await {
+            Ok(result) => (result, None),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    "sync.access_refresh: notifications sync failed, completing with partial data"
+                );
+                (
+                    SyncNotificationsResult {
+                        notifications: 0,
+                        since: None,
+                    },
+                    Some(err.to_string()),
+                )
+            }
+        };
     let notifications_payload = json!({
         "task_id": task_id,
         "stage": "notifications_summary",
@@ -24425,27 +24443,39 @@ mod tests {
             task_id.as_str(),
             user_id.as_str(),
             "",
-            |_state, _user_id| Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) }),
-            |_state, _user_id| Box::pin(async { Ok(true) }),
-            {
-                let source_error = source_error.clone();
-                move |_state, _user_id| {
+            super::AccessRefreshDependencies {
+                sync_starred: Box::new(|_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
+                    Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
+                }),
+                refresh_visibility: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
+                        Box::pin(async { Ok(true) })
+                    },
+                ),
+                sync_social: {
                     let source_error = source_error.clone();
-                    Box::pin(async move {
-                        (
-                            super::SyncSocialActivityResult::default(),
-                            Some(source_error),
-                        )
-                    })
-                }
-            },
-            |_state, _user_id| {
-                Box::pin(async {
-                    Ok(super::SyncNotificationsResult {
-                        notifications: 3,
-                        since: None,
-                    })
-                })
+                    Box::new(
+                        move |_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
+                            let source_error = source_error.clone();
+                            Box::pin(async move {
+                                (
+                                    super::SyncSocialActivityResult::default(),
+                                    Some(source_error),
+                                )
+                            })
+                        },
+                    )
+                },
+                sync_notifications: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
+                        Box::pin(async {
+                            Ok(super::SyncNotificationsResult {
+                                notifications: 3,
+                                since: None,
+                            })
+                        })
+                    },
+                ),
             },
         )
         .await

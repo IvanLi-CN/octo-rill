@@ -13,7 +13,7 @@
 - Social `source_errors` now remain non-recoverable across subscription, access-refresh, and sync-all result paths; failure events include source details, and retryable SQLite event-table pressure falls back to the already-written run log without aborting the remaining phases.
 - Mixed Social upstream-plus-SQLite failures preserve typed `source_errors` through the `anyhow` context chain, so a later SQLite write denial cannot downgrade a genuine upstream failure to recoverable backpressure.
 - Access-refresh Social failure handling is dependency-injected in tests; the regression verifies `social_error` preservation and that Notifications still completes after Social source errors.
-- The dependency seam is private test wiring and the production wrapper retains the real Social/Notifications calls; the local lint exception is limited to this seam.
+- The dependency seam is private test wiring grouped in a dependency struct; the production wrapper retains the real Social/Notifications calls and no lint suppression is required.
 - Lifecycle: active
 - Implementation: 已交付
 - Last: 2026-09-23

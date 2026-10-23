@@ -8,7 +8,7 @@
 - Subscription key events write the run log before the event table; retryable SQLite append pressure is retained in that durable log fallback and does not abort a Social worker or the remaining subscription phases.
 - Social write failures retain typed upstream/source diagnostics when SQLite backpressure is layered on top, keeping genuine upstream failures non-recoverable.
 - Access-refresh regression coverage verifies the Social source-error result is retained while the Notifications phase continues.
-- The access-refresh dependency seam is private test wiring only; the production path keeps the real Social/Notifications calls and its lint exception is local to that seam.
+- The access-refresh dependency seam is private test wiring grouped in a dependency struct; the production path keeps the real Social/Notifications calls without a lint suppression.
 - Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
