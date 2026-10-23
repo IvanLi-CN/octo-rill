@@ -2450,15 +2450,11 @@ fn with_social_source_errors(
     }
 }
 
-fn social_source_errors_from_error(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if let Some(source_errors) = error.downcast_ref::<SocialUpstreamSourceErrors>() {
-            return source_errors.details.clone();
-        }
-        current = error.source();
-    }
-    Vec::new()
+fn social_source_errors_from_error(error: &anyhow::Error) -> Vec<String> {
+    error
+        .downcast_ref::<SocialUpstreamSourceErrors>()
+        .map(|source_errors| source_errors.details.clone())
+        .unwrap_or_default()
 }
 
 async fn sync_social_activity_best_effort_with_failure(
@@ -2488,7 +2484,7 @@ async fn sync_social_activity_best_effort_with_failure(
         }
         Ok(result) => (result, None),
         Err(err) => {
-            let source_errors = social_source_errors_from_error(err.as_ref());
+            let source_errors = social_source_errors_from_error(&err);
             let sqlite_backpressure =
                 source_errors.is_empty() && is_sqlite_retryable_write_error(err.as_ref());
             tracing::warn!(
@@ -17475,11 +17471,13 @@ mod tests {
             "apply social activity snapshot",
             source_errors.as_slice(),
         );
-        assert_eq!(
-            social_source_errors_from_error(combined_error.as_ref()),
-            source_errors
-        );
+        let combined_source_errors = social_source_errors_from_error(&combined_error);
+        assert_eq!(combined_source_errors, source_errors);
         assert!(is_sqlite_retryable_write_error(combined_error.as_ref()));
+        assert!(!combined_source_errors.is_empty());
+        let combined_sqlite_backpressure = combined_source_errors.is_empty()
+            && is_sqlite_retryable_write_error(combined_error.as_ref());
+        assert!(!combined_sqlite_backpressure);
         assert_eq!(
             social_sync_failure_metadata(false),
             ("error", false, "social_sync_failed", None)
