@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: PR #340 executable candidate `6431ee1fff24f3eef977cd0cb7a1f24f41259954` refreshes webhook API test fixtures to model claimed runtime owners; the prior Backend Test failure was reproduced, fixed, and the two affected regressions pass locally. Production behavior is unchanged from the owner-CAS candidate above.
 - 2026-10-24: PR #340 executable candidate `6e50c9eb62918aa9acb61ecc173889ee66aaf5fb` extends owner-CAS protection from SQLite-backpressure deferral to active cancellation and webhook retry requeues; Social snapshot source errors are de-duplicated across fetch phases, with stale-owner and cross-phase diagnostic regressions passing. The scheduler/session pressure evidence remains bound to the unchanged path recorded below.
 - 2026-10-24: Failed-but-partial Social users now contribute their committed repo, follower, and event counters to the subscription summary while remaining failed users; cancellation remains a separate outcome.
 - 2026-10-24: Legacy `sync.all` Social failure completion events now carry `severity`, `retryable`, and `retry_after` alongside `error_kind` and `recoverable`; recoverable SQLite pressure and non-recoverable upstream regression coverage now exercise both payload classes.
