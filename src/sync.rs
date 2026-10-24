@@ -431,6 +431,11 @@ pub struct SyncSubscriptionSocialSummary {
     pub events: usize,
 }
 
+struct SyncSocialUserOutcome {
+    result: SyncSocialActivityResult,
+    succeeded: bool,
+}
+
 #[derive(Debug, Serialize, Default, Clone)]
 pub struct SyncSubscriptionNotificationsSummary {
     pub total_users: usize,
@@ -9191,7 +9196,7 @@ async fn emit_social_progress(
 }
 
 fn collect_social_result(
-    joined: Option<Result<Result<Option<SyncSocialActivityResult>>, tokio::task::JoinError>>,
+    joined: Option<Result<Result<Option<SyncSocialUserOutcome>>, tokio::task::JoinError>>,
     summary: &mut SyncSubscriptionSocialSummary,
 ) -> Result<()> {
     let Some(joined) = joined else {
@@ -9199,11 +9204,15 @@ fn collect_social_result(
     };
 
     match joined {
-        Ok(Ok(Some(success))) => {
-            summary.succeeded_users += 1;
-            summary.repo_stars += success.repo_stars;
-            summary.followers += success.followers;
-            summary.events += success.events;
+        Ok(Ok(Some(outcome))) => {
+            if outcome.succeeded {
+                summary.succeeded_users += 1;
+            } else {
+                summary.failed_users += 1;
+            }
+            summary.repo_stars += outcome.result.repo_stars;
+            summary.followers += outcome.result.followers;
+            summary.events += outcome.result.events;
             Ok(())
         }
         Ok(Ok(None)) => {
@@ -9218,7 +9227,7 @@ fn collect_social_result(
 async fn sync_social_for_user(
     context: SubscriptionRunContext,
     user_id: String,
-) -> Result<Option<SyncSocialActivityResult>> {
+) -> Result<Option<SyncSocialUserOutcome>> {
     context
         .log(
             "info",
@@ -9261,7 +9270,7 @@ async fn finish_social_sync_for_user(
     user_id: &str,
     result: SyncSocialActivityResult,
     error: Option<SocialSyncFailure>,
-) -> Result<Option<SyncSocialActivityResult>> {
+) -> Result<Option<SyncSocialUserOutcome>> {
     if let Some(error) = error {
         let (severity, recoverable, error_kind, retry_after) =
             social_sync_failure_metadata(error.sqlite_backpressure);
@@ -9293,7 +9302,10 @@ async fn finish_social_sync_for_user(
                 },
             )
             .await?;
-        return Ok(None);
+        return Ok(Some(SyncSocialUserOutcome {
+            result,
+            succeeded: false,
+        }));
     }
 
     if !result.source_errors.is_empty() {
@@ -9323,7 +9335,10 @@ async fn finish_social_sync_for_user(
                 },
             )
             .await?;
-        return Ok(None);
+        return Ok(Some(SyncSocialUserOutcome {
+            result,
+            succeeded: false,
+        }));
     }
 
     if !result.failed_repos.is_empty() {
@@ -9366,7 +9381,10 @@ async fn finish_social_sync_for_user(
         )
         .await?;
 
-    Ok(Some(result))
+    Ok(Some(SyncSocialUserOutcome {
+        result,
+        succeeded: true,
+    }))
 }
 
 async fn run_notifications_phase(
@@ -17970,7 +17988,11 @@ mod tests {
         )
         .await
         .expect("record recoverable social writer pressure");
-        assert!(outcome.is_none());
+        let outcome = outcome.expect("recoverable Social failure should retain its outcome");
+        assert!(!outcome.succeeded);
+        assert_eq!(outcome.result.repo_stars, 4);
+        assert_eq!(outcome.result.followers, 2);
+        assert_eq!(outcome.result.events, 3);
 
         let (severity, recoverable, payload_json): (String, i64, String) = sqlx::query_as(
             r#"
@@ -18011,9 +18033,13 @@ mod tests {
             total_users: 1,
             ..Default::default()
         };
-        collect_social_result(Some(Ok(Ok(None))), &mut summary).expect("count failed social user");
+        collect_social_result(Some(Ok(Ok(Some(outcome)))), &mut summary)
+            .expect("count failed social user");
         assert_eq!(summary.succeeded_users, 0);
         assert_eq!(summary.failed_users, 1);
+        assert_eq!(summary.repo_stars, 4);
+        assert_eq!(summary.followers, 2);
+        assert_eq!(summary.events, 3);
     }
 
     #[tokio::test]
@@ -18182,7 +18208,8 @@ mod tests {
         )
         .await
         .expect("record upstream social failure");
-        assert!(outcome.is_none());
+        let outcome = outcome.expect("upstream Social failure should retain its outcome");
+        assert!(!outcome.succeeded);
 
         let (severity, recoverable, payload_json): (String, i64, String) = sqlx::query_as(
             r#"
@@ -18212,7 +18239,7 @@ mod tests {
             total_users: 1,
             ..Default::default()
         };
-        collect_social_result(Some(Ok(Ok(None))), &mut summary)
+        collect_social_result(Some(Ok(Ok(Some(outcome)))), &mut summary)
             .expect("count failed upstream social user");
         assert_eq!(summary.succeeded_users, 0);
         assert_eq!(summary.failed_users, 1);
@@ -18250,7 +18277,11 @@ mod tests {
         )
         .await
         .expect("social failure should fall back to the run log");
-        assert!(outcome.is_none());
+        assert!(
+            !outcome
+                .expect("run-log fallback should retain its outcome")
+                .succeeded
+        );
         drop(held);
 
         let event_count: i64 = sqlx::query_scalar(
