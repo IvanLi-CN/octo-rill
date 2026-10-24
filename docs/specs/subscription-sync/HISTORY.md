@@ -17,6 +17,7 @@
 - 2026-10-24: Owner approval recorded for the mock-only Storybook evidence covering recoverable Social SQLite writer pressure.
 - 2026-10-24: The recoverable Social SQLite writer pressure Storybook evidence is approved in the topic SPEC and bound to PR #340's current candidate.
 - 2026-10-24: Candidate `129c817e4d0227d8055869eced0ba97844a1facf` passed the file-backed WAL scheduler/session acceptance twice in Agent VM; both runs reported `1 passed, 0 failed`.
+- 2026-10-24: Current candidate `09c6f0b6e7397d1b8ec8c8b0bb4982441323a878` passed the file-backed WAL scheduler/session acceptance twice in Agent VM; both runs reported `1 passed, 0 failed`, with test bodies taking 14.67s and 1.85s.
 - 2026-10-23: The file-backed WAL scheduler/session acceptance now releases its external SQLite lock before joining empty-queue workers, keeping the pressure proof faithful to the production foreground deadline under slow test scheduling.
 - 2026-09-23: Admin Jobs 订阅同步运行时配置 PATCH 改为经 SQLite foreground writer coordinator 在单一事务中原子保存，并从同一事务快照返回设置值；`BUSY/LOCKED` 重试耗尽时返回带 `Retry-After: 1` 的 `503 database_busy`，并覆盖写锁竞争、后续写失败回滚及成功回填回归测试。
 - 2026-09-07: 订阅同步间隔成为 Release 治理窗口的唯一长度；保存后按 UTC 对齐边界生效，活动周期冻结实际 `N+B`，任务间隔弹窗改为只读摘要，管理员重试限定为原任务失败或未完成 watcher 范围。

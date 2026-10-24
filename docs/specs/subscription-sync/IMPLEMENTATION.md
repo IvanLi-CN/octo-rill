@@ -17,7 +17,7 @@
 - Legacy `sync.all` task execution retains the completed Notifications result inside a typed Social business failure, finalizes the task as failed, and records the failure classification in `task.completed` instead of treating `social_error` as success.
 - The dependency seam is private test wiring grouped in a dependency struct; the production wrapper retains the real Social/Notifications calls and no lint suppression is required.
 - The file-backed WAL scheduler/session acceptance keeps the external lock held only through the foreground contention probe; it releases that lock before joining empty-queue background workers so host scheduling jitter cannot consume the production foreground deadline.
-- The current candidate `129c817e4d0227d8055869eced0ba97844a1facf` passed the file-backed WAL scheduler/session acceptance twice in Agent VM with Rust 1.91, 8 vCPU, and 12 GiB; the test reported `1 passed, 0 failed` on both runs.
+- The current candidate `09c6f0b6e7397d1b8ec8c8b0bb4982441323a878` passed the file-backed WAL scheduler/session acceptance twice in Agent VM with Rust 1.91, 8 vCPU, and 12 GiB; the test reported `1 passed, 0 failed` on both runs, with test bodies taking 14.67s and 1.85s.
 - Lifecycle: active
 - Implementation: 已交付
 - Last: 2026-09-23
