@@ -146,6 +146,19 @@ struct InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct FeedActivityEventsAfterFirstBatchHook {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+struct InstalledFeedActivityEventsAfterFirstBatchHook {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resume: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
 impl Drop for InstalledSocialActivitySnapshotAfterReadsHook {
     fn drop(&mut self) {
         let _ = self.resume.send(true);
@@ -176,6 +189,16 @@ impl Drop for InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
 }
 
 #[cfg(test)]
+impl Drop for InstalledFeedActivityEventsAfterFirstBatchHook {
+    fn drop(&mut self) {
+        let _ = self.resume.send(true);
+        *feed_activity_events_after_first_batch_hook_slot()
+            .lock()
+            .expect("lock feed activity first batch hook slot") = None;
+    }
+}
+
+#[cfg(test)]
 fn social_activity_snapshot_after_reads_hook_slot()
 -> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>> {
     static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>>> =
@@ -197,6 +220,14 @@ fn social_activity_snapshot_after_first_event_chunk_hook_slot()
     static HOOK: OnceLock<
         std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstEventChunkHook>>,
     > = OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn feed_activity_events_after_first_batch_hook_slot()
+-> &'static std::sync::Mutex<Option<FeedActivityEventsAfterFirstBatchHook>> {
+    static HOOK: OnceLock<std::sync::Mutex<Option<FeedActivityEventsAfterFirstBatchHook>>> =
+        OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -261,6 +292,24 @@ fn install_social_activity_snapshot_after_first_event_chunk_hook()
 }
 
 #[cfg(test)]
+fn install_feed_activity_events_after_first_batch_hook()
+-> InstalledFeedActivityEventsAfterFirstBatchHook {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = tokio::sync::watch::channel(false);
+    *feed_activity_events_after_first_batch_hook_slot()
+        .lock()
+        .expect("lock feed activity first batch hook slot") =
+        Some(FeedActivityEventsAfterFirstBatchHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    InstalledFeedActivityEventsAfterFirstBatchHook {
+        reached: reached_rx,
+        resume: resume_tx,
+    }
+}
+
+#[cfg(test)]
 async fn wait_for_social_activity_snapshot_after_reads_hook() {
     let hook = social_activity_snapshot_after_reads_hook_slot()
         .lock()
@@ -295,6 +344,21 @@ async fn wait_for_social_activity_snapshot_after_first_event_chunk_hook() {
     let hook = social_activity_snapshot_after_first_event_chunk_hook_slot()
         .lock()
         .expect("lock social activity first event chunk hook slot")
+        .clone();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let mut resume = hook.resume;
+        if !*resume.borrow() {
+            let _ = resume.changed().await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_feed_activity_events_after_first_batch_hook() {
+    let hook = feed_activity_events_after_first_batch_hook_slot()
+        .lock()
+        .expect("lock feed activity first batch hook slot")
         .clone();
     if let Some(hook) = hook {
         let _ = hook.reached.send(());
@@ -2414,7 +2478,7 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
-            let committed_events = social_activity_snapshot_committed_events(&error);
+            let committed_events = social_activity_committed_events(&error);
             with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
@@ -2438,7 +2502,7 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
-            let committed_events = social_activity_snapshot_committed_events(&error);
+            let committed_events = social_activity_committed_events(&error);
             with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
@@ -2455,6 +2519,7 @@ pub async fn sync_social_activity(
     events += insert_feed_activity_events(state, user_id, feed_events.as_slice())
         .await
         .map_err(|error| {
+            let committed_events = social_activity_committed_events(&error);
             with_social_activity_failure(
                 error,
                 "insert social feed activity events",
@@ -2462,7 +2527,7 @@ pub async fn sync_social_activity(
                 social_activity_result_snapshot(
                     &repo_collection,
                     followers.len(),
-                    events,
+                    events + committed_events,
                     source_errors.as_slice(),
                 ),
             )
@@ -2560,7 +2625,7 @@ struct SocialSyncActivityFailure {
 }
 
 #[derive(Debug)]
-struct SocialActivitySnapshotPersistenceFailure {
+struct SocialActivityPersistenceFailure {
     events: usize,
 }
 
@@ -2575,7 +2640,7 @@ impl std::fmt::Display for SocialSyncActivityFailure {
 
 impl std::error::Error for SocialSyncActivityFailure {}
 
-impl std::fmt::Display for SocialActivitySnapshotPersistenceFailure {
+impl std::fmt::Display for SocialActivityPersistenceFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -2585,7 +2650,7 @@ impl std::fmt::Display for SocialActivitySnapshotPersistenceFailure {
     }
 }
 
-impl std::error::Error for SocialActivitySnapshotPersistenceFailure {}
+impl std::error::Error for SocialActivityPersistenceFailure {}
 
 impl std::fmt::Display for SocialUpstreamSourceErrors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2646,9 +2711,9 @@ fn with_social_activity_failure(
         .context(SocialSyncActivityFailure { result })
 }
 
-fn social_activity_snapshot_committed_events(error: &anyhow::Error) -> usize {
+fn social_activity_committed_events(error: &anyhow::Error) -> usize {
     error
-        .downcast_ref::<SocialActivitySnapshotPersistenceFailure>()
+        .downcast_ref::<SocialActivityPersistenceFailure>()
         .map(|failure| failure.events)
         .unwrap_or_default()
 }
@@ -3585,7 +3650,7 @@ async fn apply_social_activity_snapshot_with_options(
     .await
     .map(|()| events_written)
     .map_err(|error| {
-        error.context(SocialActivitySnapshotPersistenceFailure {
+        error.context(SocialActivityPersistenceFailure {
             events: events_written,
         })
     })
@@ -12992,8 +13057,18 @@ async fn insert_feed_activity_events(
 
     let now = Utc::now().to_rfc3339();
     let mut written = 0usize;
+    #[cfg(test)]
+    let mut first_batch_completed = false;
     for batch in events.chunks(FEED_ACTIVITY_EVENT_BATCH_SIZE) {
-        written += insert_feed_activity_events_batch(state, user_id, batch, now.as_str()).await?;
+        let batch_written = insert_feed_activity_events_batch(state, user_id, batch, now.as_str())
+            .await
+            .map_err(|error| error.context(SocialActivityPersistenceFailure { events: written }))?;
+        written += batch_written;
+        #[cfg(test)]
+        if !first_batch_completed {
+            first_batch_completed = true;
+            wait_for_feed_activity_events_after_first_batch_hook().await;
+        }
     }
     Ok(written)
 }
@@ -15715,6 +15790,7 @@ mod tests {
         finish_social_sync_for_user, github_http_outcome, github_http_outcome_with_context,
         heartbeat_repo_release_work_item_lease, hydrate_repo_refresh_candidates,
         insert_feed_activity_events, insert_social_activity_event_tx,
+        install_feed_activity_events_after_first_batch_hook,
         install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_first_event_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
@@ -18118,7 +18194,7 @@ mod tests {
             .expect("join social snapshot")
             .expect_err("later social snapshot chunk should expose writer backpressure");
         assert!(is_sqlite_retryable_write_error(error.as_ref()));
-        assert_eq!(super::social_activity_snapshot_committed_events(&error), 64);
+        assert_eq!(super::social_activity_committed_events(&error), 64);
 
         let persisted_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM social_activity_events WHERE user_id = ? AND kind = 'repo_star_received'",
@@ -18130,7 +18206,7 @@ mod tests {
         assert_eq!(persisted_events, 64);
 
         let partial = SyncSocialActivityResult {
-            events: super::social_activity_snapshot_committed_events(&error),
+            events: super::social_activity_committed_events(&error),
             ..Default::default()
         };
         let failure = super::with_social_activity_failure(
@@ -21911,6 +21987,89 @@ mod tests {
             4,
             "large feed event batches must use four ten-row writer batches"
         );
+    }
+
+    #[tokio::test]
+    async fn feed_activity_events_preserves_committed_count_when_later_batch_fails() {
+        let _hook_test_lock = social_activity_snapshot_hook_test_lock().lock().await;
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("feed-partial-batch");
+        seed_user(&pool, user_id.as_str()).await;
+        let actor = GitHubActor {
+            id: 503,
+            login: "partial-writer-cat".to_owned(),
+            avatar_url: None,
+            html_url: None,
+        };
+        let events = (0..20)
+            .map(|index| FeedActivityEventSnapshot {
+                kind: "discussion",
+                event_id: format!("feed-partial-{index}"),
+                repo_id: Some(42),
+                repo_full_name: Some("octo/partial".to_owned()),
+                discussion_number: Some(index),
+                title: Some(format!("Discussion {index}")),
+                body: Some("discussion body".to_owned()),
+                html_url: Some(format!(
+                    "https://github.com/octo/partial/discussions/{index}"
+                )),
+                github_event_id: Some(format!("feed-partial-{index}")),
+                actor: actor.clone(),
+                occurred_at: format!("2026-03-07T12:{index:02}:00Z"),
+            })
+            .collect::<Vec<_>>();
+        let mut hook = install_feed_activity_events_after_first_batch_hook();
+        let insert_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                insert_feed_activity_events(state.as_ref(), user_id.as_str(), events.as_slice())
+                    .await
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), hook.reached.recv())
+                .await
+                .expect("wait for first committed feed event batch")
+                .is_some(),
+            "expected feed event insertion to pause after the first batch committed"
+        );
+
+        let mut external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock after first feed batch");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *external_lock)
+            .await
+            .expect("seed external sqlite writer lock after first feed batch");
+        let _ = hook.resume.send(true);
+
+        let error = tokio::time::timeout(Duration::from_secs(4), insert_task)
+            .await
+            .expect("feed event insertion should reach its writer deadline")
+            .expect("join feed event insertion")
+            .expect_err("later feed event batch should expose writer backpressure");
+        assert!(is_sqlite_retryable_write_error(error.as_ref()));
+        assert_eq!(super::social_activity_committed_events(&error), 10);
+
+        let persisted_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM social_activity_events WHERE user_id = ? AND kind = 'discussion'",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count committed feed event batches");
+        assert_eq!(persisted_events, 10);
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
     }
 
     #[tokio::test]

@@ -5,7 +5,8 @@
 ## Decision Trace
 
 - 2026-10-24：订阅 Social worker 将失败但已有 partial snapshot 的 outcome 与取消区分；摘要继续增加 `failed_users`，同时合并已持久化的 repo、follower 与 event 计数，避免管理员看到的总量低于 SQLite 已提交事实。
-- 2026-10-24：PR #340 current head `f0e7f3467975b0db225443b0db7c54da7b94c3f9` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）直接通过一次 file-backed WAL scheduler/session pressure acceptance（`1 passed, 0 failed`，测试本体 15.57 s）；同环境即时重复出现 foreground session `503`（17.16 s），而 exact-head GitHub Backend Tests check 通过，稳定性观察保留至合并前审查。
+- 2026-10-24：PR #340 final candidate `090e0060ac36d886197cf2a71c051ef4094580d7` 继承 implementation-evidence commit `f0e7f3467975b0db225443b0db7c54da7b94c3f9` 的未变代码路径；Agent VM 直接通过一次 file-backed WAL scheduler/session pressure acceptance（`1 passed, 0 failed`，测试本体 15.57 s），同环境即时重复出现 foreground session `503`（17.16 s）。exact-head GitHub Backend Tests 与四次本地 exact binary 并行运行通过，Tier 3 test-platform review 接受该单次重复为 VM 调度方差，限制记录保留。
+- 2026-10-24：feed activity event 分批写入现在在后续 batch 遇到 writer pressure 时保留此前已提交的 event count，并由回归测试锁定 10+10 batch 的 partial commit 语义，避免 Social 摘要低报已持久化事件。
 - 2026-10-24：Social 持久化在部分 snapshot 已完成后遇到 writer pressure 时，通过 typed error context 保留计数与 failed/partial repo；`sync.all` 将 failed task 行与 `task.completed` 事件合并到同一 foreground 事务，并在收尾失败前停止 heartbeat。
 - 2026-10-23：background writer admission denial 现在在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，同时保留单 background waiter 与 foreground 优先；Social SQLite 背压记录为可恢复 warning，不把未完成用户伪装成成功；job task finalize 明确走 foreground lane，避免终态提交被 heartbeat 背景等待拖成租约恢复。
 - 2026-10-23：Social 失败事件先落 run log；SQLite 可恢复背压耗尽时事件表追加降级为 durable fallback，且真实上游 source errors 在订阅、访问刷新与 sync-all 路径保持不可恢复语义。
