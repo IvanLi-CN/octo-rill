@@ -2621,6 +2621,7 @@ pub(crate) struct SocialSyncFailure {
     pub(crate) message: String,
     pub(crate) sqlite_backpressure: bool,
     pub(crate) source_errors: Vec<String>,
+    pub(crate) source_degraded: bool,
 }
 
 #[derive(Debug)]
@@ -2766,6 +2767,7 @@ pub(crate) fn social_sync_failure_from_result(
         message: result.source_errors.join("; "),
         sqlite_backpressure: false,
         source_errors: result.source_errors.clone(),
+        source_degraded: true,
     })
 }
 
@@ -2786,6 +2788,7 @@ pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyn
         sqlite_backpressure: source_errors.is_empty()
             && is_sqlite_retryable_write_error(error.as_ref()),
         source_errors,
+        source_degraded: false,
     }
 }
 
@@ -9348,6 +9351,35 @@ async fn sync_social_for_user(
     finish_social_sync_for_user(&context, user_id.as_str(), result, error).await
 }
 
+async fn emit_social_source_degraded_events(
+    context: &SubscriptionRunContext,
+    user_id: &str,
+    source_errors: &[String],
+) -> Result<()> {
+    for source_error in source_errors {
+        context
+            .key_event(
+                format!("social sync degraded for user #{}", user_id),
+                SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_source_degraded",
+                    severity: "warning",
+                    recoverable: true,
+                    attempt: 1,
+                    user_id: Some(user_id),
+                    repo_id: None,
+                    repo_full_name: None,
+                    payload: json!({
+                        "user_id": user_id,
+                        "error": source_error,
+                    }),
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn finish_social_sync_for_user(
     context: &SubscriptionRunContext,
     user_id: &str,
@@ -9355,6 +9387,13 @@ async fn finish_social_sync_for_user(
     error: Option<SocialSyncFailure>,
 ) -> Result<Option<SyncSocialUserOutcome>> {
     if let Some(error) = error {
+        if error.source_degraded {
+            emit_social_source_degraded_events(context, user_id, &error.source_errors).await?;
+            return Ok(Some(SyncSocialUserOutcome {
+                result,
+                succeeded: false,
+            }));
+        }
         let (severity, recoverable, error_kind, retry_after) =
             social_sync_failure_metadata(error.sqlite_backpressure);
         context
@@ -9392,32 +9431,7 @@ async fn finish_social_sync_for_user(
     }
 
     if !result.source_errors.is_empty() {
-        let source_errors = result.source_errors.clone();
-        let source_error_message = source_errors.join("; ");
-        let (severity, recoverable, error_kind, retry_after) = social_sync_failure_metadata(false);
-        context
-            .key_event(
-                format!("failed to refresh social activity for user #{}", user_id),
-                SubscriptionEventRecord {
-                    stage: "social",
-                    event_type: "social_sync_failed",
-                    severity,
-                    recoverable,
-                    attempt: 1,
-                    user_id: Some(user_id),
-                    repo_id: None,
-                    repo_full_name: None,
-                    payload: json!({
-                        "user_id": user_id,
-                        "error": source_error_message,
-                        "error_kind": error_kind,
-                        "retryable": recoverable,
-                        "retry_after": retry_after,
-                        "source_errors": source_errors,
-                    }),
-                },
-            )
-            .await?;
+        emit_social_source_degraded_events(context, user_id, &result.source_errors).await?;
         return Ok(Some(SyncSocialUserOutcome {
             result,
             succeeded: false,
@@ -18078,6 +18092,7 @@ mod tests {
                 message: error.to_string(),
                 sqlite_backpressure: true,
                 source_errors: Vec::new(),
+                source_degraded: false,
             }),
         )
         .await
@@ -18365,7 +18380,14 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            None,
+            Some(SocialSyncFailure {
+                message: "GitHub returned an invalid response".to_owned(),
+                sqlite_backpressure: false,
+                source_errors: vec![
+                    "owned_repos(conn:github, http_500): github returned 500".to_owned(),
+                ],
+                source_degraded: false,
+            }),
         )
         .await
         .expect("record upstream social failure");
@@ -18407,6 +18429,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn social_source_degraded_event_preserves_legacy_warning_contract() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-source-degraded");
+        let task_id = local_id::test_local_id("social-source-degraded-task");
+        seed_user(&pool, user_id.as_str()).await;
+        seed_sync_task(&state, task_id.as_str()).await;
+        let context = SubscriptionRunContext::new(state.as_ref(), task_id.as_str())
+            .await
+            .expect("open social source degraded test context");
+
+        let outcome = finish_social_sync_for_user(
+            &context,
+            user_id.as_str(),
+            SyncSocialActivityResult {
+                source_errors: vec![
+                    "followers(conn:github, http_500): github returned 500".to_owned(),
+                ],
+                ..Default::default()
+            },
+            Some(SocialSyncFailure {
+                message: "followers source degraded".to_owned(),
+                sqlite_backpressure: false,
+                source_errors: vec![
+                    "followers(conn:github, http_500): github returned 500".to_owned(),
+                ],
+                source_degraded: true,
+            }),
+        )
+        .await
+        .expect("record source degradation");
+        assert!(
+            !outcome
+                .expect("source degradation should retain result")
+                .succeeded
+        );
+
+        let (event_type, severity, recoverable, payload_json): (String, String, i64, String) =
+            sqlx::query_as(
+                r#"
+                SELECT event_type, severity, recoverable, payload_json
+                FROM sync_subscription_events
+                WHERE task_id = ?
+                ORDER BY rowid DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(task_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("load source degraded event");
+        assert_eq!(event_type, "social_source_degraded");
+        assert_eq!(severity, "warning");
+        assert_eq!(recoverable, 1);
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse event payload");
+        assert_eq!(
+            payload.get("error"),
+            Some(&json!(
+                "followers(conn:github, http_500): github returned 500"
+            ))
+        );
+        assert_eq!(context.critical_events.load(AtomicTestOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn social_failure_event_falls_back_to_run_log_when_sqlite_is_busy() {
         let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
@@ -18434,6 +18521,7 @@ mod tests {
                 message: "retryable writer pressure".to_owned(),
                 sqlite_backpressure: true,
                 source_errors: Vec::new(),
+                source_degraded: false,
             }),
         )
         .await
@@ -25252,6 +25340,7 @@ mod tests {
                                         message: source_error.clone(),
                                         sqlite_backpressure: false,
                                         source_errors: vec![source_error],
+                                        source_degraded: false,
                                     }),
                                 )
                             })
@@ -25353,6 +25442,7 @@ mod tests {
                                 message: "writer pressure".to_owned(),
                                 sqlite_backpressure: true,
                                 source_errors: Vec::new(),
+                                source_degraded: false,
                             }),
                         )
                     })
@@ -25444,6 +25534,7 @@ mod tests {
                                         message: source_error.clone(),
                                         sqlite_backpressure: false,
                                         source_errors: vec![source_error],
+                                        source_degraded: false,
                                     }),
                                 )
                             })
@@ -25528,6 +25619,7 @@ mod tests {
                                 message: "writer pressure".to_owned(),
                                 sqlite_backpressure: true,
                                 source_errors: Vec::new(),
+                                source_degraded: false,
                             }),
                         )
                     })
