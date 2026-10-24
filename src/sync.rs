@@ -2674,9 +2674,27 @@ fn with_social_source_errors(
         error
     } else {
         error.context(SocialUpstreamSourceErrors {
-            details: source_errors.to_vec(),
+            details: deduplicate_social_source_errors(source_errors.iter()),
         })
     }
+}
+
+fn deduplicate_social_source_errors<I, S>(source_errors: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut deduplicated = Vec::new();
+    for source_error in source_errors {
+        let source_error = source_error.as_ref();
+        if !deduplicated
+            .iter()
+            .any(|current: &String| current == source_error)
+        {
+            deduplicated.push(source_error.to_owned());
+        }
+    }
+    deduplicated
 }
 
 fn social_activity_result_snapshot(
@@ -2685,19 +2703,11 @@ fn social_activity_result_snapshot(
     events: usize,
     source_errors: &[String],
 ) -> SyncSocialActivityResult {
-    let mut all_source_errors =
-        Vec::with_capacity(source_errors.len() + repo_collection.source_errors.len());
-    for source_error in source_errors
-        .iter()
-        .chain(repo_collection.source_errors.iter())
-    {
-        if !all_source_errors
+    let all_source_errors = deduplicate_social_source_errors(
+        source_errors
             .iter()
-            .any(|current| current == source_error)
-        {
-            all_source_errors.push(source_error.clone());
-        }
-    }
+            .chain(repo_collection.source_errors.iter()),
+    );
     SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
         followers,
@@ -2760,11 +2770,8 @@ pub(crate) fn social_activity_result_from_error(error: &anyhow::Error) -> SyncSo
 pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyncFailure {
     let partial_result = social_activity_result_from_error(error);
     let mut source_errors = social_source_errors_from_error(error);
-    for source_error in &partial_result.source_errors {
-        if !source_errors.iter().any(|current| current == source_error) {
-            source_errors.push(source_error.clone());
-        }
-    }
+    source_errors.extend(partial_result.source_errors);
+    let source_errors = deduplicate_social_source_errors(source_errors.iter());
     SocialSyncFailure {
         message: error.to_string(),
         sqlite_backpressure: source_errors.is_empty()
@@ -18268,6 +18275,45 @@ mod tests {
         let failure = super::social_sync_failure_from_error(&error);
         assert!(!failure.sqlite_backpressure);
         assert_eq!(failure.source_errors, partial.source_errors);
+    }
+
+    #[test]
+    fn social_activity_persistence_failure_deduplicates_source_errors() {
+        let shared_error = "stargazers(repo:octo/shared): unavailable".to_owned();
+        let repo_collection = RepoStargazerCollectionResult {
+            source_errors: vec![
+                shared_error.clone(),
+                "stargazers(repo:octo/other): timeout".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let phase_errors = vec![
+            shared_error.clone(),
+            "followers(conn:github): timeout".to_owned(),
+        ];
+        let all_source_errors = phase_errors
+            .iter()
+            .chain(repo_collection.source_errors.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let partial =
+            super::social_activity_result_snapshot(&repo_collection, 2, 3, phase_errors.as_slice());
+        let error = super::with_social_activity_failure(
+            anyhow::anyhow!("social persistence failed"),
+            "apply social activity snapshot",
+            all_source_errors.as_slice(),
+            partial,
+        );
+
+        let failure = super::social_sync_failure_from_error(&error);
+        assert_eq!(
+            failure.source_errors,
+            vec![
+                shared_error,
+                "followers(conn:github): timeout".to_owned(),
+                "stargazers(repo:octo/other): timeout".to_owned(),
+            ]
+        );
     }
 
     #[test]
