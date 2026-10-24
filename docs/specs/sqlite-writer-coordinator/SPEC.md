@@ -147,7 +147,7 @@
 - feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
 - repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
 - social activity snapshot 属于生产量级集合重建路径：follower、owned-repo/member、history 与 association cleanup 的候选必须在 writer permit 外聚合；持久化使用固定 64 行 chunk，每个 chunk 独立取得并释放 writer permit，且 chunk 之间允许前台写入插入。snapshot baseline 与幂等 history materialization 必须保持可中断恢复，stale cleanup 不得删除当前 target 之外的显式 follow 选择；若后续 chunk 失败，typed failure 必须保留此前已提交的 event 计数。Feed activity event history 同样使用短 batch 事务；若后续 batch 失败，typed failure 必须保留已提交的前序 batch 计数。
-- Social 持久化耗尽 SQLite admission/deadline 预算时，订阅、access-refresh 与 sync.all 必须保留失败用户/阶段结果并使用 `error_kind=sqlite_write_backpressure`、`severity=warning`、`retryable=true`、`recoverable=true` 与既有重试提示；真实上游 source errors 保持 `error`/不可恢复。access-refresh 仍执行 Notifications，sync.all 保留已完成的 Notifications 结果但任务终态为 `failed`，其 `task.completed` payload 必须保留 `error_kind`、`severity`、`recoverable`、`retryable` 与 `retry_after`，不得把带 `social_error` 的部分结果标记为成功；若 Social 已完成部分 snapshot，失败结果必须继续携带已完成计数和 failed/partial repo 诊断。
+- Social 持久化耗尽 SQLite admission/deadline 预算时，订阅、access-refresh 与 sync.all 必须保留失败用户/阶段结果并使用 `error_kind=sqlite_write_backpressure`、`severity=warning`、`retryable=true`、`recoverable=true` 与既有重试提示；已完成但部分降级的 Social source errors 使用 `social_source_degraded` 的 warning/recoverable 分类，真正上游异常保持 `error`/不可恢复。access-refresh 仍执行 Notifications，sync.all 保留已完成的 Notifications 结果但任务终态为 `failed`，其 `task.completed` payload 必须保留 `error_kind`、`severity`、`recoverable`、`retryable` 与 `retry_after`，不得把带 `social_error` 的部分结果标记为成功；若 Social 已完成部分 snapshot，失败结果必须继续携带已完成计数和 failed/partial repo 诊断。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
 - admin runtime seed/backfill/update、LLM recovery/model health 与 translation worker slot reconciliation 只在短 SQLite 段内持有 writer permit；配置加载和 worker/AI/network 阶段留在 permit 外。
 - translation runtime 的 production internal helper 必须接收非可选 `&SqliteWriteCoordinator`；仅 `#[cfg(test)]` wrapper 可以为独立 unit fixture 创建局部 coordinator。
@@ -166,7 +166,7 @@
 - foreground deadline 超时必须返回 retryable 状态与 `Retry-After`，而不是内部 500。
 - background deadline 超时由持久化 worker/job 状态延后处理；一个失败尝试结束后不得在同一调用栈立即重试。
 - best-effort 在 writer backlog 或 deadline 前无法启动 callback 时跳过持久化，主请求保持成功路径；已经启动的 callback 保持 writer permit 并返回实际结果。
-- Social writer backpressure 的 warning/recoverable 分类只适用于 SQLite admission/busy/deadline 耗尽；结构化上游错误必须保留 source details 并继续作为 error/non-recoverable 对管理员可见。
+- Social writer backpressure 的 warning/recoverable 分类只适用于 SQLite admission/busy/deadline 耗尽；结构化上游错误必须保留 source details 并继续对管理员可见，fatal upstream 异常使用 error/non-recoverable，已完成但部分降级的 Social 结果使用兼容的 `social_source_degraded` warning/recoverable 分类。
 - `sync.all` 的 Social 业务失败必须在同一个 foreground writer transaction 内提交任务 failed 状态与 `task.completed` 事件；若终态事务未提交，任务不得被观察为已失败而缺少完成事件，heartbeat 必须在该分支退出前停止。
 
 ## 接口契约（Interfaces & Contracts）
