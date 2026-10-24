@@ -18470,6 +18470,11 @@ mod tests {
             log.contains("sqlite_write_backpressure"),
             "unexpected log: {log}"
         );
+        assert_eq!(
+            context.critical_events.load(AtomicTestOrdering::Relaxed),
+            0,
+            "recoverable Social writer pressure must not create a critical event"
+        );
     }
 
     #[test]
