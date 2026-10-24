@@ -4,6 +4,7 @@
 
 ## Current Status
 
+- PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` stops task heartbeat before propagating ordinary/canceled finalization errors, advances webhook operation-lease contention through the existing three retry/backoff slots before failing, and logs access-refresh Social progress before event-table persistence.
 - PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression proving recoverable Social run-log fallback leaves `critical_events` unchanged at zero; genuine `severity=error` upstream events retain their critical count.
 - 2026-10-23 candidate: background admission denial now uses the existing coordinator deadline and 25/50/100ms capped backoff without increasing the one-waiter queue; Social SQLite exhaustion is classified as recoverable warning metadata while preserving failed-user accounting.
 - PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to a 30-second wait budget, then returns through the existing owner-CAS reschedule/backoff path instead of holding a task lease indefinitely.

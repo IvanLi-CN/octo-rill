@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-24：PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` 在 finalization 返回错误前停止 task heartbeat；webhook operation lease 背压沿既有 3 档 retry/backoff 递进并在预算耗尽后失败收尾；access-refresh Social 进度先落 run log 再写 event table，补齐三条生命周期/诊断回归。
 - 2026-10-24：PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` 为可恢复 Social run-log fallback 增加 `critical_events == 0` 回归断言，明确事件表背压不会把 warning 误计为 critical event。
 - 2026-10-24：PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` 为 webhook 用户操作 lease admission 增加 30 秒有界等待预算；预算耗尽后沿既有 owner-CAS reschedule/backoff 回队，避免任务 lease 被无限等待占用。
 - 2026-10-24：PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` 将 Social source-error 稳定去重扩展到 typed persistence failure 提取路径，并新增失败事件回归，避免跨阶段诊断重复出现。

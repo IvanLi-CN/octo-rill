@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` makes access-refresh Social progress durable in the run log before event-table persistence and adds non-retryable event failure coverage; task heartbeat cleanup and bounded webhook lease retry exhaustion are covered in the same candidate.
 - 2026-10-24: PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression proving recoverable Social event-table fallback preserves `critical_events == 0` while upstream error events remain critical.
 - 2026-10-24: PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to 30 seconds and returns contention through the owner-CAS reschedule/backoff path.
 - 2026-10-24: PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` extends stable Social source-error de-duplication into typed persistence failures and adds a regression for failure payload diagnostics.
