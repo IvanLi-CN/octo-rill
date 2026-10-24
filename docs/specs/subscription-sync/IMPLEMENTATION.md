@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- PR #340 executable candidate `6efe5732` preserves retryable-versus-fatal source classification when Social persistence fails after a partial snapshot and gives terminal 401/404/451 statuses precedence over rate-limit metadata; focused regressions cover both combined-error classes and terminal HTTP headers.
 - PR #340 executable candidate `97843ed6` makes access-refresh progress/log metadata use the shared Social classifier: retryable completed source degradation is warning/recoverable with `next_sync_subscriptions_run`, while non-retryable upstream errors remain error/non-recoverable; the Notifications continuation regression covers the production-shaped dependency path.
 - PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` preserves terminal Social upstream classifications: retryable completed source errors remain `social_source_degraded` warning/recoverable, while non-retryable credentials/forbidden/inaccessible-repo errors become `social_sync_failed` error/non-recoverable; `LeaseHeartbeat` now aborts its active task on unexpected handle drop, with focused regressions.
 - PR #340 executable candidate `d1f4ae30d649c8b34831df808559b6ca3373f968` classifies completed `sync.all` Social source degradation as `social_source_degraded` warning/recoverable metadata while retaining failed task status and partial results; fatal upstream exceptions remain `social_sync_failed` error/non-recoverable, with completion-payload regression coverage.
