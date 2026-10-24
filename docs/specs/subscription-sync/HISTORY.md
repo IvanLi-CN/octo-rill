@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a deterministic production-path webhook operation-lease contention regression: retry count 2 reschedules through owner-CAS with retry count 3, while retry count 3 returns typed `operation_lease_busy` without falsely rescheduling the running task.
 - 2026-10-24: PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` makes access-refresh Social progress durable in the run log before event-table persistence and adds non-retryable event failure coverage; task heartbeat cleanup and bounded webhook lease retry exhaustion are covered in the same candidate.
 - 2026-10-24: PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression proving recoverable Social event-table fallback preserves `critical_events == 0` while upstream error events remain critical.
 - 2026-10-24: PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to 30 seconds and returns contention through the owner-CAS reschedule/backoff path.

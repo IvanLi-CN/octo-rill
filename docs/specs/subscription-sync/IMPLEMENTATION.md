@@ -9,7 +9,7 @@
 
 ## 当前状态
 
-- PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` makes access-refresh Social progress write the run log before event-table persistence, propagates non-retryable event failures only after the diagnostic is durable, and preserves Notifications gating; lifecycle tests also cover heartbeat cleanup and webhook lease retry-budget exhaustion.
+- PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a production-path webhook lease contention regression covering owner-CAS reschedule payload advancement and retry-budget exhaustion; the candidate also retains access-refresh Social run-log ordering and lifecycle heartbeat cleanup coverage.
 - PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression that recoverable Social run-log fallback keeps `critical_events` at zero; upstream Social errors continue to use the critical error classification.
 - 2026-10-23 candidate: Social persistence shares bounded background admission retry with heartbeat/finalize paths; exhausted SQLite pressure remains a partial failed user with `warning`/`recoverable=true` and `error_kind=sqlite_write_backpressure`, while upstream failures remain critical.
 - PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to a 30-second wait budget and reschedules through owner-CAS/backoff when another operation keeps the lease, preventing an indefinitely held task lease.
