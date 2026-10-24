@@ -50,6 +50,8 @@ const DELIVERY_RETENTION_DAYS: i64 = 30;
 const RECEIVER_WRITE_DEADLINE: Duration = Duration::from_millis(750);
 const RECEIVER_RECOVERY_RESERVE: Duration = Duration::from_millis(250);
 const RECEIVER_RETRY_AFTER_SECONDS: u64 = 1;
+const USER_OPERATION_LEASE_WAIT_BUDGET: Duration = Duration::from_secs(30);
+const USER_OPERATION_LEASE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1988,6 +1990,13 @@ fn retry_delay(attempt: u8, retry_after: Option<Duration>) -> chrono::Duration {
     chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::minutes(15))
 }
 
+fn bounded_user_operation_lease_wait(elapsed: Duration) -> Option<Duration> {
+    USER_OPERATION_LEASE_WAIT_BUDGET
+        .checked_sub(elapsed)
+        .filter(|remaining| *remaining > Duration::ZERO)
+        .map(|remaining| remaining.min(USER_OPERATION_LEASE_POLL_INTERVAL))
+}
+
 async fn pause_user_repos_for_permission_error(
     state: &AppState,
     user_id: &str,
@@ -2524,6 +2533,7 @@ async fn execute_for_user(
     demand_generation: Option<i64>,
     retry_repo_ids: &[i64],
 ) -> Result<Value> {
+    let lease_wait_started = Instant::now();
     while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
         if jobs::is_task_cancel_requested(state, task_id).await? {
             let _ = jobs::reschedule_task_with_payload_if_owned(
@@ -2545,7 +2555,37 @@ async fn execute_for_user(
             .await?;
             return Ok(json!({"operation": operation, "rescheduled": true}));
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let Some(wait_for) = bounded_user_operation_lease_wait(lease_wait_started.elapsed()) else {
+            let delay = retry_delay(retry_count, None);
+            let rescheduled = jobs::reschedule_task_with_payload_if_owned(
+                state,
+                task_id,
+                Utc::now() + delay,
+                manage_task_payload(
+                    user_id,
+                    operation,
+                    repo_id,
+                    scheduled,
+                    demand_generation,
+                    retry_repo_ids,
+                    retry_count,
+                    Some("operation_lease_busy"),
+                ),
+                json!({
+                    "operation": operation,
+                    "reason": "operation_lease_busy",
+                    "retry_after_seconds": delay.num_seconds(),
+                }),
+            )
+            .await?;
+            return Ok(json!({
+                "operation": operation,
+                "rescheduled": rescheduled,
+                "reason": "operation_lease_busy",
+                "retry_after_seconds": delay.num_seconds(),
+            }));
+        };
+        tokio::time::sleep(wait_for).await;
     }
     let operation_lock = user_operation_lock(user_id);
     let _operation_guard = operation_lock.lock().await;
@@ -3889,6 +3929,30 @@ mod tests {
         assert_eq!(
             retry_delay(0, Some(Duration::from_secs(90))),
             chrono::Duration::seconds(90)
+        );
+    }
+
+    #[test]
+    fn operation_lease_wait_is_bounded_without_oversleeping() {
+        assert_eq!(
+            bounded_user_operation_lease_wait(Duration::ZERO),
+            Some(USER_OPERATION_LEASE_POLL_INTERVAL)
+        );
+        assert_eq!(
+            bounded_user_operation_lease_wait(
+                USER_OPERATION_LEASE_WAIT_BUDGET - Duration::from_secs(1)
+            ),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            bounded_user_operation_lease_wait(USER_OPERATION_LEASE_WAIT_BUDGET),
+            None
+        );
+        assert_eq!(
+            bounded_user_operation_lease_wait(
+                USER_OPERATION_LEASE_WAIT_BUDGET + Duration::from_secs(1)
+            ),
+            None
         );
     }
 
