@@ -31,6 +31,10 @@ const ROLLBACK_CLEANUP_TIMEOUT: Duration = Duration::from_millis(150);
 const BACKGROUND_WRITER_QUEUE_LIMIT: usize = 1;
 const BACKGROUND_ADMISSION_COOLDOWN: Duration = Duration::from_millis(250);
 
+fn capped_retry_sleep_until(now: Instant, deadline_at: Instant, delay: Duration) -> Instant {
+    std::cmp::min(deadline_at, now + delay)
+}
+
 #[derive(Clone, Debug)]
 pub struct SqliteWriteCoordinator {
     state: Arc<Mutex<SqliteWriteState>>,
@@ -669,7 +673,11 @@ impl SqliteWriteCoordinator {
                     if !can_retry {
                         return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                     }
-                    tokio::time::sleep_until(Instant::now() + delay).await;
+                    tokio::time::sleep_until(std::cmp::min(deadline_at, Instant::now() + delay))
+                        .await;
+                    if Instant::now() >= deadline_at {
+                        return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+                    }
                     attempt += 1;
                 }
                 Err(err) if is_sqlite_busy_error(err.as_ref()) && Instant::now() >= deadline_at => {
@@ -940,14 +948,9 @@ impl SqliteWriteCoordinator {
         deadline: Duration,
     ) -> Result<SqliteWritePermit> {
         let started = Instant::now();
-        match tokio::time::timeout_at(
-            deadline_at,
-            self.acquire_without_deadline(lane, priority, deadline),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
+        let mut attempt = 1usize;
+        loop {
+            if Instant::now() >= deadline_at {
                 let writer_wait_ms = started.elapsed().as_millis();
                 warn!(
                     event = "sqlite.write",
@@ -964,7 +967,81 @@ impl SqliteWriteCoordinator {
                     error_kind = "writer_queue_timeout",
                     "sqlite writer permit wait exceeded deadline"
                 );
-                Err(self.deadline_error(lane, priority, "writer_queue", deadline))
+                return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+            }
+
+            match tokio::time::timeout_at(
+                deadline_at,
+                self.acquire_without_deadline(lane, priority, deadline),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => return Ok(permit),
+                Ok(Err(error))
+                    if priority == SqliteWritePriority::Background
+                        && is_sqlite_background_admission_error(error.as_ref()) =>
+                {
+                    let delay = self.retry_delay(attempt);
+                    let remaining = deadline_at.saturating_duration_since(Instant::now());
+                    let can_retry = remaining > delay;
+                    let message = if can_retry {
+                        "sqlite background writer admission denied; retrying within the same deadline"
+                    } else {
+                        "sqlite background writer admission retry deadline exhausted"
+                    };
+                    warn!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
+                        writer_wait_ms = started.elapsed().as_millis(),
+                        pool_wait_ms = 0_u128,
+                        begin_ms = 0_u128,
+                        transaction_ms = 0_u128,
+                        deadline_ms = deadline.as_millis(),
+                        attempt,
+                        retry_after_ms = delay.as_millis(),
+                        error_kind = if can_retry {
+                            "background_admission_retry"
+                        } else {
+                            "writer_queue_timeout"
+                        },
+                        error_chain = %observability::error_chain_summary(error.as_ref()),
+                        "{message}"
+                    );
+                    if !can_retry {
+                        return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+                    }
+                    tokio::time::sleep_until(capped_retry_sleep_until(
+                        Instant::now(),
+                        deadline_at,
+                        delay,
+                    ))
+                    .await;
+                    attempt += 1;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    let writer_wait_ms = started.elapsed().as_millis();
+                    warn!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        request_id = %observability::current_request_id(),
+                        request_method = %observability::current_request_method(),
+                        request_route = %observability::current_request_route(),
+                        writer_wait_ms,
+                        pool_wait_ms = 0_u128,
+                        begin_ms = 0_u128,
+                        transaction_ms = 0_u128,
+                        deadline_ms = deadline.as_millis(),
+                        error_kind = "writer_queue_timeout",
+                        "sqlite writer permit wait exceeded deadline"
+                    );
+                    return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
+                }
             }
         }
     }
@@ -1549,7 +1626,12 @@ impl SqliteWriteCoordinator {
                     if !can_retry {
                         return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                     }
-                    tokio::time::sleep_until(Instant::now() + delay).await;
+                    tokio::time::sleep_until(capped_retry_sleep_until(
+                        Instant::now(),
+                        deadline_at,
+                        delay,
+                    ))
+                    .await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -2446,9 +2528,16 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn background_writer_admission_is_bounded() {
-        let coordinator = SqliteWriteCoordinator::new();
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_writer_admission_retries_without_growing_waiter_queue() {
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(20),
+            ),
+        );
         let held = coordinator
             .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
             .await
@@ -2472,30 +2561,393 @@ mod tests {
         .await
         .expect("first background waiter should be admitted");
 
-        for _ in 0..7 {
-            let error = coordinator
-                .write("background_queue", |_| async { Ok::<_, anyhow::Error>(()) })
-                .await
-                .expect_err("background queue limit should reject excess waiters");
-            assert!(
-                error
-                    .downcast_ref::<SqliteBackgroundAdmissionError>()
-                    .is_some(),
-                "unexpected background admission error: {error:?}"
-            );
-        }
-        assert_eq!(coordinator.runtime_status().waiting_background, 1);
-        drop(held);
-        first_background
+        let foreground = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write_foreground("foreground_waiter", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground waiter should be registered");
+
+        let second_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_retry", |_| async { Ok::<_, anyhow::Error>(()) })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().background_rejected >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second background writer should hit admission denial");
+        let error = tokio::time::timeout(Duration::from_secs(2), second_background)
             .await
-            .expect("first background waiter should join")
-            .expect("first background waiter should run");
+            .expect("second background writer should honor its deadline")
+            .expect("join second background writer")
+            .expect_err("background admission should exhaust its deadline");
+        assert_eq!(
+            error
+                .downcast_ref::<SqliteWriteDeadlineError>()
+                .expect("typed writer queue deadline")
+                .phase,
+            "writer_queue"
+        );
+        assert!(coordinator.runtime_status().waiting_background <= 1);
+        drop(held);
+        let _ = first_background
+            .await
+            .expect("first background waiter should join");
+        foreground
+            .await
+            .expect("foreground waiter should join")
+            .expect_err("foreground waiter should reach its deadline");
 
         let status = coordinator.runtime_status();
         assert!(!status.active);
         assert_eq!(status.waiting_background, 0);
-        assert_eq!(status.background_rejected, 1);
-        assert_eq!(status.background_admission_coalesced, 6);
+        assert!(status.background_rejected >= 1);
+        assert!(status.background_admission_coalesced >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_writer_succeeds_after_background_admission_denial() {
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(20),
+            ),
+        );
+        let held = coordinator
+            .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
+            .await
+            .expect("acquire foreground hold");
+        let first_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_waiter", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background waiter should be registered");
+
+        let foreground = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write_foreground("foreground_after_denial", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground waiter should be registered");
+
+        let second_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_denied_then_retried", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().background_rejected >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second background writer should be denied without a second waiter");
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), foreground)
+            .await
+            .expect("foreground writer should complete after capacity clears")
+            .expect("join foreground writer")
+            .expect("foreground writer should succeed after background denial");
+        tokio::time::timeout(Duration::from_secs(1), first_background)
+            .await
+            .expect("first background writer should complete")
+            .expect("join first background writer")
+            .expect("first background writer should succeed");
+        tokio::time::timeout(Duration::from_secs(1), second_background)
+            .await
+            .expect("retried background writer should complete")
+            .expect("join retried background writer")
+            .expect("retried background writer should succeed");
+
+        let status = coordinator.runtime_status();
+        assert!(!status.active);
+        assert_eq!(status.waiting_background, 0);
+        assert_eq!(status.waiting_foreground, 0);
+        assert!(status.background_rejected >= 1);
+    }
+
+    #[test]
+    fn background_admission_retry_delay_is_25_50_100ms_capped() {
+        let coordinator = SqliteWriteCoordinator::new();
+        assert_eq!(
+            coordinator.retry_delay_for_attempt(1),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            coordinator.retry_delay_for_attempt(2),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            coordinator.retry_delay_for_attempt(3),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            coordinator.retry_delay_for_attempt(4),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn background_retry_sleep_is_capped_at_absolute_deadline() {
+        let now = Instant::now();
+        let deadline_at = now + Duration::from_millis(10);
+        assert_eq!(
+            capped_retry_sleep_until(now, deadline_at, Duration::from_millis(25)),
+            deadline_at
+        );
+        assert_eq!(
+            capped_retry_sleep_until(now, deadline_at, Duration::from_millis(5)),
+            now + Duration::from_millis(5)
+        );
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn background_admission_retry_respects_backoff_and_absolute_deadline() {
+        let deadline = Duration::from_millis(100);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(
+                Duration::from_millis(200),
+                deadline,
+                Duration::from_millis(20),
+            ),
+        );
+        let held = coordinator
+            .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
+            .await
+            .expect("acquire foreground hold");
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_first", |_| async { Ok::<_, anyhow::Error>(()) })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first background waiter should be registered");
+
+        let retrying = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_retry", |_| async { Ok::<_, anyhow::Error>(()) })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().background_rejected >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retrying background writer should be denied first");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            coordinator.runtime_status().background_admission_coalesced,
+            0,
+            "retry must not run before the first 25ms backoff"
+        );
+        tokio::time::advance(Duration::from_millis(24)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            coordinator.runtime_status().background_admission_coalesced,
+            0,
+            "retry must not run at 24ms"
+        );
+        assert!(!retrying.is_finished());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            coordinator.runtime_status().background_admission_coalesced,
+            1,
+            "retry should run at the 25ms boundary"
+        );
+        tokio::time::advance(Duration::from_millis(49)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            coordinator.runtime_status().background_admission_coalesced,
+            1,
+            "second retry must not run at 49ms after the first retry"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            coordinator.runtime_status().background_admission_coalesced,
+            2,
+            "second retry should run at the 50ms boundary"
+        );
+
+        tokio::time::advance(Duration::from_millis(25)).await;
+        let error = retrying
+            .await
+            .expect("join retrying background writer")
+            .expect_err("background retry should exhaust its absolute deadline");
+        assert_eq!(
+            error
+                .downcast_ref::<SqliteWriteDeadlineError>()
+                .expect("typed writer queue deadline")
+                .phase,
+            "writer_queue"
+        );
+        drop(held);
+        first.abort();
+        let _ = first.await;
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn background_writer_admission_recovers_after_capacity_clears() {
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(
+                Duration::from_millis(200),
+                Duration::from_millis(300),
+                Duration::from_millis(20),
+            ),
+        );
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let held = coordinator
+            .acquire_with_priority("foreground_hold", SqliteWritePriority::Foreground)
+            .await
+            .expect("acquire foreground hold");
+        let first = {
+            let coordinator = coordinator.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_first", |_| {
+                        let order = order.clone();
+                        async move {
+                            order.lock().expect("order lock").push("first");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok::<_, anyhow::Error>(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if coordinator.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first background waiter should be registered");
+
+        let second = {
+            let coordinator = coordinator.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_second", |_| {
+                        let order = order.clone();
+                        async move {
+                            order.lock().expect("order lock").push("second");
+                            Ok::<_, anyhow::Error>(())
+                        }
+                    })
+                    .await
+            })
+        };
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        tokio::time::advance(Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
+
+        first
+            .await
+            .expect("join first background writer")
+            .expect("first background writer should recover");
+        second
+            .await
+            .expect("join second background writer")
+            .expect("second background writer should recover");
+        assert_eq!(
+            order.lock().expect("order lock").as_slice(),
+            ["first", "second"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

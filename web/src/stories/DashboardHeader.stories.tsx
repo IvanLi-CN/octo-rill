@@ -423,6 +423,16 @@ export const HoverBridge: Story = {
 };
 
 export const Warmup: Story = {
+	render: (args) => (
+		<div
+			className="min-h-40 bg-background p-6"
+			data-visual-evidence-surface="dashboard-header-warmup"
+		>
+			<div data-visual-evidence-target="dashboard-header-warmup">
+				<DashboardHeader {...args} />
+			</div>
+		</div>
+	),
 	args: {
 		busy: true,
 		syncingAll: true,

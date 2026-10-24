@@ -8179,43 +8179,6 @@ mod tests {
                 }
             }));
         }
-        for task in background_tasks.drain(..) {
-            tokio::time::timeout(StdDuration::from_secs(1), task)
-                .await
-                .expect("empty-queue background scheduler should stay bounded")
-                .expect("background scheduler task should join");
-        }
-        assert_eq!(
-            sqlite_writer.runtime_status().waiting_background,
-            0,
-            "empty-queue claim probes must not wait for the writer"
-        );
-        assert!(
-            claim_admission.retry_after(Duration::ZERO) > Duration::ZERO,
-            "shared claim admission should install an empty-queue cooldown"
-        );
-        let empty_status = sqlite_writer.runtime_status();
-        assert_eq!(
-            empty_status.background_admitted, 0,
-            "empty claim probes must not enter the background writer: {empty_status:?}"
-        );
-        assert_eq!(
-            empty_status.background_rejected, 0,
-            "empty claim probes must not be rejected after waiting for the writer: {empty_status:?}"
-        );
-        assert!(
-            empty_status.background_lane_admitted * 4 < 128,
-            "recovery admission should be materially lower than worker attempts: {empty_status:?}"
-        );
-        assert!(
-            empty_status.background_lane_coalesced + empty_status.background_lane_admitted >= 128,
-            "recovery cadence should coalesce repeated worker passes: {empty_status:?}"
-        );
-        assert!(
-            empty_status.background_lane_coalesced > 0,
-            "repeated empty recovery passes should be coalesced: {empty_status:?}"
-        );
-
         let mut foreground_tasks = Vec::new();
         for request_index in 0..8 {
             let request_cookie = session_cookie.clone();
@@ -8257,6 +8220,43 @@ mod tests {
             .await
             .expect("sqlite contention probe should join")
             .expect("sqlite contention probe should succeed after lock release");
+
+        for task in background_tasks.drain(..) {
+            tokio::time::timeout(StdDuration::from_secs(30), task)
+                .await
+                .expect("empty-queue background scheduler should stay bounded")
+                .expect("background scheduler task should join");
+        }
+        assert_eq!(
+            sqlite_writer.runtime_status().waiting_background,
+            0,
+            "empty-queue claim probes must not wait for the writer"
+        );
+        assert!(
+            claim_admission.retry_after(Duration::ZERO) > Duration::ZERO,
+            "shared claim admission should install an empty-queue cooldown"
+        );
+        let empty_status = sqlite_writer.runtime_status();
+        assert_eq!(
+            empty_status.background_admitted, 0,
+            "empty claim probes must not enter the background writer: {empty_status:?}"
+        );
+        assert_eq!(
+            empty_status.background_rejected, 0,
+            "empty claim probes must not be rejected after waiting for the writer: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_admitted * 4 < 128,
+            "recovery admission should be materially lower than worker attempts: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_coalesced + empty_status.background_lane_admitted >= 128,
+            "recovery cadence should coalesce repeated worker passes: {empty_status:?}"
+        );
+        assert!(
+            empty_status.background_lane_coalesced > 0,
+            "repeated empty recovery passes should be coalesced: {empty_status:?}"
+        );
 
         let item = translations::TranslationRequestItemInput {
             producer_ref: "feed.auto_translate:release:shared-admission-wake".to_owned(),

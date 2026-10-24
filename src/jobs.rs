@@ -2342,16 +2342,25 @@ pub async fn complete_task(
     .await
 }
 
-pub async fn reschedule_task(
+pub(crate) async fn reschedule_task_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
     result: Value,
 ) -> Result<bool> {
-    reschedule_task_inner(state, task_id, available_at, None, None, result).await
+    reschedule_task_inner(
+        state,
+        task_id,
+        available_at,
+        None,
+        None,
+        result,
+        Some(state.runtime_owner_id.as_str()),
+    )
+    .await
 }
 
-pub async fn reschedule_task_with_retry_count(
+pub(crate) async fn reschedule_task_with_retry_count_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
@@ -2365,16 +2374,36 @@ pub async fn reschedule_task_with_retry_count(
         Some(retry_count),
         None,
         result,
+        Some(state.runtime_owner_id.as_str()),
     )
     .await
 }
 
-pub async fn reschedule_task_with_payload(
+pub(crate) async fn reschedule_task_with_payload_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
     payload: Value,
     result: Value,
+) -> Result<bool> {
+    reschedule_task_with_payload_inner(
+        state,
+        task_id,
+        available_at,
+        payload,
+        result,
+        Some(state.runtime_owner_id.as_str()),
+    )
+    .await
+}
+
+async fn reschedule_task_with_payload_inner(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    payload: Value,
+    result: Value,
+    runtime_owner_id: Option<&str>,
 ) -> Result<bool> {
     let payload_json = serde_json::to_string(&payload).context("serialize rescheduled payload")?;
     reschedule_task_inner(
@@ -2384,6 +2413,7 @@ pub async fn reschedule_task_with_payload(
         None,
         Some(payload_json),
         result,
+        runtime_owner_id,
     )
     .await
 }
@@ -2395,71 +2425,99 @@ async fn reschedule_task_inner(
     retry_count: Option<u8>,
     payload_json: Option<String>,
     result: Value,
+    runtime_owner_id: Option<&str>,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
-    let updated = state
+    let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .write_foreground("job_task_reschedule", |_| async {
-            if let Some(payload_json) = payload_json.as_deref() {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, payload_json = ?,
-                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(payload_json)
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task with payload")
-            } else if let Some(retry_count) = retry_count {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
-                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(i64::from(retry_count))
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task")
-            } else {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, started_at = NULL,
-                        runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task")
-            }
-        })
-        .await?;
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_reschedule",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin task reschedule transaction")?;
+    let updated = if let Some(payload_json) = payload_json.as_deref() {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, payload_json = ?,
+                started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(payload_json)
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task with payload")?
+    } else if let Some(retry_count) = retry_count {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
+                started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(i64::from(retry_count))
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task")?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, started_at = NULL,
+                runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task")?
+    };
+    if updated.rows_affected() > 0 {
+        sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to release rescheduled webhook operation lease")?;
+    }
+    tx.commit()
+        .await
+        .context("commit task reschedule transaction")?;
+    drop(sqlite_write);
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
@@ -3408,7 +3466,7 @@ async fn claim_next_queued_task_admitted(state: &AppState) -> Result<Option<Task
 async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     if task.cancel_requested != 0 {
         if is_webhook_push_task_type(task.task_type.as_str()) {
-            let _ = reschedule_task(
+            let _ = reschedule_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 Utc::now(),
@@ -3466,14 +3524,15 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .unwrap_or(false)
     {
         if is_webhook_push_task_type(task.task_type.as_str()) {
-            let _ = reschedule_task(
+            let rescheduled = reschedule_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 Utc::now(),
                 json!({"reason": "cancel_requested", "task_type": task.task_type}),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let _ = rescheduled?;
             return Ok(());
         }
         let finalized = finalize_task_if_owned(
@@ -3484,8 +3543,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             None,
             state.runtime_owner_id.as_str(),
         )
-        .await?;
+        .await;
         heartbeat.stop().await;
+        let finalized = finalized?;
         if !finalized {
             return Ok(());
         }
@@ -3509,8 +3569,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 None,
                 state.runtime_owner_id.as_str(),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let finalized = finalized?;
             if !finalized {
                 return Ok(());
             }
@@ -3535,6 +3596,22 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             }
         }
         Err(err) => {
+            if let Some(failure) = err.downcast_ref::<SyncAllSocialBusinessFailure>() {
+                let finalized = finalize_sync_all_social_failure(
+                    state.as_ref(),
+                    &task.id,
+                    failure,
+                    state.runtime_owner_id.as_str(),
+                )
+                .await;
+                heartbeat.stop().await;
+                let finalized = finalized?;
+                if !finalized {
+                    return Ok(());
+                }
+                return Ok(());
+            }
+
             if is_sqlite_write_deadline_error(err.as_ref())
                 || is_sqlite_background_admission_error(err.as_ref())
             {
@@ -3552,8 +3629,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 Some(message.clone()),
                 state.runtime_owner_id.as_str(),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let finalized = finalized?;
             if !finalized {
                 return Ok(());
             }
@@ -3582,6 +3660,109 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct SyncAllSocialBusinessFailure {
+    result: Value,
+    message: String,
+    error_kind: &'static str,
+    severity: &'static str,
+    recoverable: bool,
+    retryable: bool,
+    retry_after: Option<&'static str>,
+}
+
+impl std::fmt::Display for SyncAllSocialBusinessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SyncAllSocialBusinessFailure {}
+
+async fn finalize_sync_all_social_failure(
+    state: &AppState,
+    task_id: &str,
+    failure: &SyncAllSocialBusinessFailure,
+    runtime_owner_id: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let result_json = serde_json::to_string(&failure.result).context("serialize task result")?;
+    let completion_payload = serde_json::to_string(&json!({
+        "task_id": task_id,
+        "status": STATUS_FAILED,
+        "error": failure.message,
+        "error_kind": failure.error_kind,
+        "severity": failure.severity,
+        "recoverable": failure.recoverable,
+        "retryable": failure.retryable,
+        "retry_after": failure.retry_after,
+    }))
+    .context("serialize sync_all failure completion event")?;
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_finalize_sync_all_social_failure",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin sync_all social failure finalization tx")?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE job_tasks
+        SET status = ?,
+            result_json = ?,
+            error_message = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status = ?
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(STATUS_FAILED)
+    .bind(result_json.as_str())
+    .bind(failure.message.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(task_id)
+    .bind(STATUS_RUNNING)
+    .bind(runtime_owner_id)
+    .execute(&mut *tx)
+    .await
+    .context("finalize sync_all social failure task")?;
+    if updated.rows_affected() == 0 {
+        tx.commit()
+            .await
+            .context("commit unchanged sync_all social failure tx")?;
+        drop(sqlite_write);
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(task_id)
+    .bind("task.completed")
+    .bind(completion_payload.as_str())
+    .bind(now.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("insert sync_all social failure completion event")?;
+    tx.commit()
+        .await
+        .context("commit sync_all social failure finalization tx")?;
+    drop(sqlite_write);
+    TASK_CLAIM_ADMISSION.wake();
+    Ok(true)
+}
+
 async fn defer_task_after_sqlite_write_backpressure(
     state: &AppState,
     task: &TaskRow,
@@ -3594,7 +3775,7 @@ async fn defer_task_after_sqlite_write_backpressure(
         .unwrap_or(0);
     let retry_count = previous_retry_count.saturating_add(1);
     let available_at = Utc::now() + chrono::Duration::seconds(15);
-    let rescheduled = reschedule_task_with_retry_count(
+    let rescheduled = reschedule_task_with_retry_count_if_owned(
         state,
         &task.id,
         available_at,
@@ -3808,6 +3989,22 @@ async fn user_is_background_eligible(state: &AppState, user_id: &str) -> Result<
 
 type TaskStepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+fn sync_all_social_failure_kind(failure: &sync::SocialSyncFailure) -> &'static str {
+    if failure.sqlite_backpressure {
+        "sqlite_write_backpressure"
+    } else if failure.source_degraded {
+        "social_source_degraded"
+    } else {
+        "social_sync_failed"
+    }
+}
+
+fn sync_all_social_failure_metadata(
+    failure: &sync::SocialSyncFailure,
+) -> (&'static str, bool, &'static str, Option<&'static str>) {
+    sync::social_sync_failure_metadata(failure.sqlite_backpressure, failure.source_degraded)
+}
+
 async fn execute_sync_all_task_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
     state: &AppState,
     task_id: &str,
@@ -3841,18 +4038,30 @@ where
         return Ok(json!({"canceled": true}));
     }
 
-    let (social, social_error) = match sync_social(state, user_id).await {
-        Ok(result) => (result, None),
+    let (social, social_failure) = match sync_social(state, user_id).await {
+        Ok(result) => {
+            if let Some(failure) = sync::social_sync_failure_from_result(&result) {
+                tracing::warn!(
+                    user_id,
+                    error_kind = sync_all_social_failure_kind(&failure),
+                    error = %failure.message,
+                    "task sync_all: social activity sync completed with upstream source errors"
+                );
+                (result, Some(failure))
+            } else {
+                (result, None)
+            }
+        }
         Err(err) => {
+            let failure = sync::social_sync_failure_from_error(&err);
             tracing::warn!(
                 ?err,
                 user_id,
+                error_kind = sync_all_social_failure_kind(&failure),
                 "task sync_all: social activity sync failed, continuing with notifications"
             );
-            (
-                sync::SyncSocialActivityResult::default(),
-                Some(err.to_string()),
-            )
+            let social = sync::social_activity_result_from_error(&err);
+            (social, Some(failure))
         }
     };
     if is_task_cancel_requested(state, task_id)
@@ -3869,8 +4078,19 @@ where
         "social": social,
         "notifications": notifications,
     });
-    if let Some(error) = social_error {
-        result["social_error"] = Value::String(error);
+    if let Some(failure) = social_failure {
+        result["social_error"] = Value::String(failure.message.clone());
+        let error_kind = sync_all_social_failure_kind(&failure);
+        let (severity, recoverable, _, retry_after) = sync_all_social_failure_metadata(&failure);
+        return Err(anyhow::Error::new(SyncAllSocialBusinessFailure {
+            result,
+            message: failure.message,
+            error_kind,
+            severity,
+            recoverable,
+            retryable: recoverable,
+            retry_after,
+        }));
     }
     Ok(result)
 }
@@ -5318,38 +5538,53 @@ async fn finalize_task_if_owned(
         .transpose()
         .context("serialize task result")?;
 
-    let updated = state
+    let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .write("job_task_finalize_owned", |_| async {
-            let updated = sqlx::query(
-                r#"
-				UPDATE job_tasks
-				SET status = ?,
-				    result_json = ?,
-				    error_message = ?,
-				    finished_at = ?,
-				    runtime_owner_id = NULL,
-				    lease_heartbeat_at = NULL,
-				    updated_at = ?
-				WHERE id = ?
-				  AND status = ?
-				  AND runtime_owner_id = ?
-				"#,
-            )
-            .bind(status)
-            .bind(result_json.as_deref())
-            .bind(error_message.as_deref())
-            .bind(now.as_str())
-            .bind(now.as_str())
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_finalize_owned",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin owned task finalization transaction")?;
+    let updated = sqlx::query(
+        r#"
+			UPDATE job_tasks
+			SET status = ?,
+			    result_json = ?,
+			    error_message = ?,
+			    finished_at = ?,
+			    runtime_owner_id = NULL,
+			    lease_heartbeat_at = NULL,
+			    updated_at = ?
+			WHERE id = ?
+			  AND status = ?
+			  AND runtime_owner_id = ?
+			"#,
+    )
+    .bind(status)
+    .bind(result_json.as_deref())
+    .bind(error_message.as_deref())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(task_id)
+    .bind(STATUS_RUNNING)
+    .bind(runtime_owner_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to finalize owned task")?;
+    if updated.rows_affected() > 0 {
+        sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
             .bind(task_id)
-            .bind(STATUS_RUNNING)
-            .bind(runtime_owner_id)
-            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .execute(&mut *tx)
             .await
-            .context("failed to finalize owned task")?;
-            Ok(updated.rows_affected() > 0)
-        })
-        .await?;
+            .context("failed to release finalized webhook operation lease")?;
+    }
+    tx.commit()
+        .await
+        .context("commit owned task finalization transaction")?;
+    drop(sqlite_write);
+    let updated = updated.rows_affected() > 0;
     if updated {
         TASK_CLAIM_ADMISSION.wake();
     }
@@ -5779,12 +6014,13 @@ mod tests {
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
+        finalize_sync_all_social_failure, finalize_task_if_owned, heartbeat_task_lease,
+        is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
-        retry_candidate_is_retryable, rollback_scheduler_dispatch,
+        reschedule_task_if_owned, retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
@@ -5809,6 +6045,332 @@ mod tests {
         body.lines()
             .filter_map(|line| line.strip_prefix("id: "))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn runtime_owner_heartbeat_recovers_after_writer_pressure() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let old_heartbeat = "2026-03-06T00:00:00Z";
+        crate::runtime::upsert_runtime_owner_for_tests(
+            state.as_ref(),
+            state.runtime_owner_id.as_str(),
+            old_heartbeat,
+        )
+        .await
+        .expect("seed runtime owner");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "runtime_owner_heartbeat_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let heartbeat = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                crate::runtime::touch_runtime_owner_lease_for_tests(state.as_ref()).await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime owner heartbeat should wait behind writer pressure");
+        drop(held);
+        heartbeat
+            .await
+            .expect("join runtime owner heartbeat")
+            .expect("runtime owner heartbeat should recover");
+
+        let updated = sqlx::query_scalar::<_, String>(
+            "SELECT lease_heartbeat_at FROM runtime_owners WHERE runtime_owner_id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load runtime owner heartbeat");
+        assert_ne!(updated, old_heartbeat);
+        assert_eq!(state.sqlite_writer.runtime_status().waiting_background, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_heartbeat_recovers_after_writer_pressure() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let task_id = "heartbeat-pressure-task";
+        let old_heartbeat = "2026-03-06T00:00:00Z";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(old_heartbeat)
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed task lease");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_heartbeat_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let heartbeat = {
+            let state = state.clone();
+            tokio::spawn(async move { heartbeat_task_lease(state.as_ref(), task_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task heartbeat should wait behind writer pressure");
+        drop(held);
+        heartbeat
+            .await
+            .expect("join task heartbeat")
+            .expect("task heartbeat should recover");
+
+        let updated = sqlx::query_scalar::<_, String>(
+            "SELECT lease_heartbeat_at FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load task heartbeat");
+        assert_ne!(updated, old_heartbeat);
+        assert_eq!(state.sqlite_writer.runtime_status().waiting_background, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_reschedule_keeps_foreground_priority_under_writer_pressure() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let task_id = "foreground-reschedule-pressure-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed foreground reschedule owner");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_reschedule_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let background = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .sqlite_writer
+                    .write("job_task_heartbeat", move |_| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background heartbeat should wait behind writer pressure");
+
+        let reschedule = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                reschedule_task_if_owned(
+                    state.as_ref(),
+                    task_id,
+                    Utc::now() + Duration::minutes(1),
+                    json!({"reason": "writer_pressure"}),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground reschedule should be registered");
+        drop(held);
+        assert!(
+            reschedule
+                .await
+                .expect("join foreground reschedule")
+                .expect("foreground reschedule should recover")
+        );
+        background
+            .await
+            .expect("join background heartbeat")
+            .expect("background heartbeat should finish");
+
+        let (status, runtime_owner_id, lease_heartbeat_at): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, runtime_owner_id, lease_heartbeat_at FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load rescheduled task");
+        assert_eq!(status, STATUS_QUEUED);
+        assert_eq!(runtime_owner_id, None);
+        assert_eq!(lease_heartbeat_at, None);
+        let stale_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.recovered_failed'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stale transitions");
+        assert_eq!(stale_transition_count, 0);
+    }
+
+    #[tokio::test]
+    async fn job_task_finalize_keeps_foreground_priority_under_writer_pressure() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let task_id = "foreground-finalize-pressure-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed task owner");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "job_task_finalize_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let background = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .sqlite_writer
+                    .write("job_task_heartbeat", move |_| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_background == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background heartbeat should wait behind writer pressure");
+
+        let finalize = {
+            let state = state.clone();
+            let runtime_owner_id = state.runtime_owner_id.clone();
+            tokio::spawn(async move {
+                finalize_task_if_owned(
+                    state.as_ref(),
+                    task_id,
+                    STATUS_SUCCEEDED,
+                    Some(json!({"ok": true})),
+                    None,
+                    runtime_owner_id.as_str(),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreground finalize should be registered");
+        drop(held);
+        assert!(
+            finalize
+                .await
+                .expect("join foreground finalize")
+                .expect("foreground finalize should recover")
+        );
+        background
+            .await
+            .expect("join background heartbeat")
+            .expect("background heartbeat should finish");
+
+        let (status, runtime_owner_id, lease_heartbeat_at, result_json): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, runtime_owner_id, lease_heartbeat_at, result_json FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load finalized task");
+        assert_eq!(status, STATUS_SUCCEEDED);
+        assert_eq!(runtime_owner_id, None);
+        assert_eq!(lease_heartbeat_at, None);
+        assert_eq!(result_json.as_deref(), Some(r#"{"ok":true}"#));
+        let stale_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.recovered_failed'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stale transitions");
+        assert_eq!(stale_transition_count, 0);
     }
 
     #[tokio::test]
@@ -7677,6 +8239,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_owned_webhook_task_clears_operation_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "finalize-webhook-lease-cleanup";
+        seed_task(&pool, task_id, TASK_WEBHOOK_PUSH_MANAGE, STATUS_RUNNING, 0).await;
+        seed_user(&pool, 90_102, "finalize-lease-user").await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(&now)
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("assign webhook task owner");
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("90102")
+        .bind(task_id)
+        .bind((Utc::now() + Duration::minutes(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed webhook operation lease");
+
+        assert!(
+            finalize_task_if_owned(
+                state.as_ref(),
+                task_id,
+                STATUS_FAILED,
+                None,
+                Some("release backpressure".to_owned()),
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize webhook task")
+        );
+
+        let lease_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_push_user_operation_leases WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load finalized webhook operation lease");
+        assert_eq!(lease_count, 0);
+    }
+
+    #[tokio::test]
+    async fn reschedule_owned_webhook_task_clears_operation_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "reschedule-webhook-lease-cleanup";
+        seed_task(&pool, task_id, TASK_WEBHOOK_PUSH_MANAGE, STATUS_RUNNING, 0).await;
+        seed_user(&pool, 90_103, "reschedule-lease-user").await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("assign webhook task owner");
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("90103")
+        .bind(task_id)
+        .bind((Utc::now() + Duration::minutes(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed webhook operation lease");
+
+        assert!(
+            reschedule_task_if_owned(
+                state.as_ref(),
+                task_id,
+                Utc::now() + Duration::seconds(1),
+                json!({"reason": "operation_lease_busy"}),
+            )
+            .await
+            .expect("reschedule webhook task")
+        );
+
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM job_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load rescheduled webhook task");
+        assert_eq!(status, STATUS_QUEUED);
+        let lease_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_push_user_operation_leases WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load rescheduled webhook operation lease");
+        assert_eq!(lease_count, 0);
+    }
+
+    #[tokio::test]
     async fn recovered_task_cannot_be_completed_by_stale_worker() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -8071,7 +8733,7 @@ mod tests {
         )
         .await;
 
-        let result = execute_sync_all_task_with(
+        let error = execute_sync_all_task_with(
             state.as_ref(),
             "task-sync-all-social-fail",
             "1",
@@ -8095,13 +8757,324 @@ mod tests {
             },
         )
         .await
-        .expect("sync_all result");
+        .expect_err("sync_all should preserve a nonrecoverable social failure");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed sync_all social failure");
 
-        assert_eq!(result["starred"]["repos"], json!(4));
-        assert_eq!(result["releases"]["releases"], json!(5));
-        assert_eq!(result["social"]["events"], json!(0));
+        assert_eq!(failure.result["starred"]["repos"], json!(4));
+        assert_eq!(failure.result["releases"]["releases"], json!(5));
+        assert_eq!(failure.result["social"]["events"], json!(0));
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
+        assert_eq!(failure.result["social_error"], json!("social unavailable"));
+        assert_eq!(failure.error_kind, "social_sync_failed");
+        assert_eq!(failure.severity, "error");
+        assert!(!failure.recoverable);
+        assert!(!failure.retryable);
+        assert_eq!(failure.retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_task_classifies_completed_social_source_errors_as_recoverable() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "task-sync-all-social-source-error",
+            TASK_SYNC_ALL,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let error = execute_sync_all_task_with(
+            state.as_ref(),
+            "task-sync-all-social-source-error",
+            "1",
+            |_, _| Box::pin(async { Ok(sync::SyncStarredResult { repos: 4 }) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 2,
+                        releases: 5,
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncSocialActivityResult {
+                        source_errors: vec![
+                            "followers(conn:github, http_500): GitHub returned 500".to_owned(),
+                        ],
+                        ..Default::default()
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-03-07T00:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect_err("sync_all should preserve a recoverable social source degradation");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed sync_all social source failure");
+
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
+        assert_eq!(
+            failure.result["social_error"],
+            json!("followers(conn:github, http_500): GitHub returned 500")
+        );
+        assert_eq!(failure.error_kind, "social_source_degraded");
+        assert_eq!(failure.severity, "warning");
+        assert!(failure.recoverable);
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after, Some("next_sync_subscriptions_run"));
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_task_classifies_social_writer_pressure_as_recoverable() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "task-sync-all-social-writer-pressure",
+            TASK_SYNC_ALL,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let error = execute_sync_all_task_with(
+            state.as_ref(),
+            "task-sync-all-social-writer-pressure",
+            "1",
+            |_, _| Box::pin(async { Ok(sync::SyncStarredResult { repos: 4 }) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 2,
+                        releases: 5,
+                    })
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Err::<sync::SyncSocialActivityResult, _>(anyhow::Error::new(
+                        crate::sqlite_write::SqliteWriteDeadlineError {
+                            lane: "background",
+                            priority: "background",
+                            phase: "writer_admission",
+                            deadline_ms: 2500,
+                        },
+                    ))
+                })
+            },
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-03-07T00:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect_err("sync_all should preserve recoverable social writer pressure");
+        let failure = error
+            .downcast_ref::<super::SyncAllSocialBusinessFailure>()
+            .expect("typed recoverable sync_all social failure");
+
+        assert_eq!(failure.result["notifications"]["notifications"], json!(7));
+        assert_eq!(failure.error_kind, "sqlite_write_backpressure");
+        assert_eq!(failure.severity, "warning");
+        assert!(failure.recoverable);
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after, Some("next_sync_subscriptions_run"));
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_failure_finalizes_task_failed_with_partial_result() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-terminal-failure";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "starred": {"repos": 4},
+                "releases": {"repos": 2, "releases": 5},
+                "social": {"events": 0},
+                "notifications": {"notifications": 7},
+                "social_error": "social unavailable",
+            }),
+            message: "social unavailable".to_owned(),
+            error_kind: "social_sync_failed",
+            severity: "error",
+            recoverable: false,
+            retryable: false,
+            retry_after: None,
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize sync_all social failure")
+        );
+
+        let (status, error_message, result_json): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_message, result_json FROM job_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load finalized sync_all task");
+        assert_eq!(status, STATUS_FAILED);
+        assert_eq!(error_message.as_deref(), Some("social unavailable"));
+        let result: Value = serde_json::from_str(
+            result_json
+                .as_deref()
+                .expect("sync_all partial result should be retained"),
+        )
+        .expect("parse retained sync_all result");
         assert_eq!(result["notifications"]["notifications"], json!(7));
-        assert_eq!(result["social_error"], json!("social unavailable"));
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load sync_all failure completion event");
+        let event: Value = serde_json::from_str(&event_payload).expect("parse completion event");
+        assert_eq!(event["status"], json!(STATUS_FAILED));
+        assert_eq!(event["error_kind"], json!("social_sync_failed"));
+        assert_eq!(event["severity"], json!("error"));
+        assert_eq!(event["recoverable"], json!(false));
+        assert_eq!(event["retryable"], json!(false));
+        assert_eq!(event["retry_after"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_recoverable_failure_completion_payload_preserves_retry_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-recoverable-failure";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed recoverable sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "social": {"events": 3},
+                "notifications": {"notifications": 7},
+                "social_error": "sqlite writer admission deadline exhausted",
+            }),
+            message: "sqlite writer admission deadline exhausted".to_owned(),
+            error_kind: "sqlite_write_backpressure",
+            severity: "warning",
+            recoverable: true,
+            retryable: true,
+            retry_after: Some("next_sync_subscriptions_run"),
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize recoverable sync_all social failure")
+        );
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recoverable sync_all failure completion event");
+        let event: Value =
+            serde_json::from_str(&event_payload).expect("parse recoverable completion event");
+        assert_eq!(event["error_kind"], json!("sqlite_write_backpressure"));
+        assert_eq!(event["severity"], json!("warning"));
+        assert_eq!(event["recoverable"], json!(true));
+        assert_eq!(event["retryable"], json!(true));
+        assert_eq!(event["retry_after"], json!("next_sync_subscriptions_run"));
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_source_degradation_completion_payload_preserves_warning_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-source-degraded";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed source-degraded sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "social": {"events": 0},
+                "social_error": "followers(conn:github, http_500): GitHub returned 500",
+            }),
+            message: "followers(conn:github, http_500): GitHub returned 500".to_owned(),
+            error_kind: "social_source_degraded",
+            severity: "warning",
+            recoverable: true,
+            retryable: true,
+            retry_after: Some("next_sync_subscriptions_run"),
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize source-degraded sync_all failure")
+        );
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load source-degraded sync_all failure completion event");
+        let event: Value =
+            serde_json::from_str(&event_payload).expect("parse source-degraded completion event");
+        assert_eq!(event["error_kind"], json!("social_source_degraded"));
+        assert_eq!(event["severity"], json!("warning"));
+        assert_eq!(event["recoverable"], json!(true));
+        assert_eq!(event["retryable"], json!(true));
+        assert_eq!(event["retry_after"], json!("next_sync_subscriptions_run"));
     }
 
     async fn setup_pool() -> SqlitePool {
@@ -8235,6 +9208,12 @@ mod tests {
             0,
         )
         .await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind("sqlite-deadline-task")
+            .execute(&pool)
+            .await
+            .expect("seed deferred task owner");
         let payload = json!({"retry_count": 3});
         sqlx::query("UPDATE job_tasks SET payload_json = ? WHERE id = ?")
             .bind(payload.to_string())
@@ -8282,6 +9261,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_write_backpressure_does_not_reschedule_reclaimed_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sqlite-reclaimed-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        let payload = json!({"retry_count": 3});
+        sqlx::query("UPDATE job_tasks SET payload_json = ?, runtime_owner_id = ? WHERE id = ?")
+            .bind(payload.to_string())
+            .bind("new-runtime-owner")
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed reclaimed task owner");
+        let task = TaskRow {
+            id: task_id.to_owned(),
+            task_type: TASK_SYNC_RELEASES.to_owned(),
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            payload_json: payload.to_string(),
+            cancel_requested: 0,
+        };
+
+        let rescheduled =
+            defer_task_after_sqlite_write_backpressure(state.as_ref(), &task, &payload)
+                .await
+                .expect("defer reclaimed task after sqlite deadline");
+
+        assert!(!rescheduled);
+        let (status, runtime_owner_id, retry_count): (String, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT status, runtime_owner_id, json_extract(payload_json, '$.retry_count') FROM job_tasks WHERE id = ?",
+            )
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load reclaimed task state");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(runtime_owner_id.as_deref(), Some("new-runtime-owner"));
+        assert_eq!(retry_count, 3);
+        let rescheduled_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.rescheduled'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count reclaimed task reschedule events");
+        assert_eq!(rescheduled_event_count, 0);
+    }
+
+    #[tokio::test]
+    async fn owned_task_reschedule_does_not_reschedule_reclaimed_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "owned-reschedule-reclaimed-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind("new-runtime-owner")
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed reclaimed task owner");
+
+        let rescheduled = reschedule_task_if_owned(
+            state.as_ref(),
+            task_id,
+            Utc::now() + Duration::minutes(1),
+            json!({"reason": "cancel_requested"}),
+        )
+        .await
+        .expect("reschedule reclaimed task");
+
+        assert!(!rescheduled);
+        let (status, runtime_owner_id): (String, Option<String>) =
+            sqlx::query_as("SELECT status, runtime_owner_id FROM job_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load reclaimed task state");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(runtime_owner_id.as_deref(), Some("new-runtime-owner"));
+    }
+
+    #[tokio::test]
     async fn webhook_audit_partial_dispatch_reschedules_same_task() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -8305,6 +9367,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert audit task");
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = 'audit-retry'")
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("claim audit task for test runtime");
         sqlx::raw_sql(
             r#"
             CREATE TRIGGER fail_one_webhook_dispatch
