@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-24：PR #340 executable candidate `6e50c9eb62918aa9acb61ecc173889ee66aaf5fb` 将 owner-CAS 约束扩展到 active task 的取消、webhook retry 与 SQLite 背压 requeue/deferral，并为跨阶段 Social source errors 增加稳定去重回归；scheduler/session pressure 证据仍绑定下方记录的未变代码路径。
 - 2026-10-24：订阅 Social worker 将失败但已有 partial snapshot 的 outcome 与取消区分；摘要继续增加 `failed_users`，同时合并已持久化的 repo、follower 与 event 计数，避免管理员看到的总量低于 SQLite 已提交事实。
 - 2026-10-24：legacy `sync.all` 的 Social failed `task.completed` payload 补齐 `severity`、`retryable` 与 `retry_after`，让可恢复 SQLite 背压和真实上游失败在兼容收尾路径中保持完整分类；新增两类最终事件回归。
 - 2026-10-24：PR #340 executable candidate `4a4a39d20bd74a1d56d6417da44274afc8701db9` 继承 implementation-evidence commit `f0e7f3467975b0db225443b0db7c54da7b94c3f9` 的未变 scheduler/session 代码路径；Agent VM 直接通过一次 file-backed WAL scheduler/session pressure acceptance（`1 passed, 0 failed`，测试本体 15.57 s），同环境即时重复出现 foreground session `503`（17.16 s）。该可执行候选的 GitHub Backend Tests 与四次本地 exact binary 并行运行通过，Tier 3 test-platform review 接受该单次重复为 VM 调度方差，限制记录保留；后续 PR head 仅更新文档。
