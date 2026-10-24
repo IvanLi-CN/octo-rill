@@ -133,6 +133,19 @@ struct InstalledSocialActivitySnapshotAfterFirstChunkHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct SocialActivitySnapshotAfterFirstEventChunkHook {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+struct InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resume: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
 impl Drop for InstalledSocialActivitySnapshotAfterReadsHook {
     fn drop(&mut self) {
         let _ = self.resume.send(true);
@@ -153,6 +166,16 @@ impl Drop for InstalledSocialActivitySnapshotAfterFirstChunkHook {
 }
 
 #[cfg(test)]
+impl Drop for InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
+    fn drop(&mut self) {
+        let _ = self.resume.send(true);
+        *social_activity_snapshot_after_first_event_chunk_hook_slot()
+            .lock()
+            .expect("lock social activity first event chunk hook slot") = None;
+    }
+}
+
+#[cfg(test)]
 fn social_activity_snapshot_after_reads_hook_slot()
 -> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>> {
     static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>>> =
@@ -165,6 +188,15 @@ fn social_activity_snapshot_after_first_chunk_hook_slot()
 -> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstChunkHook>> {
     static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstChunkHook>>> =
         OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn social_activity_snapshot_after_first_event_chunk_hook_slot()
+-> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstEventChunkHook>> {
+    static HOOK: OnceLock<
+        std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstEventChunkHook>>,
+    > = OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -211,6 +243,24 @@ fn install_social_activity_snapshot_after_first_chunk_hook()
 }
 
 #[cfg(test)]
+fn install_social_activity_snapshot_after_first_event_chunk_hook()
+-> InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = tokio::sync::watch::channel(false);
+    *social_activity_snapshot_after_first_event_chunk_hook_slot()
+        .lock()
+        .expect("lock social activity first event chunk hook slot") =
+        Some(SocialActivitySnapshotAfterFirstEventChunkHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    InstalledSocialActivitySnapshotAfterFirstEventChunkHook {
+        reached: reached_rx,
+        resume: resume_tx,
+    }
+}
+
+#[cfg(test)]
 async fn wait_for_social_activity_snapshot_after_reads_hook() {
     let hook = social_activity_snapshot_after_reads_hook_slot()
         .lock()
@@ -230,6 +280,21 @@ async fn wait_for_social_activity_snapshot_after_first_chunk_hook() {
     let hook = social_activity_snapshot_after_first_chunk_hook_slot()
         .lock()
         .expect("lock social activity first chunk hook slot")
+        .clone();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let mut resume = hook.resume;
+        if !*resume.borrow() {
+            let _ = resume.changed().await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_social_activity_snapshot_after_first_event_chunk_hook() {
+    let hook = social_activity_snapshot_after_first_event_chunk_hook_slot()
+        .lock()
+        .expect("lock social activity first event chunk hook slot")
         .clone();
     if let Some(hook) = hook {
         let _ = hook.reached.send(());
@@ -2344,6 +2409,7 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
+            let committed_events = social_activity_snapshot_committed_events(&error);
             with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
@@ -2351,7 +2417,7 @@ pub async fn sync_social_activity(
                 social_activity_result_snapshot(
                     &repo_collection,
                     followers.len(),
-                    0,
+                    committed_events,
                     source_errors.as_slice(),
                 ),
             )
@@ -2367,6 +2433,7 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
+            let committed_events = social_activity_snapshot_committed_events(&error);
             with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
@@ -2374,7 +2441,7 @@ pub async fn sync_social_activity(
                 social_activity_result_snapshot(
                     &repo_collection,
                     followers.len(),
-                    0,
+                    committed_events,
                     source_errors.as_slice(),
                 ),
             )
@@ -2487,6 +2554,11 @@ struct SocialSyncActivityFailure {
     result: SyncSocialActivityResult,
 }
 
+#[derive(Debug)]
+struct SocialActivitySnapshotPersistenceFailure {
+    events: usize,
+}
+
 impl std::fmt::Display for SocialSyncActivityFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -2497,6 +2569,18 @@ impl std::fmt::Display for SocialSyncActivityFailure {
 }
 
 impl std::error::Error for SocialSyncActivityFailure {}
+
+impl std::fmt::Display for SocialActivitySnapshotPersistenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "social activity snapshot persistence failed after committing {} events",
+            self.events
+        )
+    }
+}
+
+impl std::error::Error for SocialActivitySnapshotPersistenceFailure {}
 
 impl std::fmt::Display for SocialUpstreamSourceErrors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2555,6 +2639,13 @@ fn with_social_activity_failure(
 ) -> anyhow::Error {
     with_social_source_errors(error, operation, source_errors)
         .context(SocialSyncActivityFailure { result })
+}
+
+fn social_activity_snapshot_committed_events(error: &anyhow::Error) -> usize {
+    error
+        .downcast_ref::<SocialActivitySnapshotPersistenceFailure>()
+        .map(|failure| failure.events)
+        .unwrap_or_default()
 }
 
 fn social_source_errors_from_error(error: &anyhow::Error) -> Vec<String> {
@@ -3473,6 +3564,50 @@ async fn apply_social_activity_snapshot_with_options(
     delete_stale_repo_members: bool,
     delete_stale_followers: bool,
 ) -> Result<usize> {
+    let mut events_written = 0usize;
+    apply_social_activity_snapshot_with_options_inner(
+        state,
+        user_id,
+        SocialActivitySnapshotWriteOptions {
+            owned_repos,
+            repo_members,
+            followers,
+            delete_stale_repo_members,
+            delete_stale_followers,
+            events_written: &mut events_written,
+        },
+    )
+    .await
+    .map(|()| events_written)
+    .map_err(|error| {
+        error.context(SocialActivitySnapshotPersistenceFailure {
+            events: events_written,
+        })
+    })
+}
+
+struct SocialActivitySnapshotWriteOptions<'a> {
+    owned_repos: Option<&'a [OwnedRepoSnapshot]>,
+    repo_members: Option<&'a [(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)]>,
+    followers: Option<&'a [FollowerSnapshot]>,
+    delete_stale_repo_members: bool,
+    delete_stale_followers: bool,
+    events_written: &'a mut usize,
+}
+
+async fn apply_social_activity_snapshot_with_options_inner(
+    state: &AppState,
+    user_id: &str,
+    options: SocialActivitySnapshotWriteOptions<'_>,
+) -> Result<()> {
+    let SocialActivitySnapshotWriteOptions {
+        owned_repos,
+        repo_members,
+        followers,
+        delete_stale_repo_members,
+        delete_stale_followers,
+        events_written,
+    } = options;
     debug_assert_eq!(owned_repos.is_some(), repo_members.is_some());
 
     let now = Utc::now().to_rfc3339();
@@ -3729,7 +3864,8 @@ async fn apply_social_activity_snapshot_with_options(
     wait_for_social_activity_snapshot_after_reads_hook().await;
 
     let mut metrics = SocialActivitySnapshotWriteMetrics::default();
-    let mut events_written = 0usize;
+    #[cfg(test)]
+    let mut first_event_chunk_completed = false;
     let mut should_dispatch_webhook_reconcile = false;
     let mut webhook_demand_evaluated = false;
 
@@ -3845,7 +3981,12 @@ async fn apply_social_activity_snapshot_with_options(
             tx.commit()
                 .await
                 .context("commit social activity follower member tx")?;
-            events_written += chunk_events_written;
+            *events_written += chunk_events_written;
+            #[cfg(test)]
+            if !first_event_chunk_completed && chunk_events_written > 0 {
+                first_event_chunk_completed = true;
+                wait_for_social_activity_snapshot_after_first_event_chunk_hook().await;
+            }
             record_social_activity_write_chunk(
                 &mut metrics,
                 "follower_members",
@@ -3902,7 +4043,12 @@ async fn apply_social_activity_snapshot_with_options(
             tx.commit()
                 .await
                 .context("commit social activity follower history tx")?;
-            events_written += chunk_events_written;
+            *events_written += chunk_events_written;
+            #[cfg(test)]
+            if !first_event_chunk_completed && chunk_events_written > 0 {
+                first_event_chunk_completed = true;
+                wait_for_social_activity_snapshot_after_first_event_chunk_hook().await;
+            }
             record_social_activity_write_chunk(
                 &mut metrics,
                 "follower_history",
@@ -4162,7 +4308,12 @@ async fn apply_social_activity_snapshot_with_options(
                         repo.full_name
                     )
                 })?;
-                events_written += chunk_events_written;
+                *events_written += chunk_events_written;
+                #[cfg(test)]
+                if !first_event_chunk_completed && chunk_events_written > 0 {
+                    first_event_chunk_completed = true;
+                    wait_for_social_activity_snapshot_after_first_event_chunk_hook().await;
+                }
                 record_social_activity_write_chunk(
                     &mut metrics,
                     "repo_members",
@@ -4235,7 +4386,12 @@ async fn apply_social_activity_snapshot_with_options(
                         repo.full_name
                     )
                 })?;
-                events_written += chunk_events_written;
+                *events_written += chunk_events_written;
+                #[cfg(test)]
+                if !first_event_chunk_completed && chunk_events_written > 0 {
+                    first_event_chunk_completed = true;
+                    wait_for_social_activity_snapshot_after_first_event_chunk_hook().await;
+                }
                 record_social_activity_write_chunk(
                     &mut metrics,
                     "repo_history",
@@ -4382,7 +4538,7 @@ async fn apply_social_activity_snapshot_with_options(
         max_chunk_elapsed_ms = metrics.max_chunk_elapsed_ms,
         max_query_elapsed_ms = metrics.max_query_elapsed_ms,
         max_writer_wait_ms = metrics.max_writer_wait_ms,
-        events_written,
+        events_written = *events_written,
         "social activity snapshot persisted in bounded writer chunks"
     );
     #[cfg(test)]
@@ -4394,7 +4550,7 @@ async fn apply_social_activity_snapshot_with_options(
         metrics.max_query_elapsed_ms,
         metrics.max_writer_wait_ms,
         candidate_read_elapsed_ms,
-        events_written,
+        *events_written,
     );
 
     if should_dispatch_webhook_reconcile
@@ -4407,7 +4563,7 @@ async fn apply_social_activity_snapshot_with_options(
             "social activity snapshot committed but webhook reconcile dispatch failed"
         );
     }
-    Ok(events_written)
+    Ok(())
 }
 
 fn record_social_activity_write_chunk(
@@ -15542,6 +15698,7 @@ mod tests {
         heartbeat_repo_release_work_item_lease, hydrate_repo_refresh_candidates,
         insert_feed_activity_events, insert_social_activity_event_tx,
         install_social_activity_snapshot_after_first_chunk_hook,
+        install_social_activity_snapshot_after_first_event_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
         load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
         load_public_release_usage_sync_access, load_repo_release_candidate_users,
@@ -17857,6 +18014,114 @@ mod tests {
         collect_social_result(Some(Ok(Ok(None))), &mut summary).expect("count failed social user");
         assert_eq!(summary.succeeded_users, 0);
         assert_eq!(summary.failed_users, 1);
+    }
+
+    #[tokio::test]
+    async fn social_activity_snapshot_preserves_committed_events_when_later_chunk_fails() {
+        let _hook_test_lock = social_activity_snapshot_hook_test_lock().lock().await;
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-snapshot-partial-events");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/partial-events".to_owned(),
+            is_private: false,
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+            repo_stargazer_count: Some(65),
+        };
+        let members = (0..65_i64)
+            .map(|id| {
+                let second = id % 60;
+                RepoStargazerSnapshot {
+                    repo_id: repo.repo_id,
+                    repo_full_name: repo.full_name.clone(),
+                    actor: GitHubActor {
+                        id: 10_000 + id,
+                        login: format!("partial-event-{id}"),
+                        avatar_url: None,
+                        html_url: None,
+                    },
+                    starred_at: Some(format!("2026-03-07T00:00:{second:02}Z")),
+                }
+            })
+            .collect::<Vec<_>>();
+        let repo_members = vec![(repo.clone(), members)];
+        let mut hook = install_social_activity_snapshot_after_first_event_chunk_hook();
+        let snapshot_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                apply_social_activity_snapshot_partial(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    Some(std::slice::from_ref(&repo)),
+                    Some(repo_members.as_slice()),
+                    None,
+                )
+                .await
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), hook.reached.recv())
+                .await
+                .expect("wait for first committed social event chunk")
+                .is_some(),
+            "expected social snapshot to pause after the first event chunk committed"
+        );
+
+        let mut external_lock = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external sqlite writer lock after first event chunk");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *external_lock)
+            .await
+            .expect("seed external sqlite writer lock after first event chunk");
+        let _ = hook.resume.send(true);
+
+        let error = tokio::time::timeout(Duration::from_secs(4), snapshot_task)
+            .await
+            .expect("social snapshot should reach its writer deadline")
+            .expect("join social snapshot")
+            .expect_err("later social snapshot chunk should expose writer backpressure");
+        assert!(is_sqlite_retryable_write_error(error.as_ref()));
+        assert_eq!(super::social_activity_snapshot_committed_events(&error), 64);
+
+        let persisted_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM social_activity_events WHERE user_id = ? AND kind = 'repo_star_received'",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count committed social event chunks");
+        assert_eq!(persisted_events, 64);
+
+        let partial = SyncSocialActivityResult {
+            events: super::social_activity_snapshot_committed_events(&error),
+            ..Default::default()
+        };
+        let failure = super::with_social_activity_failure(
+            error,
+            "apply social activity snapshot",
+            &[],
+            partial,
+        );
+        assert_eq!(
+            super::social_activity_result_from_error(&failure).events,
+            64
+        );
+
+        external_lock
+            .rollback()
+            .await
+            .expect("release external sqlite writer lock");
     }
 
     #[test]

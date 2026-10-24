@@ -10,6 +10,8 @@
 - Access-refresh regression coverage verifies the Social source-error result is retained while the Notifications phase continues.
 - Access-refresh progress/log payloads carry the typed Social failure classification; SQLite writer pressure is warning/recoverable with retry metadata, while upstream source errors remain error/non-recoverable. Legacy `sync.all` retains completed Notifications data but finalizes a Social business failure as a failed task with classification in `task.completed`.
 - Social persistence errors now carry the partial snapshot through the typed error context; `sync.subscriptions`, access-refresh, and `sync.all` retain completed counters and failed/partial repos instead of replacing them with an empty result. `sync.all` finalization commits the failed task row and `task.completed` event atomically on the foreground lane, and stops the heartbeat before propagating any finalization error.
+- Social snapshot failures retain the number of event rows committed by earlier 64-row chunks, including when a later chunk exhausts SQLite backpressure; the compatibility result therefore reflects persisted events instead of under-reporting them as zero.
+- Background admission and `BEGIN IMMEDIATE` busy retries cap every sleep at the original absolute deadline, so a retry cannot extend heartbeat, worker, or finalization latency beyond its caller budget.
 - The access-refresh dependency seam is private test wiring grouped in a dependency struct; the production path keeps the real Social/Notifications calls without a lint suppression.
 - The file-backed scheduler/session pressure regression keeps its empty-queue worker join bounded with a 30-second test budget for the Agent VM acceptance; production admission and writer deadlines remain unchanged.
 - Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。
@@ -83,7 +85,7 @@
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
 - `bash scripts/check-rust-source-quality.sh`（PR #340 current-head required check 通过）
 - 当前调度查询/回滚候选的 `jobs::tests::` 67 项全部通过；新增回归锁定 status-first query plan，以及显式 scheduler rollback 后 writer connection 可复用。`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings` 与 source-quality gate 均在候选 head 通过。
-- file-backed WAL acceptance：实现候选 `014b166cb237242caac012f0aafdad391337e64f` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（均为 1 passed, 0 failed；测试本体分别耗时 2.31 s 与 4.59 s）；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言；测试先启动后台压力并在外部锁释放后回收后台任务，避免测试调度抖动消耗生产 foreground deadline。后续仅文档提交不改变该实现验收，PR exact head 以交付证据为准。
+- file-backed WAL acceptance：实现候选 `014b166cb237242caac012f0aafdad391337e64f` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（均为 1 passed, 0 failed；测试本体分别耗时 2.31 s 与 4.59 s）；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言。这是历史实现候选的继承证据，不代表后续修复提交的 exact head 已通过 A6。
 - 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - 此前候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
 - 当前修复候选的生产形状并发回归：397 个 owned repos、至少 100,000 条 search documents 下，dashboard updates、session save、task enqueue 在后台 social snapshot 压力下均成功，`busy_or_500=0`；完整候选 head 的数值证据以 PR #340 当前 CI 与本地 acceptance 输出为准。
@@ -94,7 +96,7 @@
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
 - `0092`、`0093`、`0094`、`0095`、`0096`、`0097`、`0098` 和 `0099` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、terminal projection failures/recovery、announcement fanout cursor、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
-- 当前候选的 file-backed WAL acceptance 已通过；HTTP 经验验收与合并后的 101 线上 30 分钟观察仍是发布后门禁，在后者完成前不能宣称线上 rollout 已验证。
+- file-backed WAL acceptance 的历史候选证据已记录，但当前 PR exact head 的 A6 仍须单独验证；此前 Agent VM 三次尝试均在 guest readiness 阶段因 `guest_readiness_timeout` 结束，未进入测试。HTTP 经验验收与合并后的 101 线上 30 分钟观察仍是发布后门禁，在后者完成前不能宣称线上 rollout 已验证。
 
 ## Related Changes
 

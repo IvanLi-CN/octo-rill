@@ -11,12 +11,13 @@ SQLite writer contention is already serialized by an application coordinator wit
 ## Decision
 
 - Retry background admission denial inside the coordinator using the original monotonic deadline and the existing 25/50/100ms capped retry schedule.
+- Cap the actual retry sleep, including `BEGIN IMMEDIATE` busy retry, at that same absolute deadline; checking the remaining budget before sleeping is not sufficient if the clock advances between the check and the sleep.
 - Do not register another background waiter, enlarge the queue, lower business worker concurrency, or reset the deadline between attempts. Foreground admission remains ahead of background work.
 - Keep job task terminal finalization on the existing foreground lane so a completed or canceled task cannot be starved behind heartbeat admission; this is a lifecycle priority choice, not a new writer priority.
 - When the deadline is exhausted, return the existing typed retryable writer deadline so the caller's existing worker backoff and lifecycle handling remain in control.
 - Keep Social activity persistence in its existing fixed 64-row short transactions. Classify SQLite busy, writer deadline, and background admission exhaustion as `social_sync_failed` with `severity=warning`, `recoverable=true`, `error_kind=sqlite_write_backpressure`, and `retry_after=next_sync_subscriptions_run`. The user remains failed for the current run; upstream failures remain `error` and non-recoverable.
 - Treat non-empty Social upstream `source_errors` as non-recoverable in subscription, access-refresh, and sync-all compatibility results, preserving their details even when a later SQLite write also fails. Write the failure to the run log before `sync_subscription_events`; if only retryable SQLite pressure prevents the event-table append, keep the run log as the durable fallback and continue the remaining phases.
-- Preserve any Social counters and failed/partial repo diagnostics collected before a persistence failure in a typed error context, so compatibility callers do not replace a partial result with an empty one.
+- Preserve any Social counters, including event rows committed by earlier 64-row chunks, and failed/partial repo diagnostics collected before a persistence failure in a typed error context, so compatibility callers do not replace a partial result with an empty or under-counted one.
 - Finalize a `sync.all` Social business failure by committing the failed task row and its `task.completed` event in one foreground transaction; stop the task heartbeat before returning a finalization error so the lifecycle cannot retain a stale lease.
 
 ## Consequences
@@ -39,5 +40,7 @@ Transient writer pressure can clear without creating a false Social failure, whi
 - `jobs::tests::execute_sync_all_task_marks_social_source_errors_without_false_success`
 - `jobs::tests::sync_all_social_failure_finalizes_task_failed_with_partial_result`
 - `sync::tests::social_activity_failure_preserves_partial_result_and_upstream_classification`
+- `sync::tests::social_activity_snapshot_preserves_committed_events_when_later_chunk_fails`
+- `sqlite_write::tests::background_retry_sleep_is_capped_at_absolute_deadline`
 - `sqlite_write::tests::foreground_writer_succeeds_after_background_admission_denial`
 - Mock-only Storybook: `Admin/Task Type Detail/SyncSubscriptionsRecoverableSocialWriterPressure`

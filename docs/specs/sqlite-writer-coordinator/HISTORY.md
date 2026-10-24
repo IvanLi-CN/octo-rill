@@ -11,8 +11,8 @@
 - 2026-10-23：补充 access-refresh Social source-error 与 Notifications 继续执行的回归，依赖通过私有 dependency struct 聚合，覆盖共享 writer 背压修复的另一条兼容结果路径。
 - 2026-10-24：access-refresh 的 Social progress/log 现在保留上游错误与 SQLite 背压的结构化分类；legacy `sync.all` 保留 Notifications 部分结果但以失败终态记录 Social 业务失败，避免 `social_error` 形成假成功。
 - 2026-10-24：owner 已确认 mock-only Storybook 的 Social SQLite writer pressure 证据，可作为当前 PR 的视觉证据提交。
-- 2026-10-24：当前候选 `a7946f62` 的 file-backed WAL scheduler/session pressure acceptance 通过；PR #340 的 required checks 与四个 Tier 3 formal review lane 均绑定该候选头部。
-- 2026-10-24：当前候选 `129c817e4d0227d8055869eced0ba97844a1facf` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；此前低资源 VM 的 503 复现未能在稳定资源条件下重现，代码差异确认仅为文档同步。
+- 2026-10-24：历史候选 `a7946f62` 的 file-backed WAL scheduler/session pressure acceptance 通过；该结果只属于当时的候选头部，不能替代 PR #340 后续修复提交的 exact-head A6。
+- 2026-10-24：历史候选 `129c817e4d0227d8055869eced0ba97844a1facf` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；当前候选的 A6 仍需重新绑定验证。
 - 2026-10-24：文档候选 `09c6f0b6e7397d1b8ec8c8b0bb4982441323a878` 继承并复核了此前实现验收；测试均为 `1 passed, 0 failed`。
 - 2026-10-24：实现候选 `014b166cb237242caac012f0aafdad391337e64f` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；测试均为 `1 passed, 0 failed`，测试本体分别耗时 2.31 s 与 4.59 s。
 - 2026-10-23：文件型 WAL scheduler/session 压力回归的 empty-queue worker join 改用 30 秒测试预算，以覆盖 Agent VM 的冷/热调度抖动；生产 admission 与 writer deadline 不变。

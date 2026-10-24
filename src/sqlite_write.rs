@@ -31,6 +31,10 @@ const ROLLBACK_CLEANUP_TIMEOUT: Duration = Duration::from_millis(150);
 const BACKGROUND_WRITER_QUEUE_LIMIT: usize = 1;
 const BACKGROUND_ADMISSION_COOLDOWN: Duration = Duration::from_millis(250);
 
+fn capped_retry_sleep_until(now: Instant, deadline_at: Instant, delay: Duration) -> Instant {
+    std::cmp::min(deadline_at, now + delay)
+}
+
 #[derive(Clone, Debug)]
 pub struct SqliteWriteCoordinator {
     state: Arc<Mutex<SqliteWriteState>>,
@@ -1010,7 +1014,12 @@ impl SqliteWriteCoordinator {
                     if !can_retry {
                         return Err(self.deadline_error(lane, priority, "writer_queue", deadline));
                     }
-                    tokio::time::sleep_until(Instant::now() + delay).await;
+                    tokio::time::sleep_until(capped_retry_sleep_until(
+                        Instant::now(),
+                        deadline_at,
+                        delay,
+                    ))
+                    .await;
                     attempt += 1;
                 }
                 Ok(Err(error)) => return Err(error),
@@ -1617,7 +1626,12 @@ impl SqliteWriteCoordinator {
                     if !can_retry {
                         return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                     }
-                    tokio::time::sleep_until(Instant::now() + delay).await;
+                    tokio::time::sleep_until(capped_retry_sleep_until(
+                        Instant::now(),
+                        deadline_at,
+                        delay,
+                    ))
+                    .await;
                     attempt += 1;
                 }
                 Err(err) => {
@@ -2734,6 +2748,20 @@ mod tests {
         assert_eq!(
             coordinator.retry_delay_for_attempt(4),
             Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn background_retry_sleep_is_capped_at_absolute_deadline() {
+        let now = Instant::now();
+        let deadline_at = now + Duration::from_millis(10);
+        assert_eq!(
+            capped_retry_sleep_until(now, deadline_at, Duration::from_millis(25)),
+            deadline_at
+        );
+        assert_eq!(
+            capped_retry_sleep_until(now, deadline_at, Duration::from_millis(5)),
+            now + Duration::from_millis(5)
         );
     }
 
