@@ -2348,7 +2348,7 @@ pub async fn reschedule_task(
     available_at: DateTime<Utc>,
     result: Value,
 ) -> Result<bool> {
-    reschedule_task_inner(state, task_id, available_at, None, None, result).await
+    reschedule_task_inner(state, task_id, available_at, None, None, result, None).await
 }
 
 pub async fn reschedule_task_with_retry_count(
@@ -2365,6 +2365,26 @@ pub async fn reschedule_task_with_retry_count(
         Some(retry_count),
         None,
         result,
+        None,
+    )
+    .await
+}
+
+async fn reschedule_task_with_retry_count_if_owned(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    retry_count: u8,
+    result: Value,
+) -> Result<bool> {
+    reschedule_task_inner(
+        state,
+        task_id,
+        available_at,
+        Some(retry_count),
+        None,
+        result,
+        Some(state.runtime_owner_id.as_str()),
     )
     .await
 }
@@ -2384,6 +2404,7 @@ pub async fn reschedule_task_with_payload(
         None,
         Some(payload_json),
         result,
+        None,
     )
     .await
 }
@@ -2395,6 +2416,7 @@ async fn reschedule_task_inner(
     retry_count: Option<u8>,
     payload_json: Option<String>,
     result: Value,
+    runtime_owner_id: Option<&str>,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
@@ -2408,7 +2430,9 @@ async fn reschedule_task_inner(
                     SET status = ?, available_at = ?, payload_json = ?,
                         started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
                         cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND (? IS NULL OR runtime_owner_id = ?)
                     "#,
                 )
                 .bind(STATUS_QUEUED)
@@ -2417,6 +2441,8 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
+                    .bind(runtime_owner_id)
+                    .bind(runtime_owner_id)
                 .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task with payload")
@@ -2427,7 +2453,9 @@ async fn reschedule_task_inner(
                     SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
                         started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
                         cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND (? IS NULL OR runtime_owner_id = ?)
                     "#,
                 )
                 .bind(STATUS_QUEUED)
@@ -2436,6 +2464,8 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
+                    .bind(runtime_owner_id)
+                    .bind(runtime_owner_id)
                 .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
@@ -2446,7 +2476,9 @@ async fn reschedule_task_inner(
                     SET status = ?, available_at = ?, started_at = NULL,
                         runtime_owner_id = NULL, lease_heartbeat_at = NULL,
                         cancel_requested = 0, updated_at = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND (? IS NULL OR runtime_owner_id = ?)
                     "#,
                 )
                 .bind(STATUS_QUEUED)
@@ -2454,6 +2486,8 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
+                    .bind(runtime_owner_id)
+                    .bind(runtime_owner_id)
                 .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
@@ -3713,7 +3747,7 @@ async fn defer_task_after_sqlite_write_backpressure(
         .unwrap_or(0);
     let retry_count = previous_retry_count.saturating_add(1);
     let available_at = Utc::now() + chrono::Duration::seconds(15);
-    let rescheduled = reschedule_task_with_retry_count(
+    let rescheduled = reschedule_task_with_retry_count_if_owned(
         state,
         &task.id,
         available_at,
@@ -8965,6 +8999,12 @@ mod tests {
             0,
         )
         .await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind("sqlite-deadline-task")
+            .execute(&pool)
+            .await
+            .expect("seed deferred task owner");
         let payload = json!({"retry_count": 3});
         sqlx::query("UPDATE job_tasks SET payload_json = ? WHERE id = ?")
             .bind(payload.to_string())
@@ -9009,6 +9049,56 @@ mod tests {
         .await
         .expect("load task deferral event");
         assert_eq!(event_type, "task.rescheduled");
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_backpressure_does_not_reschedule_reclaimed_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sqlite-reclaimed-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        let payload = json!({"retry_count": 3});
+        sqlx::query("UPDATE job_tasks SET payload_json = ?, runtime_owner_id = ? WHERE id = ?")
+            .bind(payload.to_string())
+            .bind("new-runtime-owner")
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed reclaimed task owner");
+        let task = TaskRow {
+            id: task_id.to_owned(),
+            task_type: TASK_SYNC_RELEASES.to_owned(),
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            payload_json: payload.to_string(),
+            cancel_requested: 0,
+        };
+
+        let rescheduled =
+            defer_task_after_sqlite_write_backpressure(state.as_ref(), &task, &payload)
+                .await
+                .expect("defer reclaimed task after sqlite deadline");
+
+        assert!(!rescheduled);
+        let (status, runtime_owner_id, retry_count): (String, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT status, runtime_owner_id, json_extract(payload_json, '$.retry_count') FROM job_tasks WHERE id = ?",
+            )
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load reclaimed task state");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(runtime_owner_id.as_deref(), Some("new-runtime-owner"));
+        assert_eq!(retry_count, 3);
+        let rescheduled_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_task_events WHERE task_id = ? AND event_type = 'task.rescheduled'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count reclaimed task reschedule events");
+        assert_eq!(rescheduled_event_count, 0);
     }
 
     #[tokio::test]
