@@ -226,7 +226,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - 达到页预算的 partial snapshot 不能删除本地未出现在浅窗口里的旧成员；全量成员修正交给低频 reconciliation。
 - social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
 - Social 持久化遇到 SQLite busy、writer deadline 或 background admission 耗尽时，`social_sync_failed` 事件类型保持不变，但必须使用 `severity=warning`、`recoverable=true`，payload 增加 `error_kind=sqlite_write_backpressure`、`retryable=true` 与 `retry_after=next_sync_subscriptions_run`；用户仍计入当前轮 failed，不得伪装成成功。完成但存在部分上游 source error 的 snapshot 继续使用 legacy `social_source_degraded` warning/recoverable 事件；fatal GitHub/upstream 错误继续使用 `social_sync_failed` error/non-recoverable。
-- Social 真实上游 `source_errors` 必须使当前用户或同步结果保持 failed/non-success，并在 `sync.subscriptions`、`sync.access_refresh` 与 `sync.all` 的兼容结果中保留错误详情；即使后续 SQLite 写入同时失败，也必须保留上游错误分类与详情，不得仅因为部分数据已写入就发出 `user_succeeded` 或返回业务成功；已完成但部分降级的 `sync.all` 结果使用 `social_source_degraded` 的 warning/recoverable 元数据，fatal upstream 异常仍使用 `social_sync_failed` 的 error/non-recoverable 元数据；access-refresh 仍需继续执行 Notifications 阶段。
+- Social 真实上游 `source_errors` 必须使当前用户或同步结果保持 failed/non-success，并在 `sync.subscriptions`、`sync.access_refresh` 与 `sync.all` 的兼容结果中保留错误详情；即使后续 SQLite 写入同时失败，也必须保留上游错误分类与详情，不得仅因为部分数据已写入就发出 `user_succeeded` 或返回业务成功；可重试的已完成部分降级结果使用 `social_source_degraded` 的 warning/recoverable 元数据，非重试上游错误（包括 invalid credentials、forbidden access、inaccessible repo）使用 `social_sync_failed` 的 error/non-recoverable 元数据；access-refresh 仍需继续执行 Notifications 阶段。
 - Social 持久化在部分 snapshot 已完成后失败时，兼容结果必须保留已完成的 `repo_stars`、`followers`、`events`（包括此前已提交 64 行 snapshot chunk 或 feed event batch 的 event 计数）与 failed/partial repo 诊断；`sync.subscriptions` 摘要合并这些计数但仍增加 `failed_users`，`sync.all` 仍以 failed task 终态表达 Social 业务失败，不得将该部分结果伪装成成功。
 - Social 失败事件先写入 run log；若 `sync_subscription_events` 的追加只因 SQLite 可恢复背压耗尽而失败，run log 作为 durable fallback，不能中止剩余用户或后续阶段；非 SQLite 持久化错误仍需向上传播。
 - 已领取的订阅任务由活动 worker 发起取消、webhook 重试、SQLite 背压或其他可恢复延迟回写时，必须保留原 runtime owner 的 CAS 条件；旧 worker 失去 lease 后不得清除新 owner 或伪造 `task.rescheduled` 事件。
@@ -344,9 +344,13 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When Notifications 阶段已经完成
   Then task result 保留 Notifications 结果但任务终态为 `failed`，`task.completed` 保留 `error_kind`、`severity`、`recoverable`、`retryable` 与 `retry_after`，不得把含 `social_error` 的本轮结果标记为成功。
 
-- Given `sync.all` 的 Social 阶段已完成抓取但返回非空 `source_errors`
+- Given `sync.all` 的 Social 阶段已完成抓取但返回可重试/部分降级的非空 `source_errors`
   When Notifications 阶段已经完成并进入任务收尾
   Then task 仍为 `failed` 且保留 `social_error`，但 `task.completed` 使用 `error_kind=social_source_degraded`、`severity=warning`、`recoverable=true`、`retryable=true` 与 `retry_after=next_sync_subscriptions_run`；真正的上游异常仍使用 `social_sync_failed` 的 error/non-recoverable 分类。
+
+- Given `sync.all` 的 Social 阶段返回非重试的 credentials、forbidden 或 inaccessible-repo 上游错误
+  When Notifications 阶段已经完成并进入任务收尾
+  Then task 仍为 `failed` 且保留 `social_error`，`task.completed` 使用 `error_kind=social_sync_failed`、`severity=error`、`recoverable=false`、`retryable=false` 与空的 `retry_after`。
 
 - Given `sync.all` 的 Social 阶段已完成部分 snapshot 后遇到持久化失败
   When 任务进入 Social 业务失败收尾

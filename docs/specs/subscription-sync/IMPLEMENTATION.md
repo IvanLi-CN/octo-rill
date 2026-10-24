@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` preserves terminal Social upstream classifications: retryable completed source errors remain `social_source_degraded` warning/recoverable, while non-retryable credentials/forbidden/inaccessible-repo errors become `social_sync_failed` error/non-recoverable; `LeaseHeartbeat` now aborts its active task on unexpected handle drop, with focused regressions.
 - PR #340 executable candidate `d1f4ae30d649c8b34831df808559b6ca3373f968` classifies completed `sync.all` Social source degradation as `social_source_degraded` warning/recoverable metadata while retaining failed task status and partial results; fatal upstream exceptions remain `social_sync_failed` error/non-recoverable, with completion-payload regression coverage.
 - PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` makes webhook operation lease cleanup atomic with owned task finalize/reschedule, preventing a release write failure under SQLite pressure from leaving a terminal or queued task lease until expiry; both transitions have focused regressions.
 - PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` preserves the legacy `social_source_degraded` warning/recoverable event for completed-but-partially-degraded upstream snapshots, while fatal upstream failures remain `social_sync_failed` error/non-recoverable; both paths have explicit regressions.
