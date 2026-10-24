@@ -225,6 +225,12 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - owned repo stargazers 默认 `per_page=50`、每 repo 最多 1 页；
   - 达到页预算的 partial snapshot 不能删除本地未出现在浅窗口里的旧成员；全量成员修正交给低频 reconciliation。
 - social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
+- Social 持久化遇到 SQLite busy、writer deadline 或 background admission 耗尽时，`social_sync_failed` 事件类型保持不变，但必须使用 `severity=warning`、`recoverable=true`，payload 增加 `error_kind=sqlite_write_backpressure`、`retryable=true` 与 `retry_after=next_sync_subscriptions_run`；用户仍计入当前轮 failed，不得伪装成成功。完成但存在部分上游 source error 的 snapshot 继续使用 legacy `social_source_degraded` warning/recoverable 事件；fatal GitHub/upstream 错误继续使用 `social_sync_failed` error/non-recoverable。
+- Social 真实上游 `source_errors` 必须使当前用户或同步结果保持 failed/non-success，并在 `sync.subscriptions`、`sync.access_refresh` 与 `sync.all` 的兼容结果中保留错误详情；即使后续 SQLite 写入同时失败，也必须保留上游错误分类与详情，不得仅因为部分数据已写入就发出 `user_succeeded` 或返回业务成功；可重试的已完成部分降级结果使用 `social_source_degraded` 的 warning/recoverable 元数据，非重试上游错误（包括 invalid credentials、forbidden access、inaccessible repo）使用 `social_sync_failed` 的 error/non-recoverable 元数据；access-refresh 仍需继续执行 Notifications 阶段。
+- Social 持久化在部分 snapshot 已完成后失败时，兼容结果必须保留已完成的 `repo_stars`、`followers`、`events`（包括此前已提交 64 行 snapshot chunk 或 feed event batch 的 event 计数）与 failed/partial repo 诊断；`sync.subscriptions` 摘要合并这些计数但仍增加 `failed_users`，`sync.all` 仍以 failed task 终态表达 Social 业务失败，不得将该部分结果伪装成成功。
+- Social 失败事件先写入 run log；若 `sync_subscription_events` 的追加只因 SQLite 可恢复背压耗尽而失败，run log 作为 durable fallback，不能中止剩余用户或后续阶段；非 SQLite 持久化错误仍需向上传播。
+- 已领取的订阅任务由活动 worker 发起取消、webhook 重试、SQLite 背压或其他可恢复延迟回写时，必须保留原 runtime owner 的 CAS 条件；旧 worker 失去 lease 后不得清除新 owner 或伪造 `task.rescheduled` 事件。
+- webhook operation lease 的 release 写入若因 SQLite writer 背压失败，任务随后进入 terminal finalize 或 owner-CAS reschedule 时，必须在同一 foreground 短事务内清理该 task 的 operation lease，不能让已完成或 queued 任务持有租约直到过期。
 - social feed 中的 GitHub `ReleaseEvent` 写为 `release_update`，不得复用 `announcement`；Discussions Announcements 继续使用 `announcement`。
 - `release_update` 命中的 repo 会以 interactive 优先级挂入共享 repo release queue，用于加速发现，但不得替代定时同步中的全量 repo demand。
 
@@ -318,6 +324,52 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When `sync.subscriptions` 结束
   Then 整轮任务仍可完成，但 Admin Jobs 详情页会展示 partial outcome，并能从 `recent_events` 看到对应失败线索。
 
+- Given Social 持久化在本轮耗尽 SQLite background admission、busy 或 writer deadline
+  When `sync.subscriptions` 写入诊断事件
+  Then `social_sync_failed` 保持当前轮 failed 计数但使用 `warning`/`recoverable=true`，payload 标记 `sqlite_write_backpressure` 与下一轮重试范围，`critical_events` 不增加；真实 GitHub/upstream 错误仍为 `error`/`recoverable=false`。
+
+- Given Social 上游 fetch 返回 `source_errors`，或上游错误与 SQLite 写入压力同时发生
+  When `sync.subscriptions`、`sync.access_refresh` 或 `sync.all` 完成 Social 阶段
+  Then 结果保留上游错误详情，当前用户/同步结果不得计为成功；组合错误不得丢失上游错误分类。
+
+- Given Social 已完成部分 source snapshot 后又遇到 SQLite 持久化背压
+  When 结果携带 retryable source errors
+  Then source degradation 仍使用 `social_source_degraded` warning/recoverable 分类；若 source snapshot 标记为 fatal，则使用 `social_sync_failed` error/non-recoverable 分类，不得被 SQLite 背压覆盖。
+
+- Given `sync.access_refresh` 的 Social 阶段返回不可重试的上游 `source_errors`
+  When Social 阶段完成
+  Then `social_error` 保留完整错误详情，Social progress/log payload 使用 `error_kind=social_sync_failed`、`severity=error`、`retryable=false`、`recoverable=false`，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
+
+- Given `sync.access_refresh` 的 Social 阶段返回可重试的已完成部分降级 `source_errors`
+  When Social 阶段完成
+  Then `social_error` 保留完整错误详情，Social progress/log payload 使用 `error_kind=social_source_degraded`、`severity=warning`、`retryable=true`、`recoverable=true` 与 `retry_after=next_sync_subscriptions_run`，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
+
+- Given `sync.access_refresh` 的 Social 持久化耗尽 SQLite 背压预算
+  When Social 阶段完成
+  Then progress/log payload 使用 `error_kind=sqlite_write_backpressure`、`severity=warning`、`retryable=true`、`recoverable=true` 和 `retry_after=next_sync_subscriptions_run`，Notifications 阶段仍执行。
+
+- Given `sync.all` 的 Social 阶段返回上游错误或 SQLite 背压
+  When Notifications 阶段已经完成
+  Then task result 保留 Notifications 结果但任务终态为 `failed`，`task.completed` 保留 `error_kind`、`severity`、`recoverable`、`retryable` 与 `retry_after`，不得把含 `social_error` 的本轮结果标记为成功。
+
+- Given `sync.all` 的 Social 阶段已完成抓取但返回可重试/部分降级的非空 `source_errors`
+  When Notifications 阶段已经完成并进入任务收尾
+  Then task 仍为 `failed` 且保留 `social_error`，但 `task.completed` 使用 `error_kind=social_source_degraded`、`severity=warning`、`recoverable=true`、`retryable=true` 与 `retry_after=next_sync_subscriptions_run`；真正的上游异常仍使用 `social_sync_failed` 的 error/non-recoverable 分类。
+
+- Given `sync.all` 的 Social 阶段返回非重试的 credentials、forbidden 或 inaccessible-repo 上游错误
+  When Notifications 阶段已经完成并进入任务收尾
+  Then task 仍为 `failed` 且保留 `social_error`，`task.completed` 使用 `error_kind=social_sync_failed`、`severity=error`、`recoverable=false`、`retryable=false` 与空的 `retry_after`。
+
+- Given `sync.all` 的 Social 阶段已完成部分 snapshot 后遇到持久化失败
+  When 任务进入 Social 业务失败收尾
+  Then `result_json` 保留该部分 Social 计数与 failed/partial repo 诊断，任务 failed 状态与 `task.completed` 事件原子提交，且 heartbeat 在分支退出前停止。
+
+- The access-refresh dependency seam used by this regression is private test wiring grouped in a dependency struct; production execution continues to call the real Social and Notifications implementations.
+
+- Given Social 失败事件的 `sync_subscription_events` 写入耗尽 SQLite 背压预算
+  When run log 已经写入该失败事件
+  Then 当前 Social 用户仍计入 failed，后续用户和通知阶段继续执行，Admin diagnostics 可从 run log 读取该事件。
+
 - Given 管理员把 Release worker 数量从 5 调整到 16
   When 保存设置
   Then `GET /api/admin/jobs/sync/runtime-config` 返回 `repo_release_worker_concurrency=16`，后续 repo release worker 按 16 个活跃槽位 claim。
@@ -347,6 +399,10 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 source_type=storybook_canvas
 target_program=mock-only
 capture_scope=element
+margin_policy=require_margin
+evidence_surface=component
+surface_selector=[data-visual-evidence-surface="dashboard-header-warmup"]
+target_selector=[data-visual-evidence-target="dashboard-header-warmup"]
 requested_viewport=1440x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
@@ -362,7 +418,7 @@ source_type=ui_demo
 target_program=mock-only
 capture_scope=element
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish AccessSyncEmptyState
 state=auto-sync-empty-state
 evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
@@ -470,6 +526,23 @@ state=subscription-sync-list-skipped-status
 evidence_note=验证订阅同步列表中底层 succeeded 但 `skipped=true` 的任务显示“已跳过”，不再显示“成功”。
 
 ![Subscription sync list skipped status](./assets/subscription-sync-list-skipped-status.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+margin_policy=require_margin
+evidence_surface=component
+surface_selector=[data-visual-evidence-surface="admin-jobs-social-writer-pressure"]
+target_selector=[data-visual-evidence-target="admin-jobs-social-writer-pressure"]
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Task Type Detail/SyncSubscriptionsRecoverableSocialWriterPressure
+state=recoverable-social-writer-pressure
+evidence_note=验证 Social SQLite writer 背压保持 partial/warning 可恢复语义，failed 用户仍被计数且关键事件计数不增加。
+
+![Recoverable Social SQLite writer pressure](./assets/admin-jobs-social-writer-pressure.png)
 
 source_type=storybook_canvas
 target_program=mock-only
@@ -584,6 +657,7 @@ evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法
 ## Related ADRs
 
 - [ADR 0006: Decouple Star Synchronization from Subscription Governance](../../adr/0006-decouple-star-sync-schedules.md)
+- [ADR 0021: SQLite background admission bounded retry](../../adr/0021-sqlite-background-admission-retry.md)
 
 ## Verification
 

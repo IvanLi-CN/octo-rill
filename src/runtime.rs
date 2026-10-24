@@ -52,6 +52,15 @@ impl LeaseHeartbeat {
     }
 }
 
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop_tx.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            join_handle.abort();
+        }
+    }
+}
+
 pub fn spawn_lease_heartbeat<F, Fut>(
     label: &'static str,
     interval: Duration,
@@ -262,4 +271,54 @@ pub async fn upsert_runtime_owner_for_tests(
     .await
     .context("failed to upsert runtime owner for tests")?;
     Ok(())
+}
+
+#[cfg(test)]
+pub async fn touch_runtime_owner_lease_for_tests(state: &AppState) -> Result<()> {
+    touch_runtime_owner_lease(state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    use super::{Duration, spawn_lease_heartbeat};
+
+    struct DropProbe(Arc<Notify>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_lease_heartbeat_aborts_an_active_beat() {
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let heartbeat = {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            spawn_lease_heartbeat("test", Duration::from_millis(1), move || {
+                let started = started.clone();
+                let dropped = dropped.clone();
+                async move {
+                    started.notify_one();
+                    let _probe = DropProbe(dropped);
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("heartbeat beat should start");
+        drop(heartbeat);
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("dropping heartbeat should abort its active beat");
+    }
 }

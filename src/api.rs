@@ -29893,8 +29893,9 @@ mod tests {
         )
         .await
         .expect("enqueue worker test task");
-        sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+        sqlx::query("UPDATE job_tasks SET status = ?, runtime_owner_id = ? WHERE id = ?")
             .bind(jobs::STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
             .bind(&task.task_id)
             .execute(&pool)
             .await
@@ -29933,8 +29934,9 @@ mod tests {
             .expect("lock request counts")
             .get("GET /repositories/102")
             .expect("healthy repo lookup count");
-        sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+        sqlx::query("UPDATE job_tasks SET status = ?, runtime_owner_id = ? WHERE id = ?")
             .bind(jobs::STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
             .bind(&task.task_id)
             .execute(&pool)
             .await
@@ -30072,8 +30074,9 @@ mod tests {
             "retry_repo_ids": [],
         });
         for attempt in 0..=3 {
-            sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+            sqlx::query("UPDATE job_tasks SET status = ?, runtime_owner_id = ? WHERE id = ?")
                 .bind(jobs::STATUS_RUNNING)
+                .bind(state.runtime_owner_id.as_str())
                 .bind(&task.task_id)
                 .execute(&pool)
                 .await

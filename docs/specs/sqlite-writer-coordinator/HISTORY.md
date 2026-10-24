@@ -4,6 +4,38 @@
 
 ## Decision Trace
 
+- 2026-10-25：PR #340 executable candidate `6efe5732` 修复 partial Social snapshot 后发生 SQLite 持久化背压时的 source 严重性丢失，并让 401/404/451 在限流头存在时仍保持不可重试；新增 retryable source+SQLite、fatal source+SQLite 与终端 HTTP 元数据回归。
+- 2026-10-25：PR #340 executable candidate `97843ed6` 修复 access-refresh Social 进度/日志只识别 SQLite 背压、误将可重试 HTTP 500/网络降级标记为不可恢复的问题；共享分类器现在同时覆盖 SQLite 背压、可重试 source degradation 与 fatal upstream，并新增真实 access-refresh 依赖路径回归。
+- 2026-10-24：PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` 将 Social source-error 的 retryability 传入聚合结果：credentials、forbidden、inaccessible-repo 等非重试上游错误保持 `social_sync_failed` error/non-recoverable；同时为丢弃的 `LeaseHeartbeat` 增加 abort 兜底和生命周期回归。
+- 2026-10-24：PR #340 executable candidate `d1f4ae30d649c8b34831df808559b6ca3373f968` 修复 completed `sync.all` Social source error 的收尾分类：任务仍保持 failed 并保留 partial 结果，但 `task.completed` 使用 `social_source_degraded` warning/recoverable 重试元数据；fatal upstream 异常继续使用 `social_sync_failed` error/non-recoverable。
+- 2026-10-24：PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` 将 webhook operation lease 清理并入 owned task finalize/reschedule 的 foreground 短事务；release 写入因 writer 背压失败后，终态或 queued 任务不再残留可阻塞同一用户的租约，新增两条生命周期回归。
+- 2026-10-24：PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` 恢复已完成但存在部分上游 source error 时的 `social_source_degraded` warning/recoverable 兼容事件，并用回归测试区分其与 fatal `social_sync_failed` error/non-recoverable 路径。
+- 2026-10-24：PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` 新增 webhook operation lease 背压的生产路径回归：retry count 2 通过 owner-CAS 回队并写入 count 3，count 3 则返回 typed `operation_lease_busy`，保持 running task 不被伪装为成功或回队。
+- 2026-10-24：PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` 在 finalization 返回错误前停止 task heartbeat；webhook operation lease 背压沿既有 3 档 retry/backoff 递进并在预算耗尽后失败收尾；access-refresh Social 进度先落 run log 再写 event table，补齐三条生命周期/诊断回归。
+- 2026-10-24：PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` 为可恢复 Social run-log fallback 增加 `critical_events == 0` 回归断言，明确事件表背压不会把 warning 误计为 critical event。
+- 2026-10-24：PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` 为 webhook 用户操作 lease admission 增加 30 秒有界等待预算；预算耗尽后沿既有 owner-CAS reschedule/backoff 回队，避免任务 lease 被无限等待占用。
+- 2026-10-24：PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` 将 Social source-error 稳定去重扩展到 typed persistence failure 提取路径，并新增失败事件回归，避免跨阶段诊断重复出现。
+- 2026-10-24：PR #340 executable candidate `6431ee1fff24f3eef977cd0cb7a1f24f41259954` 刷新 webhook API 测试夹具以模拟已领取的 runtime owner；此前 Backend Test 的两条失败已复现并修复，相关回归本地通过，生产行为与上一条 owner-CAS 候选一致。
+- 2026-10-24：PR #340 executable candidate `6e50c9eb62918aa9acb61ecc173889ee66aaf5fb` 将 owner-CAS 约束扩展到 active task 的取消、webhook retry 与 SQLite 背压 requeue/deferral，并为跨阶段 Social source errors 增加稳定去重回归；scheduler/session pressure 证据仍绑定下方记录的未变代码路径。
+- 2026-10-24：订阅 Social worker 将失败但已有 partial snapshot 的 outcome 与取消区分；摘要继续增加 `failed_users`，同时合并已持久化的 repo、follower 与 event 计数，避免管理员看到的总量低于 SQLite 已提交事实。
+- 2026-10-24：legacy `sync.all` 的 Social failed `task.completed` payload 补齐 `severity`、`retryable` 与 `retry_after`，让可恢复 SQLite 背压和真实上游失败在兼容收尾路径中保持完整分类；新增两类最终事件回归。
+- 2026-10-24：PR #340 executable candidate `4a4a39d20bd74a1d56d6417da44274afc8701db9` 继承 implementation-evidence commit `f0e7f3467975b0db225443b0db7c54da7b94c3f9` 的未变 scheduler/session 代码路径；Agent VM 直接通过一次 file-backed WAL scheduler/session pressure acceptance（`1 passed, 0 failed`，测试本体 15.57 s），同环境即时重复出现 foreground session `503`（17.16 s）。该可执行候选的 GitHub Backend Tests 与四次本地 exact binary 并行运行通过，Tier 3 test-platform review 接受该单次重复为 VM 调度方差，限制记录保留；后续 PR head 仅更新文档。
+- 2026-10-24：SQLite 背压任务延迟现在使用原 runtime owner 的 CAS 条件；旧 worker 在 lease recovery 后不得把新 owner 的 running task 重排回 queued，新增回归覆盖状态、owner 与审计事件均不被覆盖。
+- 2026-10-24：feed activity event 分批写入现在在后续 batch 遇到 writer pressure 时保留此前已提交的 event count，并由回归测试锁定 10+10 batch 的 partial commit 语义，避免 Social 摘要低报已持久化事件。
+- 2026-10-24：Social 持久化在部分 snapshot 已完成后遇到 writer pressure 时，通过 typed error context 保留计数与 failed/partial repo；`sync.all` 将 failed task 行与 `task.completed` 事件合并到同一 foreground 事务，并在收尾失败前停止 heartbeat。
+- 2026-10-23：background writer admission denial 现在在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，同时保留单 background waiter 与 foreground 优先；Social SQLite 背压记录为可恢复 warning，不把未完成用户伪装成成功；job task finalize 明确走 foreground lane，避免终态提交被 heartbeat 背景等待拖成租约恢复。
+- 2026-10-23：Social 失败事件先落 run log；SQLite 可恢复背压耗尽时事件表追加降级为 durable fallback，且真实上游 source errors 在订阅、访问刷新与 sync-all 路径保持不可恢复语义。
+- 2026-10-23：混合 Social 上游错误与 SQLite 背压现在通过 typed `anyhow` context 保留上游详情，避免把真实上游失败误归类为可恢复 SQLite 背压。
+- 2026-10-23：补充 access-refresh Social source-error 与 Notifications 继续执行的回归，依赖通过私有 dependency struct 聚合，覆盖共享 writer 背压修复的另一条兼容结果路径。
+- 2026-10-24：access-refresh 的 Social progress/log 现在保留上游错误与 SQLite 背压的结构化分类；legacy `sync.all` 保留 Notifications 部分结果但以失败终态记录 Social 业务失败，避免 `social_error` 形成假成功。
+- 2026-10-24：owner 已确认 mock-only Storybook 的 Social SQLite writer pressure 证据，可作为当前 PR 的视觉证据提交。
+- 2026-10-24：历史候选 `a7946f62` 的 file-backed WAL scheduler/session pressure acceptance 通过；该结果只属于当时的候选头部，不能替代 PR #340 后续修复提交的 exact-head A6。
+- 2026-10-24：历史候选 `129c817e4d0227d8055869eced0ba97844a1facf` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；当前候选的 A6 仍需重新绑定验证。
+- 2026-10-24：文档候选 `09c6f0b6e7397d1b8ec8c8b0bb4982441323a878` 继承并复核了此前实现验收；测试均为 `1 passed, 0 failed`。
+- 2026-10-24：实现候选 `014b166cb237242caac012f0aafdad391337e64f` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；测试均为 `1 passed, 0 failed`，测试本体分别耗时 2.31 s 与 4.59 s。
+- 2026-10-23：文件型 WAL scheduler/session 压力回归的 empty-queue worker join 改用 30 秒测试预算，以覆盖 Agent VM 的冷/热调度抖动；生产 admission 与 writer deadline 不变。
+- 2026-10-23：文件型 WAL scheduler/session 压力回归先在外部锁释放后回收 empty-queue worker，避免测试夹具在生产 foreground deadline 内人为保持 SQLite 锁；生产 admission、writer deadline 与后台并发不变。
+- 2026-10-23：确认 access-refresh 的依赖注入只存在于私有测试 seam，不改变生产 Social/Notifications 调用。
 - 2026-10-06：PR3.9.3 复现确认每个 global content worker 都在同一 tick 调用 recovery 会放大 `BEGIN IMMEDIATE` 与 cleanup；决定把 content recovery 放到共享 coordinator cadence admission，并为所有 background writer 增加最多一个等待位的 admission budget，foreground waiter 出现后拒绝新的 background waiter，由 worker backoff 消化本轮。HTTP access log 同时扩展到正常成功请求；request ID、method、route 通过 task-local context 进入 SQLite transaction/session/admission telemetry。新增文件型 WAL + 多 reader/单 writer pool 的 scheduler recovery/claim 与 foreground session HTTP 写入回归，验证无 foreground retryable 5xx、队列清理完成、recovery pass 显著低于 worker attempts 且 writer 可继续复用。
 - 2026-10-02：PR3.9.2 将 session load 保留在 reader pool，并把 create/save/delete 改为独立 writer pool 上的 direct SQL；session save 共享单调 foreground deadline，activity-only refresh 在 writer pressure 下保留原业务响应并禁止虚假续期 cookie，critical/mixed 写入继续返回可识别的 retryable 503。代码候选 `12c8ea90` 改为请求任务局部、按 session ID 绑定的 baseline，不再依赖跨请求的有限 snapshot cache/history；existing-row save 无同请求 baseline 或当前行已被删除时返回 retryable session conflict，并按 baseline diff 合并并发字段、单调合并 expiry，避免复活已删除 session。该候选通过 fresh HTTP acceptance、真实语句中断恢复与质量门禁；review、CI 与 merge 仍待完成。
 - 2026-10-02：复核连接归还的失败边界后，确认专用 writer 连接的事务深度仍非零时不能再取得第二个清理预算；`after_release` 立即返回错误让 SQLx hard-close/evict，普通读池/内存 fallback 则在同一个 150 ms budget 内完成 queued rollback，只有清理确认成功的连接才允许复用。

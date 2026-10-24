@@ -639,6 +639,133 @@ export const SyncSubscriptions: Story = {
 	},
 };
 
+export const SyncSubscriptionsRecoverableSocialWriterPressure: Story = {
+	render: (args) => (
+		<div
+			className="bg-background p-6"
+			data-visual-evidence-surface="admin-jobs-social-writer-pressure"
+		>
+			<div
+				className="mx-auto max-w-4xl"
+				data-visual-evidence-target="admin-jobs-social-writer-pressure"
+			>
+				<TaskTypeDetailSection {...args} />
+			</div>
+		</div>
+	),
+	args: {
+		detail: buildDetail(
+			"sync.subscriptions",
+			{ trigger: "schedule", schedule_key: "2026-03-06T15:15" },
+			{
+				skipped: false,
+				skip_reason: null,
+				collect: { total_users: 3 },
+				release: {
+					total_repos: 0,
+					succeeded_repos: 0,
+					failed_repos: 0,
+					candidate_failures: 0,
+				},
+				social: {
+					total_users: 3,
+					succeeded_users: 2,
+					failed_users: 1,
+					repo_stars: 8,
+					followers: 5,
+					events: 12,
+				},
+				notifications: {
+					total_users: 3,
+					succeeded_users: 3,
+					failed_users: 0,
+					notifications: 4,
+				},
+				releases_written: 0,
+				critical_events: 0,
+			},
+			[
+				{ stage: "collect", total_users: 3 },
+				{
+					stage: "social_summary",
+					total_users: 3,
+					succeeded_users: 2,
+					failed_users: 1,
+					repo_stars: 8,
+					followers: 5,
+					events: 12,
+				},
+			],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "partial",
+						label: "部分成功",
+						message:
+							"Social 写入遇到短时 SQLite 背压，当前用户保留失败计数并等待下一轮重试。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-03-06T15:15",
+						skipped: false,
+						skip_reason: null,
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-sync.subscriptions/log",
+						collect: { total_users: 3 },
+						release: {
+							total_repos: 0,
+							succeeded_repos: 0,
+							failed_repos: 0,
+							candidate_failures: 0,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
+						},
+						social: {
+							total_users: 3,
+							succeeded_users: 2,
+							failed_users: 1,
+							repo_stars: 8,
+							followers: 5,
+							events: 12,
+						},
+						notifications: {
+							total_users: 3,
+							succeeded_users: 3,
+							failed_users: 0,
+							notifications: 4,
+						},
+						releases_written: 0,
+						critical_events: 0,
+						recent_events: [
+							{
+								id: "evt-social-writer-pressure",
+								stage: "social",
+								event_type: "social_sync_failed",
+								severity: "warning",
+								recoverable: true,
+								attempt: 1,
+								user_id: TARGET_USER_ID,
+								repo_id: null,
+								repo_full_name: null,
+								message:
+									"failed to refresh social activity: SQLite writer backpressure; retry on next subscription sync",
+								created_at: "2026-03-06T15:15:20Z",
+							},
+						],
+					},
+				},
+			},
+		),
+	},
+	parameters: {
+		viewport: { defaultViewport: "taskDetailDesktop1440" },
+	},
+};
+
 export const SyncSubscriptionsSkipped: Story = {
 	args: {
 		detail: buildDetail(
