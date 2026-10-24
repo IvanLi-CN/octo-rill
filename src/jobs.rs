@@ -3992,8 +3992,25 @@ type TaskStepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>
 fn sync_all_social_failure_kind(failure: &sync::SocialSyncFailure) -> &'static str {
     if failure.sqlite_backpressure {
         "sqlite_write_backpressure"
+    } else if failure.source_degraded {
+        "social_source_degraded"
     } else {
         "social_sync_failed"
+    }
+}
+
+fn sync_all_social_failure_metadata(
+    failure: &sync::SocialSyncFailure,
+) -> (&'static str, bool, &'static str, Option<&'static str>) {
+    if failure.source_degraded {
+        (
+            "warning",
+            true,
+            "social_source_degraded",
+            Some("next_sync_subscriptions_run"),
+        )
+    } else {
+        sync::social_sync_failure_metadata(failure.sqlite_backpressure)
     }
 }
 
@@ -4035,7 +4052,7 @@ where
             if let Some(failure) = sync::social_sync_failure_from_result(&result) {
                 tracing::warn!(
                     user_id,
-                    error_kind = "social_sync_failed",
+                    error_kind = sync_all_social_failure_kind(&failure),
                     error = %failure.message,
                     "task sync_all: social activity sync completed with upstream source errors"
                 );
@@ -4073,8 +4090,7 @@ where
     if let Some(failure) = social_failure {
         result["social_error"] = Value::String(failure.message.clone());
         let error_kind = sync_all_social_failure_kind(&failure);
-        let (severity, recoverable, _, retry_after) =
-            sync::social_sync_failure_metadata(failure.sqlite_backpressure);
+        let (severity, recoverable, _, retry_after) = sync_all_social_failure_metadata(&failure);
         return Err(anyhow::Error::new(SyncAllSocialBusinessFailure {
             result,
             message: failure.message,
@@ -8768,7 +8784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sync_all_task_marks_social_source_errors_without_false_success() {
+    async fn execute_sync_all_task_classifies_completed_social_source_errors_as_recoverable() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_task(
@@ -8813,7 +8829,7 @@ mod tests {
             },
         )
         .await
-        .expect_err("sync_all should preserve a nonrecoverable social source error");
+        .expect_err("sync_all should preserve a recoverable social source degradation");
         let failure = error
             .downcast_ref::<super::SyncAllSocialBusinessFailure>()
             .expect("typed sync_all social source failure");
@@ -8823,11 +8839,11 @@ mod tests {
             failure.result["social_error"],
             json!("followers(conn:github, http_500): GitHub returned 500")
         );
-        assert_eq!(failure.error_kind, "social_sync_failed");
-        assert_eq!(failure.severity, "error");
-        assert!(!failure.recoverable);
-        assert!(!failure.retryable);
-        assert_eq!(failure.retry_after, None);
+        assert_eq!(failure.error_kind, "social_source_degraded");
+        assert_eq!(failure.severity, "warning");
+        assert!(failure.recoverable);
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after, Some("next_sync_subscriptions_run"));
     }
 
     #[tokio::test]
@@ -9011,6 +9027,59 @@ mod tests {
         let event: Value =
             serde_json::from_str(&event_payload).expect("parse recoverable completion event");
         assert_eq!(event["error_kind"], json!("sqlite_write_backpressure"));
+        assert_eq!(event["severity"], json!("warning"));
+        assert_eq!(event["recoverable"], json!(true));
+        assert_eq!(event["retryable"], json!(true));
+        assert_eq!(event["retry_after"], json!("next_sync_subscriptions_run"));
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_source_degradation_completion_payload_preserves_warning_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-source-degraded";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed source-degraded sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "social": {"events": 0},
+                "social_error": "followers(conn:github, http_500): GitHub returned 500",
+            }),
+            message: "followers(conn:github, http_500): GitHub returned 500".to_owned(),
+            error_kind: "social_source_degraded",
+            severity: "warning",
+            recoverable: true,
+            retryable: true,
+            retry_after: Some("next_sync_subscriptions_run"),
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize source-degraded sync_all failure")
+        );
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load source-degraded sync_all failure completion event");
+        let event: Value =
+            serde_json::from_str(&event_payload).expect("parse source-degraded completion event");
+        assert_eq!(event["error_kind"], json!("social_source_degraded"));
         assert_eq!(event["severity"], json!("warning"));
         assert_eq!(event["recoverable"], json!(true));
         assert_eq!(event["retryable"], json!(true));
