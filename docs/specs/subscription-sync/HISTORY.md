@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to 30 seconds and returns contention through the owner-CAS reschedule/backoff path.
 - 2026-10-24: PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` extends stable Social source-error de-duplication into typed persistence failures and adds a regression for failure payload diagnostics.
 - 2026-10-24: PR #340 executable candidate `6431ee1fff24f3eef977cd0cb7a1f24f41259954` refreshes webhook API test fixtures to model claimed runtime owners; the prior Backend Test failure was reproduced, fixed, and the two affected regressions pass locally. Production behavior is unchanged from the owner-CAS candidate above.
 - 2026-10-24: PR #340 executable candidate `6e50c9eb62918aa9acb61ecc173889ee66aaf5fb` extends owner-CAS protection from SQLite-backpressure deferral to active cancellation and webhook retry requeues; Social snapshot source errors are de-duplicated across fetch phases, with stale-owner and cross-phase diagnostic regressions passing. The scheduler/session pressure evidence remains bound to the unchanged path recorded below.

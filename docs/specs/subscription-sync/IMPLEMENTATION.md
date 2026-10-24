@@ -10,6 +10,7 @@
 ## 当前状态
 
 - 2026-10-23 candidate: Social persistence shares bounded background admission retry with heartbeat/finalize paths; exhausted SQLite pressure remains a partial failed user with `warning`/`recoverable=true` and `error_kind=sqlite_write_backpressure`, while upstream failures remain critical.
+- PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to a 30-second wait budget and reschedules through owner-CAS/backoff when another operation keeps the lease, preventing an indefinitely held task lease.
 - Social `source_errors` now remain non-recoverable across subscription, access-refresh, and sync-all result paths; failure events include source details, and retryable SQLite event-table pressure falls back to the already-written run log without aborting the remaining phases.
 - Mixed Social upstream-plus-SQLite failures preserve typed `source_errors` through the `anyhow` context chain, so a later SQLite write denial cannot downgrade a genuine upstream failure to recoverable backpressure.
 - Access-refresh Social failure handling is dependency-injected in tests; the regression verifies `social_error` preservation and that Notifications still completes after Social source errors.

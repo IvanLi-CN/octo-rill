@@ -5,6 +5,7 @@
 ## Current Status
 
 - 2026-10-23 candidate: background admission denial now uses the existing coordinator deadline and 25/50/100ms capped backoff without increasing the one-waiter queue; Social SQLite exhaustion is classified as recoverable warning metadata while preserving failed-user accounting.
+- PR #340 executable candidate `08429680b8f8570a94f9774911ae41ae5042db7e` bounds webhook user-operation lease admission to a 30-second wait budget, then returns through the existing owner-CAS reschedule/backoff path instead of holding a task lease indefinitely.
 - PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` extends stable Social source-error de-duplication through typed persistence failures, so Admin Jobs and compatibility failure payloads do not repeat diagnostics collected by multiple fetch phases.
 - Subscription key events write the run log before the event table; retryable SQLite append pressure is retained in that durable log fallback and does not abort a Social worker or the remaining subscription phases.
 - Social write failures retain typed upstream/source diagnostics when SQLite backpressure is layered on top, keeping genuine upstream failures non-recoverable.
