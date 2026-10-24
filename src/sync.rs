@@ -1662,7 +1662,7 @@ fn subscription_event_counts_as_critical(severity: &str) -> bool {
     severity == "error"
 }
 
-fn social_sync_failure_metadata(
+pub(crate) fn social_sync_failure_metadata(
     sqlite_backpressure: bool,
 ) -> (&'static str, bool, &'static str, Option<&'static str>) {
     if sqlite_backpressure {

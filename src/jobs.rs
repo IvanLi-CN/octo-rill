@@ -3603,7 +3603,10 @@ struct SyncAllSocialBusinessFailure {
     result: Value,
     message: String,
     error_kind: &'static str,
+    severity: &'static str,
     recoverable: bool,
+    retryable: bool,
+    retry_after: Option<&'static str>,
 }
 
 impl std::fmt::Display for SyncAllSocialBusinessFailure {
@@ -3627,7 +3630,10 @@ async fn finalize_sync_all_social_failure(
         "status": STATUS_FAILED,
         "error": failure.message,
         "error_kind": failure.error_kind,
+        "severity": failure.severity,
         "recoverable": failure.recoverable,
+        "retryable": failure.retryable,
+        "retry_after": failure.retry_after,
     }))
     .context("serialize sync_all failure completion event")?;
     let (sqlite_write, mut tx) = state
@@ -4005,12 +4011,16 @@ where
     if let Some(failure) = social_failure {
         result["social_error"] = Value::String(failure.message.clone());
         let error_kind = sync_all_social_failure_kind(&failure);
-        let recoverable = failure.sqlite_backpressure;
+        let (severity, recoverable, _, retry_after) =
+            sync::social_sync_failure_metadata(failure.sqlite_backpressure);
         return Err(anyhow::Error::new(SyncAllSocialBusinessFailure {
             result,
             message: failure.message,
             error_kind,
+            severity,
             recoverable,
+            retryable: recoverable,
+            retry_after,
         }));
     }
     Ok(result)
@@ -8568,7 +8578,10 @@ mod tests {
         assert_eq!(failure.result["notifications"]["notifications"], json!(7));
         assert_eq!(failure.result["social_error"], json!("social unavailable"));
         assert_eq!(failure.error_kind, "social_sync_failed");
+        assert_eq!(failure.severity, "error");
         assert!(!failure.recoverable);
+        assert!(!failure.retryable);
+        assert_eq!(failure.retry_after, None);
     }
 
     #[tokio::test]
@@ -8628,7 +8641,10 @@ mod tests {
             json!("followers(conn:github, http_500): GitHub returned 500")
         );
         assert_eq!(failure.error_kind, "social_sync_failed");
+        assert_eq!(failure.severity, "error");
         assert!(!failure.recoverable);
+        assert!(!failure.retryable);
+        assert_eq!(failure.retry_after, None);
     }
 
     #[tokio::test]
@@ -8686,7 +8702,10 @@ mod tests {
 
         assert_eq!(failure.result["notifications"]["notifications"], json!(7));
         assert_eq!(failure.error_kind, "sqlite_write_backpressure");
+        assert_eq!(failure.severity, "warning");
         assert!(failure.recoverable);
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after, Some("next_sync_subscriptions_run"));
     }
 
     #[tokio::test]
@@ -8712,7 +8731,10 @@ mod tests {
             }),
             message: "social unavailable".to_owned(),
             error_kind: "social_sync_failed",
+            severity: "error",
             recoverable: false,
+            retryable: false,
+            retry_after: None,
         };
 
         assert!(
@@ -8752,7 +8774,64 @@ mod tests {
         let event: Value = serde_json::from_str(&event_payload).expect("parse completion event");
         assert_eq!(event["status"], json!(STATUS_FAILED));
         assert_eq!(event["error_kind"], json!("social_sync_failed"));
+        assert_eq!(event["severity"], json!("error"));
         assert_eq!(event["recoverable"], json!(false));
+        assert_eq!(event["retryable"], json!(false));
+        assert_eq!(event["retry_after"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn sync_all_social_recoverable_failure_completion_payload_preserves_retry_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "task-sync-all-social-recoverable-failure";
+        seed_task(&pool, task_id, TASK_SYNC_ALL, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed recoverable sync_all task owner");
+
+        let failure = super::SyncAllSocialBusinessFailure {
+            result: json!({
+                "social": {"events": 3},
+                "notifications": {"notifications": 7},
+                "social_error": "sqlite writer admission deadline exhausted",
+            }),
+            message: "sqlite writer admission deadline exhausted".to_owned(),
+            error_kind: "sqlite_write_backpressure",
+            severity: "warning",
+            recoverable: true,
+            retryable: true,
+            retry_after: Some("next_sync_subscriptions_run"),
+        };
+
+        assert!(
+            finalize_sync_all_social_failure(
+                state.as_ref(),
+                task_id,
+                &failure,
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize recoverable sync_all social failure")
+        );
+
+        let event_payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM job_task_events WHERE task_id = ? AND event_type = 'task.completed' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recoverable sync_all failure completion event");
+        let event: Value =
+            serde_json::from_str(&event_payload).expect("parse recoverable completion event");
+        assert_eq!(event["error_kind"], json!("sqlite_write_backpressure"));
+        assert_eq!(event["severity"], json!("warning"));
+        assert_eq!(event["recoverable"], json!(true));
+        assert_eq!(event["retryable"], json!(true));
+        assert_eq!(event["retry_after"], json!("next_sync_subscriptions_run"));
     }
 
     async fn setup_pool() -> SqlitePool {

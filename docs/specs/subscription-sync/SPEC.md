@@ -340,7 +340,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 
 - Given `sync.all` 的 Social 阶段返回上游错误或 SQLite 背压
   When Notifications 阶段已经完成
-  Then task result 保留 Notifications 结果但任务终态为 `failed`，`task.completed` 保留 `error_kind` 与 `recoverable`，不得把含 `social_error` 的本轮结果标记为成功。
+  Then task result 保留 Notifications 结果但任务终态为 `failed`，`task.completed` 保留 `error_kind`、`severity`、`recoverable`、`retryable` 与 `retry_after`，不得把含 `social_error` 的本轮结果标记为成功。
 
 - Given `sync.all` 的 Social 阶段已完成部分 snapshot 后遇到持久化失败
   When 任务进入 Social 业务失败收尾

@@ -8,6 +8,7 @@
 ## 历史摘要
 
 - 2026-10-24: Failed-but-partial Social users now contribute their committed repo, follower, and event counters to the subscription summary while remaining failed users; cancellation remains a separate outcome.
+- 2026-10-24: Legacy `sync.all` Social failure completion events now carry `severity`, `retryable`, and `retry_after` alongside `error_kind` and `recoverable`; recoverable SQLite pressure and non-recoverable upstream regression coverage now exercise both payload classes.
 - 2026-10-24: PR #340 final candidate `85c1fdd2` retains the unchanged code path from implementation-evidence commit `f0e7f3467975b0db225443b0db7c54da7b94c3f9` and passed the file-backed WAL scheduler/session pressure acceptance once in Agent VM (`1 passed, 0 failed`, 15.57 s); an immediate repeat returned foreground session `503` after 17.16 s, while exact-head GitHub Backend Tests and four parallel runs of the exact local binary passed. The Tier 3 test-platform review accepted the single repeat as VM scheduling variance; the stability observation remains recorded.
 - 2026-10-24: Feed activity event batches now preserve already-committed event counts when a later batch encounters writer pressure; a 10+10 partial-commit regression locks the count propagation into Social failure summaries.
 - 2026-10-24: Social persistence failures now retain partial snapshot counters and failed/partial repo diagnostics; legacy `sync.all` commits the failed task row and `task.completed` event atomically and stops heartbeat before surfacing finalization errors.
