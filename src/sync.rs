@@ -2813,12 +2813,13 @@ pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyn
     let mut source_errors = social_source_errors_from_error(error);
     source_errors.extend(partial_result.source_errors);
     let source_errors = deduplicate_social_source_errors(source_errors.iter());
+    let source_degraded = !partial_result.fatal_source_errors && !source_errors.is_empty();
     SocialSyncFailure {
         message: error.to_string(),
         sqlite_backpressure: source_errors.is_empty()
             && is_sqlite_retryable_write_error(error.as_ref()),
         source_errors,
-        source_degraded: false,
+        source_degraded,
     }
 }
 
@@ -2854,6 +2855,8 @@ async fn sync_social_activity_best_effort_with_failure(
                 context,
                 error_kind = if failure.sqlite_backpressure {
                     "sqlite_write_backpressure"
+                } else if failure.source_degraded {
+                    "social_source_degraded"
                 } else {
                     "social_sync_failed"
                 },
@@ -12243,21 +12246,10 @@ fn classify_github_http_error(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     let body_lower = body.to_ascii_lowercase();
-    if status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-        || remaining == "0"
+    let rate_limit_signal = remaining == "0"
         || headers.contains_key("retry-after")
         || body_lower.contains("secondary rate limit")
-        || body_lower.contains("abuse detection")
-    {
-        return SyncRequestError::retryable(
-            "rate_limited",
-            format!("{operation}: github returned {status}"),
-            Some(status),
-        )
-        .with_phase("http_status");
-    }
+        || body_lower.contains("abuse detection");
 
     if status == StatusCode::UNAUTHORIZED {
         return SyncRequestError::non_retryable(
@@ -12268,7 +12260,16 @@ fn classify_github_http_error(
         .with_phase("http_status");
     }
 
-    if status == StatusCode::FORBIDDEN {
+    if status == StatusCode::NOT_FOUND || status.as_u16() == 451 {
+        return SyncRequestError::non_retryable(
+            "repo_inaccessible",
+            format!("{operation}: github returned {status}"),
+            Some(status),
+        )
+        .with_phase("http_status");
+    }
+
+    if status == StatusCode::FORBIDDEN && !rate_limit_signal {
         let reason_code =
             if body_lower.contains("scope") || body_lower.contains("resource not accessible") {
                 "scope_insufficient"
@@ -12283,9 +12284,13 @@ fn classify_github_http_error(
         .with_phase("http_status");
     }
 
-    if status == StatusCode::NOT_FOUND || status.as_u16() == 451 {
-        return SyncRequestError::non_retryable(
-            "repo_inaccessible",
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+        || rate_limit_signal
+    {
+        return SyncRequestError::retryable(
+            "rate_limited",
             format!("{operation}: github returned {status}"),
             Some(status),
         )
@@ -18093,6 +18098,18 @@ mod tests {
             assert_eq!(failure.source_errors, result.source_errors);
         }
 
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::NOT_FOUND] {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_static("1"));
+            headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+            let request_error =
+                classify_github_http_error("sync social source", status, &headers, "");
+            assert!(
+                !request_error.retryable,
+                "terminal status {status} must not become retryable from rate-limit metadata"
+            );
+        }
+
         let result = SyncSocialActivityResult {
             source_errors: vec!["sync social source: github returned 500".to_owned()],
             fatal_source_errors: false,
@@ -18373,7 +18390,30 @@ mod tests {
 
         let failure = super::social_sync_failure_from_error(&error);
         assert!(!failure.sqlite_backpressure);
+        assert!(failure.source_degraded);
         assert_eq!(failure.source_errors, partial.source_errors);
+
+        let fatal_partial = SyncSocialActivityResult {
+            source_errors: partial.source_errors.clone(),
+            fatal_source_errors: true,
+            ..Default::default()
+        };
+        let fatal_source_errors = fatal_partial.source_errors.clone();
+        let fatal_error = super::with_social_activity_failure(
+            anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
+                lane: "social_activity_snapshot",
+                priority: "background",
+                phase: "writer_queue",
+                deadline_ms: 2_500,
+            }),
+            "apply social activity snapshot",
+            fatal_source_errors.as_slice(),
+            fatal_partial,
+        );
+        let fatal_failure = super::social_sync_failure_from_error(&fatal_error);
+        assert!(!fatal_failure.sqlite_backpressure);
+        assert!(!fatal_failure.source_degraded);
+        assert_eq!(fatal_failure.source_errors, partial.source_errors);
     }
 
     #[test]
