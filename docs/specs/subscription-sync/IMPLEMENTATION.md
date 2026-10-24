@@ -20,6 +20,7 @@
 - Subscription Social summaries now merge counters from failed-but-partial user outcomes while keeping those users in `failed_users`; cancellation remains distinct from a completed or failed result.
 - The dependency seam is private test wiring grouped in a dependency struct; the production wrapper retains the real Social/Notifications calls and no lint suppression is required.
 - The file-backed WAL scheduler/session acceptance keeps the external lock held only through the foreground contention probe; it releases that lock before joining empty-queue background workers so host scheduling jitter cannot consume the production foreground deadline.
+- PR #340 current head `296e9f4c21892a2e862599f842950ff68afba369` passed the file-backed WAL scheduler/session acceptance twice in Agent VM (Rust 1.91, 8 vCPU, 12 GiB); both runs reported `1 passed, 0 failed`, with test bodies taking 28.47 s and 29.93 s. This exact-head evidence covers foreground session writes, background claim coalescing, busy telemetry, and writer cleanup.
 - The historical implementation candidate `014b166cb237242caac012f0aafdad391337e64f` passed the file-backed WAL scheduler/session acceptance twice in Agent VM with Rust 1.91, 8 vCPU, and 12 GiB; the test reported `1 passed, 0 failed` on both runs, with test bodies taking 2.31s and 4.59s. This inherited evidence does not claim that the current PR exact head has passed A6; current-head facts remain in delivery evidence.
 - Lifecycle: active
 - Implementation: 已交付

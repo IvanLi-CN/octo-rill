@@ -8,6 +8,7 @@
 ## 历史摘要
 
 - 2026-10-24: Failed-but-partial Social users now contribute their committed repo, follower, and event counters to the subscription summary while remaining failed users; cancellation remains a separate outcome.
+- 2026-10-24: PR #340 current head `296e9f4c21892a2e862599f842950ff68afba369` passed the file-backed WAL scheduler/session pressure acceptance twice in Agent VM; both runs reported `1 passed, 0 failed`, with test bodies taking 28.47 s and 29.93 s, completing the exact-head A6 evidence.
 - 2026-10-24: Social persistence failures now retain partial snapshot counters and failed/partial repo diagnostics; legacy `sync.all` commits the failed task row and `task.completed` event atomically and stops heartbeat before surfacing finalization errors.
 - 2026-10-23: Social SQLite writer backpressure now uses shared same-deadline admission retry and records exhausted pressure as a recoverable `social_sync_failed` warning with explicit retry metadata; upstream failures retain error/non-recoverable semantics.
 - 2026-10-23: Social upstream `source_errors` now keep subscription, access-refresh, and sync-all results non-successful with preserved details; retryable failure-event persistence pressure falls back to the durable run log so the remaining sync phases continue.

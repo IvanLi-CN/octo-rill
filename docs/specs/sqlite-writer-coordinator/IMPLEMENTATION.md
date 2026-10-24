@@ -86,6 +86,7 @@
 - `cargo clippy --offline --all-targets --all-features -- -D warnings`
 - `bash scripts/check-rust-source-quality.sh`（PR #340 current-head required check 通过）
 - 当前调度查询/回滚候选的 `jobs::tests::` 67 项全部通过；新增回归锁定 status-first query plan，以及显式 scheduler rollback 后 writer connection 可复用。`cargo check --offline --all-targets --all-features`、`cargo clippy --offline --all-targets --all-features -- -D warnings` 与 source-quality gate 均在候选 head 通过。
+- PR #340 current head `296e9f4c21892a2e862599f842950ff68afba369` 的 file-backed WAL acceptance 已在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`；两次均为 `1 passed, 0 failed`，测试本体分别耗时 28.47 s 与 29.93 s。两次运行均验证 foreground session writes、background claim coalescing、busy telemetry 与 writer cleanup。
 - file-backed WAL acceptance：实现候选 `014b166cb237242caac012f0aafdad391337e64f` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`（均为 1 passed, 0 failed；测试本体分别耗时 2.31 s 与 4.59 s）；foreground session writes、background claim coalescing、busy telemetry 和 writer cleanup 均有断言。这是历史实现候选的继承证据，不代表后续修复提交的 exact head 已通过 A6。
 - 真实 `tower_sessions` statement-interruption probe（existing focused regression：retryable `503` with `Retry-After: 1`, interrupted session unchanged, connection eviction observed, trigger removed, then `/api/me` `200` after recovery）
 - 此前候选覆盖 0097/0098/0099 终态投影失败隔离与延迟恢复、内容资格转换、announcement lane 分批、scheduler active lookup 防坏 JSON、failed-outbox recovery 轮询索引和 outbox lease 竞争；本地门禁、定向 search/content-processing 回归与完整串行套件均以最终 head 的本地日志和 CI 为准。
@@ -97,7 +98,7 @@
 
 - 当前候选尚未合入 `main`，因此没有新的发布版本或线上 rollout 事实；发布版本和 101 线上观察必须绑定合并后的 image/merge SHA。
 - `0092`、`0093`、`0094`、`0095`、`0096`、`0097`、`0098` 和 `0099` 应绑定发布候选的 image/merge SHA 观察；默认 INFO 不显示 supersession page counters，线上验收需临时启用 `octo_rill::content_processing=debug`、`octo_rill::search_index=debug` 与 `octo_rill::sqlite_write=debug`，并记录 scheduler coalesced/committed/rolled-back、outbox backlog/attempt/lag、terminal projection failures/recovery、announcement fanout cursor、writer wait/deadline、HTTP p95/p99 与 CPU 五分钟中位数。
-- file-backed WAL acceptance 的历史候选证据已记录，但当前 PR exact head 的 A6 仍须单独验证；此前 Agent VM 三次尝试均在 guest readiness 阶段因 `guest_readiness_timeout` 结束，未进入测试。HTTP 经验验收与合并后的 101 线上 30 分钟观察仍是发布后门禁，在后者完成前不能宣称线上 rollout 已验证。
+- file-backed WAL acceptance 的当前 PR exact head 已连续两次通过；此前 Agent VM 的 readiness 超时尝试仅作为环境诊断记录保留。HTTP 经验验收与合并后的 101 线上 30 分钟观察仍是发布后门禁，在后者完成前不能宣称线上 rollout 已验证。
 
 ## Related Changes
 

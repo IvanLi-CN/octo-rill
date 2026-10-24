@@ -5,6 +5,7 @@
 ## Decision Trace
 
 - 2026-10-24：订阅 Social worker 将失败但已有 partial snapshot 的 outcome 与取消区分；摘要继续增加 `failed_users`，同时合并已持久化的 repo、follower 与 event 计数，避免管理员看到的总量低于 SQLite 已提交事实。
+- 2026-10-24：PR #340 current head `296e9f4c21892a2e862599f842950ff68afba369` 在 Agent VM（Rust 1.91、8 vCPU、12 GiB）连续两次通过 file-backed WAL scheduler/session pressure acceptance；两次均为 `1 passed, 0 failed`，测试本体分别耗时 28.47 s 与 29.93 s，A6 exact-head 证据完成绑定。
 - 2026-10-24：Social 持久化在部分 snapshot 已完成后遇到 writer pressure 时，通过 typed error context 保留计数与 failed/partial repo；`sync.all` 将 failed task 行与 `task.completed` 事件合并到同一 foreground 事务，并在收尾失败前停止 heartbeat。
 - 2026-10-23：background writer admission denial 现在在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，同时保留单 background waiter 与 foreground 优先；Social SQLite 背压记录为可恢复 warning，不把未完成用户伪装成成功；job task finalize 明确走 foreground lane，避免终态提交被 heartbeat 背景等待拖成租约恢复。
 - 2026-10-23：Social 失败事件先落 run log；SQLite 可恢复背压耗尽时事件表追加降级为 durable fallback，且真实上游 source errors 在订阅、访问刷新与 sync-all 路径保持不可恢复语义。
