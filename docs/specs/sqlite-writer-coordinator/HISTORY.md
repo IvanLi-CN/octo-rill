@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-24：PR #340 executable candidate `5ced09070ddc126c8c706fa58b0420476ea5ee91` 将 Social source-error 稳定去重扩展到 typed persistence failure 提取路径，并新增失败事件回归，避免跨阶段诊断重复出现。
 - 2026-10-24：PR #340 executable candidate `6431ee1fff24f3eef977cd0cb7a1f24f41259954` 刷新 webhook API 测试夹具以模拟已领取的 runtime owner；此前 Backend Test 的两条失败已复现并修复，相关回归本地通过，生产行为与上一条 owner-CAS 候选一致。
 - 2026-10-24：PR #340 executable candidate `6e50c9eb62918aa9acb61ecc173889ee66aaf5fb` 将 owner-CAS 约束扩展到 active task 的取消、webhook retry 与 SQLite 背压 requeue/deferral，并为跨阶段 Social source errors 增加稳定去重回归；scheduler/session pressure 证据仍绑定下方记录的未变代码路径。
 - 2026-10-24：订阅 Social worker 将失败但已有 partial snapshot 的 outcome 与取消区分；摘要继续增加 `failed_users`，同时合并已持久化的 repo、follower 与 event 计数，避免管理员看到的总量低于 SQLite 已提交事实。
