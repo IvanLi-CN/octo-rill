@@ -20,6 +20,7 @@ SQLite writer contention is already serialized by an application coordinator wit
 - Preserve any Social counters, including event rows committed by earlier 64-row chunks, and failed/partial repo diagnostics collected before a persistence failure in a typed error context, so compatibility callers do not replace a partial result with an empty or under-counted one.
 - Carry a failed-but-partial Social worker outcome into `sync.subscriptions` summaries: increment `failed_users` and merge its committed counters; reserve the empty outcome for cancellation/incomplete work rather than using it to discard partial data.
 - Finalize a `sync.all` Social business failure by committing the failed task row and its `task.completed` event in one foreground transaction; stop the task heartbeat before returning a finalization error so the lifecycle cannot retain a stale lease.
+- Defer a running job after SQLite backpressure only when the original runtime owner still matches; a late worker must return no-op after lease recovery rather than requeueing a newer owner's task.
 - Keep the `sync.all` compatibility completion payload complete: preserve `error_kind`, `severity`, `recoverable`, `retryable`, and `retry_after` for both SQLite backpressure and genuine upstream failures, including null retry metadata when the failure is non-recoverable.
 
 ## Consequences

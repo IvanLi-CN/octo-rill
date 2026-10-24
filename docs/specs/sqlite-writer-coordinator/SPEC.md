@@ -247,6 +247,10 @@
   When worker 进入下一次 claim loop
   Then 同类 claim 使用 1/2/4/8/16/30 秒基础退避和不提前的抖动等待；成功 DB 尝试后退避复位，故障解除后任务继续领取且 lease/幂等状态保持正确。
 
+- Given 已领取的 job task 因 SQLite writer 背压需要延迟重试
+  When 原 worker 在写入前失去 lease，或任务已被另一个 runtime owner 接管
+  Then 延迟更新必须带原 runtime owner 的 CAS 条件；旧 worker 返回未更新且不得清除新 owner、写入 `task.rescheduled` 或改变任务状态。
+
 - Given 多个 global content worker 在同一 recovery window 内同时 tick
   When worker 执行 recovery/claim loop
   Then recovery transaction 只由共享 cadence admission 启动一次，重复 worker pass 被 coalesce 或按有界 background admission 拒绝，且 worker 通过 backoff 结束本轮而不自旋。
