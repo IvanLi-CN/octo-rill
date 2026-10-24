@@ -1666,12 +1666,20 @@ fn subscription_event_counts_as_critical(severity: &str) -> bool {
 
 pub(crate) fn social_sync_failure_metadata(
     sqlite_backpressure: bool,
+    source_degraded: bool,
 ) -> (&'static str, bool, &'static str, Option<&'static str>) {
     if sqlite_backpressure {
         (
             "warning",
             true,
             "sqlite_write_backpressure",
+            Some("next_sync_subscriptions_run"),
+        )
+    } else if source_degraded {
+        (
+            "warning",
+            true,
+            "social_source_degraded",
             Some("next_sync_subscriptions_run"),
         )
     } else {
@@ -3333,7 +3341,7 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
     });
     if let Some(failure) = social_failure.as_ref() {
         let (severity, recoverable, error_kind, retry_after) =
-            social_sync_failure_metadata(failure.sqlite_backpressure);
+            social_sync_failure_metadata(failure.sqlite_backpressure, failure.source_degraded);
         social_payload["severity"] = Value::String(severity.to_owned());
         social_payload["recoverable"] = Value::Bool(recoverable);
         social_payload["retryable"] = Value::Bool(recoverable);
@@ -3352,7 +3360,9 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
     }
     let social_log_level = social_failure
         .as_ref()
-        .map(|failure| social_sync_failure_metadata(failure.sqlite_backpressure).0)
+        .map(|failure| {
+            social_sync_failure_metadata(failure.sqlite_backpressure, failure.source_degraded).0
+        })
         .unwrap_or("info");
     append_access_refresh_social_progress_event(
         state,
@@ -9429,7 +9439,7 @@ async fn finish_social_sync_for_user(
             }));
         }
         let (severity, recoverable, error_kind, retry_after) =
-            social_sync_failure_metadata(error.sqlite_backpressure);
+            social_sync_failure_metadata(error.sqlite_backpressure, error.source_degraded);
         context
             .key_event(
                 format!("failed to refresh social activity for user #{}", user_id),
@@ -18003,6 +18013,7 @@ mod tests {
         });
         let sqlite_metadata = social_sync_failure_metadata(
             crate::sqlite_write::is_sqlite_retryable_write_error(sqlite_error.as_ref()),
+            false,
         );
         assert_eq!(
             sqlite_metadata,
@@ -18017,6 +18028,7 @@ mod tests {
         let upstream_error = anyhow::anyhow!("GitHub returned an invalid response");
         let upstream_metadata = social_sync_failure_metadata(
             crate::sqlite_write::is_sqlite_retryable_write_error(upstream_error.as_ref()),
+            false,
         );
         assert_eq!(
             upstream_metadata,
@@ -18043,8 +18055,17 @@ mod tests {
             && is_sqlite_retryable_write_error(combined_error.as_ref());
         assert!(!combined_sqlite_backpressure);
         assert_eq!(
-            social_sync_failure_metadata(false),
+            social_sync_failure_metadata(false, false),
             ("error", false, "social_sync_failed", None)
+        );
+        assert_eq!(
+            social_sync_failure_metadata(false, true),
+            (
+                "warning",
+                true,
+                "social_source_degraded",
+                Some("next_sync_subscriptions_run")
+            )
         );
     }
 
@@ -25478,6 +25499,101 @@ mod tests {
         assert_eq!(social_payload.get("retryable"), Some(&json!(false)));
         assert_eq!(social_payload.get("recoverable"), Some(&json!(false)));
         assert_eq!(social_payload.get("retry_after"), Some(&Value::Null));
+        assert_eq!(
+            social_payload.get("source_errors"),
+            Some(&json!([source_error]))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_marks_retryable_social_source_degradation_recoverable() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-social-source-degraded");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-social-source-degraded");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+        let source_error = "followers(conn:github, http_500): GitHub returned 500".to_owned();
+
+        let result = super::sync_access_refresh_with_freshness_and_dependencies(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            "",
+            super::AccessRefreshDependencies {
+                sync_starred: Box::new(|_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
+                    Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
+                }),
+                refresh_visibility: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
+                        Box::pin(async { Ok(true) })
+                    },
+                ),
+                sync_social: {
+                    let source_error = source_error.clone();
+                    Box::new(
+                        move |_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
+                            let source_error = source_error.clone();
+                            Box::pin(async move {
+                                (
+                                    super::SyncSocialActivityResult::default(),
+                                    Some(super::SocialSyncFailure {
+                                        message: source_error.clone(),
+                                        sqlite_backpressure: false,
+                                        source_errors: vec![source_error],
+                                        source_degraded: true,
+                                    }),
+                                )
+                            })
+                        },
+                    )
+                },
+                sync_notifications: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
+                        Box::pin(async {
+                            Ok(super::SyncNotificationsResult {
+                                notifications: 4,
+                                since: None,
+                            })
+                        })
+                    },
+                ),
+                append_task_event: super::default_access_refresh_task_event_dependency(),
+            },
+        )
+        .await
+        .expect("access refresh should complete with degraded social data");
+
+        assert_eq!(result.social_error.as_deref(), Some(source_error.as_str()));
+        assert_eq!(result.notifications.notifications, 4);
+
+        let social_payload: String = sqlx::query_scalar(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'social_summary'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load access refresh degraded social progress event");
+        let social_payload: Value =
+            serde_json::from_str(&social_payload).expect("parse degraded social payload");
+        assert_eq!(social_payload.get("severity"), Some(&json!("warning")));
+        assert_eq!(
+            social_payload.get("error_kind"),
+            Some(&json!("social_source_degraded"))
+        );
+        assert_eq!(social_payload.get("retryable"), Some(&json!(true)));
+        assert_eq!(social_payload.get("recoverable"), Some(&json!(true)));
+        assert_eq!(
+            social_payload.get("retry_after"),
+            Some(&json!("next_sync_subscriptions_run"))
+        );
         assert_eq!(
             social_payload.get("source_errors"),
             Some(&json!([source_error]))

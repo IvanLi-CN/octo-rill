@@ -4002,16 +4002,7 @@ fn sync_all_social_failure_kind(failure: &sync::SocialSyncFailure) -> &'static s
 fn sync_all_social_failure_metadata(
     failure: &sync::SocialSyncFailure,
 ) -> (&'static str, bool, &'static str, Option<&'static str>) {
-    if failure.source_degraded {
-        (
-            "warning",
-            true,
-            "social_source_degraded",
-            Some("next_sync_subscriptions_run"),
-        )
-    } else {
-        sync::social_sync_failure_metadata(failure.sqlite_backpressure)
-    }
+    sync::social_sync_failure_metadata(failure.sqlite_backpressure, failure.source_degraded)
 }
 
 async fn execute_sync_all_task_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
