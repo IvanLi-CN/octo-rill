@@ -3509,14 +3509,15 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .unwrap_or(false)
     {
         if is_webhook_push_task_type(task.task_type.as_str()) {
-            let _ = reschedule_task_if_owned(
+            let rescheduled = reschedule_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 Utc::now(),
                 json!({"reason": "cancel_requested", "task_type": task.task_type}),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let _ = rescheduled?;
             return Ok(());
         }
         let finalized = finalize_task_if_owned(
@@ -3527,8 +3528,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             None,
             state.runtime_owner_id.as_str(),
         )
-        .await?;
+        .await;
         heartbeat.stop().await;
+        let finalized = finalized?;
         if !finalized {
             return Ok(());
         }
@@ -3552,8 +3554,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 None,
                 state.runtime_owner_id.as_str(),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let finalized = finalized?;
             if !finalized {
                 return Ok(());
             }
@@ -3611,8 +3614,9 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 Some(message.clone()),
                 state.runtime_owner_id.as_str(),
             )
-            .await?;
+            .await;
             heartbeat.stop().await;
+            let finalized = finalized?;
             if !finalized {
                 return Ok(());
             }

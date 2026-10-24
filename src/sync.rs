@@ -2014,6 +2014,15 @@ async fn append_access_refresh_social_progress_event(
     payload: Value,
     append_event: &AccessRefreshTaskEventFn,
 ) -> Result<()> {
+    append_access_refresh_log_entry(
+        state,
+        task_id,
+        level,
+        "social",
+        "social sync completed",
+        payload.clone(),
+    )
+    .await;
     match append_event(state, task_id, payload.clone()).await {
         Ok(()) => Ok(()),
         Err(error) if is_sqlite_retryable_write_error(error.as_ref()) => {
@@ -3316,15 +3325,6 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
         &dependencies.append_task_event,
     )
     .await?;
-    append_access_refresh_log_entry(
-        state,
-        task_id,
-        social_log_level,
-        "social",
-        "social sync completed",
-        social_payload,
-    )
-    .await;
 
     let (notifications, notifications_error) =
         match (dependencies.sync_notifications)(state, user_id).await {
@@ -25404,6 +25404,95 @@ mod tests {
             Some(&json!("next_sync_subscriptions_run"))
         );
         assert_eq!(social_payload.get("source_errors"), Some(&json!([])));
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_logs_social_before_nonretryable_event_failure() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-social-event-failure");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-social-event-failure");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+        let source_error = "followers(conn:github): event table unavailable".to_owned();
+        let notifications_called = Arc::new(AtomicUsize::new(0));
+        let notifications_called_for_dependency = notifications_called.clone();
+
+        let error = super::sync_access_refresh_with_freshness_and_dependencies(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            "",
+            super::AccessRefreshDependencies {
+                sync_starred: Box::new(|_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
+                    Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
+                }),
+                refresh_visibility: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
+                        Box::pin(async { Ok(true) })
+                    },
+                ),
+                sync_social: {
+                    let source_error = source_error.clone();
+                    Box::new(
+                        move |_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
+                            let source_error = source_error.clone();
+                            Box::pin(async move {
+                                (
+                                    super::SyncSocialActivityResult::default(),
+                                    Some(super::SocialSyncFailure {
+                                        message: source_error.clone(),
+                                        sqlite_backpressure: false,
+                                        source_errors: vec![source_error],
+                                    }),
+                                )
+                            })
+                        },
+                    )
+                },
+                sync_notifications: Box::new(
+                    move |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
+                        let notifications_called = notifications_called_for_dependency.clone();
+                        Box::pin(async move {
+                            notifications_called.fetch_add(1, AtomicTestOrdering::SeqCst);
+                            Ok(super::SyncNotificationsResult {
+                                notifications: 0,
+                                since: None,
+                            })
+                        })
+                    },
+                ),
+                append_task_event: Box::new(
+                    |_state, _task_id, _payload| -> super::AccessRefreshTaskEventFuture<'_> {
+                        Box::pin(async { Err(anyhow!("event table unavailable")) })
+                    },
+                ),
+            },
+        )
+        .await
+        .expect_err("non-retryable Social event persistence should propagate");
+        assert!(error.to_string().contains("event table unavailable"));
+        assert_eq!(
+            notifications_called.load(AtomicTestOrdering::SeqCst),
+            0,
+            "Notifications must not run after a non-retryable Social event failure"
+        );
+
+        let log_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
+            .await
+            .expect("load access refresh log path")
+            .expect("access refresh log path should exist");
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("read access refresh log");
+        assert!(
+            log.contains("\"stage\":\"social_summary\""),
+            "Social progress must be logged before event persistence: {log}"
+        );
+        assert!(
+            log.contains(source_error.as_str()),
+            "Social source diagnostics must survive event persistence failure: {log}"
+        );
     }
 
     #[tokio::test]

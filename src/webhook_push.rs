@@ -1997,6 +1997,10 @@ fn bounded_user_operation_lease_wait(elapsed: Duration) -> Option<Duration> {
         .map(|remaining| remaining.min(USER_OPERATION_LEASE_POLL_INTERVAL))
 }
 
+fn next_operation_lease_retry_count(retry_count: u8) -> Option<u8> {
+    (retry_count < 3).then_some(retry_count + 1)
+}
+
 async fn pause_user_repos_for_permission_error(
     state: &AppState,
     user_id: &str,
@@ -2556,6 +2560,12 @@ async fn execute_for_user(
             return Ok(json!({"operation": operation, "rescheduled": true}));
         }
         let Some(wait_for) = bounded_user_operation_lease_wait(lease_wait_started.elapsed()) else {
+            let Some(next_retry_count) = next_operation_lease_retry_count(retry_count) else {
+                return Err(anyhow::Error::new(RetryableWebhookReconcileError {
+                    reason: "operation_lease_busy",
+                    message: "user operation lease remained busy after retry budget".to_owned(),
+                }));
+            };
             let delay = retry_delay(retry_count, None);
             let rescheduled = jobs::reschedule_task_with_payload_if_owned(
                 state,
@@ -2568,12 +2578,13 @@ async fn execute_for_user(
                     scheduled,
                     demand_generation,
                     retry_repo_ids,
-                    retry_count,
+                    next_retry_count,
                     Some("operation_lease_busy"),
                 ),
                 json!({
                     "operation": operation,
                     "reason": "operation_lease_busy",
+                    "retry_count": next_retry_count,
                     "retry_after_seconds": delay.num_seconds(),
                 }),
             )
@@ -2582,6 +2593,7 @@ async fn execute_for_user(
                 "operation": operation,
                 "rescheduled": rescheduled,
                 "reason": "operation_lease_busy",
+                "retry_count": next_retry_count,
                 "retry_after_seconds": delay.num_seconds(),
             }));
         };
@@ -3954,6 +3966,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn operation_lease_busy_retry_count_advances_until_budget() {
+        assert_eq!(next_operation_lease_retry_count(0), Some(1));
+        assert_eq!(next_operation_lease_retry_count(1), Some(2));
+        assert_eq!(next_operation_lease_retry_count(2), Some(3));
+        assert_eq!(next_operation_lease_retry_count(3), None);
     }
 
     #[test]
