@@ -230,6 +230,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 - Social 持久化在部分 snapshot 已完成后失败时，兼容结果必须保留已完成的 `repo_stars`、`followers`、`events`（包括此前已提交 64 行 snapshot chunk 或 feed event batch 的 event 计数）与 failed/partial repo 诊断；`sync.subscriptions` 摘要合并这些计数但仍增加 `failed_users`，`sync.all` 仍以 failed task 终态表达 Social 业务失败，不得将该部分结果伪装成成功。
 - Social 失败事件先写入 run log；若 `sync_subscription_events` 的追加只因 SQLite 可恢复背压耗尽而失败，run log 作为 durable fallback，不能中止剩余用户或后续阶段；非 SQLite 持久化错误仍需向上传播。
 - 已领取的订阅任务由活动 worker 发起取消、webhook 重试、SQLite 背压或其他可恢复延迟回写时，必须保留原 runtime owner 的 CAS 条件；旧 worker 失去 lease 后不得清除新 owner 或伪造 `task.rescheduled` 事件。
+- webhook operation lease 的 release 写入若因 SQLite writer 背压失败，任务随后进入 terminal finalize 或 owner-CAS reschedule 时，必须在同一 foreground 短事务内清理该 task 的 operation lease，不能让已完成或 queued 任务持有租约直到过期。
 - social feed 中的 GitHub `ReleaseEvent` 写为 `release_update`，不得复用 `announcement`；Discussions Announcements 继续使用 `announcement`。
 - `release_update` 命中的 repo 会以 interactive 优先级挂入共享 repo release queue，用于加速发现，但不得替代定时同步中的全量 repo demand。
 

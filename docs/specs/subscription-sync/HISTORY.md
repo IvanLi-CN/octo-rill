@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` makes webhook operation lease cleanup atomic with owned task finalize/reschedule, preventing release backpressure from leaving a terminal or queued task lease until expiry; both lifecycle transitions have focused regressions.
 - 2026-10-24: PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` restores the legacy `social_source_degraded` warning/recoverable event for completed-but-partially-degraded upstream snapshots and adds a regression separating it from fatal `social_sync_failed` errors.
 - 2026-10-24: PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a deterministic production-path webhook operation-lease contention regression: retry count 2 reschedules through owner-CAS with retry count 3, while retry count 3 returns typed `operation_lease_busy` without falsely rescheduling the running task.
 - 2026-10-24: PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` makes access-refresh Social progress durable in the run log before event-table persistence and adds non-retryable event failure coverage; task heartbeat cleanup and bounded webhook lease retry exhaustion are covered in the same candidate.

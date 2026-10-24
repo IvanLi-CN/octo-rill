@@ -4,6 +4,7 @@
 
 ## Current Status
 
+- PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` makes owned task finalization and rescheduling atomically clear any webhook operation lease bound to the task, so a release write denied by SQLite backpressure cannot leave a terminal or queued task blocking the same user; regressions cover both transitions.
 - PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` separates completed-but-partially-degraded Social source errors from fatal Social failures: the former retain `social_source_degraded` warning/recoverable compatibility events, while the latter retain `social_sync_failed` error/non-recoverable classification.
 - PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a production-path webhook operation-lease contention regression for owner-CAS retry payload advancement and budget exhaustion, while retaining the candidate's heartbeat cleanup and access-refresh Social run-log ordering fixes.
 - PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression proving recoverable Social run-log fallback leaves `critical_events` unchanged at zero; genuine `severity=error` upstream events retain their critical count.
@@ -21,6 +22,7 @@
 - `sync.subscriptions` now carries failed Social users as explicit failed outcomes with their partial counters, so progress and final summaries count persisted `repo_stars`/`followers`/`events` without counting the user as succeeded.
 - Background admission and `BEGIN IMMEDIATE` busy retries cap every sleep at the original absolute deadline, so a retry cannot extend heartbeat, worker, or finalization latency beyond its caller budget.
 - Active job requeue/deferral paths for cancellation, webhook retry, and SQLite writer backpressure now use the claimed runtime owner as a CAS predicate; a late worker cannot requeue a task that lease recovery has already assigned to another runtime.
+- Owned task finalization and rescheduling now commit the task transition together with `DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?`; this closes the release-failure path where a terminal or queued webhook task could otherwise retain an operation lease until expiry.
 - The access-refresh dependency seam is private test wiring grouped in a dependency struct; the production path keeps the real Social/Notifications calls without a lint suppression.
 - The file-backed scheduler/session pressure regression keeps its empty-queue worker join bounded with a 30-second test budget for the Agent VM acceptance; production admission and writer deadlines remain unchanged.
 - Implementation: PR3.9 writer-pool 路由、事务清理与 translation deadline 修复已实现；PR3.9.1 补齐异步取消连接恢复与后台 claim 退避；PR3.9.2 session writer isolation and pressure semantics implemented；PR3.9.3 补齐共享 background admission/cadence、HTTP request-to-writer correlation 与 file-backed scheduler/session regression；当前直接修复候选还收敛 scheduler atomic dispatch、search projection outbox lease safety、FTS duplicate-write removal、公告多用户 lane rebuild 与 resource-key query plan。

@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` makes webhook operation lease cleanup atomic with owned task finalize/reschedule, preventing a release write failure under SQLite pressure from leaving a terminal or queued task lease until expiry; both transitions have focused regressions.
 - PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` preserves the legacy `social_source_degraded` warning/recoverable event for completed-but-partially-degraded upstream snapshots, while fatal upstream failures remain `social_sync_failed` error/non-recoverable; both paths have explicit regressions.
 - PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a production-path webhook lease contention regression covering owner-CAS reschedule payload advancement and retry-budget exhaustion; the candidate also retains access-refresh Social run-log ordering and lifecycle heartbeat cleanup coverage.
 - PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression that recoverable Social run-log fallback keeps `critical_events` at zero; upstream Social errors continue to use the critical error classification.

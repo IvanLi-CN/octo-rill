@@ -21,6 +21,7 @@ SQLite writer contention is already serialized by an application coordinator wit
 - Carry a failed-but-partial Social worker outcome into `sync.subscriptions` summaries: increment `failed_users` and merge its committed counters; reserve the empty outcome for cancellation/incomplete work rather than using it to discard partial data.
 - Finalize a `sync.all` Social business failure by committing the failed task row and its `task.completed` event in one foreground transaction; stop the task heartbeat before returning a finalization error so the lifecycle cannot retain a stale lease.
 - Requeue or defer a running job after cancellation, webhook retry, or SQLite backpressure only when the original runtime owner still matches; a late worker must return no-op after lease recovery rather than requeueing a newer owner's task.
+- When a webhook operation-lease release write is denied or exhausted by SQLite backpressure, the subsequent owned task finalize/reschedule must clear the lease by `task_id` in the same foreground transaction as the task state transition; terminal and queued tasks must not retain a blocking lease until expiry.
 - Keep the `sync.all` compatibility completion payload complete: preserve `error_kind`, `severity`, `recoverable`, `retryable`, and `retry_after` for both SQLite backpressure and genuine upstream failures, including null retry metadata when the failure is non-recoverable.
 
 ## Consequences
@@ -47,6 +48,8 @@ Transient writer pressure can clear without creating a false Social failure, whi
 - `sync::tests::social_activity_failure_preserves_partial_result_and_upstream_classification`
 - `sync::tests::social_activity_snapshot_preserves_committed_events_when_later_chunk_fails`
 - `jobs::tests::owned_task_reschedule_does_not_reschedule_reclaimed_task`
+- `jobs::tests::finalize_owned_webhook_task_clears_operation_lease`
+- `jobs::tests::reschedule_owned_webhook_task_clears_operation_lease`
 - `sync::tests::social_activity_snapshot_deduplicates_cross_phase_source_errors`
 - `sqlite_write::tests::background_retry_sleep_is_capped_at_absolute_deadline`
 - `sqlite_write::tests::foreground_writer_succeeds_after_background_admission_denial`

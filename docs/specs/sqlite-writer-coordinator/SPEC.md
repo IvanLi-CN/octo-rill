@@ -142,6 +142,7 @@
 
 - 后台 worker 可以继续高并发执行网络/AI 阶段；进入 SQLite 写入时通过 coordinator 排队。
 - 登录/session、手动触发任务、job enqueue、任务终态 finalize 与取消任务走 foreground lane；后台 claim/heartbeat/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
+- webhook operation lease 的持有任务进入 finalize 或 reschedule 时，任务状态转换与按 `task_id` 清理 operation lease 必须在同一个 foreground 短事务内完成；release admission 失败不得把租约留在已完成或 queued 任务上等待过期。
 - translation batch 的启动状态切换必须在单个短事务内完成：`translation_batches` 的 `queued -> running`、关联 `translation_work_items` 的 `running` 标记与 lease 元数据更新都要在 writer permit 内提交，AI 调用与后续长计算继续留在 permit 外。
 - feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
 - repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
@@ -251,6 +252,10 @@
   When 原 worker 在写入前失去 lease，或任务已被另一个 runtime owner 接管
   Then 更新必须带原 runtime owner 的 CAS 条件；旧 worker 返回未更新且不得清除新 owner、写入 `task.rescheduled` 或改变任务状态。
 
+- Given webhook operation lease 的 release 写入因 SQLite writer 背压失败
+  When 原任务随后进入 terminal finalize 或 owner-CAS reschedule
+  Then 状态转换与按 task id 清理 operation lease 必须原子提交，已完成或 queued 任务不得留下可阻塞同一用户后续操作的租约。
+
 - Given 多个 global content worker 在同一 recovery window 内同时 tick
   When worker 执行 recovery/claim loop
   Then recovery transaction 只由共享 cadence admission 启动一次，重复 worker pass 被 coalesce 或按有界 background admission 拒绝，且 worker 通过 backoff 结束本轮而不自旋。
@@ -297,7 +302,7 @@
 
 ### VER-SQLITE-WRITER-006
 
-- Method: `sqlite_write::tests::background_writer_admission_retries_without_growing_waiter_queue`, `sqlite_write::tests::background_writer_admission_recovers_after_capacity_clears`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `jobs::tests::runtime_owner_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_reschedule_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::job_task_finalize_keeps_foreground_priority_under_writer_pressure`, `sync::tests::repo_release_heartbeat_recovers_after_writer_pressure`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
+- Method: `sqlite_write::tests::background_writer_admission_retries_without_growing_waiter_queue`, `sqlite_write::tests::background_writer_admission_recovers_after_capacity_clears`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `jobs::tests::runtime_owner_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_reschedule_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::job_task_finalize_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::finalize_owned_webhook_task_clears_operation_lease`, `jobs::tests::reschedule_owned_webhook_task_clears_operation_lease`, `sync::tests::repo_release_heartbeat_recovers_after_writer_pressure`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
 - covers: REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013, REQ-SQLITE-WRITER-014
 - Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under a real external SQLite writer lock, writer state is reusable after the run, and a request's `http.access` and `sqlite.write` events carry matching request ID, method, and route fields; fast 4xx access logs carry the complete field set at `warn` level.
 
