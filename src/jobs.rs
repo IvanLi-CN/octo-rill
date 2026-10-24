@@ -2429,80 +2429,95 @@ async fn reschedule_task_inner(
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
-    let updated = state
+    let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .write_foreground("job_task_reschedule", |_| async {
-            if let Some(payload_json) = payload_json.as_deref() {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, payload_json = ?,
-                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND (? IS NULL OR runtime_owner_id = ?)
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(payload_json)
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                    .bind(runtime_owner_id)
-                    .bind(runtime_owner_id)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task with payload")
-            } else if let Some(retry_count) = retry_count {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
-                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND (? IS NULL OR runtime_owner_id = ?)
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(i64::from(retry_count))
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                    .bind(runtime_owner_id)
-                    .bind(runtime_owner_id)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task")
-            } else {
-                sqlx::query(
-                    r#"
-                    UPDATE job_tasks
-                    SET status = ?, available_at = ?, started_at = NULL,
-                        runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                        cancel_requested = 0, updated_at = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND (? IS NULL OR runtime_owner_id = ?)
-                    "#,
-                )
-                .bind(STATUS_QUEUED)
-                .bind(&available_at)
-                .bind(&now)
-                .bind(task_id)
-                .bind(STATUS_RUNNING)
-                    .bind(runtime_owner_id)
-                    .bind(runtime_owner_id)
-                .execute(state.sqlite_writer.write_pool_or(&state.pool))
-                .await
-                .context("failed to reschedule task")
-            }
-        })
-        .await?;
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_reschedule",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin task reschedule transaction")?;
+    let updated = if let Some(payload_json) = payload_json.as_deref() {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, payload_json = ?,
+                started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(payload_json)
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task with payload")?
+    } else if let Some(retry_count) = retry_count {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
+                started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(i64::from(retry_count))
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task")?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, available_at = ?, started_at = NULL,
+                runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+              AND status = ?
+              AND (? IS NULL OR runtime_owner_id = ?)
+            "#,
+        )
+        .bind(STATUS_QUEUED)
+        .bind(&available_at)
+        .bind(&now)
+        .bind(task_id)
+        .bind(STATUS_RUNNING)
+        .bind(runtime_owner_id)
+        .bind(runtime_owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to reschedule task")?
+    };
+    if updated.rows_affected() > 0 {
+        sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to release rescheduled webhook operation lease")?;
+    }
+    tx.commit()
+        .await
+        .context("commit task reschedule transaction")?;
+    drop(sqlite_write);
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
@@ -5516,38 +5531,53 @@ async fn finalize_task_if_owned(
         .transpose()
         .context("serialize task result")?;
 
-    let updated = state
+    let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .write_foreground("job_task_finalize_owned", |_| async {
-            let updated = sqlx::query(
-                r#"
-				UPDATE job_tasks
-				SET status = ?,
-				    result_json = ?,
-				    error_message = ?,
-				    finished_at = ?,
-				    runtime_owner_id = NULL,
-				    lease_heartbeat_at = NULL,
-				    updated_at = ?
-				WHERE id = ?
-				  AND status = ?
-				  AND runtime_owner_id = ?
-				"#,
-            )
-            .bind(status)
-            .bind(result_json.as_deref())
-            .bind(error_message.as_deref())
-            .bind(now.as_str())
-            .bind(now.as_str())
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_finalize_owned",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin owned task finalization transaction")?;
+    let updated = sqlx::query(
+        r#"
+			UPDATE job_tasks
+			SET status = ?,
+			    result_json = ?,
+			    error_message = ?,
+			    finished_at = ?,
+			    runtime_owner_id = NULL,
+			    lease_heartbeat_at = NULL,
+			    updated_at = ?
+			WHERE id = ?
+			  AND status = ?
+			  AND runtime_owner_id = ?
+			"#,
+    )
+    .bind(status)
+    .bind(result_json.as_deref())
+    .bind(error_message.as_deref())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(task_id)
+    .bind(STATUS_RUNNING)
+    .bind(runtime_owner_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to finalize owned task")?;
+    if updated.rows_affected() > 0 {
+        sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
             .bind(task_id)
-            .bind(STATUS_RUNNING)
-            .bind(runtime_owner_id)
-            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .execute(&mut *tx)
             .await
-            .context("failed to finalize owned task")?;
-            Ok(updated.rows_affected() > 0)
-        })
-        .await?;
+            .context("failed to release finalized webhook operation lease")?;
+    }
+    tx.commit()
+        .await
+        .context("commit owned task finalization transaction")?;
+    drop(sqlite_write);
+    let updated = updated.rows_affected() > 0;
     if updated {
         TASK_CLAIM_ADMISSION.wake();
     }
@@ -8199,6 +8229,106 @@ mod tests {
         .await
         .expect("load recovered task events");
         assert_eq!(event_types, vec!["task.recovered_failed"]);
+    }
+
+    #[tokio::test]
+    async fn finalize_owned_webhook_task_clears_operation_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "finalize-webhook-lease-cleanup";
+        seed_task(&pool, task_id, TASK_WEBHOOK_PUSH_MANAGE, STATUS_RUNNING, 0).await;
+        seed_user(&pool, 90_102, "finalize-lease-user").await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(&now)
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("assign webhook task owner");
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("90102")
+        .bind(task_id)
+        .bind((Utc::now() + Duration::minutes(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed webhook operation lease");
+
+        assert!(
+            finalize_task_if_owned(
+                state.as_ref(),
+                task_id,
+                STATUS_FAILED,
+                None,
+                Some("release backpressure".to_owned()),
+                state.runtime_owner_id.as_str(),
+            )
+            .await
+            .expect("finalize webhook task")
+        );
+
+        let lease_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_push_user_operation_leases WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load finalized webhook operation lease");
+        assert_eq!(lease_count, 0);
+    }
+
+    #[tokio::test]
+    async fn reschedule_owned_webhook_task_clears_operation_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "reschedule-webhook-lease-cleanup";
+        seed_task(&pool, task_id, TASK_WEBHOOK_PUSH_MANAGE, STATUS_RUNNING, 0).await;
+        seed_user(&pool, 90_103, "reschedule-lease-user").await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("assign webhook task owner");
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("90103")
+        .bind(task_id)
+        .bind((Utc::now() + Duration::minutes(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed webhook operation lease");
+
+        assert!(
+            reschedule_task_if_owned(
+                state.as_ref(),
+                task_id,
+                Utc::now() + Duration::seconds(1),
+                json!({"reason": "operation_lease_busy"}),
+            )
+            .await
+            .expect("reschedule webhook task")
+        );
+
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM job_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load rescheduled webhook task");
+        assert_eq!(status, STATUS_QUEUED);
+        let lease_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_push_user_operation_leases WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load rescheduled webhook operation lease");
+        assert_eq!(lease_count, 0);
     }
 
     #[tokio::test]
