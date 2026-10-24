@@ -332,9 +332,13 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When `sync.subscriptions`、`sync.access_refresh` 或 `sync.all` 完成 Social 阶段
   Then 结果保留上游错误详情，当前用户/同步结果不得计为成功；组合错误不得丢失上游错误分类。
 
-- Given `sync.access_refresh` 的 Social 阶段返回上游 `source_errors`
+- Given `sync.access_refresh` 的 Social 阶段返回不可重试的上游 `source_errors`
   When Social 阶段完成
   Then `social_error` 保留完整错误详情，Social progress/log payload 使用 `error_kind=social_sync_failed`、`severity=error`、`retryable=false`、`recoverable=false`，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
+
+- Given `sync.access_refresh` 的 Social 阶段返回可重试的已完成部分降级 `source_errors`
+  When Social 阶段完成
+  Then `social_error` 保留完整错误详情，Social progress/log payload 使用 `error_kind=social_source_degraded`、`severity=warning`、`retryable=true`、`recoverable=true` 与 `retry_after=next_sync_subscriptions_run`，Notifications 阶段仍执行并写入 `notifications_summary` 进度事件。
 
 - Given `sync.access_refresh` 的 Social 持久化耗尽 SQLite 背压预算
   When Social 阶段完成

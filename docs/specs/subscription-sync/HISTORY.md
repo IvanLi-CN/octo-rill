@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-25: PR #340 executable candidate `97843ed6` fixes access-refresh Social progress/log classification so retryable completed source degradation is warning/recoverable with the next-run retry hint, while non-retryable upstream failures remain error/non-recoverable; a production-shaped dependency regression covers Notifications continuation.
 - 2026-10-24: PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` preserves non-retryable Social upstream errors as `social_sync_failed` error/non-recoverable instead of downgrading credentials/forbidden/inaccessible-repo failures to source degradation; it also adds RAII cleanup for dropped lease-heartbeat handles.
 - 2026-10-24: PR #340 executable candidate `d1f4ae30d649c8b34831df808559b6ca3373f968` fixes the completed `sync.all` Social source-error classification: the task remains failed with preserved partial data, while its completion payload uses `social_source_degraded` warning/recoverable metadata; fatal upstream exceptions remain non-recoverable.
 - 2026-10-24: PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` makes webhook operation lease cleanup atomic with owned task finalize/reschedule, preventing release backpressure from leaving a terminal or queued task lease until expiry; both lifecycle transitions have focused regressions.

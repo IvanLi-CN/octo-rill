@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-25：PR #340 executable candidate `97843ed6` 修复 access-refresh Social 进度/日志只识别 SQLite 背压、误将可重试 HTTP 500/网络降级标记为不可恢复的问题；共享分类器现在同时覆盖 SQLite 背压、可重试 source degradation 与 fatal upstream，并新增真实 access-refresh 依赖路径回归。
 - 2026-10-24：PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` 将 Social source-error 的 retryability 传入聚合结果：credentials、forbidden、inaccessible-repo 等非重试上游错误保持 `social_sync_failed` error/non-recoverable；同时为丢弃的 `LeaseHeartbeat` 增加 abort 兜底和生命周期回归。
 - 2026-10-24：PR #340 executable candidate `d1f4ae30d649c8b34831df808559b6ca3373f968` 修复 completed `sync.all` Social source error 的收尾分类：任务仍保持 failed 并保留 partial 结果，但 `task.completed` 使用 `social_source_degraded` warning/recoverable 重试元数据；fatal upstream 异常继续使用 `social_sync_failed` error/non-recoverable。
 - 2026-10-24：PR #340 executable candidate `dc1056f800a46cdd7faa16db69346770c91f3a72` 将 webhook operation lease 清理并入 owned task finalize/reschedule 的 foreground 短事务；release 写入因 writer 背压失败后，终态或 queued 任务不再残留可阻塞同一用户的租约，新增两条生命周期回归。
