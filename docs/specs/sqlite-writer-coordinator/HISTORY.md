@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-24：Social 持久化在部分 snapshot 已完成后遇到 writer pressure 时，通过 typed error context 保留计数与 failed/partial repo；`sync.all` 将 failed task 行与 `task.completed` 事件合并到同一 foreground 事务，并在收尾失败前停止 heartbeat。
 - 2026-10-23：background writer admission denial 现在在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，同时保留单 background waiter 与 foreground 优先；Social SQLite 背压记录为可恢复 warning，不把未完成用户伪装成成功；job task finalize 明确走 foreground lane，避免终态提交被 heartbeat 背景等待拖成租约恢复。
 - 2026-10-23：Social 失败事件先落 run log；SQLite 可恢复背压耗尽时事件表追加降级为 durable fallback，且真实上游 source errors 在订阅、访问刷新与 sync-all 路径保持不可恢复语义。
 - 2026-10-23：混合 Social 上游错误与 SQLite 背压现在通过 typed `anyhow` context 保留上游详情，避免把真实上游失败误归类为可恢复 SQLite 背压。

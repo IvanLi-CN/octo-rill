@@ -308,7 +308,7 @@ pub struct SyncNotificationsResult {
     pub since: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SyncSocialActivityResult {
     pub repo_stars: usize,
     pub followers: usize,
@@ -1878,8 +1878,9 @@ async fn append_access_refresh_social_progress_event(
     task_id: &str,
     level: &str,
     payload: Value,
+    append_event: &AccessRefreshTaskEventFn,
 ) -> Result<()> {
-    match jobs::append_task_event(state, task_id, "task.progress", payload.clone()).await {
+    match append_event(state, task_id, payload.clone()).await {
         Ok(()) => Ok(()),
         Err(error) if is_sqlite_retryable_write_error(error.as_ref()) => {
             tracing::warn!(
@@ -2323,6 +2324,11 @@ pub async fn sync_social_activity(
         );
     }
 
+    let social_source_errors = source_errors
+        .iter()
+        .cloned()
+        .chain(repo_collection.source_errors.iter().cloned())
+        .collect::<Vec<_>>();
     let mut events = match (
         (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
         (!followers.is_empty()).then_some(followers.as_slice()),
@@ -2338,10 +2344,16 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
-            with_social_source_errors(
+            with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
-                source_errors.as_slice(),
+                social_source_errors.as_slice(),
+                social_activity_result_snapshot(
+                    &repo_collection,
+                    followers.len(),
+                    0,
+                    source_errors.as_slice(),
+                ),
             )
         })?,
         _ => apply_social_activity_snapshot_with_options(
@@ -2355,46 +2367,56 @@ pub async fn sync_social_activity(
         )
         .await
         .map_err(|error| {
-            with_social_source_errors(
+            with_social_activity_failure(
                 error,
                 "apply social activity snapshot",
-                source_errors.as_slice(),
+                social_source_errors.as_slice(),
+                social_activity_result_snapshot(
+                    &repo_collection,
+                    followers.len(),
+                    0,
+                    source_errors.as_slice(),
+                ),
             )
         })?,
     };
     events += insert_feed_activity_events(state, user_id, feed_events.as_slice())
         .await
         .map_err(|error| {
-            with_social_source_errors(
+            with_social_activity_failure(
                 error,
                 "insert social feed activity events",
-                source_errors.as_slice(),
+                social_source_errors.as_slice(),
+                social_activity_result_snapshot(
+                    &repo_collection,
+                    followers.len(),
+                    events,
+                    source_errors.as_slice(),
+                ),
             )
         })?;
     enqueue_global_announcement_work(state, user_id, feed_events.as_slice())
         .await
         .map_err(|error| {
-            with_social_source_errors(
+            with_social_activity_failure(
                 error,
                 "enqueue social announcement work",
-                source_errors.as_slice(),
+                social_source_errors.as_slice(),
+                social_activity_result_snapshot(
+                    &repo_collection,
+                    followers.len(),
+                    events,
+                    source_errors.as_slice(),
+                ),
             )
         })?;
 
-    Ok(SyncSocialActivityResult {
-        repo_stars: repo_collection.repo_stars,
-        followers: followers.len(),
+    Ok(social_activity_result_snapshot(
+        &repo_collection,
+        followers.len(),
         events,
-        failed_repos: repo_collection
-            .failed_repos
-            .into_iter()
-            .chain(repo_collection.partial_repos.into_iter())
-            .collect(),
-        source_errors: source_errors
-            .into_iter()
-            .chain(repo_collection.source_errors)
-            .collect(),
-    })
+        source_errors.as_slice(),
+    ))
 }
 
 async fn enqueue_global_announcement_work(
@@ -2460,6 +2482,22 @@ struct SocialUpstreamSourceErrors {
     details: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SocialSyncActivityFailure {
+    result: SyncSocialActivityResult,
+}
+
+impl std::fmt::Display for SocialSyncActivityFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "social activity persistence failed after partial snapshot"
+        )
+    }
+}
+
+impl std::error::Error for SocialSyncActivityFailure {}
+
 impl std::fmt::Display for SocialUpstreamSourceErrors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -2487,6 +2525,38 @@ fn with_social_source_errors(
     }
 }
 
+fn social_activity_result_snapshot(
+    repo_collection: &RepoStargazerCollectionResult,
+    followers: usize,
+    events: usize,
+    source_errors: &[String],
+) -> SyncSocialActivityResult {
+    let mut all_source_errors = source_errors.to_vec();
+    all_source_errors.extend(repo_collection.source_errors.iter().cloned());
+    SyncSocialActivityResult {
+        repo_stars: repo_collection.repo_stars,
+        followers,
+        events,
+        failed_repos: repo_collection
+            .failed_repos
+            .iter()
+            .cloned()
+            .chain(repo_collection.partial_repos.iter().cloned())
+            .collect(),
+        source_errors: all_source_errors,
+    }
+}
+
+fn with_social_activity_failure(
+    error: anyhow::Error,
+    operation: &'static str,
+    source_errors: &[String],
+    result: SyncSocialActivityResult,
+) -> anyhow::Error {
+    with_social_source_errors(error, operation, source_errors)
+        .context(SocialSyncActivityFailure { result })
+}
+
 fn social_source_errors_from_error(error: &anyhow::Error) -> Vec<String> {
     error
         .downcast_ref::<SocialUpstreamSourceErrors>()
@@ -2508,8 +2578,21 @@ pub(crate) fn social_sync_failure_from_result(
     })
 }
 
+pub(crate) fn social_activity_result_from_error(error: &anyhow::Error) -> SyncSocialActivityResult {
+    error
+        .downcast_ref::<SocialSyncActivityFailure>()
+        .map(|failure| failure.result.clone())
+        .unwrap_or_default()
+}
+
 pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyncFailure {
-    let source_errors = social_source_errors_from_error(error);
+    let partial_result = social_activity_result_from_error(error);
+    let mut source_errors = social_source_errors_from_error(error);
+    for source_error in &partial_result.source_errors {
+        if !source_errors.iter().any(|current| current == source_error) {
+            source_errors.push(source_error.clone());
+        }
+    }
     SocialSyncFailure {
         message: error.to_string(),
         sqlite_backpressure: source_errors.is_empty()
@@ -2551,7 +2634,7 @@ async fn sync_social_activity_best_effort_with_failure(
                 },
                 "social activity sync failed, continuing"
             );
-            (SyncSocialActivityResult::default(), Some(failure))
+            (social_activity_result_from_error(&err), Some(failure))
         }
     }
 }
@@ -2788,6 +2871,7 @@ type AccessRefreshSocialFuture<'a> = Pin<
 >;
 type AccessRefreshNotificationsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SyncNotificationsResult>> + Send + 'a>>;
+type AccessRefreshTaskEventFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 type AccessRefreshStarredFn =
     Box<dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a> + Send + Sync>;
@@ -2798,12 +2882,27 @@ type AccessRefreshSocialFn =
 type AccessRefreshNotificationsFn = Box<
     dyn for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshNotificationsFuture<'a> + Send + Sync,
 >;
+type AccessRefreshTaskEventFn = Box<
+    dyn for<'a> Fn(&'a AppState, &'a str, Value) -> AccessRefreshTaskEventFuture<'a> + Send + Sync,
+>;
+
+fn default_access_refresh_task_event_dependency() -> AccessRefreshTaskEventFn {
+    Box::new(|state, task_id, payload| {
+        Box::pin(jobs::append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            payload,
+        ))
+    })
+}
 
 struct AccessRefreshDependencies {
     sync_starred: AccessRefreshStarredFn,
     refresh_visibility: AccessRefreshVisibilityFn,
     sync_social: AccessRefreshSocialFn,
     sync_notifications: AccessRefreshNotificationsFn,
+    append_task_event: AccessRefreshTaskEventFn,
 }
 
 async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
@@ -2868,6 +2967,7 @@ where
                     Box::pin(sync_notifications(state, user_id))
                 },
             ),
+            append_task_event: default_access_refresh_task_event_dependency(),
         },
     )
     .await
@@ -3034,6 +3134,7 @@ async fn sync_access_refresh_with_freshness_and_dependencies(
         task_id,
         social_log_level,
         social_payload.clone(),
+        &dependencies.append_task_event,
     )
     .await?;
     append_access_refresh_log_entry(
@@ -9027,6 +9128,11 @@ async fn finish_social_sync_for_user(
                         "retryable": recoverable,
                         "retry_after": retry_after,
                         "source_errors": error.source_errors,
+                        "repo_stars": result.repo_stars,
+                        "followers": result.followers,
+                        "events": result.events,
+                        "failed_repos": result.failed_repos,
+                        "partial_result": true,
                     }),
                 },
             )
@@ -17692,7 +17798,13 @@ mod tests {
         let outcome = finish_social_sync_for_user(
             &context,
             user_id.as_str(),
-            SyncSocialActivityResult::default(),
+            SyncSocialActivityResult {
+                repo_stars: 4,
+                followers: 2,
+                events: 3,
+                failed_repos: vec!["octo/backpressure".to_owned()],
+                source_errors: Vec::new(),
+            },
             Some(SocialSyncFailure {
                 message: error.to_string(),
                 sqlite_backpressure: true,
@@ -17728,6 +17840,14 @@ mod tests {
             payload.get("retry_after"),
             Some(&json!("next_sync_subscriptions_run"))
         );
+        assert_eq!(payload.get("repo_stars"), Some(&json!(4)));
+        assert_eq!(payload.get("followers"), Some(&json!(2)));
+        assert_eq!(payload.get("events"), Some(&json!(3)));
+        assert_eq!(
+            payload.get("failed_repos"),
+            Some(&json!(["octo/backpressure"]))
+        );
+        assert_eq!(payload.get("partial_result"), Some(&json!(true)));
         assert_eq!(context.critical_events.load(AtomicTestOrdering::Relaxed), 0);
 
         let mut summary = SyncSubscriptionSocialSummary {
@@ -17737,6 +17857,39 @@ mod tests {
         collect_social_result(Some(Ok(Ok(None))), &mut summary).expect("count failed social user");
         assert_eq!(summary.succeeded_users, 0);
         assert_eq!(summary.failed_users, 1);
+    }
+
+    #[test]
+    fn social_activity_failure_preserves_partial_result_and_upstream_classification() {
+        let partial = SyncSocialActivityResult {
+            repo_stars: 4,
+            followers: 2,
+            events: 3,
+            failed_repos: vec!["octo/partial".to_owned()],
+            source_errors: vec!["followers(conn:github, http_500): GitHub returned 500".to_owned()],
+        };
+        let error = super::with_social_activity_failure(
+            anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
+                lane: "social_activity_snapshot",
+                priority: "background",
+                phase: "writer_queue",
+                deadline_ms: 2_500,
+            }),
+            "apply social activity snapshot",
+            partial.source_errors.as_slice(),
+            partial.clone(),
+        );
+
+        let restored = super::social_activity_result_from_error(&error);
+        assert_eq!(restored.repo_stars, partial.repo_stars);
+        assert_eq!(restored.followers, partial.followers);
+        assert_eq!(restored.events, partial.events);
+        assert_eq!(restored.failed_repos, partial.failed_repos);
+        assert_eq!(restored.source_errors, partial.source_errors);
+
+        let failure = super::social_sync_failure_from_error(&error);
+        assert!(!failure.sqlite_backpressure);
+        assert_eq!(failure.source_errors, partial.source_errors);
     }
 
     #[tokio::test]
@@ -24570,6 +24723,7 @@ mod tests {
                         })
                     },
                 ),
+                append_task_event: super::default_access_refresh_task_event_dependency(),
             },
         )
         .await
@@ -24668,6 +24822,7 @@ mod tests {
                         })
                     },
                 ),
+                append_task_event: super::default_access_refresh_task_event_dependency(),
             },
         )
         .await
@@ -24708,94 +24863,71 @@ mod tests {
 
     #[tokio::test]
     async fn sync_access_refresh_continues_notifications_when_social_event_is_backpressured() {
-        let pool = setup_pool_with_max_connections(1).await;
+        let pool = setup_pool().await;
         let user_id = test_user_id("access-refresh-social-event-backpressure");
         seed_user(&pool, user_id.as_str()).await;
         let state = setup_state(pool.clone());
         let task_id = local_id::test_local_id("task-access-refresh-social-event-backpressure");
         seed_access_refresh_task(&state, task_id.as_str()).await;
-        let social_ready = Arc::new(tokio::sync::Notify::new());
-        let release_social = Arc::new(tokio::sync::Notify::new());
         let notifications_called = Arc::new(AtomicUsize::new(0));
+        let notifications_called_for_dependency = notifications_called.clone();
 
-        let access_refresh = tokio::spawn({
-            let state = state.clone();
-            let social_ready = social_ready.clone();
-            let release_social = release_social.clone();
-            let notifications_called = notifications_called.clone();
-            let user_id = user_id.clone();
-            let task_id = task_id.clone();
-            async move {
-                super::sync_access_refresh_with_freshness_and_dependencies(
-                    state.as_ref(),
-                    task_id.as_str(),
-                    user_id.as_str(),
-                    "",
-                    super::AccessRefreshDependencies {
-                        sync_starred: Box::new(
-                            |_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
-                                Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
-                            },
-                        ),
-                        refresh_visibility: Box::new(
-                            |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
-                                Box::pin(async { Ok(true) })
-                            },
-                        ),
-                        sync_social: Box::new(
-                            move |_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
-                                let social_ready = social_ready.clone();
-                                let release_social = release_social.clone();
-                                Box::pin(async move {
-                                    social_ready.notify_one();
-                                    release_social.notified().await;
-                                    (
-                                        super::SyncSocialActivityResult::default(),
-                                        Some(super::SocialSyncFailure {
-                                            message: "writer pressure".to_owned(),
-                                            sqlite_backpressure: true,
-                                            source_errors: Vec::new(),
-                                        }),
-                                    )
-                                })
-                            },
-                        ),
-                        sync_notifications: Box::new(
-                            move |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
-                                let notifications_called = notifications_called.clone();
-                                Box::pin(async move {
-                                    notifications_called.fetch_add(1, AtomicTestOrdering::SeqCst);
-                                    Ok(super::SyncNotificationsResult {
-                                        notifications: 2,
-                                        since: None,
-                                    })
-                                })
-                            },
-                        ),
+        let result = super::sync_access_refresh_with_freshness_and_dependencies(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            "",
+            super::AccessRefreshDependencies {
+                sync_starred: Box::new(|_state, _user_id| -> super::AccessRefreshStarFuture<'_> {
+                    Box::pin(async { Ok(super::SyncStarredResult { repos: 0 }) })
+                }),
+                refresh_visibility: Box::new(
+                    |_state, _user_id| -> super::AccessRefreshVisibilityFuture<'_> {
+                        Box::pin(async { Ok(true) })
                     },
-                )
-                .await
-            }
-        });
-
-        social_ready.notified().await;
-        let held = state
-            .sqlite_writer
-            .acquire_with_priority(
-                "test_social_progress_event_backpressure",
-                crate::sqlite_write::SqliteWritePriority::Foreground,
-            )
-            .await
-            .expect("hold writer while social progress event is persisted");
-        release_social.notify_one();
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        drop(held);
-
-        let result = tokio::time::timeout(Duration::from_secs(3), access_refresh)
-            .await
-            .expect("access refresh should finish after social event backpressure")
-            .expect("join access refresh")
-            .expect("social progress event pressure should be recoverable");
+                ),
+                sync_social: Box::new(|_state, _user_id| -> super::AccessRefreshSocialFuture<'_> {
+                    Box::pin(async {
+                        (
+                            super::SyncSocialActivityResult::default(),
+                            Some(super::SocialSyncFailure {
+                                message: "writer pressure".to_owned(),
+                                sqlite_backpressure: true,
+                                source_errors: Vec::new(),
+                            }),
+                        )
+                    })
+                }),
+                sync_notifications: Box::new(
+                    move |_state, _user_id| -> super::AccessRefreshNotificationsFuture<'_> {
+                        let notifications_called = notifications_called_for_dependency.clone();
+                        Box::pin(async move {
+                            notifications_called.fetch_add(1, AtomicTestOrdering::SeqCst);
+                            Ok(super::SyncNotificationsResult {
+                                notifications: 2,
+                                since: None,
+                            })
+                        })
+                    },
+                ),
+                append_task_event: Box::new(
+                    |_state, _task_id, _payload| -> super::AccessRefreshTaskEventFuture<'_> {
+                        Box::pin(async {
+                            Err(anyhow::Error::new(
+                                crate::sqlite_write::SqliteWriteDeadlineError {
+                                    lane: "test_social_progress_event_backpressure",
+                                    priority: "foreground",
+                                    phase: "writer_queue",
+                                    deadline_ms: 1000,
+                                },
+                            ))
+                        })
+                    },
+                ),
+            },
+        )
+        .await
+        .expect("social progress event pressure should be recoverable");
         assert_eq!(result.notifications.notifications, 2);
         assert_eq!(
             notifications_called.load(AtomicTestOrdering::SeqCst),

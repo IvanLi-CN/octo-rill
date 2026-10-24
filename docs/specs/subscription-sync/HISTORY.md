@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-10-24: Social persistence failures now retain partial snapshot counters and failed/partial repo diagnostics; legacy `sync.all` commits the failed task row and `task.completed` event atomically and stops heartbeat before surfacing finalization errors.
 - 2026-10-23: Social SQLite writer backpressure now uses shared same-deadline admission retry and records exhausted pressure as a recoverable `social_sync_failed` warning with explicit retry metadata; upstream failures retain error/non-recoverable semantics.
 - 2026-10-23: Social upstream `source_errors` now keep subscription, access-refresh, and sync-all results non-successful with preserved details; retryable failure-event persistence pressure falls back to the durable run log so the remaining sync phases continue.
 - 2026-10-23: Mixed Social upstream-plus-SQLite failures now preserve typed upstream details through `anyhow` context extraction and remain non-recoverable instead of being misclassified as SQLite backpressure.

@@ -3536,14 +3536,18 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         }
         Err(err) => {
             if let Some(failure) = err.downcast_ref::<SyncAllSocialBusinessFailure>() {
-                finalize_sync_all_social_failure(
+                let finalized = finalize_sync_all_social_failure(
                     state.as_ref(),
                     &task.id,
                     failure,
                     state.runtime_owner_id.as_str(),
                 )
-                .await?;
+                .await;
                 heartbeat.stop().await;
+                let finalized = finalized?;
+                if !finalized {
+                    return Ok(());
+                }
                 return Ok(());
             }
 
@@ -3616,31 +3620,78 @@ async fn finalize_sync_all_social_failure(
     failure: &SyncAllSocialBusinessFailure,
     runtime_owner_id: &str,
 ) -> Result<bool> {
-    let finalized = finalize_task_if_owned(
-        state,
-        task_id,
-        STATUS_FAILED,
-        Some(failure.result.clone()),
-        Some(failure.message.clone()),
-        runtime_owner_id,
+    let now = Utc::now().to_rfc3339();
+    let result_json = serde_json::to_string(&failure.result).context("serialize task result")?;
+    let completion_payload = serde_json::to_string(&json!({
+        "task_id": task_id,
+        "status": STATUS_FAILED,
+        "error": failure.message,
+        "error_kind": failure.error_kind,
+        "recoverable": failure.recoverable,
+    }))
+    .context("serialize sync_all failure completion event")?;
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "job_task_finalize_sync_all_social_failure",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin sync_all social failure finalization tx")?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE job_tasks
+        SET status = ?,
+            result_json = ?,
+            error_message = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status = ?
+          AND runtime_owner_id = ?
+        "#,
     )
-    .await?;
-    if !finalized {
+    .bind(STATUS_FAILED)
+    .bind(result_json.as_str())
+    .bind(failure.message.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(task_id)
+    .bind(STATUS_RUNNING)
+    .bind(runtime_owner_id)
+    .execute(&mut *tx)
+    .await
+    .context("finalize sync_all social failure task")?;
+    if updated.rows_affected() == 0 {
+        tx.commit()
+            .await
+            .context("commit unchanged sync_all social failure tx")?;
+        drop(sqlite_write);
         return Ok(false);
     }
-    append_task_event(
-        state,
-        task_id,
-        "task.completed",
-        json!({
-            "task_id": task_id,
-            "status": STATUS_FAILED,
-            "error": failure.message,
-            "error_kind": failure.error_kind,
-            "recoverable": failure.recoverable,
-        }),
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
     )
-    .await?;
+    .bind(local_id::generate_local_id())
+    .bind(task_id)
+    .bind("task.completed")
+    .bind(completion_payload.as_str())
+    .bind(now.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("insert sync_all social failure completion event")?;
+    tx.commit()
+        .await
+        .context("commit sync_all social failure finalization tx")?;
+    drop(sqlite_write);
+    TASK_CLAIM_ADMISSION.wake();
     Ok(true)
 }
 
@@ -3933,10 +3984,7 @@ where
                 error_kind = sync_all_social_failure_kind(&failure),
                 "task sync_all: social activity sync failed, continuing with notifications"
             );
-            let social = sync::SyncSocialActivityResult {
-                source_errors: failure.source_errors.clone(),
-                ..Default::default()
-            };
+            let social = sync::social_activity_result_from_error(&err);
             (social, Some(failure))
         }
     };
