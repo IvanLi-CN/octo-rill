@@ -4,6 +4,7 @@
 
 ## Current Status
 
+- PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` separates completed-but-partially-degraded Social source errors from fatal Social failures: the former retain `social_source_degraded` warning/recoverable compatibility events, while the latter retain `social_sync_failed` error/non-recoverable classification.
 - PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` adds a production-path webhook operation-lease contention regression for owner-CAS retry payload advancement and budget exhaustion, while retaining the candidate's heartbeat cleanup and access-refresh Social run-log ordering fixes.
 - PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` adds a direct regression proving recoverable Social run-log fallback leaves `critical_events` unchanged at zero; genuine `severity=error` upstream events retain their critical count.
 - 2026-10-23 candidate: background admission denial now uses the existing coordinator deadline and 25/50/100ms capped backoff without increasing the one-waiter queue; Social SQLite exhaustion is classified as recoverable warning metadata while preserving failed-user accounting.

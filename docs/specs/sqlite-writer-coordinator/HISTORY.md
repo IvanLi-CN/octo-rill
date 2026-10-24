@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-24：PR #340 executable candidate `e103af0c9dee6f13b168b0a89c141777f7307089` 恢复已完成但存在部分上游 source error 时的 `social_source_degraded` warning/recoverable 兼容事件，并用回归测试区分其与 fatal `social_sync_failed` error/non-recoverable 路径。
 - 2026-10-24：PR #340 executable candidate `ae4e522bc4eeada802f2d9c951b9c6fc23830da7` 新增 webhook operation lease 背压的生产路径回归：retry count 2 通过 owner-CAS 回队并写入 count 3，count 3 则返回 typed `operation_lease_busy`，保持 running task 不被伪装为成功或回队。
 - 2026-10-24：PR #340 executable candidate `6178d16c8e1d5f4b9751e527d6aa1c005953ffb3` 在 finalization 返回错误前停止 task heartbeat；webhook operation lease 背压沿既有 3 档 retry/backoff 递进并在预算耗尽后失败收尾；access-refresh Social 进度先落 run log 再写 event table，补齐三条生命周期/诊断回归。
 - 2026-10-24：PR #340 executable candidate `ce27dba716ab85971a014596c2050b73c8e887f9` 为可恢复 Social run-log fallback 增加 `critical_events == 0` 回归断言，明确事件表背压不会把 warning 误计为 critical event。
