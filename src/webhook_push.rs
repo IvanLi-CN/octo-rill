@@ -1990,8 +1990,11 @@ fn retry_delay(attempt: u8, retry_after: Option<Duration>) -> chrono::Duration {
     chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::minutes(15))
 }
 
-fn bounded_user_operation_lease_wait(elapsed: Duration) -> Option<Duration> {
-    USER_OPERATION_LEASE_WAIT_BUDGET
+fn bounded_user_operation_lease_wait_for_budget(
+    elapsed: Duration,
+    budget: Duration,
+) -> Option<Duration> {
+    budget
         .checked_sub(elapsed)
         .filter(|remaining| *remaining > Duration::ZERO)
         .map(|remaining| remaining.min(USER_OPERATION_LEASE_POLL_INTERVAL))
@@ -2537,6 +2540,49 @@ async fn execute_for_user(
     demand_generation: Option<i64>,
     retry_repo_ids: &[i64],
 ) -> Result<Value> {
+    execute_for_user_with_lease_wait_budget(
+        state,
+        UserOperationRequest {
+            task_id,
+            user_id,
+            operation,
+            repo_id,
+            scheduled,
+            retry_count,
+            demand_generation,
+            retry_repo_ids,
+        },
+        USER_OPERATION_LEASE_WAIT_BUDGET,
+    )
+    .await
+}
+
+struct UserOperationRequest<'a> {
+    task_id: &'a str,
+    user_id: &'a str,
+    operation: &'a str,
+    repo_id: Option<i64>,
+    scheduled: bool,
+    retry_count: u8,
+    demand_generation: Option<i64>,
+    retry_repo_ids: &'a [i64],
+}
+
+async fn execute_for_user_with_lease_wait_budget(
+    state: &AppState,
+    request: UserOperationRequest<'_>,
+    lease_wait_budget: Duration,
+) -> Result<Value> {
+    let UserOperationRequest {
+        task_id,
+        user_id,
+        operation,
+        repo_id,
+        scheduled,
+        retry_count,
+        demand_generation,
+        retry_repo_ids,
+    } = request;
     let lease_wait_started = Instant::now();
     while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
         if jobs::is_task_cancel_requested(state, task_id).await? {
@@ -2559,7 +2605,10 @@ async fn execute_for_user(
             .await?;
             return Ok(json!({"operation": operation, "rescheduled": true}));
         }
-        let Some(wait_for) = bounded_user_operation_lease_wait(lease_wait_started.elapsed()) else {
+        let Some(wait_for) = bounded_user_operation_lease_wait_for_budget(
+            lease_wait_started.elapsed(),
+            lease_wait_budget,
+        ) else {
             let Some(next_retry_count) = next_operation_lease_retry_count(retry_count) else {
                 return Err(anyhow::Error::new(RetryableWebhookReconcileError {
                     reason: "operation_lease_busy",
@@ -3947,22 +3996,30 @@ mod tests {
     #[test]
     fn operation_lease_wait_is_bounded_without_oversleeping() {
         assert_eq!(
-            bounded_user_operation_lease_wait(Duration::ZERO),
+            bounded_user_operation_lease_wait_for_budget(
+                Duration::ZERO,
+                USER_OPERATION_LEASE_WAIT_BUDGET,
+            ),
             Some(USER_OPERATION_LEASE_POLL_INTERVAL)
         );
         assert_eq!(
-            bounded_user_operation_lease_wait(
-                USER_OPERATION_LEASE_WAIT_BUDGET - Duration::from_secs(1)
+            bounded_user_operation_lease_wait_for_budget(
+                USER_OPERATION_LEASE_WAIT_BUDGET - Duration::from_secs(1),
+                USER_OPERATION_LEASE_WAIT_BUDGET,
             ),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            bounded_user_operation_lease_wait(USER_OPERATION_LEASE_WAIT_BUDGET),
+            bounded_user_operation_lease_wait_for_budget(
+                USER_OPERATION_LEASE_WAIT_BUDGET,
+                USER_OPERATION_LEASE_WAIT_BUDGET,
+            ),
             None
         );
         assert_eq!(
-            bounded_user_operation_lease_wait(
-                USER_OPERATION_LEASE_WAIT_BUDGET + Duration::from_secs(1)
+            bounded_user_operation_lease_wait_for_budget(
+                USER_OPERATION_LEASE_WAIT_BUDGET + Duration::from_secs(1),
+                USER_OPERATION_LEASE_WAIT_BUDGET,
             ),
             None
         );
@@ -3974,6 +4031,197 @@ mod tests {
         assert_eq!(next_operation_lease_retry_count(1), Some(2));
         assert_eq!(next_operation_lease_retry_count(2), Some(3));
         assert_eq!(next_operation_lease_retry_count(3), None);
+    }
+
+    async fn operation_lease_test_state() -> Arc<AppState> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        crate::database_migrations::run(&pool)
+            .await
+            .expect("run sqlite migrations");
+
+        let encryption_key = crate::crypto::EncryptionKey::from_base64(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .expect("build encryption key");
+        let config = crate::config::AppConfig {
+            bind_addr: "127.0.0.1:58090".parse().expect("parse bind address"),
+            public_base_url: url::Url::parse("http://127.0.0.1:58090")
+                .expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 1,
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-webhook-push-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: encryption_key.clone(),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: url::Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+            logging: crate::observability::LoggingThresholds::default(),
+        };
+        let github_oauth = crate::state::build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
+            config,
+            pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
+            http: reqwest::Client::new(),
+            github_rest_http: reqwest::Client::new(),
+            github_rest_api_base: url::Url::parse("https://api.github.com/")
+                .expect("parse github rest api base"),
+            github_graphql_url: url::Url::parse("https://api.github.com/graphql")
+                .expect("parse github graphql api base"),
+            github_oauth,
+            linuxdo_oauth: None,
+            webauthn,
+            encryption_key,
+            runtime_owner_id: "webhook-test-runtime-owner".to_owned(),
+        })
+    }
+
+    async fn seed_running_operation_task(state: &AppState, task_id: &str, retry_count: u8) {
+        let now = Utc::now().to_rfc3339();
+        let payload = serde_json::to_string(&manage_task_payload(
+            "lease-user",
+            OP_CHECK,
+            None,
+            false,
+            None,
+            &[],
+            retry_count,
+            None,
+        ))
+        .expect("serialize webhook task payload");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, payload_json,
+              created_at, started_at, updated_at, runtime_owner_id, lease_heartbeat_at
+            ) VALUES (?, ?, 'running', 'test', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(jobs::TASK_WEBHOOK_PUSH_MANAGE)
+        .bind("lease-user")
+        .bind(payload)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&state.runtime_owner_id)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .expect("seed running webhook task");
+    }
+
+    #[tokio::test]
+    async fn operation_lease_busy_production_path_reschedules_and_exhausts() {
+        let state = operation_lease_test_state().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES ('lease-user', 987654321, 'lease-user', ?, ?)
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .expect("seed lease user");
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("lease-user")
+        .bind("lease-holder")
+        .bind((Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .expect("seed held operation lease");
+
+        seed_running_operation_task(&state, "lease-busy-reschedule", 2).await;
+        let result = execute_for_user_with_lease_wait_budget(
+            &state,
+            UserOperationRequest {
+                task_id: "lease-busy-reschedule",
+                user_id: "lease-user",
+                operation: OP_CHECK,
+                repo_id: None,
+                scheduled: false,
+                retry_count: 2,
+                demand_generation: None,
+                retry_repo_ids: &[],
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("busy operation should be rescheduled");
+        assert_eq!(result["rescheduled"], json!(true));
+        assert_eq!(result["retry_count"], json!(3));
+
+        let (status, payload_json) = sqlx::query_as::<_, (String, String)>(
+            "SELECT status, payload_json FROM job_tasks WHERE id = ?",
+        )
+        .bind("lease-busy-reschedule")
+        .fetch_one(&state.pool)
+        .await
+        .expect("load rescheduled operation task");
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse task payload");
+        assert_eq!(status, jobs::STATUS_QUEUED);
+        assert_eq!(payload["retry_count"], json!(3));
+        assert_eq!(payload["reason"], json!("operation_lease_busy"));
+
+        sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+            .bind(jobs::STATUS_SUCCEEDED)
+            .bind("lease-busy-reschedule")
+            .execute(&state.pool)
+            .await
+            .expect("close rescheduled operation task fixture");
+
+        seed_running_operation_task(&state, "lease-busy-exhausted", 3).await;
+        let error = execute_for_user_with_lease_wait_budget(
+            &state,
+            UserOperationRequest {
+                task_id: "lease-busy-exhausted",
+                user_id: "lease-user",
+                operation: OP_CHECK,
+                repo_id: None,
+                scheduled: false,
+                retry_count: 3,
+                demand_generation: None,
+                retry_repo_ids: &[],
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("exhausted lease contention should remain retryable failure");
+        assert!(is_retryable_webhook_reconcile_error(&error));
+        assert!(error.to_string().contains("operation_lease_busy"));
+
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM job_tasks WHERE id = ?")
+            .bind("lease-busy-exhausted")
+            .fetch_one(&state.pool)
+            .await
+            .expect("load exhausted operation task");
+        assert_eq!(status, jobs::STATUS_RUNNING);
     }
 
     #[test]
