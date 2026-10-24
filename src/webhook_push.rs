@@ -2526,7 +2526,7 @@ async fn execute_for_user(
 ) -> Result<Value> {
     while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
         if jobs::is_task_cancel_requested(state, task_id).await? {
-            let _ = jobs::reschedule_task_with_payload(
+            let _ = jobs::reschedule_task_with_payload_if_owned(
                 state,
                 task_id,
                 Utc::now(),
@@ -2712,7 +2712,7 @@ async fn execute_for_user_locked(
     let mut failed_repo_ids = Vec::new();
     for (index, repo) in targets.iter().enumerate() {
         if jobs::is_task_cancel_requested(state, task_id).await? {
-            let _ = jobs::reschedule_task_with_payload(
+            let _ = jobs::reschedule_task_with_payload_if_owned(
                 state,
                 task_id,
                 Utc::now(),
@@ -2831,7 +2831,7 @@ async fn execute_for_user_locked(
         }
     }
     if jobs::is_task_cancel_requested(state, task_id).await? {
-        let _ = jobs::reschedule_task_with_payload(
+        let _ = jobs::reschedule_task_with_payload_if_owned(
             state,
             task_id,
             Utc::now(),
@@ -2852,7 +2852,7 @@ async fn execute_for_user_locked(
     }
     if retryable_failure && retry_count < 3 {
         let delay = retry_delay(retry_count, retry_after);
-        let _ = jobs::reschedule_task_with_payload(
+        let _ = jobs::reschedule_task_with_payload_if_owned(
             state,
             task_id,
             Utc::now() + delay,
@@ -2964,7 +2964,7 @@ pub async fn execute_manage_task(
         Err(error) if is_retryable_webhook_reconcile_error(&error) && retry_count < 3 => {
             let delay = retry_delay(retry_count, None);
             let next_retry_count = retry_count + 1;
-            let _ = jobs::reschedule_task_with_payload(
+            let _ = jobs::reschedule_task_with_payload_if_owned(
                 state,
                 task_id,
                 Utc::now() + delay,
@@ -2996,7 +2996,7 @@ pub async fn execute_manage_task(
         Err(error) if is_sqlite_busy_error(error.as_ref()) && retry_count < 3 => {
             let delay = retry_delay(retry_count, None);
             let next_retry_count = retry_count + 1;
-            let _ = jobs::reschedule_task_with_payload(
+            let _ = jobs::reschedule_task_with_payload_if_owned(
                 state,
                 task_id,
                 Utc::now() + delay,
@@ -3111,7 +3111,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value
             let next_retry_count = retry_count + 1;
             let delay = retry_delay(retry_count, None);
             let available_at = Utc::now() + delay;
-            let rescheduled = jobs::reschedule_task_with_retry_count(
+            let rescheduled = jobs::reschedule_task_with_retry_count_if_owned(
                 state,
                 task_id,
                 available_at,

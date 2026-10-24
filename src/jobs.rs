@@ -2342,35 +2342,25 @@ pub async fn complete_task(
     .await
 }
 
-pub async fn reschedule_task(
+pub(crate) async fn reschedule_task_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
-    result: Value,
-) -> Result<bool> {
-    reschedule_task_inner(state, task_id, available_at, None, None, result, None).await
-}
-
-pub async fn reschedule_task_with_retry_count(
-    state: &AppState,
-    task_id: &str,
-    available_at: DateTime<Utc>,
-    retry_count: u8,
     result: Value,
 ) -> Result<bool> {
     reschedule_task_inner(
         state,
         task_id,
         available_at,
-        Some(retry_count),
+        None,
         None,
         result,
-        None,
+        Some(state.runtime_owner_id.as_str()),
     )
     .await
 }
 
-async fn reschedule_task_with_retry_count_if_owned(
+pub(crate) async fn reschedule_task_with_retry_count_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
@@ -2389,12 +2379,31 @@ async fn reschedule_task_with_retry_count_if_owned(
     .await
 }
 
-pub async fn reschedule_task_with_payload(
+pub(crate) async fn reschedule_task_with_payload_if_owned(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
     payload: Value,
     result: Value,
+) -> Result<bool> {
+    reschedule_task_with_payload_inner(
+        state,
+        task_id,
+        available_at,
+        payload,
+        result,
+        Some(state.runtime_owner_id.as_str()),
+    )
+    .await
+}
+
+async fn reschedule_task_with_payload_inner(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    payload: Value,
+    result: Value,
+    runtime_owner_id: Option<&str>,
 ) -> Result<bool> {
     let payload_json = serde_json::to_string(&payload).context("serialize rescheduled payload")?;
     reschedule_task_inner(
@@ -2404,7 +2413,7 @@ pub async fn reschedule_task_with_payload(
         None,
         Some(payload_json),
         result,
-        None,
+        runtime_owner_id,
     )
     .await
 }
@@ -3442,7 +3451,7 @@ async fn claim_next_queued_task_admitted(state: &AppState) -> Result<Option<Task
 async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     if task.cancel_requested != 0 {
         if is_webhook_push_task_type(task.task_type.as_str()) {
-            let _ = reschedule_task(
+            let _ = reschedule_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 Utc::now(),
@@ -3500,7 +3509,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .unwrap_or(false)
     {
         if is_webhook_push_task_type(task.task_type.as_str()) {
-            let _ = reschedule_task(
+            let _ = reschedule_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 Utc::now(),
@@ -5970,7 +5979,7 @@ mod tests {
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
-        reschedule_task, retry_candidate_is_retryable, rollback_scheduler_dispatch,
+        reschedule_task_if_owned, retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
@@ -6116,6 +6125,12 @@ mod tests {
         let state = setup_state(pool.clone());
         let task_id = "foreground-reschedule-pressure-task";
         seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind(state.runtime_owner_id.as_str())
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed foreground reschedule owner");
 
         let held = state
             .sqlite_writer
@@ -6151,7 +6166,7 @@ mod tests {
         let reschedule = {
             let state = state.clone();
             tokio::spawn(async move {
-                reschedule_task(
+                reschedule_task_if_owned(
                     state.as_ref(),
                     task_id,
                     Utc::now() + Duration::minutes(1),
@@ -9102,6 +9117,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_task_reschedule_does_not_reschedule_reclaimed_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "owned-reschedule-reclaimed-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
+            .bind("new-runtime-owner")
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .expect("seed reclaimed task owner");
+
+        let rescheduled = reschedule_task_if_owned(
+            state.as_ref(),
+            task_id,
+            Utc::now() + Duration::minutes(1),
+            json!({"reason": "cancel_requested"}),
+        )
+        .await
+        .expect("reschedule reclaimed task");
+
+        assert!(!rescheduled);
+        let (status, runtime_owner_id): (String, Option<String>) =
+            sqlx::query_as("SELECT status, runtime_owner_id FROM job_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load reclaimed task state");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(runtime_owner_id.as_deref(), Some("new-runtime-owner"));
+    }
+
+    #[tokio::test]
     async fn webhook_audit_partial_dispatch_reschedules_same_task() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -9125,6 +9173,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert audit task");
+        sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = 'audit-retry'")
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("claim audit task for test runtime");
         sqlx::raw_sql(
             r#"
             CREATE TRIGGER fail_one_webhook_dispatch

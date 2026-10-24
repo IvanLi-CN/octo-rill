@@ -2685,8 +2685,19 @@ fn social_activity_result_snapshot(
     events: usize,
     source_errors: &[String],
 ) -> SyncSocialActivityResult {
-    let mut all_source_errors = source_errors.to_vec();
-    all_source_errors.extend(repo_collection.source_errors.iter().cloned());
+    let mut all_source_errors =
+        Vec::with_capacity(source_errors.len() + repo_collection.source_errors.len());
+    for source_error in source_errors
+        .iter()
+        .chain(repo_collection.source_errors.iter())
+    {
+        if !all_source_errors
+            .iter()
+            .any(|current| current == source_error)
+        {
+            all_source_errors.push(source_error.clone());
+        }
+    }
     SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
         followers,
@@ -15772,14 +15783,14 @@ mod tests {
         REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
         ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate, RepoReleaseFetchOutcome,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
-        RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        SocialSyncFailure, StaleRepoReleaseWorkRow, StarPhaseSuccess, StarredFetchResult,
-        StarredRepoSnapshot, SubscriptionEventRecord, SubscriptionPrunePhaseOutcome,
-        SubscriptionRunContext, SubscriptionRunLogger, SyncRequestError, SyncSocialActivityResult,
-        SyncSubscriptionSocialSummary, aggregate_release_visible_repos, aggregate_repos,
-        announcement_category_id_from_repo_value, append_subscription_event,
-        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        apply_social_activity_snapshot_with_options,
+        RepoStargazerCollectionResult, RepoStargazerFetchResult, RepoStargazerSnapshot,
+        SocialActivityEventInsert, SocialSyncFailure, StaleRepoReleaseWorkRow, StarPhaseSuccess,
+        StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
+        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SubscriptionRunLogger,
+        SyncRequestError, SyncSocialActivityResult, SyncSubscriptionSocialSummary,
+        aggregate_release_visible_repos, aggregate_repos, announcement_category_id_from_repo_value,
+        append_subscription_event, apply_social_activity_snapshot,
+        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
         attach_and_wait_for_user_release_demand_with_freshness, attach_release_demand,
         attach_release_demand_with_freshness, claim_next_repo_release_work_item,
         classify_github_http_error, cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
@@ -18257,6 +18268,34 @@ mod tests {
         let failure = super::social_sync_failure_from_error(&error);
         assert!(!failure.sqlite_backpressure);
         assert_eq!(failure.source_errors, partial.source_errors);
+    }
+
+    #[test]
+    fn social_activity_snapshot_deduplicates_cross_phase_source_errors() {
+        let shared_error = "stargazers(repo:octo/shared): unavailable".to_owned();
+        let repo_collection = RepoStargazerCollectionResult {
+            source_errors: vec![
+                shared_error.clone(),
+                "stargazers(repo:octo/other): timeout".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let phase_errors = vec![
+            shared_error.clone(),
+            "followers(conn:github): timeout".to_owned(),
+        ];
+
+        let snapshot =
+            super::social_activity_result_snapshot(&repo_collection, 2, 3, phase_errors.as_slice());
+
+        assert_eq!(
+            snapshot.source_errors,
+            vec![
+                shared_error,
+                "followers(conn:github): timeout".to_owned(),
+                "stargazers(repo:octo/other): timeout".to_owned(),
+            ]
+        );
     }
 
     #[tokio::test]
