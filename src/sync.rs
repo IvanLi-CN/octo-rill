@@ -446,6 +446,8 @@ pub struct SyncSocialActivityResult {
     pub failed_repos: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_errors: Vec<String>,
+    #[serde(skip)]
+    pub(crate) fatal_source_errors: bool,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -1836,9 +1838,17 @@ impl SyncRequestError {
     }
 
     fn into_anyhow(self) -> anyhow::Error {
-        anyhow!(self.message)
+        anyhow::Error::new(self)
     }
 }
+
+impl std::fmt::Display for SyncRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for SyncRequestError {}
 
 fn default_sync_request_phase(reason_code: &str) -> &'static str {
     match reason_code {
@@ -2292,6 +2302,7 @@ pub async fn sync_social_activity(
         .await
         .map_err(SyncRequestError::into_anyhow)?;
     let mut source_errors = Vec::new();
+    let mut fatal_source_errors = false;
     let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
     let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
     let mut followers_partial = false;
@@ -2311,6 +2322,7 @@ pub async fn sync_social_activity(
                 }
             }
             Err(err) => {
+                fatal_source_errors |= !err.retryable;
                 tracing::warn!(
                     event = "upstream.call",
                     operation = "sync.social.owned_repo_snapshot",
@@ -2335,6 +2347,7 @@ pub async fn sync_social_activity(
                 }
             }
             Err(err) => {
+                fatal_source_errors |= !err.retryable;
                 tracing::warn!(
                     event = "upstream.call",
                     operation = "sync.social.followers_snapshot",
@@ -2366,6 +2379,7 @@ pub async fn sync_social_activity(
                 }
             }
             Err(err) => {
+                fatal_source_errors |= !err.retryable;
                 tracing::warn!(
                     event = "upstream.call",
                     operation = "sync.social.feed_activity_snapshot",
@@ -2397,6 +2411,7 @@ pub async fn sync_social_activity(
                 }
             }
             Err(err) => {
+                fatal_source_errors |= !err.retryable;
                 tracing::warn!(
                     event = "upstream.call",
                     operation = "sync.social.discussion_announcements_snapshot",
@@ -2497,6 +2512,7 @@ pub async fn sync_social_activity(
                     followers.len(),
                     committed_events,
                     source_errors.as_slice(),
+                    fatal_source_errors,
                 ),
             )
         })?,
@@ -2521,6 +2537,7 @@ pub async fn sync_social_activity(
                     followers.len(),
                     committed_events,
                     source_errors.as_slice(),
+                    fatal_source_errors,
                 ),
             )
         })?,
@@ -2538,6 +2555,7 @@ pub async fn sync_social_activity(
                     followers.len(),
                     events + committed_events,
                     source_errors.as_slice(),
+                    fatal_source_errors,
                 ),
             )
         })?;
@@ -2553,6 +2571,7 @@ pub async fn sync_social_activity(
                     followers.len(),
                     events,
                     source_errors.as_slice(),
+                    fatal_source_errors,
                 ),
             )
         })?;
@@ -2562,6 +2581,7 @@ pub async fn sync_social_activity(
         followers.len(),
         events,
         source_errors.as_slice(),
+        fatal_source_errors,
     ))
 }
 
@@ -2712,6 +2732,7 @@ fn social_activity_result_snapshot(
     followers: usize,
     events: usize,
     source_errors: &[String],
+    fatal_source_errors: bool,
 ) -> SyncSocialActivityResult {
     let all_source_errors = deduplicate_social_source_errors(
         source_errors
@@ -2729,6 +2750,7 @@ fn social_activity_result_snapshot(
             .chain(repo_collection.partial_repos.iter().cloned())
             .collect(),
         source_errors: all_source_errors,
+        fatal_source_errors: fatal_source_errors || repo_collection.fatal_source_errors,
     }
 }
 
@@ -2767,7 +2789,7 @@ pub(crate) fn social_sync_failure_from_result(
         message: result.source_errors.join("; "),
         sqlite_backpressure: false,
         source_errors: result.source_errors.clone(),
-        source_degraded: true,
+        source_degraded: !result.fatal_source_errors,
     })
 }
 
@@ -2803,7 +2825,11 @@ async fn sync_social_activity_best_effort_with_failure(
                 tracing::warn!(
                     user_id,
                     context,
-                    error_kind = "social_sync_failed",
+                    error_kind = if failure.source_degraded {
+                        "social_source_degraded"
+                    } else {
+                        "social_sync_failed"
+                    },
                     source_errors = ?failure.source_errors,
                     "social activity sync completed with upstream source errors"
                 );
@@ -2859,6 +2885,7 @@ async fn collect_repo_stargazer_snapshots_for_sources(
     let mut failed_repos = Vec::new();
     let mut partial_repos = Vec::new();
     let mut source_errors = Vec::new();
+    let mut fatal_source_errors = false;
     let mut join_set = JoinSet::new();
     let mut pending = repos.iter().cloned().enumerate();
     let concurrency = SOCIAL_STARGAZER_FETCH_CONCURRENCY.max(1);
@@ -2894,6 +2921,9 @@ async fn collect_repo_stargazer_snapshots_for_sources(
                 repo_members.push((index, repo, result.members));
             }
             Ok((_, repo, Err(err))) => {
+                fatal_source_errors |= err
+                    .downcast_ref::<SyncRequestError>()
+                    .is_some_and(|request_error| !request_error.retryable);
                 tracing::warn!(
                     ?err,
                     repo = repo.full_name.as_str(),
@@ -2904,6 +2934,7 @@ async fn collect_repo_stargazer_snapshots_for_sources(
                 source_errors.push(format!("stargazers(repo:{repo_name}): {err}"));
             }
             Err(err) => {
+                fatal_source_errors = true;
                 tracing::warn!(
                     ?err,
                     "sync social activity: repo stargazers task join failed"
@@ -2924,6 +2955,7 @@ async fn collect_repo_stargazer_snapshots_for_sources(
         failed_repos,
         partial_repos,
         source_errors,
+        fatal_source_errors,
     }
 }
 
@@ -2938,6 +2970,7 @@ struct RepoStargazerCollectionResult {
     failed_repos: Vec<String>,
     partial_repos: Vec<String>,
     source_errors: Vec<String>,
+    fatal_source_errors: bool,
 }
 
 #[cfg(test)]
@@ -3013,6 +3046,7 @@ where
         failed_repos,
         partial_repos,
         source_errors,
+        fatal_source_errors: false,
     }
 }
 
@@ -12382,14 +12416,6 @@ fn github_rest_url(state: &AppState, path_and_query: &str) -> Result<String, Syn
         })
 }
 
-fn github_rest_url_anyhow(state: &AppState, path_and_query: &str) -> Result<String> {
-    state
-        .github_rest_api_base
-        .join(path_and_query)
-        .map(|url| url.to_string())
-        .context("failed to build github rest url")
-}
-
 async fn fetch_github_rest_page<T: DeserializeOwned>(
     state: &AppState,
     access_token: &str,
@@ -13192,7 +13218,7 @@ async fn fetch_repo_stargazers_snapshot(
 
     while page <= SOCIAL_STARGAZER_MAX_PAGES {
         let operation = format!("sync social stargazers {} page {page}", repo.full_name);
-        let url = github_rest_url_anyhow(
+        let url = github_rest_url(
             state,
             format!(
                 "repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
@@ -15834,7 +15860,8 @@ mod tests {
         recover_repo_release_runtime_state_on_startup, refresh_public_repo_release_if_stale,
         replace_starred_repos, repo_release_deadline_at, repo_release_timestamp_is_fresh,
         resolve_notification_open_url, social_activity_snapshot_hook_test_lock,
-        social_source_errors_from_error, social_sync_failure_metadata, store_sync_state_value,
+        social_source_errors_from_error, social_sync_failure_from_result,
+        social_sync_failure_metadata, store_sync_state_value,
         subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
@@ -18021,6 +18048,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn social_source_failure_classification_keeps_terminal_http_errors_nonrecoverable() {
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, ""),
+            (
+                StatusCode::FORBIDDEN,
+                "resource not accessible by integration",
+            ),
+            (StatusCode::NOT_FOUND, ""),
+        ] {
+            let request_error =
+                classify_github_http_error("sync social source", status, &HeaderMap::new(), body);
+            assert!(!request_error.retryable);
+            let result = SyncSocialActivityResult {
+                source_errors: vec![request_error.message.clone()],
+                fatal_source_errors: true,
+                ..Default::default()
+            };
+            let failure = social_sync_failure_from_result(&result)
+                .expect("terminal source error should become a typed failure");
+            assert!(!failure.source_degraded, "status {status} was downgraded");
+            assert_eq!(failure.source_errors, result.source_errors);
+        }
+
+        let result = SyncSocialActivityResult {
+            source_errors: vec!["sync social source: github returned 500".to_owned()],
+            fatal_source_errors: false,
+            ..Default::default()
+        };
+        let failure = social_sync_failure_from_result(&result)
+            .expect("retryable source error should become a typed failure");
+        assert!(failure.source_degraded);
+    }
+
     #[tokio::test]
     async fn social_sync_sqlite_backpressure_emits_recoverable_event_and_counts_user_failed() {
         let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
@@ -18087,6 +18148,7 @@ mod tests {
                 events: 3,
                 failed_repos: vec!["octo/backpressure".to_owned()],
                 source_errors: Vec::new(),
+                fatal_source_errors: false,
             },
             Some(SocialSyncFailure {
                 message: error.to_string(),
@@ -18267,6 +18329,7 @@ mod tests {
             events: 3,
             failed_repos: vec!["octo/partial".to_owned()],
             source_errors: vec!["followers(conn:github, http_500): GitHub returned 500".to_owned()],
+            fatal_source_errors: false,
         };
         let error = super::with_social_activity_failure(
             anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
@@ -18311,8 +18374,13 @@ mod tests {
             .chain(repo_collection.source_errors.iter())
             .cloned()
             .collect::<Vec<_>>();
-        let partial =
-            super::social_activity_result_snapshot(&repo_collection, 2, 3, phase_errors.as_slice());
+        let partial = super::social_activity_result_snapshot(
+            &repo_collection,
+            2,
+            3,
+            phase_errors.as_slice(),
+            false,
+        );
         let error = super::with_social_activity_failure(
             anyhow::anyhow!("social persistence failed"),
             "apply social activity snapshot",
@@ -18346,8 +18414,13 @@ mod tests {
             "followers(conn:github): timeout".to_owned(),
         ];
 
-        let snapshot =
-            super::social_activity_result_snapshot(&repo_collection, 2, 3, phase_errors.as_slice());
+        let snapshot = super::social_activity_result_snapshot(
+            &repo_collection,
+            2,
+            3,
+            phase_errors.as_slice(),
+            false,
+        );
 
         assert_eq!(
             snapshot.source_errors,
