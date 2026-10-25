@@ -113,6 +113,7 @@
 - repository visibility/identity/metadata 变化 MUST 进入可去重的 metadata queue；source deletion 也 MUST enqueue the affected repo，且每次新的 metadata event MUST 将该 repo 的 release rowid cursor 重置为 0；每个 `Background` SQLite 事务最多刷新 25 个 release projection rows。队列必须在进程重启、低磁盘暂停和前台 writer 竞争后继续处理；worker 在每个完成的 batch 后让出执行权，并在 ready 后继续轮询新队列。历史 source phase MUST 使用稳定的 `rowid > cursor ORDER BY rowid LIMIT 25` 访问路径，并为 repository-id 与 translation-lane lookup 提供可命中的 SQLite indexes。
 - worker MUST 在写入前检查数据库目录的 `statvfs` 可用空间；低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时暂停并将搜索状态标记为 `paused_low_disk`，不得继续写入 FTS/WAL。低磁盘状态只在状态转换时写入；暂停和恢复的结构化日志必须包含观测空闲字节数与配置水位。索引状态 MUST 以 `building`、`ready`、`paused_low_disk` 或 `failed` 出现在搜索响应中。
 - 如果任意 backfill batch 失败，worker MUST 在记录失败前显式 rollback 当前 writer transaction，保留 phase/cursor，并将状态置为 `failed`；`failed` 是终态，worker MUST 停止且不得对同一 cursor 自动进行 5 秒重试。失败必须通过结构化日志和 `index_status = failed` 可见。
+- realtime content projection 如果基础 `search_documents` 尚未物化，MUST 将其识别为预期 deferred dependency，并在同一个 apply transaction 内清除 projection lease、写入固定 `missing_search_document` 的 `last_error` 和既有 retry schedule 后提交；不得先 rollback 再以第二个 writer transaction 记录该预期状态。真实 SQL、unsupported resource 或其他状态错误仍 MUST rollback，并复用既有 bounded recovery、`search_projection_outbox_failed` 和 terminal reactivation 机制。
 - 管理员 MUST 能通过 `GET /api/admin/jobs/search-index` 查看 phase、cursor、status、last_error、updated_at 和 metadata queue 状态，并通过 `POST /api/admin/jobs/search-index/resume` 显式恢复 `failed` 状态。恢复 MUST 在前台 writer transaction 中清除 last_error、保留 phase/cursor 并回到 `building`，随后重新启动 worker；非 `failed` 状态的 resume MUST 返回状态冲突。
 - 迁移运行器 MUST 只对白名单历史版本 `81` 接受精确 SHA-384 checksum；dirty、缺失、未知或 checksum 不匹配的迁移历史 MUST 终止启动。
 - covers: 启动可用性、可恢复索引、资源保护与迁移兼容性。
@@ -173,9 +174,16 @@
 - covers: `REQ-CPS-013`
 - Pass condition: the first release batch projects exactly 25 rows and persists cursor 25, the next batch projects the remaining row and persists cursor 26, a failed batch leaves source projection/cursor unchanged and records `failed` only after rollback, foreground writes succeed immediately afterward, explicit resume restarts at the persisted cursor, and the repository/translation plans use the dedicated indexes.
 
+### VER-CPS-010
+
+- Method: realtime content projection fixture where the outbox item precedes its base `search_documents` row, followed by a legal projection SQL failure fixture and terminal retry loop.
+- covers: `REQ-CPS-013`
+- Pass condition: the missing base document commits a deferred retry state in the apply transaction with a cleared lease and stable `missing_search_document` reason, the later base-document materialization converges, and actual SQL/state errors rollback before bounded retry and terminal recovery remain available.
+
 ## Related ADRs
 
 - [ADR 0017: Rowid-Mapped Search FTS Recovery](../../adr/0017-search-fts-rowid-recovery.md)
+- [ADR 0021: SQLite background admission bounded retry](../../adr/0021-sqlite-background-admission-retry.md)
 
 ## Visual Evidence
 

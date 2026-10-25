@@ -4,6 +4,7 @@
 
 ## Lifecycle / Compatibility
 
+- 2026-10-25：realtime content projection 将缺失基础 `search_documents` 识别为预期 deferred outcome，在同一个 apply transaction 内清除 lease 并写入固定 `missing_search_document` retry reason；真实 SQL/state error 继续 rollback 并复用既有 recovery/terminal queue，不新增 schema 或迁移。
 - New active topic. No predecessor or successor.
 - The endpoint is additive and the existing reading, synchronization, notification and brief routes remain the source of truth for their own workflows.
 

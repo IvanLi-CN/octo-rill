@@ -2600,6 +2600,9 @@ mod tests {
         })
         .await
         .expect("second background writer should hit admission denial");
+        let status = coordinator.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
         let error = tokio::time::timeout(Duration::from_secs(2), second_background)
             .await
             .expect("second background writer should honor its deadline")
@@ -2695,16 +2698,29 @@ mod tests {
                     .await
             })
         };
+        let third_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_denied_then_retried_again", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if coordinator.runtime_status().background_rejected >= 1 {
+                if coordinator.runtime_status().background_rejected >= 2 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("second background writer should be denied without a second waiter");
+        .expect("background writers should be denied without a second waiter");
+        let status = coordinator.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
 
         drop(held);
         tokio::time::timeout(Duration::from_secs(1), foreground)
@@ -2722,12 +2738,17 @@ mod tests {
             .expect("retried background writer should complete")
             .expect("join retried background writer")
             .expect("retried background writer should succeed");
+        tokio::time::timeout(Duration::from_secs(1), third_background)
+            .await
+            .expect("second retried background writer should complete")
+            .expect("join second retried background writer")
+            .expect("second retried background writer should succeed");
 
         let status = coordinator.runtime_status();
         assert!(!status.active);
         assert_eq!(status.waiting_background, 0);
         assert_eq!(status.waiting_foreground, 0);
-        assert!(status.background_rejected >= 1);
+        assert!(status.background_rejected >= 2);
     }
 
     #[test]
