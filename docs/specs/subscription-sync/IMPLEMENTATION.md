@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- Follow-up candidate preserves typed `ApiError` across Social content-processing adapters, so foreground `sqlite_write_retryable` failures are classified as recoverable SQLite backpressure while genuine upstream failures retain their non-recoverable classification.
 - PR #340 executable candidate `6efe5732` preserves retryable-versus-fatal source classification when Social persistence fails after a partial snapshot and gives terminal 401/404/451 statuses precedence over rate-limit metadata; focused regressions cover both combined-error classes and terminal HTTP headers.
 - PR #340 executable candidate `97843ed6` makes access-refresh progress/log metadata use the shared Social classifier: retryable completed source degradation is warning/recoverable with `next_sync_subscriptions_run`, while non-retryable upstream errors remain error/non-recoverable; the Notifications continuation regression covers the production-shaped dependency path.
 - PR #340 executable candidate `b0c272cf644cba486aa83cba77e6bbd13bfbd945` preserves terminal Social upstream classifications: retryable completed source errors remain `social_source_degraded` warning/recoverable, while non-retryable credentials/forbidden/inaccessible-repo errors become `social_sync_failed` error/non-recoverable; `LeaseHeartbeat` now aborts its active task on unexpected handle drop, with focused regressions.
