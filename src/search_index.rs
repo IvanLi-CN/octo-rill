@@ -698,14 +698,20 @@ async fn apply_projection_outbox_item(
     row: &ProjectionOutboxRow,
 ) -> Result<ProjectionApplyOutcome> {
     if row.operation == "delete" {
-        if row.resource_type == "content" {
-            let canonical_type = row
-                .canonical_resource_type
-                .as_deref()
-                .context("content projection delete is missing canonical resource type")?;
-            let _ = refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
-        } else {
-            delete_search_document(tx, &row.projection_key).await?;
+        match row.resource_type.as_str() {
+            "content" => {
+                let canonical_type = row
+                    .canonical_resource_type
+                    .as_deref()
+                    .context("content projection delete is missing canonical resource type")?;
+                let _ = refresh_content_projection(tx, canonical_type, &row.resource_id).await?;
+            }
+            "announcement" | "notification" => {
+                delete_search_document(tx, &row.projection_key).await?;
+            }
+            resource_type => {
+                bail!("unsupported search projection resource type {resource_type}");
+            }
         }
         return Ok(ProjectionApplyOutcome::Complete);
     }

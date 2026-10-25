@@ -5,6 +5,7 @@
 ## Decision Trace
 
 - 2026-10-25：realtime content projection 的预期缺失基础文档改为在 apply transaction 内提交 deferred retry state，避免 rollback 后第二次 recovery write；runtime owner/job heartbeat 继续使用 background lane，并仅对 SQLite admission/busy/deadline 做 100/250/500 ms 有界重试，保留单 background waiter、foreground priority、既有 deadline/backoff 和 terminal recovery 语义。
+- 2026-10-25：正式审查补回 unsupported projection delete 的数据安全边界；delete apply 现在显式限制为 `content`、`announcement` 与 `notification`，未知 resource type 沿现有 rollback、lease cleanup、bounded retry 和 terminal recovery 路径处理；同时记录当前候选的本地全量/source guard 结果，Agent VM exact-head 压力证据因 `guest_resize_unverified` 环境限制暂不可用。
 - 2026-10-25：后续修复保留 Social content-processing 适配器中的 typed `ApiError`，使 `sqlite_write_retryable` 能继续映射到 `sqlite_write_backpressure` warning/recoverable 事件；真实 upstream error、当前轮 failed 计数与下一轮调度重试语义保持不变。
 - 2026-10-25：PR #340 executable candidate `6efe5732` 修复 partial Social snapshot 后发生 SQLite 持久化背压时的 source 严重性丢失，并让 401/404/451 在限流头存在时仍保持不可重试；新增 retryable source+SQLite、fatal source+SQLite 与终端 HTTP 元数据回归。
 - 2026-10-25：PR #340 executable candidate `97843ed6` 修复 access-refresh Social 进度/日志只识别 SQLite 背压、误将可重试 HTTP 500/网络降级标记为不可恢复的问题；共享分类器现在同时覆盖 SQLite 背压、可重试 source degradation 与 fatal upstream，并新增真实 access-refresh 依赖路径回归。

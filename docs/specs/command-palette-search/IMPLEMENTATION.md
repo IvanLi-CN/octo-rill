@@ -48,7 +48,7 @@
 - `search::tests::metadata_change_restarts_release_cursor`：覆盖 metadata fanout 进行中变更 repository identity 后 cursor 重置并重新刷新前段 rows。
 - `search::tests::fts_doc_id_maintenance_uses_indexed_point_updates`：覆盖 global 与 user-lane FTS `doc_id` 维护均走 mapping rowid point lookup，且不出现旧 virtual-table scan plan。
 - `search::tests::production_sized_fts_maintenance_benchmark`：手动 ignored 基准，覆盖 397 associations、39,700 release documents、397 lanes、旧/新 plan、writer batch 和并发 search/GET/session workload。
-- `search::tests::content_projection_retries_until_search_document_exists`、`search::tests::realtime_projection_outbox_moves_terminal_failures_to_recovery_queue` 与 `search::tests::realtime_projection_actual_apply_error_rolls_back_before_recovery`：覆盖 content-first deferred commit、terminal recovery 和真实 apply SQL error rollback。
+- `search::tests::content_projection_retries_until_search_document_exists`、`search::tests::realtime_projection_outbox_moves_terminal_failures_to_recovery_queue`、`search::tests::realtime_projection_actual_apply_error_rolls_back_before_recovery` 与 `search::tests::realtime_projection_unsupported_delete_rolls_back_before_recovery`：覆盖 content-first deferred commit、terminal recovery、真实 apply SQL error rollback 和 unsupported delete rollback。
 - `search::tests::backfill_prefers_ready_projection_over_newer_running_projection`：覆盖恢复回填与触发器一致的 ready 投影优先级。
 - `search::tests::owned_release_visibility_repairs_cached_release_metadata`：覆盖历史 Release 投影在自有仓库可见性启用、仓库改名和回填恢复后的元数据与深链。
 - `search::tests::repository_rename_deduplicates_star_and_association_projection`：覆盖 star 同步先改名、association 随后写入时按 `repo_id` 清理旧 projection。

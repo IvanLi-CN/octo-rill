@@ -2588,6 +2588,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_projection_unsupported_delete_rolls_back_before_recovery() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let mut connection = pool.acquire().await.expect("acquire fixture connection");
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .expect("allow invalid resource type for rollback fixture");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('unsupported:delete', 'delete', 'unsupported', 'unsupported', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *connection)
+        .await
+        .expect("seed unsupported delete projection");
+        drop(connection);
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "unsupported projection deletes must keep the source error"
+        );
+        let (attempt_count, last_error, lease_owner, lease_expires_at) = sqlx::query_as::<
+            _,
+            (i64, Option<String>, Option<String>, Option<String>),
+        >(
+            "SELECT attempt_count, last_error, lease_owner, lease_expires_at FROM search_projection_outbox WHERE projection_key = 'unsupported:delete'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered unsupported projection");
+        assert_eq!(attempt_count, 1);
+        assert!(last_error.as_deref().is_some_and(|error| {
+            error.contains("unsupported search projection resource type unsupported")
+        }));
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
+    }
+
+    #[tokio::test]
     async fn realtime_projection_terminal_recovery_failure_does_not_block_active_work() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
