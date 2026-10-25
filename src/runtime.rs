@@ -355,7 +355,9 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use super::{Duration, spawn_lease_heartbeat};
+    use super::{Duration, LEASE_HEARTBEAT_RETRY_DELAYS, spawn_lease_heartbeat};
+
+    type ErrorFactory = Arc<dyn Fn() -> anyhow::Error + Send + Sync>;
 
     struct DropProbe(Arc<Notify>);
 
@@ -425,6 +427,82 @@ mod tests {
             .expect("heartbeat should recover after sqlite backpressure");
         assert!(attempts.load(Ordering::Acquire) >= 2);
         heartbeat.stop().await;
+    }
+
+    #[tokio::test]
+    async fn lease_heartbeat_bounds_each_sqlite_backpressure_retry_class() {
+        let error_factories: [(&str, ErrorFactory); 3] = [
+            (
+                "background_admission",
+                Arc::new(|| {
+                    anyhow::Error::new(crate::sqlite_write::SqliteBackgroundAdmissionError {
+                        lane: "heartbeat_test",
+                        waiting_foreground: 1,
+                        waiting_background: 1,
+                        queue_limit: 1,
+                    })
+                }),
+            ),
+            (
+                "busy",
+                Arc::new(|| anyhow::anyhow!("error returned from database: database is locked")),
+            ),
+            (
+                "writer_deadline",
+                Arc::new(|| {
+                    anyhow::Error::new(crate::sqlite_write::SqliteWriteDeadlineError {
+                        lane: "heartbeat_test",
+                        priority: "background",
+                        phase: "acquire",
+                        deadline_ms: 100,
+                    })
+                }),
+            ),
+        ];
+
+        for (expected_kind, error_factory) in error_factories {
+            let error = error_factory();
+            assert!(
+                super::is_sqlite_heartbeat_backpressure(&error),
+                "{expected_kind} should be retryable backpressure"
+            );
+            assert_eq!(
+                super::sqlite_heartbeat_error_kind(&error),
+                expected_kind,
+                "{expected_kind} should keep its classification"
+            );
+
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let exhausted = Arc::new(Notify::new());
+            let heartbeat = {
+                let attempts = attempts.clone();
+                let exhausted = exhausted.clone();
+                spawn_lease_heartbeat("test", Duration::from_secs(2), move || {
+                    let attempts = attempts.clone();
+                    let exhausted = exhausted.clone();
+                    let error_factory = error_factory.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::AcqRel) + 1;
+                        if attempt == LEASE_HEARTBEAT_RETRY_DELAYS.len() + 1 {
+                            exhausted.notify_one();
+                        }
+                        Err(error_factory())
+                    }
+                })
+            };
+
+            tokio::time::timeout(Duration::from_secs(4), exhausted.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{expected_kind} heartbeat should exhaust its bounded retries")
+                });
+            assert_eq!(
+                attempts.load(Ordering::Acquire),
+                LEASE_HEARTBEAT_RETRY_DELAYS.len() + 1,
+                "{expected_kind} heartbeat should stop after the initial attempt plus bounded retries"
+            );
+            heartbeat.stop().await;
+        }
     }
 
     #[tokio::test]
