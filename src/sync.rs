@@ -28,7 +28,9 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
-    admin_runtime, content_processing, jobs, local_id, runtime,
+    admin_runtime, content_processing,
+    error::ApiError,
+    jobs, local_id, runtime,
     sqlite_write::{
         SqliteWritePermit, SqliteWritePriority, is_sqlite_background_admission_error,
         is_sqlite_retryable_write_error, is_sqlite_write_deadline_error,
@@ -2625,10 +2627,10 @@ async fn enqueue_global_announcement_work(
             };
             let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
             content_processing::submit_item(state, user_id, "async", &canonical)
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
         }
     }
     Ok(())
@@ -2786,6 +2788,15 @@ fn social_source_errors_from_error(error: &anyhow::Error) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn is_social_sqlite_retryable_error(error: &anyhow::Error) -> bool {
+    is_sqlite_retryable_write_error(error.as_ref())
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ApiError>()
+                .is_some_and(ApiError::is_sqlite_write_retryable)
+        })
+}
+
 pub(crate) fn social_sync_failure_from_result(
     result: &SyncSocialActivityResult,
 ) -> Option<SocialSyncFailure> {
@@ -2816,8 +2827,7 @@ pub(crate) fn social_sync_failure_from_error(error: &anyhow::Error) -> SocialSyn
     let source_degraded = !partial_result.fatal_source_errors && !source_errors.is_empty();
     SocialSyncFailure {
         message: error.to_string(),
-        sqlite_backpressure: source_errors.is_empty()
-            && is_sqlite_retryable_write_error(error.as_ref()),
+        sqlite_backpressure: source_errors.is_empty() && is_social_sqlite_retryable_error(error),
         source_errors,
         source_degraded,
     }
@@ -5494,10 +5504,10 @@ async fn enqueue_background_release_translation_task(
                     source,
                 )
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
                 content_processing::submit_item(state, user_id, "async", &item)
                     .await
-                    .map_err(|error| anyhow!(error.to_string()))?;
+                    .map_err(ApiError::into_anyhow)?;
             }
             return Ok(None);
         }
@@ -5550,10 +5560,10 @@ async fn enqueue_background_release_smart_task(
                     source,
                 )
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
                 content_processing::submit_item(state, user_id, "async", &item)
                     .await
-                    .map_err(|error| anyhow!(error.to_string()))?;
+                    .map_err(ApiError::into_anyhow)?;
             }
             return Ok(None);
         }
@@ -15227,10 +15237,10 @@ async fn enqueue_global_notification_work(
             };
             let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
             content_processing::submit_item(state, user_id, "async", &canonical)
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .map_err(ApiError::into_anyhow)?;
         }
     }
     Ok(())
@@ -18414,6 +18424,136 @@ mod tests {
         assert!(!fatal_failure.sqlite_backpressure);
         assert!(!fatal_failure.source_degraded);
         assert_eq!(fatal_failure.source_errors, partial.source_errors);
+    }
+
+    #[test]
+    fn social_sync_failure_from_api_error() {
+        let retryable = crate::error::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sqlite_write_retryable",
+            "SQLite write capacity is busy; retry the request.",
+        )
+        .into_anyhow();
+        let failure = super::social_sync_failure_from_error(&retryable);
+        assert!(failure.sqlite_backpressure);
+        assert!(failure.source_errors.is_empty());
+        assert_eq!(
+            super::social_sync_failure_metadata(
+                failure.sqlite_backpressure,
+                failure.source_degraded
+            ),
+            (
+                "warning",
+                true,
+                "sqlite_write_backpressure",
+                Some("next_sync_subscriptions_run")
+            )
+        );
+
+        let upstream = crate::error::ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "GitHub returned an invalid response",
+        )
+        .into_anyhow();
+        let upstream_failure = super::social_sync_failure_from_error(&upstream);
+        assert!(!upstream_failure.sqlite_backpressure);
+        assert_eq!(
+            super::social_sync_failure_metadata(
+                upstream_failure.sqlite_backpressure,
+                upstream_failure.source_degraded,
+            ),
+            ("error", false, "social_sync_failed", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn social_global_announcement_enqueue_sqlite_backpressure() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-global-announcement-backpressure");
+        seed_user(&pool, user_id.as_str()).await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("enable global content processing mode");
+
+        let actor = GitHubActor {
+            id: 9001,
+            login: "announcement-author".to_owned(),
+            avatar_url: None,
+            html_url: None,
+        };
+        let mut tx = pool.begin().await.expect("begin announcement seed tx");
+        insert_social_activity_event_tx(
+            &mut tx,
+            SocialActivityEventInsert {
+                user_id: user_id.as_str(),
+                kind: "announcement",
+                repo_id: Some(42),
+                repo_full_name: Some("octo/alpha"),
+                discussion_number: Some(42),
+                repo_visual: None,
+                title: Some("SQLite writer pressure"),
+                body: Some("Announcement body"),
+                html_url: Some("https://github.com/octo/alpha/discussions/42"),
+                github_event_id: Some("social-global-announcement-backpressure"),
+                actor: &actor,
+                occurred_at: "2026-03-07T00:00:00Z",
+                detected_at: "2026-03-07T00:00:00Z",
+            },
+        )
+        .await
+        .expect("seed announcement source");
+        tx.commit().await.expect("commit announcement source");
+
+        let held = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "social_global_announcement_backpressure_hold",
+                crate::sqlite_write::SqliteWritePriority::Foreground,
+            )
+            .await
+            .expect("hold sqlite writer admission");
+        let error = super::enqueue_global_announcement_work(
+            state.as_ref(),
+            user_id.as_str(),
+            &[FeedActivityEventSnapshot {
+                kind: "announcement",
+                event_id: "social-global-announcement-backpressure".to_owned(),
+                repo_id: Some(42),
+                repo_full_name: Some("octo/alpha".to_owned()),
+                discussion_number: Some(42),
+                title: Some("SQLite writer pressure".to_owned()),
+                body: Some("Announcement body".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/discussions/42".to_owned()),
+                github_event_id: Some("social-global-announcement-backpressure".to_owned()),
+                actor,
+                occurred_at: "2026-03-07T00:00:00Z".to_owned(),
+            }],
+        )
+        .await
+        .expect_err("foreground content processing admission should surface backpressure");
+
+        let api_error = error
+            .downcast_ref::<crate::error::ApiError>()
+            .expect("content processing ApiError should remain typed");
+        assert_eq!(api_error.code(), "sqlite_write_retryable");
+        let failure = super::social_sync_failure_from_error(&error);
+        assert!(failure.sqlite_backpressure);
+        assert_eq!(
+            super::social_sync_failure_metadata(
+                failure.sqlite_backpressure,
+                failure.source_degraded
+            ),
+            (
+                "warning",
+                true,
+                "sqlite_write_backpressure",
+                Some("next_sync_subscriptions_run")
+            )
+        );
+        drop(held);
     }
 
     #[test]

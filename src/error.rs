@@ -56,6 +56,14 @@ impl ApiError {
         self.code
     }
 
+    pub(crate) fn is_sqlite_write_retryable(&self) -> bool {
+        self.code == "sqlite_write_retryable"
+    }
+
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+
     #[cfg(test)]
     pub fn status(&self) -> StatusCode {
         self.status
@@ -208,5 +216,21 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn api_error_into_anyhow_preserves_structured_identity() {
+        let error = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sqlite_write_retryable",
+            "SQLite write capacity is busy; retry the request.",
+        )
+        .into_anyhow();
+
+        let api_error = error
+            .downcast_ref::<ApiError>()
+            .expect("typed ApiError should remain downcastable");
+        assert_eq!(api_error.code(), "sqlite_write_retryable");
+        assert!(api_error.is_sqlite_write_retryable());
     }
 }
