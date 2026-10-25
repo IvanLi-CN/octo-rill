@@ -4,6 +4,7 @@
 
 ## Lifecycle / Compatibility
 
+- 2026-10-26：为 content projection 增加基础 `search_documents` 的事务内存在性短路；缺失依赖仍沿既有 `missing_search_document` deferred commit 和 retry schedule 收口，真实 SQL/state error 与 terminal recovery 合同不变。同步补齐 file-backed WAL pressure fixture 的生产 pool cleanup 配置。
 - 2026-10-25：realtime content projection 将缺失基础 `search_documents` 识别为预期 deferred outcome，在同一个 apply transaction 内清除 lease 并写入固定 `missing_search_document` retry reason；真实 SQL/state error 继续 rollback 并复用既有 recovery/terminal queue，不新增 schema 或迁移。
 - 2026-10-25：realtime projection delete 现在显式拒绝未知 resource type；unsupported delete 会 rollback 并复用既有 bounded recovery/terminal queue，新增回归锁定 lease 清理与 retry reason，不新增 schema 或迁移。
 - New active topic. No predecessor or successor.

@@ -4,6 +4,7 @@
 
 ## Decision Trace
 
+- 2026-10-26：复核 Agent VM 的 file-backed WAL 压力回归时发现，搜索测试 fixture 复用了 writer pool 却没有生产 `after_release` 清理合同，且连接清理在检查 transaction depth 前未冲刷 SQLx worker 队列；现已补齐 fixture 的 WAL/synchronous/cleanup 配置，并让 cleanup 在 150 ms budget 内先 `ping` 再决定复用或硬驱逐。该修复不改变 writer queue limit、foreground priority、deadline 或重试退避。
 - 2026-10-25：realtime content projection 的预期缺失基础文档改为在 apply transaction 内提交 deferred retry state，避免 rollback 后第二次 recovery write；runtime owner/job heartbeat 继续使用 background lane，并仅对 SQLite admission/busy/deadline 做 100/250/500 ms 有界重试，保留单 background waiter、foreground priority、既有 deadline/backoff 和 terminal recovery 语义。
 - 2026-10-25：正式审查补回 unsupported projection delete 的数据安全边界；delete apply 现在显式限制为 `content`、`announcement` 与 `notification`，未知 resource type 沿现有 rollback、lease cleanup、bounded retry 和 terminal recovery 路径处理；同时记录当前候选的本地全量/source guard 结果，Agent VM exact-head 压力证据因 `guest_resize_unverified` 环境限制暂不可用。
 - 2026-10-25：后续修复保留 Social content-processing 适配器中的 typed `ApiError`，使 `sqlite_write_retryable` 能继续映射到 `sqlite_write_backpressure` warning/recoverable 事件；真实 upstream error、当前轮 failed 计数与下一轮调度重试语义保持不变。

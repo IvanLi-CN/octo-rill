@@ -1180,6 +1180,20 @@ async fn refresh_content_projection(
     resource_type: &str,
     resource_id: &str,
 ) -> Result<bool> {
+    let document_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+           SELECT 1 FROM search_documents
+           WHERE resource_type = ? AND resource_id = ?
+         )",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if document_exists == 0 {
+        return Ok(false);
+    }
+
     let identity_upgrade_complete =
         crate::content_identity_upgrade::is_complete_in_transaction(tx).await?;
     let mut updated_any = false;

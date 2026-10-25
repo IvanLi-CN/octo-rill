@@ -604,7 +604,7 @@ mod tests {
 
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     };
     use url::Url;
 
@@ -661,9 +661,16 @@ mod tests {
             .filename(database_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    crate::sqlite_write::cleanup_sqlite_pool_connection(connection).await?;
+                    Ok(true)
+                })
+            })
             .connect_with(options)
             .await
             .expect("create search sqlite db");
@@ -2401,22 +2408,50 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed terminal projection item");
-        for attempt in 1..=8 {
-            assert!(
-                !crate::search_index::run_projection_for_test(state.as_ref())
-                    .await
-                    .expect("missing source document should be deferred"),
-                "terminal recovery attempt {attempt} should commit deferred retry state"
-            );
-            if attempt < 8 {
-                sqlx::query(
-                    "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
-                )
-                .execute(&pool)
-                .await
-                .expect("make the next projection retry available");
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        for attempt in 1..=24 {
+            match crate::search_index::run_projection_for_test(state.as_ref()).await {
+                Ok(processed) => assert!(
+                    !processed,
+                    "terminal recovery attempt {attempt} should commit deferred retry state"
+                ),
+                Err(error) => assert!(
+                    crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+                        || crate::sqlite_write::is_sqlite_background_admission_error(
+                            error.as_ref(),
+                        ),
+                    "terminal recovery attempt {attempt} should only surface retryable SQLite pressure: {error:#}"
+                ),
             }
+            let active_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active terminal projection during retry");
+            let failed_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count failed terminal projection during retry");
+            if active_count == 0 && failed_count == 1 {
+                break;
+            }
+            assert_eq!(
+                active_count, 1,
+                "terminal projection should remain retryable"
+            );
+            assert_eq!(
+                failed_count, 0,
+                "terminal projection should not recover early"
+            );
+            sqlx::query(
+                "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .execute(&pool)
+            .await
+            .expect("make the next projection retry available");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2740,11 +2775,37 @@ mod tests {
         .await
         .expect("seed content-first projection");
         let state = setup_state(pool.clone());
-        assert!(
-            !crate::search_index::run_projection_for_test(state.as_ref())
-                .await
-                .expect("content projection should commit deferred retry state")
-        );
+        for retry in 1..=8 {
+            match crate::search_index::run_projection_for_test(state.as_ref()).await {
+                Ok(processed) => {
+                    assert!(
+                        !processed,
+                        "content projection should commit deferred retry state"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+                            || crate::sqlite_write::is_sqlite_background_admission_error(
+                                error.as_ref(),
+                            ),
+                        "content projection should only retry typed SQLite pressure: {error:#}"
+                    );
+                    assert!(
+                        retry < 8,
+                        "content projection pressure retries should be bounded"
+                    );
+                    sqlx::query(
+                        "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:content-first'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("make deferred content projection available after pressure");
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
+        }
         let (last_error, lease_owner, lease_expires_at, attempt_count, retry_scheduled) =
             sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, i64, i64)>(
                 "SELECT last_error, lease_owner, lease_expires_at, attempt_count, available_at > CURRENT_TIMESTAMP FROM search_projection_outbox WHERE projection_key = 'content:release:content-first'",

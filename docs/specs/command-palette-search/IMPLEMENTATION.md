@@ -5,6 +5,7 @@
 ## Current Status
 
 - Implementation: 已实现并通过本地验证，视觉证据已由 owner 确认；FTS rowid 恢复、metadata queue、可恢复分批回填和 realtime content projection deferred/recovery 收口已进入 PR 合并收口
+- 2026-10-26 candidate validation: realtime content projection now checks for the base `search_documents` row before loading optional content identity/projection data, preserving the same in-transaction `missing_search_document` deferred commit while avoiding unnecessary work; the exact-head Agent VM matrix passed the file-backed WAL and projection recovery cases.
 - Lifecycle: active
 - Catalog note: 已定义；本地缓存搜索、命令面板和 anchored fixed-window quota 合同已锁定
 
