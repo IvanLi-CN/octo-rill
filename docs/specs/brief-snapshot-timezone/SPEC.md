@@ -20,7 +20,7 @@
 ### Non-goals
 
 - 不扩展成任意自定义时间段或分钟级内容边界。
-- 不为从未存在过 brief 的历史日期补造新日报。
+- 历史恢复只允许按管理员确认的 `brief.daily_slot` 原始 payload 精确重放；没有原始窗口快照的日期不得推测性补造日报。
 - 不改 release feed、Inbox 或 reaction 功能的主体业务语义。
 
 ## 范围（Scope）
@@ -70,9 +70,21 @@
   When 应用启动并触发历史重算任务
   Then 任务会幂等地把 legacy brief 迁入 snapshot 语义，并补齐 memberships。
 
+- Given 事故期间存在 `brief.daily_slot` 的失败或部分失败事件
+  When 管理员按 `key_date` 去重并通过现有 retry 接口重放原始任务
+  Then 每个候选日期最多使用一个窗口快照，重试保留原始用户时区、出报时间与 UTC 边界；窗口不一致或缺少快照的日期必须停留在人工确认项。
+
 - Given 日报在其自然日窗口尚未关闭时被错误写入，或当前自然日存在旧快照
   When 普通用户读取 Dashboard、日报列表或日报详情
   Then 该快照不可见；窗口关闭后重新生成才恢复可见，原始动态与管理员审计记录保持不变。
+
+## Requirements
+
+- REQ-BRIEF-SNAPSHOT-EXACT-REPLAY: 事故期间的 `brief.daily_slot` 恢复必须按 `key_date` 去重并精确重放原始窗口 payload；缺失或不一致的窗口快照不得自动生成。
+
+## Verification
+
+- VER-BRIEF-SNAPSHOT-EXACT-REPLAY: `upsert_daily_brief_snapshot_refreshes_existing_snapshot_in_place` 验证同窗口幂等更新与 memberships 保持一致；管理员 retry 的生产恢复结果需要在部署后按精确候选日期集观察并记录。
 
 ## Visual Evidence
 
@@ -95,6 +107,10 @@
 ![管理员任务详情中的历史日报重算摘要](./assets/admin-task-type-detail-brief-history-recompute.png)
 
 - Dashboard/历史折叠相关视觉证据移至 `docs/specs/dashboard-day-grouping/SPEC.md` 的 `## Visual Evidence`。
+
+## Related ADRs
+
+None
 
 ## 参考
 
