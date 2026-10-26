@@ -604,7 +604,7 @@ mod tests {
 
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     };
     use url::Url;
 
@@ -661,9 +661,16 @@ mod tests {
             .filename(database_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    crate::sqlite_write::cleanup_sqlite_pool_connection(connection).await?;
+                    Ok(true)
+                })
+            })
             .connect_with(options)
             .await
             .expect("create search sqlite db");
@@ -2283,9 +2290,9 @@ mod tests {
             (0, None)
         );
         assert!(
-            crate::search_index::run_projection_for_test(state.as_ref())
+            !crate::search_index::run_projection_for_test(state.as_ref())
                 .await
-                .is_err()
+                .expect("source update with a missing base document should defer")
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2401,22 +2408,50 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed terminal projection item");
-        for attempt in 1..=8 {
-            assert!(
-                crate::search_index::run_projection_for_test(state.as_ref())
-                    .await
-                    .is_err(),
-                "malformed projection attempt {attempt} should fail"
-            );
-            if attempt < 8 {
-                sqlx::query(
-                    "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
-                )
-                .execute(&pool)
-                .await
-                .expect("make the next projection retry available");
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        for attempt in 1..=24 {
+            match crate::search_index::run_projection_for_test(state.as_ref()).await {
+                Ok(processed) => assert!(
+                    !processed,
+                    "terminal recovery attempt {attempt} should commit deferred retry state"
+                ),
+                Err(error) => assert!(
+                    crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+                        || crate::sqlite_write::is_sqlite_background_admission_error(
+                            error.as_ref(),
+                        ),
+                    "terminal recovery attempt {attempt} should only surface retryable SQLite pressure: {error:#}"
+                ),
             }
+            let active_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count active terminal projection during retry");
+            let failed_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_projection_outbox_failed WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count failed terminal projection during retry");
+            if active_count == 0 && failed_count == 1 {
+                break;
+            }
+            assert_eq!(
+                active_count, 1,
+                "terminal projection should remain retryable"
+            );
+            assert_eq!(
+                failed_count, 0,
+                "terminal projection should not recover early"
+            );
+            sqlx::query(
+                "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:terminal-missing'",
+            )
+            .execute(&pool)
+            .await
+            .expect("make the next projection retry available");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2476,10 +2511,9 @@ mod tests {
         .expect("seed stale terminal projection failure");
 
         assert!(
-            crate::search_index::run_projection_for_test(state.as_ref())
+            !crate::search_index::run_projection_for_test(state.as_ref())
                 .await
-                .is_err(),
-            "reactivated malformed projection should still report its source error"
+                .expect("reactivated missing source document should be deferred")
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2508,6 +2542,124 @@ mod tests {
             .expect("read reset retry budget"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_actual_apply_error_rolls_back_before_recovery() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-actual-error-work', 'release', 'actual-error', 'translation', 'summary',
+                      'zh-CN', 'search-actual-error-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed actual-error work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-actual-error-projection', 'release', 'actual-error', 'translation', 'summary',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-actual-error-hash',
+                      'search-actual-error-work', 'search-actual-error-work', '{"title":"should not publish"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed actual-error projection");
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:actual-error', 'release', 'actual-error', 'source title', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed actual-error search document");
+        sqlx::query(
+            "CREATE TRIGGER force_content_projection_failure BEFORE UPDATE OF translated_text ON search_documents WHEN NEW.id = 'release:actual-error' BEGIN SELECT RAISE(ABORT, 'forced projection apply failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create projection failure trigger");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, canonical_resource_type, available_at, created_at, updated_at) VALUES ('content:release:actual-error', 'upsert', 'content', 'actual-error', 'release', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(projection_key) DO UPDATE SET operation = excluded.operation, resource_type = excluded.resource_type, resource_id = excluded.resource_id, canonical_resource_type = excluded.canonical_resource_type, available_at = CURRENT_TIMESTAMP, lease_owner = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = CURRENT_TIMESTAMP",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed actual-error projection item");
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "actual projection SQL errors must keep the source error"
+        );
+        let (attempt_count, last_error, lease_owner, lease_expires_at) = sqlx::query_as::<
+            _,
+            (i64, Option<String>, Option<String>, Option<String>),
+        >(
+            "SELECT attempt_count, last_error, lease_owner, lease_expires_at FROM search_projection_outbox WHERE projection_key = 'content:release:actual-error'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered actual-error projection");
+        assert_eq!(attempt_count, 1);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("forced projection apply failure"))
+        );
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn realtime_projection_unsupported_delete_rolls_back_before_recovery() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let mut connection = pool.acquire().await.expect("acquire fixture connection");
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .expect("allow invalid resource type for rollback fixture");
+        sqlx::query(
+            "INSERT INTO search_projection_outbox (projection_key, operation, resource_type, resource_id, available_at, created_at, updated_at) VALUES ('unsupported:delete', 'delete', 'unsupported', 'unsupported', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *connection)
+        .await
+        .expect("seed unsupported delete projection");
+        drop(connection);
+
+        assert!(
+            crate::search_index::run_projection_for_test(state.as_ref())
+                .await
+                .is_err(),
+            "unsupported projection deletes must keep the source error"
+        );
+        let (attempt_count, last_error, lease_owner, lease_expires_at) = sqlx::query_as::<
+            _,
+            (i64, Option<String>, Option<String>, Option<String>),
+        >(
+            "SELECT attempt_count, last_error, lease_owner, lease_expires_at FROM search_projection_outbox WHERE projection_key = 'unsupported:delete'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered unsupported projection");
+        assert_eq!(attempt_count, 1);
+        assert!(last_error.as_deref().is_some_and(|error| {
+            error.contains("unsupported search projection resource type unsupported")
+        }));
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
     }
 
     #[tokio::test]
@@ -2623,12 +2775,49 @@ mod tests {
         .await
         .expect("seed content-first projection");
         let state = setup_state(pool.clone());
-        assert!(
-            crate::search_index::run_projection_for_test(state.as_ref())
-                .await
-                .is_err(),
-            "content projection must remain retryable before its source document exists"
-        );
+        for retry in 1..=8 {
+            match crate::search_index::run_projection_for_test(state.as_ref()).await {
+                Ok(processed) => {
+                    assert!(
+                        !processed,
+                        "content projection should commit deferred retry state"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+                            || crate::sqlite_write::is_sqlite_background_admission_error(
+                                error.as_ref(),
+                            ),
+                        "content projection should only retry typed SQLite pressure: {error:#}"
+                    );
+                    assert!(
+                        retry < 8,
+                        "content projection pressure retries should be bounded"
+                    );
+                    sqlx::query(
+                        "UPDATE search_projection_outbox SET available_at = CURRENT_TIMESTAMP WHERE projection_key = 'content:release:content-first'",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("make deferred content projection available after pressure");
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
+        }
+        let (last_error, lease_owner, lease_expires_at, attempt_count, retry_scheduled) =
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, i64, i64)>(
+                "SELECT last_error, lease_owner, lease_expires_at, attempt_count, available_at > CURRENT_TIMESTAMP FROM search_projection_outbox WHERE projection_key = 'content:release:content-first'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read deferred content projection state");
+        assert_eq!(last_error.as_deref(), Some("missing_search_document"));
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
+        assert_eq!(attempt_count, 1);
+        assert_eq!(retry_scheduled, 1);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM search_projection_outbox WHERE projection_key = 'content:release:content-first'",
