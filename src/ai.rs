@@ -21,7 +21,7 @@ use crate::{
     admin_runtime, api,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    local_id, observability,
+    content_processing, local_id, observability,
     release_links::{
         InternalReleaseRef, build_internal_brief_release_href_from_html_url,
         parse_internal_release_ref, parse_release_locator_from_github_release_url,
@@ -5368,12 +5368,21 @@ async fn load_brief_release_summary_states(
         .iter()
         .map(|release| release.release_id)
         .collect::<Vec<_>>();
-    translations::enqueue_release_smart_translation_requests(state, user_id, &release_ids)
+    let legacy_route = content_processing::legacy_writer_route(state)
         .await
         .map_err(anyhow::Error::from)?;
-    let items = api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let items = if legacy_route.is_some() {
+        translations::enqueue_release_smart_translation_requests(state, user_id, &release_ids)
+            .await
+            .map_err(anyhow::Error::from)?;
+        api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
+            .await
+            .map_err(anyhow::Error::from)?
+    } else {
+        api::summarize_releases_smart_batch_for_user(state, user_id, &release_ids)
+            .await
+            .map_err(anyhow::Error::from)?
+    };
     let mut summary_states = HashMap::new();
 
     for item in items.items {
@@ -10221,6 +10230,10 @@ mod tests {
         let state = setup_llm_state_with_ai(Some(base_url)).await;
         let user_id = brief_test_user_id();
         let now = "2026-03-07T00:00:00Z";
+        sqlx::query("UPDATE content_processing_control SET mode = 'legacy' WHERE id = 1")
+            .execute(&state.pool)
+            .await
+            .expect("set legacy content processing mode");
         seed_brief_release_scope(
             state.as_ref(),
             user_id,
@@ -10258,6 +10271,142 @@ mod tests {
                 .content_markdown
                 .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
         );
+    }
+
+    #[tokio::test]
+    async fn load_brief_release_summary_states_legacy_mode_does_not_call_provider_for_uncached_release()
+     {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&request_count);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let observed_requests = Arc::clone(&observed_requests);
+                async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "choices": [{ "message": { "content": "unexpected" } }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.0".to_owned(),
+            body: "- feat(api): add batch endpoint".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+            published_at: "2026-03-06T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
+        let now = "2026-03-07T00:00:00Z";
+        sqlx::query("UPDATE content_processing_control SET mode = 'legacy' WHERE id = 1")
+            .execute(&state.pool)
+            .await
+            .expect("set legacy content processing mode");
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "acme/rocket",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+
+        let summary_states = load_brief_release_summary_states(
+            state.as_ref(),
+            user_id,
+            std::slice::from_ref(&release),
+        )
+        .await
+        .expect("load legacy brief summary states");
+        assert!(matches!(
+            summary_states.get(&release.release_id),
+            Some(BriefReleaseSummaryState::Unavailable)
+        ));
+        let rendered = build_repo_rendered(
+            "acme/rocket",
+            std::slice::from_ref(&release),
+            &summary_states,
+        );
+        assert_eq!(
+            rendered.releases[0].bullets,
+            vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_uses_global_queue_and_deterministic_fallback() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "content": "" } }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.0".to_owned(),
+            body: "- feat(api): add batch endpoint".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+            published_at: "2026-03-06T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
+        let now = "2026-03-07T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "acme/rocket",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&state.pool)
+            .await
+            .expect("set global content processing mode");
+        sqlx::query(
+            "UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1",
+        )
+        .execute(&state.pool)
+        .await
+        .expect("complete content identity upgrade");
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content in global mode");
+
+        assert!(brief_content_is_canonical(&built.content_markdown));
+        assert!(
+            built
+                .content_markdown
+                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
+        );
+        let queued_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = '42' AND pipeline = 'polishing' AND variant = 'smart' AND status = 'queued'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("count queued global summary work");
+        assert_eq!(queued_count, 1);
     }
 
     #[tokio::test]
