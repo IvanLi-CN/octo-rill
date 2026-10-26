@@ -6226,6 +6226,9 @@ mod tests {
         })
         .await
         .expect("foreground reschedule should be registered");
+        let status = state.sqlite_writer.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
         drop(held);
         assert!(
             reschedule
@@ -6335,6 +6338,9 @@ mod tests {
         })
         .await
         .expect("foreground finalize should be registered");
+        let status = state.sqlite_writer.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
         drop(held);
         assert!(
             finalize

@@ -107,7 +107,7 @@
 - coordinator 对 writer permit、write-pool acquisition、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试使用同一个单调时钟总 deadline：foreground 为 900 ms，background 为 2500 ms；best-effort 不排队，取得 permit 后沿用 2500 ms 操作预算。deadline 到期后不得启动新的 callback 或重试。
 - SQLite write connection 的 `busy_timeout` 不得超过 100 ms；普通 coordinator callback 最多 4 次尝试，退避为 25/50/100 ms。`BEGIN IMMEDIATE` 在连接恢复期间可在同一个总 deadline 内继续使用 25/50/100 ms 退避，不得被固定尝试次数提前截断。busy timeout 与退避、队列、连接池、事务启动和重试开始都受总 deadline 限制，不得在重试后重新开始 deadline。
 - callback 在 deadline 前启动后不得由 coordinator 的异步 timeout 取消；它必须持有 writer permit 直到返回 SQLite 的实际结果。事务中的 SQLite 语句仍可由 progress handler 在 deadline 后中断。
-- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。事务 future 被取消时必须中断活动 SQLite 语句；专用 writer pool 连接归还时若 transaction depth 仍非零，必须立即硬驱逐不确定连接；普通读池/内存 fallback 则可在同一个 150 ms budget 内完成 queued rollback，只有 transaction depth 已清零且 progress handler 已移除并确认成功的连接才可复用。回滚或连接清理失败/超时时不得复用不确定连接，必须由对应 pool 补建。
+- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。事务 future 被取消时必须中断活动 SQLite 语句；连接归还清理必须先移除 progress handler，并通过连接 worker 的 `ping` 或等价 flush 等待已排队的 rollback/transaction command 完成，再检查 transaction depth；专用 writer pool 连接归还时若 transaction depth 仍非零，必须立即硬驱逐不确定连接；普通读池/内存 fallback 则可在同一个 150 ms budget 内完成 queued rollback，只有 transaction depth 已清零且 progress handler 已移除并确认成功的连接才可复用。回滚或连接清理失败/超时时不得复用不确定连接，必须由对应 pool 补建。
 
 ### REQ-SQLITE-WRITER-012
 
@@ -127,6 +127,7 @@
 - background writer admission 必须有共享的有界等待预算；默认最多保留一个等待中的 background writer。已有 background waiter 不得被新的 background 请求无限堆积，超出预算时必须返回 typed admission error 并记录 `waiting_foreground`、`waiting_background`、`queue_limit` 与 `request_id`。
 - foreground waiter 出现后不得再接纳新的 background waiter；后续 background admission denial 在同一个单调 deadline 内按 25/50/100ms 封顶退避重试，不新增 waiter 或重置 deadline，预算耗尽后返回 typed retryable deadline 并由 worker backoff 处理，不得立即自旋。
 - per-lane background work 可以通过共享 coordinator 的 cadence admission 合并同一时间窗口内的重复执行。content processing recovery 的所有 worker 必须共享 cadence 状态，重复 tick 只增加 coalesced telemetry，不得重复开始 recovery transaction。
+- runtime owner heartbeat、job task heartbeat、search projection 与其他 lease/recovery 心跳的 SQLite 写入 MUST 继续使用 `Background` lane；仅当错误属于 admission、busy 或 writer deadline 背压时，heartbeat loop 才能按短、有限、绝对有界预算重试，重试期间不得新增 waiter 或 tight loop，单次失败不得退出 heartbeat loop；非背压错误 MUST 保持原错误路径并等待下一次调度 tick。
 - HTTP access telemetry 必须覆盖正常成功请求以及慢请求和错误请求，并至少包含 `request_id`、method、route、status、latency 与 slow 标记；同一请求上下文内的 `sqlite.write` telemetry 必须带 request correlation 字段。
 
 ### SHOULD
@@ -168,6 +169,7 @@
 - 外部进程持有 SQLite writer lock 时，coordinator retry 后仍可失败，但失败必须可观测。
 - foreground deadline 超时必须返回 retryable 状态与 `Retry-After`，而不是内部 500。
 - background deadline 超时由持久化 worker/job 状态延后处理；一个失败尝试结束后不得在同一调用栈立即重试。
+- heartbeat 的 SQLite 背压重试耗尽后必须保留可观测失败并继续存活到下一次 tick；foreground lifecycle write 仍必须优先于 background heartbeat、projection 和 recovery。
 - best-effort 在 writer backlog 或 deadline 前无法启动 callback 时跳过持久化，主请求保持成功路径；已经启动的 callback 保持 writer permit 并返回实际结果。
 - Social writer backpressure 的 warning/recoverable 分类只适用于 SQLite admission/busy/deadline 耗尽；结构化上游错误必须保留 source details 并继续对管理员可见，非重试 fatal upstream 异常使用 error/non-recoverable，可重试且已完成但部分降级的 Social 结果使用兼容的 `social_source_degraded` warning/recoverable 分类。
 - `sync.all` 的 Social 业务失败必须在同一个 foreground writer transaction 内提交任务 failed 状态与 `task.completed` 事件；若终态事务未提交，任务不得被观察为已失败而缺少完成事件，heartbeat 必须在该分支退出前停止。
@@ -308,6 +310,12 @@
 - Method: `sqlite_write::tests::background_writer_admission_retries_without_growing_waiter_queue`, `sqlite_write::tests::background_writer_admission_recovers_after_capacity_clears`, `sqlite_write::tests::foreground_write_runs_before_queued_background_write`, `jobs::tests::runtime_owner_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_heartbeat_recovers_after_writer_pressure`, `jobs::tests::job_task_reschedule_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::job_task_finalize_keeps_foreground_priority_under_writer_pressure`, `jobs::tests::finalize_owned_webhook_task_clears_operation_lease`, `jobs::tests::reschedule_owned_webhook_task_clears_operation_lease`, `sync::tests::repo_release_heartbeat_recovers_after_writer_pressure`, `content_processing::tests::global_scheduler_coalesces_recovery_across_workers`, `content_processing::tests::file_backed_scheduler_pressure_preserves_foreground_session_writes`, and `server::tests::fast_success_request_emits_normal_access_log`.
 - covers: REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-012, REQ-SQLITE-WRITER-013, REQ-SQLITE-WRITER-014
 - Pass condition: background admission remains bounded and observable, foreground work is admitted before queued background work, recovery passes are coalesced across workers, file-backed session writes remain successful under a real external SQLite writer lock, writer state is reusable after the run, and a request's `http.access` and `sqlite.write` events carry matching request ID, method, and route fields; fast 4xx access logs carry the complete field set at `warn` level.
+
+### VER-SQLITE-WRITER-007
+
+- Method: focused coordinator admission tests with multiple background writers, runtime heartbeat retry tests using typed SQLite admission pressure, job heartbeat/reschedule/finalize pressure fixtures, and file-backed WAL pressure acceptance on the current candidate.
+- covers: `REQ-SQLITE-WRITER-009`, `REQ-SQLITE-WRITER-011`, `REQ-SQLITE-WRITER-014`
+- Pass condition: background waiting never exceeds one, foreground lifecycle writes complete before background work, runtime and job heartbeat loops recover from bounded SQLite pressure without exiting or spinning, non-SQLite heartbeat errors are not retried, and the file-backed WAL writer remains reusable after pressure clears.
 
 ## 验收清单（Acceptance checklist）
 

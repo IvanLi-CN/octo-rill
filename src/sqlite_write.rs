@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use sqlx::{
-    Sqlite, SqliteConnection, SqlitePool, Transaction, TransactionManager,
+    Connection, Sqlite, SqliteConnection, SqlitePool, Transaction, TransactionManager,
     sqlite::SqliteTransactionManager,
 };
 use tokio::{
@@ -2046,35 +2046,32 @@ async fn cleanup_sqlite_connection(
     connection: &mut SqliteConnection,
     evict_open_transaction: bool,
 ) -> Result<(), sqlx::Error> {
-    if evict_open_transaction && SqliteTransactionManager::get_transaction_depth(connection) != 0 {
-        warn!(
-            event = "sqlite.write",
-            operation = "writer_pool_after_release",
-            request_id = %observability::current_request_id(),
-            request_method = %observability::current_request_method(),
-            request_route = %observability::current_request_route(),
-            error_kind = "transaction_cleanup_pending",
-            recovery = "evict",
-            "sqlite writer connection still has an open transaction; evicting before reuse"
-        );
-        let error = sqlx::Error::Protocol(
-            "sqlite writer connection returned with an open transaction".to_owned(),
-        );
-        tracing::warn!(
-            event = "sqlite.write",
-            operation = "writer_pool_after_release",
-            request_id = %observability::current_request_id(),
-            request_method = %observability::current_request_method(),
-            request_route = %observability::current_request_route(),
-            connection_recovery = "evict",
-            error = %error,
-            "sqlite writer connection cleanup evicted an open transaction"
-        );
-        return Err(error);
-    }
-
     let cleanup = async {
         disable_sqlite_connection_progress_handler(connection).await?;
+        // Transaction::drop and cancelled SQLx commands enqueue rollback work on the
+        // connection worker. Ping after disabling the handler so the depth check observes
+        // that queued cleanup before deciding whether this connection can be reused.
+        connection.ping().await?;
+        if evict_open_transaction
+            && SqliteTransactionManager::get_transaction_depth(connection) != 0
+        {
+            let error = sqlx::Error::Protocol(
+                "sqlite writer connection returned with an open transaction".to_owned(),
+            );
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "writer_pool_after_release",
+                request_id = %observability::current_request_id(),
+                request_method = %observability::current_request_method(),
+                request_route = %observability::current_request_route(),
+                error_kind = "transaction_cleanup_pending",
+                recovery = "evict",
+                connection_recovery = "evict",
+                error = %error,
+                "sqlite writer connection cleanup evicted an open transaction"
+            );
+            return Err(error);
+        }
         while !evict_open_transaction
             && SqliteTransactionManager::get_transaction_depth(connection) != 0
         {
@@ -2600,6 +2597,9 @@ mod tests {
         })
         .await
         .expect("second background writer should hit admission denial");
+        let status = coordinator.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
         let error = tokio::time::timeout(Duration::from_secs(2), second_background)
             .await
             .expect("second background writer should honor its deadline")
@@ -2695,16 +2695,29 @@ mod tests {
                     .await
             })
         };
+        let third_background = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .write("background_denied_then_retried_again", |_| async {
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if coordinator.runtime_status().background_rejected >= 1 {
+                if coordinator.runtime_status().background_rejected >= 2 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("second background writer should be denied without a second waiter");
+        .expect("background writers should be denied without a second waiter");
+        let status = coordinator.runtime_status();
+        assert_eq!(status.waiting_foreground, 1);
+        assert!(status.waiting_background <= 1);
 
         drop(held);
         tokio::time::timeout(Duration::from_secs(1), foreground)
@@ -2722,12 +2735,17 @@ mod tests {
             .expect("retried background writer should complete")
             .expect("join retried background writer")
             .expect("retried background writer should succeed");
+        tokio::time::timeout(Duration::from_secs(1), third_background)
+            .await
+            .expect("second retried background writer should complete")
+            .expect("join second retried background writer")
+            .expect("second retried background writer should succeed");
 
         let status = coordinator.runtime_status();
         assert!(!status.active);
         assert_eq!(status.waiting_background, 0);
         assert_eq!(status.waiting_foreground, 0);
-        assert!(status.background_rejected >= 1);
+        assert!(status.background_rejected >= 2);
     }
 
     #[test]
