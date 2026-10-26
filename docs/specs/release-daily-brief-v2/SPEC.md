@@ -57,6 +57,7 @@
 - `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
 - `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只允许在确有可提炼变更时以连续的 `  - ...` 子 bullet 组成，低信息 release 只保留主行。
 - release 要点提取必须复用 `release_smart` 的事实链路：`body valuable -> 直接总结`，否则走 compare fallback；两者都无价值时，不得编造任何伪摘要或固定占位文案。
+- 日报 release 摘要必须通过 mode-aware 的 `summarize_releases_smart_batch_for_user` 路由：legacy 模式保持既有缓存/写入语义，global 模式提交全局内容工作；请求尚未 ready 时必须使用 deterministic fallback 继续生成日报，不得调用 legacy writer。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
 - REQ-GITHUB-LINKS: related links 的 canonical Markdown 必须使用 ` · ` 分隔的裸 GitHub URL，不得生成不存在的标题；前端显示时 PR / Issue 为 `#编号`，commit 为 7 位 SHA，release 为 tag，compare 为可读的 `base...head`，标准行号片段直接追加。人工 Markdown 标题、查询参数、非行号 fragment 与非 GitHub URL 保持其原有可见文字与 href。
 - REQ-POLISH-CANONICAL: 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
@@ -83,6 +84,7 @@
 ### Core flows
 
 - 用户手动生成日报或定时任务生成日报时，服务端会按同一窗口查询 Release 与 social activity，并输出 V2 markdown 结构。
+- 日报生成在 release 摘要阶段遵循当前 content-processing mode；global 模式的 queued / blocked result 不阻塞快照生成，而是回退到 deterministic markdown，直到全局结果 ready 后再由后续生成刷新内容。
 - 若同一窗口已经存在标准化 brief，新的生成结果会原位更新该行的 markdown、memberships 与 `updated_at`，同时保留原 `brief_id` 与 `created_at`。
 - 服务端启动后，既有 legacy history recompute 继续只处理 `generation_source=legacy/history_recompute_failed` 的快照；新增的内容刷新任务只处理已有窗口信息的过期 brief。
 - 历史内容刷新任务命中旧签名（例如含 `## 概览`、缺少 `## 获星与关注`、正文被整篇 markdown fence 包裹、或 V2 章节齐全但 release 正文层级漂移）时，会按存量窗口重建 V2 内容并原位覆盖。
@@ -145,6 +147,10 @@ None
 - Given 某个窗口已经存在标准化 brief，但内容仍是旧格式
   When 手动重新生成该窗口日报或历史刷新任务命中该行
   Then 原 `brief_id` 被原位刷新为 V2 正文，不会再返回旧内容。
+
+- Given content-processing mode 为 global 且 release smart 结果尚未 ready
+  When 定时任务生成日报
+  Then 全局请求会被入队，日报仍以 deterministic fallback 成功落库；切回 legacy mode 时既有 smart summary 缓存路径保持可用。
 
 - Given 后台存在可重建窗口的历史旧格式 brief
   When 内容刷新任务执行完成
