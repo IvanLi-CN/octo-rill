@@ -907,6 +907,15 @@ mod tests {
             .expect("read migration 102"),
             1
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 103 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 103"),
+            1
+        );
         for table in [
             "release_reading_backfill_runs",
             "release_reading_backfill_items",
@@ -926,6 +935,7 @@ mod tests {
         for index in [
             "idx_release_reading_backfill_runs_status",
             "idx_release_reading_backfill_items_cursor",
+            "idx_release_reading_backfill_items_release",
         ] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
@@ -950,6 +960,77 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(foreign_key_tables.contains("release_reading_backfill_runs"));
         assert!(foreign_key_tables.contains("repo_releases"));
+
+        let run_columns = sqlx::query("PRAGMA table_info('release_reading_backfill_runs')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill run columns");
+        let run_column_names = run_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "id",
+            "started_at",
+            "window_start_utc",
+            "window_end_utc",
+            "status",
+            "total",
+            "succeeded",
+            "failed",
+            "waiting",
+            "skipped",
+            "lease_owner",
+            "lease_expires_at",
+            "error_text",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                run_column_names.contains(required),
+                "missing run column {required}"
+            );
+        }
+        let item_columns = sqlx::query("PRAGMA table_info('release_reading_backfill_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill item columns");
+        let item_column_names = item_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "run_id",
+            "release_id",
+            "authorized_user_id",
+            "published_at",
+            "status",
+            "attempt_count",
+            "error_text",
+            "updated_at",
+        ] {
+            assert!(
+                item_column_names.contains(required),
+                "missing item column {required}"
+            );
+        }
+        let run_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'release_reading_backfill_runs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read run table definition");
+        assert!(run_sql.contains(
+            "CHECK (status IN ('queued', 'running', 'waiting', 'paused', 'succeeded', 'failed'))"
+        ));
+        let item_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'release_reading_backfill_items'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read item table definition");
+        assert!(item_sql.contains("PRIMARY KEY (run_id, release_id)"));
+        assert!(item_sql.contains("ON DELETE CASCADE"));
     }
 
     #[tokio::test]
@@ -985,7 +1066,7 @@ mod tests {
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(
-            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102]"
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103]"
         ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(

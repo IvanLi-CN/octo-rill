@@ -2928,6 +2928,39 @@ pub async fn admin_jobs_overview(
     }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminReleaseReadingBackfillResponse {
+    task_id: Option<String>,
+    status: String,
+}
+
+/// Start or resume the recent Release reading backfill only through an
+/// explicit admin action. Startup deliberately does not enqueue this job.
+pub async fn admin_enqueue_release_reading_backfill(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminReleaseReadingBackfillResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = jobs::enqueue_release_reading_backfill_if_needed(state.as_ref())
+        .await
+        .map_err(ApiError::internal)?;
+    let status = if task_id.is_some() {
+        "queued".to_owned()
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM release_reading_backfill_runs ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| "idle".to_owned())
+    };
+    Ok(Json(AdminReleaseReadingBackfillResponse {
+        task_id,
+        status,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminDashboardQuery {
     window: Option<String>,
@@ -21755,8 +21788,32 @@ pub(crate) async fn global_release_request_item(
     let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
     let has_actionable_release_text =
         release_body_has_actionable_content(title.as_str(), body.as_str());
+    // Public output must never inherit a private compare projection. Resolve
+    // the audience from current server-side visibility/publication state.
+    let is_public_release = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+          SELECT 1
+          FROM user_release_visible_repos
+          WHERE user_id = ? AND repo_id = ? AND is_private = 0
+        ) OR EXISTS(
+          SELECT 1
+          FROM public_repo_release_usage
+          WHERE repo_id = ?
+            AND access_kind IN ('github_public', 'private_owner_published')
+            AND last_sync_status <> 'inaccessible'
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(row.repo_id)
+    .bind(row.repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        != 0;
     let (reading_evidence_text, reading_evidence) =
-        if kind == "release_smart" && !has_actionable_release_text {
+        if kind == "release_smart" && !has_actionable_release_text && !is_public_release {
             prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
                 state,
                 user_id,
@@ -21830,7 +21887,9 @@ pub(crate) async fn global_release_request_item(
         "detail"
     } else if kind.ends_with("_smart") {
         if kind == "release_smart" {
-            if release_body_has_actionable_content(title.as_str(), body.as_str()) {
+            if is_public_release
+                || release_body_has_actionable_content(title.as_str(), body.as_str())
+            {
                 translations::RELEASE_READING_PUBLIC_VARIANT
             } else {
                 translations::RELEASE_READING_AUTHORIZED_VARIANT
@@ -22977,7 +23036,6 @@ struct ReleaseSmartBatchCandidate {
     entity_id: String,
     full_name: String,
     tag_name: String,
-    previous_tag_name: Option<String>,
     title: String,
     body: String,
     source_hash: String,
@@ -23254,7 +23312,6 @@ fn summarize_patch_excerpt(patch: &str) -> Option<String> {
 
 struct CompareDigest {
     text: String,
-    complete: bool,
 }
 
 fn build_compare_digest_with_coverage(compare: &GitHubCompareResponse) -> Option<CompareDigest> {
@@ -23345,7 +23402,6 @@ fn build_compare_digest_with_coverage(compare: &GitHubCompareResponse) -> Option
     } else {
         Some(CompareDigest {
             text: lines.join("\n"),
-            complete,
         })
     }
 }
@@ -23379,90 +23435,6 @@ fn github_rest_compare_http_error(
         }
     }
     ApiError::internal(format!("github compare returned {status}: {body}"))
-}
-
-async fn fetch_release_compare_digest_request(
-    state: &AppState,
-    repo_full_name: &str,
-    base_tag: &str,
-    head_tag: &str,
-    access_token: Option<&str>,
-) -> Result<Option<String>, ApiError> {
-    let payload = fetch_release_compare_payload_request(
-        state,
-        repo_full_name,
-        base_tag,
-        head_tag,
-        "...",
-        access_token,
-    )
-    .await?;
-    let (payload, comparison_mode) = if compare_requires_endpoint_diff(payload.status.as_deref()) {
-        (
-            fetch_release_compare_payload_request(
-                state,
-                repo_full_name,
-                base_tag,
-                head_tag,
-                "..",
-                access_token,
-            )
-            .await?,
-            Some("two-dot"),
-        )
-    } else {
-        (payload, None)
-    };
-    Ok(build_compare_digest_with_coverage(&payload)
-        .filter(|digest| digest.complete)
-        .map(|digest| {
-            comparison_mode
-                .map(|mode| format!("comparison_mode: {mode}\n{}", digest.text))
-                .unwrap_or(digest.text)
-        }))
-}
-
-async fn fetch_release_compare_digest(
-    state: &AppState,
-    user_id: &str,
-    repo_full_name: &str,
-    base_tag: &str,
-    head_tag: &str,
-) -> Result<Option<String>, ApiError> {
-    let connections = state
-        .load_github_connections(user_id)
-        .await
-        .map_err(|err| ApiError::internal(format!("load github connections failed: {err}")))?;
-
-    let mut last_auth_err: Option<ApiError> = None;
-    for connection in connections {
-        match fetch_release_compare_digest_request(
-            state,
-            repo_full_name,
-            base_tag,
-            head_tag,
-            Some(connection.access_token.as_str()),
-        )
-        .await
-        {
-            Ok(digest) => return Ok(digest),
-            Err(err) if should_retry_public_compare_without_auth(&err) => {
-                last_auth_err = Some(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    if let Some(auth_err) = last_auth_err {
-        match fetch_release_compare_digest_request(state, repo_full_name, base_tag, head_tag, None)
-            .await
-        {
-            Ok(digest) => Ok(digest),
-            Err(public_err) => Err(map_public_compare_fallback_error(auth_err, public_err)),
-        }
-    } else {
-        fetch_release_compare_digest_request(state, repo_full_name, base_tag, head_tag, None).await
-    }
 }
 
 fn should_retry_public_compare_without_auth(err: &ApiError) -> bool {
@@ -23605,6 +23577,40 @@ async fn select_release_compare_baseline_from_db(
     Ok(select_release_compare_baseline(&current, &candidates))
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseCompareCurrentRow {
+    repo_id: i64,
+    tag_name: String,
+    is_prerelease: i64,
+    published_at: Option<String>,
+    created_at: Option<String>,
+}
+
+async fn select_release_compare_baseline_for_release(
+    state: &AppState,
+    release_id: i64,
+) -> Result<Option<ReleaseCompareBaselineRow>, ApiError> {
+    let Some(current) = sqlx::query_as::<_, ReleaseCompareCurrentRow>(
+        "SELECT repo_id, tag_name, is_prerelease, published_at, created_at FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)? else {
+        return Ok(None);
+    };
+    select_release_compare_baseline_from_db(
+        state,
+        current.repo_id,
+        release_id,
+        current.tag_name.as_str(),
+        current.is_prerelease != 0,
+        current.published_at.as_deref(),
+        current.created_at.as_deref(),
+    )
+    .await
+}
+
 async fn fetch_release_compare_snapshot_request(
     state: &AppState,
     repo_full_name: &str,
@@ -23661,7 +23667,9 @@ async fn fetch_release_compare_snapshot_request(
 }
 
 fn compare_requires_endpoint_diff(status: Option<&str>) -> bool {
-    status.is_some_and(|value| value.eq_ignore_ascii_case("diverged"))
+    status.is_some_and(|value| {
+        value.eq_ignore_ascii_case("diverged") || value.eq_ignore_ascii_case("behind")
+    })
 }
 
 async fn fetch_release_compare_payload_request(
@@ -24012,33 +24020,46 @@ async fn summarize_release_smart_candidate_with_ai_diagnostics(
         });
     }
 
-    let Some(previous_tag_name) = item
-        .previous_tag_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(ReleaseSmartAiResult {
-            value: None,
-            call_ids,
-        });
-    };
-    let compare_range = format!("{previous_tag_name}...{}", item.tag_name);
-    let digest = fetch_release_compare_digest(
+    let baseline = select_release_compare_baseline_for_release(state, item.release_id)
+        .await
+        .map_err(|error| (error, call_ids.clone()))?
+        .ok_or_else(|| {
+            (
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "reading_evidence_unavailable",
+                    "no semver-verifiable Release baseline is available",
+                ),
+                call_ids.clone(),
+            )
+        })?;
+    let compare_range = format!("{}...{}", baseline.tag_name, item.tag_name);
+    let snapshot = fetch_release_compare_snapshot(
         state,
         user_id,
         item.full_name.as_str(),
-        previous_tag_name,
+        baseline.tag_name.as_str(),
         item.tag_name.as_str(),
     )
     .await
     .map_err(|error| (error, call_ids.clone()))?;
-    let Some(digest) = digest else {
+    let Some(snapshot) = snapshot else {
         return Ok(ReleaseSmartAiResult {
             value: None,
             call_ids,
         });
     };
+    if !snapshot.coverage_complete {
+        return Err((
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reading_evidence_unavailable",
+                "Release compare evidence is incomplete",
+            ),
+            call_ids,
+        ));
+    }
+    let digest = snapshot.digest;
 
     let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
     let (parsed, diff_call_ids) = request_release_smart_payload(
@@ -24181,7 +24202,6 @@ async fn prepare_release_smart_batch(
             entity_id,
             full_name: row.full_name.clone(),
             tag_name: row.tag_name.clone(),
-            previous_tag_name: row.previous_tag_name.clone(),
             title,
             body,
             source_hash,
@@ -24635,20 +24655,26 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
         )
         .await?;
         let (_, response) = content_processing::submit_item(state, user_id, "wait", &input).await?;
-        let reading = response
-            .result
-            .get("reading")
-            .cloned()
-            .and_then(|raw| serde_json::from_value::<translations::ReleaseReadingResult>(raw).ok())
-            .filter(|reading| reading.validate().is_ok());
+        let current_ready = matches!(
+            response.status.as_str(),
+            "ready" | "completed" | "succeeded"
+        );
+        let reading = current_ready
+            .then(|| {
+                response
+                    .result
+                    .get("reading")
+                    .cloned()
+                    .and_then(|raw| {
+                        serde_json::from_value::<translations::ReleaseReadingResult>(raw).ok()
+                    })
+                    .filter(|reading| reading.validate().is_ok())
+            })
+            .flatten();
         readings.insert(
             *release_id,
             GlobalReleaseReadingState {
-                status: if reading.is_some() {
-                    "ready".to_owned()
-                } else {
-                    response.status
-                },
+                status: response.status,
                 reading,
             },
         );
@@ -37901,7 +37927,6 @@ body={}
             entity_id: "356108921".to_owned(),
             full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
             tag_name: "v2.42.0".to_owned(),
-            previous_tag_name: Some("v2.41.2".to_owned()),
             title: "v2.42.0".to_owned(),
             body: "PR: #653 feat(prompt-cache): add conversation operations tab\nChannel: stable\nBump: minor\nCommit: 60f036ff163d14a44d179101b8ebf4539a1473ee".to_owned(),
             source_hash: "hash".to_owned(),
@@ -38030,7 +38055,6 @@ body={}
                 entity_id: "356108921".to_owned(),
                 full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
                 tag_name: "v2.42.0".to_owned(),
-                previous_tag_name: Some("v2.41.2".to_owned()),
                 title: "v2.42.0".to_owned(),
                 body: "stub".to_owned(),
                 source_hash: "hash".to_owned(),
@@ -38113,7 +38137,6 @@ body={}
                 entity_id: "356108921".to_owned(),
                 full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
                 tag_name: "v2.42.0".to_owned(),
-                previous_tag_name: Some("v2.41.2".to_owned()),
                 title: "v2.42.0".to_owned(),
                 body: "PR: #653 feat(prompt-cache): add conversation operations tab\nChannel: stable\nBump: minor\nCommit: 60f036ff163d14a44d179101b8ebf4539a1473ee".to_owned(),
                 source_hash: "hash".to_owned(),
@@ -38236,7 +38259,6 @@ body={}
         })
         .expect("incomplete compare still needs an audit record");
 
-        assert!(!digest.complete);
         assert!(digest.text.contains("coverage_complete: false"));
     }
 
@@ -38244,6 +38266,8 @@ body={}
     fn diverged_compare_uses_fixed_endpoint_diff() {
         assert!(compare_requires_endpoint_diff(Some("diverged")));
         assert!(compare_requires_endpoint_diff(Some("DIVERGED")));
+        assert!(compare_requires_endpoint_diff(Some("behind")));
+        assert!(compare_requires_endpoint_diff(Some("BEHIND")));
         assert!(!compare_requires_endpoint_diff(Some("ahead")));
         assert!(!compare_requires_endpoint_diff(None));
     }

@@ -62,7 +62,6 @@ pub const TASK_WEBHOOK_PUSH_MANAGE: &str = "webhook.push.manage";
 pub const TASK_WEBHOOK_PUSH_AUDIT: &str = "webhook.push.audit";
 
 const RELEASE_READING_BACKFILL_BATCH_SIZE: i64 = 100;
-#[allow(dead_code)]
 const RELEASE_READING_BACKFILL_WINDOW_DAYS: i64 = 30;
 
 fn is_webhook_push_task_type(task_type: &str) -> bool {
@@ -868,7 +867,6 @@ struct ReleaseReadingBackfillRunRow {
     failed: i64,
     waiting: i64,
     skipped: i64,
-    #[allow(dead_code)]
     lease_expires_at: Option<String>,
 }
 
@@ -883,7 +881,6 @@ struct ReleaseReadingBackfillItemRow {
 /// Freeze the first recent 30-day release set once, then let the normal task
 /// worker consume it. The run table is deliberately separate from job_tasks so
 /// a restart can recover the window and counters without moving the boundary.
-#[allow(dead_code)]
 pub async fn enqueue_release_reading_backfill_if_needed(
     state: &AppState,
 ) -> Result<Option<String>> {
@@ -2652,6 +2649,7 @@ pub(crate) async fn reschedule_task_if_owned(
         None,
         result,
         Some(state.runtime_owner_id.as_str()),
+        None,
     )
     .await
 }
@@ -2671,6 +2669,28 @@ pub(crate) async fn reschedule_task_with_retry_count_if_owned(
         None,
         result,
         Some(state.runtime_owner_id.as_str()),
+        None,
+    )
+    .await
+}
+
+async fn reschedule_release_reading_backfill_with_retry_count_if_owned(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    retry_count: u8,
+    run_id: &str,
+    result: Value,
+) -> Result<bool> {
+    reschedule_task_inner(
+        state,
+        task_id,
+        available_at,
+        Some(retry_count),
+        None,
+        result,
+        Some(state.runtime_owner_id.as_str()),
+        Some(run_id),
     )
     .await
 }
@@ -2710,10 +2730,12 @@ async fn reschedule_task_with_payload_inner(
         Some(payload_json),
         result,
         runtime_owner_id,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reschedule_task_inner(
     state: &AppState,
     task_id: &str,
@@ -2722,6 +2744,7 @@ async fn reschedule_task_inner(
     payload_json: Option<String>,
     result: Value,
     runtime_owner_id: Option<&str>,
+    release_backfill_run_id: Option<&str>,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
@@ -2804,6 +2827,14 @@ async fn reschedule_task_inner(
         .context("failed to reschedule task")?
     };
     if updated.rows_affected() > 0 {
+        if let Some(run_id) = release_backfill_run_id {
+            reset_release_reading_backfill_run_in_transaction(
+                tx.as_transaction_mut(),
+                run_id,
+                &now,
+            )
+            .await?;
+        }
         sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
             .bind(task_id)
             .execute(&mut *tx)
@@ -4071,20 +4102,49 @@ async fn defer_task_after_sqlite_write_backpressure(
         .unwrap_or(0);
     let retry_count = previous_retry_count.saturating_add(1);
     let available_at = Utc::now() + chrono::Duration::seconds(15);
-    let rescheduled = reschedule_task_with_retry_count_if_owned(
-        state,
-        &task.id,
-        available_at,
-        retry_count,
-        json!({
-            "reason": "sqlite_write_backpressure",
-            "retry_count": retry_count,
-        }),
-    )
-    .await?;
-    if rescheduled && task.task_type == TASK_RELEASE_READING_BACKFILL {
-        reset_release_reading_backfill_run_after_backpressure(state, payload).await?;
-    }
+    let rescheduled = if task.task_type == TASK_RELEASE_READING_BACKFILL {
+        if let Some(run_id) = payload.get("run_id").and_then(Value::as_str) {
+            // The task requeue and run-lease release share one writer
+            // transaction. A queued task can therefore never observe the
+            // old run lease after a backpressure recovery.
+            reschedule_release_reading_backfill_with_retry_count_if_owned(
+                state,
+                &task.id,
+                available_at,
+                retry_count,
+                run_id,
+                json!({
+                    "reason": "sqlite_write_backpressure",
+                    "retry_count": retry_count,
+                }),
+            )
+            .await?
+        } else {
+            reschedule_task_with_retry_count_if_owned(
+                state,
+                &task.id,
+                available_at,
+                retry_count,
+                json!({
+                    "reason": "sqlite_write_backpressure",
+                    "retry_count": retry_count,
+                }),
+            )
+            .await?
+        }
+    } else {
+        reschedule_task_with_retry_count_if_owned(
+            state,
+            &task.id,
+            available_at,
+            retry_count,
+            json!({
+                "reason": "sqlite_write_backpressure",
+                "retry_count": retry_count,
+            }),
+        )
+        .await?
+    };
     if rescheduled {
         tracing::warn!(
             task_id = task.id,
@@ -4097,6 +4157,23 @@ async fn defer_task_after_sqlite_write_backpressure(
     Ok(rescheduled)
 }
 
+async fn reset_release_reading_backfill_run_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(now)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await
+    .context("requeue release reading backfill after sqlite backpressure")?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn reset_release_reading_backfill_run_after_backpressure(
     state: &AppState,
     payload: &Value,
@@ -4114,14 +4191,8 @@ async fn reset_release_reading_backfill_run_after_backpressure(
         )
         .await
         .context("begin release reading backfill backpressure recovery")?;
-    sqlx::query(
-        "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
-    )
-    .bind(&now)
-    .bind(run_id)
-    .execute(&mut *tx)
-    .await
-    .context("requeue release reading backfill after sqlite backpressure")?;
+    reset_release_reading_backfill_run_in_transaction(tx.as_transaction_mut(), run_id, &now)
+        .await?;
     tx.commit()
         .await
         .context("commit release reading backfill backpressure recovery")?;
@@ -4889,6 +4960,22 @@ async fn finish_release_reading_backfill(
     .execute(&mut *tx)
     .await
     .context("persist release reading backfill terminal state")?;
+    if error_text == Some("target_release_deleted") {
+        sqlx::query(
+            r#"
+            UPDATE release_reading_backfill_runs
+            SET failed = MAX(
+                failed,
+                total - succeeded - failed - waiting - skipped
+            )
+            WHERE id = ?
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .context("account deleted release reading backfill targets")?;
+    }
     let summary = sqlx::query_as::<_, ReleaseReadingBackfillRunRow>(
         r#"
         SELECT id, window_start_utc, window_end_utc, status,
@@ -4994,24 +5081,34 @@ async fn execute_release_reading_backfill_task(
         .await
         .context("load release reading backfill batch")?;
         if items.is_empty() {
-            let (failed, waiting): (i64, i64) = sqlx::query_as(
-                "SELECT failed, waiting FROM release_reading_backfill_runs WHERE id = ?",
+            let (total, failed, waiting, terminal_items): (i64, i64, i64, i64) = sqlx::query_as(
+                r#"
+                SELECT total, failed, waiting,
+                       (SELECT COUNT(*)
+                        FROM release_reading_backfill_items
+                        WHERE run_id = ?
+                          AND status IN ('succeeded', 'failed', 'waiting', 'skipped'))
+                FROM release_reading_backfill_runs
+                WHERE id = ?
+                "#,
             )
+            .bind(run_id)
             .bind(run_id)
             .fetch_one(&state.pool)
             .await
             .context("load release reading backfill terminal counts")?;
+            let targets_disappeared = terminal_items < total;
             return finish_release_reading_backfill(
                 state,
                 run_id,
-                if waiting > 0 {
-                    "waiting"
-                } else if failed > 0 {
+                if targets_disappeared || failed > 0 {
                     "failed"
+                } else if waiting > 0 {
+                    "waiting"
                 } else {
                     "succeeded"
                 },
-                None,
+                targets_disappeared.then_some("target_release_deleted"),
             )
             .await;
         }

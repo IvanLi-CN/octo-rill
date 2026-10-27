@@ -2163,6 +2163,41 @@ async fn apply_translation_batch(tx: &mut Transaction<'_, Sqlite>, rowids: &[i64
         let Some(document_id) = document_id else {
             continue;
         };
+        if resource_type == "release" && is_smart {
+            // Legacy release smart rows may still be replayed by the
+            // translations backfill. They are user-scoped and may contain
+            // private compare facts, so remove both the lane and its FTS row
+            // instead of materializing them again.
+            sqlx::query(
+                "UPDATE search_document_user_lanes SET smart_text = NULL, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE document_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM search_document_user_lanes WHERE document_id = ? AND user_id = ? AND translated_text IS NULL",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM search_document_user_lanes_fts WHERE doc_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO search_document_user_lanes_fts (doc_id, user_id, translated_text, smart_text) SELECT document_id, user_id, COALESCE(translated_text, ''), COALESCE(smart_text, '') FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            continue;
+        }
         let text = title
             .into_iter()
             .chain(summary)
