@@ -11850,9 +11850,11 @@ async fn load_public_release_translation_rows(
                         &base.tag_name,
                         base.name.as_deref(),
                         base.body.as_deref(),
-                        &base.html_url,
-                        base.updated_at.as_str(),
-                        base.detected_at.as_deref(),
+                        PublicReleaseReadingRevision {
+                            html_url: &base.html_url,
+                            updated_at: base.updated_at.as_str(),
+                            detected_at: base.detected_at.as_deref(),
+                        },
                     ) else {
                         continue;
                     };
@@ -21522,15 +21524,19 @@ fn global_release_source_hash(
 /// connection or any private compare endpoint. It is intentionally defined
 /// only for bodies that already contain actionable public facts; an empty or
 /// template-only body must never match a projection derived from private code.
+struct PublicReleaseReadingRevision<'a> {
+    html_url: &'a str,
+    updated_at: &'a str,
+    detected_at: Option<&'a str>,
+}
+
 fn public_release_reading_source_hash(
     release_id: i64,
     repo_full_name: &str,
     tag_name: &str,
     name: Option<&str>,
     body: Option<&str>,
-    html_url: &str,
-    updated_at: &str,
-    detected_at: Option<&str>,
+    revision: PublicReleaseReadingRevision<'_>,
 ) -> Option<String> {
     let title = name
         .map(str::trim)
@@ -21573,8 +21579,8 @@ fn public_release_reading_source_hash(
             text: evidence_text.to_owned(),
         },
     ];
-    let source_revision_parts = vec![
-        html_url.to_owned(),
+    let source_revision_parts = [
+        revision.html_url.to_owned(),
         tag_name.to_owned(),
         title.clone(),
         body.clone(),
@@ -21596,7 +21602,10 @@ fn public_release_reading_source_hash(
             max_wait_ms: 0,
             source_blocks: with_source_revision(
                 source_blocks,
-                content_processing::authoritative_release_revision(updated_at, detected_at),
+                content_processing::authoritative_release_revision(
+                    revision.updated_at,
+                    revision.detected_at,
+                ),
                 Some(source_revision_tiebreak.as_str()),
             ),
             target_slots: vec![
@@ -21676,17 +21685,17 @@ pub(crate) async fn global_release_request_item(
     let (reading_evidence_text, reading_evidence) = if kind == "release_smart"
         && !release_body_has_actionable_content(title.as_str(), body.as_str())
     {
-        prepare_release_reading_evidence(
+        prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
             state,
             user_id,
-            row.repo_id,
+            repo_id: row.repo_id,
             release_id,
-            repo_full_name.as_str(),
-            row.tag_name.as_str(),
-            row.is_prerelease != 0,
-            row.published_at.as_deref(),
-            row.created_at.as_deref(),
-        )
+            repo_full_name: repo_full_name.as_str(),
+            tag_name: row.tag_name.as_str(),
+            is_prerelease: row.is_prerelease != 0,
+            published_at: row.published_at.as_deref(),
+            created_at: row.created_at.as_deref(),
+        })
         .await?
     } else if kind == "release_smart" {
         (
@@ -23627,46 +23636,51 @@ async fn fetch_release_compare_snapshot(
     }
 }
 
-async fn prepare_release_reading_evidence(
-    state: &AppState,
-    user_id: &str,
+struct ReleaseReadingEvidenceRequest<'a> {
+    state: &'a AppState,
+    user_id: &'a str,
     repo_id: i64,
     release_id: i64,
-    repo_full_name: &str,
-    tag_name: &str,
+    repo_full_name: &'a str,
+    tag_name: &'a str,
     is_prerelease: bool,
-    published_at: Option<&str>,
-    created_at: Option<&str>,
+    published_at: Option<&'a str>,
+    created_at: Option<&'a str>,
+}
+
+async fn prepare_release_reading_evidence(
+    request: ReleaseReadingEvidenceRequest<'_>,
 ) -> Result<(String, Vec<translations::ReleaseReadingEvidence>), ApiError> {
     let Some(baseline) = select_release_compare_baseline_from_db(
-        state,
-        repo_id,
-        release_id,
-        tag_name,
-        is_prerelease,
-        published_at,
-        created_at,
+        request.state,
+        request.repo_id,
+        request.release_id,
+        request.tag_name,
+        request.is_prerelease,
+        request.published_at,
+        request.created_at,
     )
     .await?
     else {
         return Ok((
             format!(
-                "No semver-verifiable lower release baseline was found for {tag_name}. Use the release body only; do not infer a code change."
+                "No semver-verifiable lower release baseline was found for {}. Use the release body only; do not infer a code change.",
+                request.tag_name
             ),
             vec![translations::ReleaseReadingEvidence {
                 kind: "baseline_unavailable".to_owned(),
-                reference: tag_name.to_owned(),
+                reference: request.tag_name.to_owned(),
                 scope: Some("semver baseline selection completed".to_owned()),
             }],
         ));
     };
 
     let snapshot = match fetch_release_compare_snapshot(
-        state,
-        user_id,
-        repo_full_name,
+        request.state,
+        request.user_id,
+        request.repo_full_name,
         baseline.tag_name.as_str(),
-        tag_name,
+        request.tag_name,
     )
     .await
     {
@@ -23675,11 +23689,11 @@ async fn prepare_release_reading_evidence(
             return Ok((
                 format!(
                     "Compare completed for {}...{}, but it contained no readable changes after noise filtering. Do not invent a user-facing change.",
-                    baseline.tag_name, tag_name
+                    baseline.tag_name, request.tag_name
                 ),
                 vec![translations::ReleaseReadingEvidence {
                     kind: "github_compare_empty".to_owned(),
-                    reference: format!("{}...{}", baseline.tag_name, tag_name),
+                    reference: format!("{}...{}", baseline.tag_name, request.tag_name),
                     scope: Some("compare completed; filtered digest was empty".to_owned()),
                 }],
             ));
@@ -23689,12 +23703,12 @@ async fn prepare_release_reading_evidence(
                 format!(
                     "Compare evidence is unavailable for {}...{} ({}). Keep the Release reading pending or failed; do not infer a change.",
                     baseline.tag_name,
-                    tag_name,
+                    request.tag_name,
                     error.code()
                 ),
                 vec![translations::ReleaseReadingEvidence {
                     kind: "compare_unavailable".to_owned(),
-                    reference: format!("{}...{}", baseline.tag_name, tag_name),
+                    reference: format!("{}...{}", baseline.tag_name, request.tag_name),
                     scope: Some(error.code().to_owned()),
                 }],
             ));
@@ -27490,7 +27504,8 @@ mod tests {
         GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
         ReleaseCompareBaselineRow,
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
-        RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
+        PublicReleaseReadingRevision, RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts,
+        ReleaseReactionRow,
         ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslateReleaseRequest,
         TranslateReleasesBatchRequest, TranslationCacheRow, TranslationUpsert,
@@ -37813,9 +37828,11 @@ body={}
             "v1.2.0",
             Some("v1.2.0"),
             Some("新增 CLI 子命令并说明兼容性限制。"),
-            "https://github.com/acme/demo/releases/tag/v1.2.0",
-            "2026-10-27T00:00:00Z",
-            None,
+            PublicReleaseReadingRevision {
+                html_url: "https://github.com/acme/demo/releases/tag/v1.2.0",
+                updated_at: "2026-10-27T00:00:00Z",
+                detected_at: None,
+            },
         )
         .expect("actionable public body should have a public identity");
         assert!(!public_hash.is_empty());
@@ -37826,9 +37843,11 @@ body={}
                 "v1.2.0",
                 Some("v1.2.0"),
                 Some("Release v1.2.0\nSource-SHA: abc123"),
-                "https://github.com/acme/demo/releases/tag/v1.2.0",
-                "2026-10-27T00:00:00Z",
-                None,
+                PublicReleaseReadingRevision {
+                    html_url: "https://github.com/acme/demo/releases/tag/v1.2.0",
+                    updated_at: "2026-10-27T00:00:00Z",
+                    detected_at: None,
+                },
             )
             .is_none()
         );
@@ -37839,9 +37858,11 @@ body={}
                 "v1.2.0",
                 Some("v1.2.0"),
                 None,
-                "https://github.com/acme/demo/releases/tag/v1.2.0",
-                "2026-10-27T00:00:00Z",
-                None,
+                PublicReleaseReadingRevision {
+                    html_url: "https://github.com/acme/demo/releases/tag/v1.2.0",
+                    updated_at: "2026-10-27T00:00:00Z",
+                    detected_at: None,
+                },
             )
             .is_none()
         );

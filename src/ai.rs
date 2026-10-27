@@ -5256,11 +5256,12 @@ fn parse_brief_smart_summary_bullets(summary: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .filter(|line| {
             let normalized = line.to_ascii_lowercase();
-            !normalized.starts_with("相关链接")
-                && !normalized.starts_with("来源")
-                && !normalized.starts_with("实现依据")
-                && !normalized.starts_with("暂未生成")
-                && !(normalized.starts_with("由 ") && normalized.contains("提交"))
+            let low_value = normalized.starts_with("相关链接")
+                || normalized.starts_with("来源")
+                || normalized.starts_with("实现依据")
+                || normalized.starts_with("暂未生成")
+                || (normalized.starts_with("由 ") && normalized.contains("提交"));
+            !low_value
         })
         .take(4)
         .collect()
@@ -5861,13 +5862,13 @@ async fn build_brief_content_from_digests(
         .iter()
         .flat_map(|repo| repo.releases.iter())
         .any(|release| release.status_label.is_some());
-    if !has_processing_states {
-        if let Some(polished) = polish_brief_markdown(state, &deterministic, &releases).await {
-            return Ok(BuiltBriefContent {
-                content_markdown: reconcile_brief_release_links(&polished, &releases),
-                releases,
-            });
-        }
+    if !has_processing_states
+        && let Some(polished) = polish_brief_markdown(state, &deterministic, &releases).await
+    {
+        return Ok(BuiltBriefContent {
+            content_markdown: reconcile_brief_release_links(&polished, &releases),
+            releases,
+        });
     }
 
     Ok(BuiltBriefContent {
