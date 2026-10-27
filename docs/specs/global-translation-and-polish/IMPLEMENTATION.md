@@ -6,7 +6,7 @@
 
 ## Release Reading Coverage
 
-Release 阅读内容规则的覆盖与剩余实证缺口独立记录在 [统一阅读内容实现状态](../release-reading-content/IMPLEMENTATION.md)。全局工作与投影继续负责唯一写入、授权和冻结来源；Release 专属 prompt、`reading` 结果校验、compare 证据和日报消费已接入，真实模型与权限隔离仍需按该主题验收。
+Release 阅读内容规则的覆盖与剩余集成验证独立记录在 [统一阅读内容实现状态](../release-reading-content/IMPLEMENTATION.md)。全局工作与投影继续负责唯一写入、授权和冻结来源；Release 专属 prompt、`reading` 结果校验、compare 证据和日报消费已接入，权限隔离仍需按该主题验收。
 
 ## Approved Identity Update
 

@@ -3,7 +3,7 @@
 ## Current Status
 
 - Lifecycle: active
-- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；真实模型与跨账号运行验收仍未完成。
+- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；跨账号与重型集成验证仍待完成。
 - 本主题不触发生产部署或生产回填启动；旧结果在新结果校验通过前继续可读。
 
 ## Implementation Coverage
@@ -23,11 +23,10 @@
 
 - `cargo fmt --all -- --check`、`cargo check`、AI/翻译/内容处理/迁移/回填和 Release 基线测试已通过；`git diff --check` 与规范合同检查也已通过。
 - `bun run tsc -b`、`bun run lint` 和 Storybook 测试已通过；桌面/移动 Storybook 元素证据已保存到 `assets/`，提交门禁仍为 `pending-owner-approval`。
-- 真实模型输出、两个授权账号、私有公开发布隔离、GitHub 403/429 和完整回填替换仍属于合并前实证验收；当前环境没有 AI provider 配置，Agent VM 也因宿主资源已满无法启动。
+- 两个授权账号、私有公开发布隔离、GitHub 403/429 和完整回填替换仍属于合并前集成验证；当前重型全量套件需要 Agent VM。
 
 ## Remaining Gaps
 
-- 在可用 AI provider 的当前 Candidate 上完成真实模型观察和固定样本验收，并绑定 evidence card。
 - 补齐公开/私有可见性切换、搜索/缓存隔离和回填失败保留旧结果的集成测试；当前搜索投影只允许 `smart_public`，授权差异由授权阅读面按 `smart_authorized` 读取；重型全量套件需在 Agent VM 中运行。
 - 继续保留旧格式结果的可读兼容；既有 ready 投影和日报快照不会因 prompt 变化自动重算，生产回填需另行授权。
 

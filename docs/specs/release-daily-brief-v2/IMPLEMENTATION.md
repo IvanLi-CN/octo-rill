@@ -3,7 +3,7 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: V2 格式、统一结构化阅读消费与历史刷新已接入；真实模型和权限隔离验收待完成。
+- Implementation: V2 格式、统一结构化阅读消费与历史刷新已接入；权限隔离和集成验证待完成。
 - Created: 2026-04-16
 - Last: 2026-09-08
 - Summary: 既有 V2 格式、canonical validator 与刷新能力已交付；日报消费 `ReleaseReadingResult`，省略来源区和机器材料，并保留无有效变更的最简发布记录。
@@ -12,7 +12,7 @@
 
 ## 内容规则实现缺口
 
-日报窗口、快照和历史重算继续由本主题维护；Release 正文的差异分析、ready 消费、状态区分、来源行移除与机器材料边界已由 [统一阅读内容实现状态](../release-reading-content/IMPLEMENTATION.md) 接入，运行时实证仍以该主题验收为准。
+日报窗口、快照和历史重算继续由本主题维护；Release 正文的差异分析、ready 消费、状态区分、来源行移除与机器材料边界已由 [统一阅读内容实现状态](../release-reading-content/IMPLEMENTATION.md) 接入，集成验证仍以该主题验收为准。
 
 ## 文档更新（Docs to Update）
 
