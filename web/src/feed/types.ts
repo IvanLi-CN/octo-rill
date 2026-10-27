@@ -1,4 +1,5 @@
 import type { RepoVisual } from "@/lib/repoVisual";
+import type { ReleaseReading } from "@/releaseReading";
 
 export type TranslatedStatus =
 	| "ready"
@@ -46,6 +47,7 @@ export type SmartItem = {
 	error_summary?: string | null;
 	error_detail?: string | null;
 	auto_translate?: boolean;
+	reading?: ReleaseReading | null;
 };
 
 export type FeedLane = "original" | "translated" | "smart";

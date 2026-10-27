@@ -33,6 +33,8 @@ use crate::{
 };
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
+pub const RELEASE_READING_PUBLIC_VARIANT: &str = "smart_public";
+pub const RELEASE_READING_AUTHORIZED_VARIANT: &str = "smart_authorized";
 const TRANSLATION_MODEL_PROFILE_DISABLED: &str = "ai-disabled";
 const TRANSLATION_BATCH_MAX_TOKENS: u32 = 1_800;
 const TRANSLATION_BATCH_SCAN_INTERVAL: Duration = Duration::from_millis(250);
@@ -114,9 +116,118 @@ pub struct TranslationResultItem {
     pub title_zh: Option<String>,
     pub summary_md: Option<String>,
     pub body_md: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<ReleaseReadingResult>,
     pub error: Option<String>,
     pub work_item_id: Option<String>,
     pub batch_id: Option<String>,
+}
+
+/// Structured, human-facing facts extracted from a Release body and/or its
+/// frozen compare evidence. The evidence field is retained in the projection
+/// for internal audit only and is never exposed by the public reading views.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReadingResult {
+    pub version: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub changes: Vec<ReleaseReadingChange>,
+    #[serde(default)]
+    pub machine_materials: Vec<ReleaseReadingMaterial>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ReleaseReadingEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReadingChange {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReadingMaterial {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReadingEvidence {
+    pub kind: String,
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl ReleaseReadingResult {
+    pub fn is_changes(&self) -> bool {
+        self.outcome == "changes"
+    }
+
+    pub fn is_insufficient(&self) -> bool {
+        self.outcome == "insufficient"
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.version.trim().is_empty() {
+            return Err("reading.version must be non-empty");
+        }
+        if !matches!(self.outcome.as_str(), "changes" | "insufficient") {
+            return Err("reading.outcome must be changes or insufficient");
+        }
+        if self.title.as_deref().is_some_and(|title| {
+            let text = title.trim();
+            text.is_empty() || release_reading_text_is_low_value(text)
+        }) {
+            return Err("reading.title must contain a useful change title");
+        }
+        if self.changes.iter().any(|change| {
+            let text = change.text.trim();
+            text.is_empty() || release_reading_text_is_low_value(text)
+        }) {
+            return Err("reading.changes must contain readable text");
+        }
+        if self
+            .machine_materials
+            .iter()
+            .any(|material| material.label.trim().is_empty() || material.value.trim().is_empty())
+        {
+            return Err("reading.machine_materials must contain labels and values");
+        }
+        if self.is_changes() && self.changes.is_empty() {
+            return Err("reading.changes must be non-empty for changes outcome");
+        }
+        if self.is_insufficient() && !self.changes.is_empty() {
+            return Err("reading.changes must be empty for insufficient outcome");
+        }
+        if self.is_insufficient() && !self.machine_materials.is_empty() {
+            return Err("reading.machine_materials must be empty for insufficient outcome");
+        }
+        Ok(())
+    }
+}
+
+fn release_reading_text_is_low_value(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    let version_only = normalized
+        .strip_prefix("release ")
+        .or_else(|| normalized.strip_prefix("version "))
+        .unwrap_or(&normalized)
+        .trim_start_matches('v');
+    normalized.starts_with("相关链接")
+        || normalized.starts_with("来源")
+        || normalized.starts_with("实现依据")
+        || normalized.starts_with("发布原文")
+        || (normalized.starts_with("由 ") && normalized.contains("提交"))
+        || normalized.starts_with("http://")
+        || normalized.starts_with("https://")
+        || semver::Version::parse(version_only).is_ok()
+        || matches!(
+            normalized.as_str(),
+            "版本更新" | "更新要点" | "发布说明" | "版本发布" | "稳定版更新" | "补丁更新"
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +338,9 @@ fn public_translation_result_item(item: TranslationResultItem) -> PublicTranslat
         .then(|| classify_translation_error(item.error.as_deref()))
         .flatten();
     let mut item = item;
+    if let Some(reading) = item.reading.as_mut() {
+        reading.evidence.clear();
+    }
     if let Some(classified) = classified.as_ref() {
         item.error = Some(classified.summary.to_owned());
     }
@@ -955,6 +1069,7 @@ impl RequestRow {
             title_zh: self.title_zh.clone(),
             summary_md: self.summary_md.clone(),
             body_md: self.body_md.clone(),
+            reading: None,
             error: self.error_text.clone(),
             work_item_id: self.work_item_id.clone(),
             batch_id: self.batch_id.clone(),
@@ -991,6 +1106,7 @@ impl TranslationStateRow {
             title_zh: None,
             summary_md: None,
             body_md: None,
+            reading: None,
             error: self.error_text.clone(),
             work_item_id: self.active_work_item_id.clone(),
             batch_id: None,
@@ -1102,6 +1218,7 @@ fn queued_request_result(
         title_zh: None,
         summary_md: None,
         body_md: None,
+        reading: None,
         error: None,
         work_item_id,
         batch_id: None,
@@ -1118,6 +1235,7 @@ fn missing_result(item: &TranslationRequestItemInput) -> TranslationResultItem {
         title_zh: None,
         summary_md: None,
         body_md: None,
+        reading: None,
         error: None,
         work_item_id: None,
         batch_id: None,
@@ -7199,6 +7317,7 @@ async fn fail_batch_with_message(
                 title_zh: None,
                 summary_md: None,
                 body_md: None,
+                reading: None,
                 error: Some(message.to_owned()),
                 work_item_id: Some(item.id.clone()),
                 batch_id: Some(batch_id.to_owned()),
@@ -7784,6 +7903,7 @@ async fn load_translation_result_items_by_batch(
                     title_zh: row.get("title_zh"),
                     summary_md: row.get("summary_md"),
                     body_md: row.get("body_md"),
+                    reading: None,
                     error: classified
                         .as_ref()
                         .map(|value| value.summary.to_owned())
@@ -8500,6 +8620,7 @@ fn pending_result_from_work_row(
         title_zh: None,
         summary_md: None,
         body_md: None,
+        reading: None,
         error: None,
         work_item_id: Some(row.id.clone()),
         batch_id: row.batch_id.clone(),
@@ -8524,6 +8645,7 @@ fn translation_result_for_request(
         title_zh,
         summary_md: None,
         body_md: None,
+        reading: None,
         error,
         work_item_id,
         batch_id,
@@ -8654,6 +8776,40 @@ mod tests {
 
         assert_eq!(classified.code, "output_contract_invalid");
         assert_eq!(classified.summary, "模型输出未通过 JSON 契约");
+    }
+
+    #[test]
+    fn release_reading_result_rejects_version_repetition_and_source_notes() {
+        for text in ["v1.2.0", "相关链接：PR#42", "由 Ivan 提交"] {
+            let result = ReleaseReadingResult {
+                version: "v1.2.0".to_owned(),
+                outcome: "changes".to_owned(),
+                title: Some(text.to_owned()),
+                changes: vec![ReleaseReadingChange {
+                    text: "新增批处理限制".to_owned(),
+                    versions: vec!["v1.2.0".to_owned()],
+                }],
+                machine_materials: Vec::new(),
+                evidence: Vec::new(),
+            };
+            assert!(result.validate().is_err(), "low-value title should reject");
+        }
+
+        let result = ReleaseReadingResult {
+            version: "v1.2.0".to_owned(),
+            outcome: "changes".to_owned(),
+            title: Some("新增批处理限制".to_owned()),
+            changes: vec![ReleaseReadingChange {
+                text: "v1.2.0".to_owned(),
+                versions: Vec::new(),
+            }],
+            machine_materials: Vec::new(),
+            evidence: Vec::new(),
+        };
+        assert!(
+            result.validate().is_err(),
+            "version-only change should reject"
+        );
     }
 
     #[test]
@@ -8850,6 +9006,7 @@ mod tests {
             title_zh: None,
             summary_md: None,
             body_md: None,
+            reading: None,
             error: Some("body exceeds 3000 chars".to_owned()),
             work_item_id: Some("work-1".to_owned()),
             batch_id: Some("batch-1".to_owned()),
@@ -9756,6 +9913,7 @@ mod tests {
                     title_zh: Some("标题".to_owned()),
                     summary_md: Some("摘要".to_owned()),
                     body_md: Some("正文".to_owned()),
+                    reading: None,
                     error: None,
                     work_item_id: Some("work-item-ready".to_owned()),
                     batch_id: Some("batch-ready".to_owned()),
@@ -15151,6 +15309,7 @@ mod tests {
                 title_zh: None,
                 summary_md: None,
                 body_md: None,
+                reading: None,
                 error: None,
                 work_item_id: Some("work-1".to_owned()),
                 batch_id: Some("batch-1".to_owned()),
@@ -15215,6 +15374,7 @@ mod tests {
                 title_zh: None,
                 summary_md: None,
                 body_md: None,
+                reading: None,
                 error: None,
                 work_item_id: Some("work-1".to_owned()),
                 batch_id: Some("batch-1".to_owned()),

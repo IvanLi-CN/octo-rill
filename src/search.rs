@@ -2853,6 +2853,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_search_projection_excludes_authorized_reading_variant() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES ('search-private-reading-work', 'release', 'private-reading', 'polishing', 'smart_authorized',
+                      'zh-CN', 'search-private-reading-hash', 'content-processing.v1', 'test-model',
+                      '{}', 'test-config', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed private reading work item");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES ('search-private-reading-projection', 'release', 'private-reading', 'polishing', 'smart_authorized',
+                      'zh-CN', 'content-processing.v1', 'test-model', 'search-private-reading-hash',
+                      'search-private-reading-work', 'search-private-reading-work',
+                      '{"title_zh":"内部差异","summary_md":"仅授权可见"}',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed private reading projection");
+        sqlx::query(
+            "INSERT INTO search_documents (id, resource_type, resource_id, title, body, created_at, updated_at) VALUES ('release:private-reading', 'release', 'private-reading', 'source title', 'source body', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed private reading search document");
+
+        let state = setup_state(pool.clone());
+        drain_search_projection_outbox(state.as_ref()).await;
+
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT smart_text FROM search_documents WHERE id = 'release:private-reading'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read public search projection"),
+            None,
+            "authorized compare text must never enter the shared search projection"
+        );
+    }
+
+    #[tokio::test]
     async fn content_projection_eligibility_change_refreshes_the_previous_search_key() {
         let pool = setup_pool().await;
         sqlx::query(

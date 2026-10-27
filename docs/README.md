@@ -5,6 +5,7 @@
 ## 从哪里开始
 
 - **先理解项目现在做什么**：看 [`product.md`](./product.md)
+- **先统一阅读领域用语**：看根目录 [`GLOSSARY.md`](../GLOSSARY.md)；润色与日报的内容边界看 [`Release 阅读内容与变更依据`](./specs/release-reading-content/SPEC.md)，实现覆盖看其 [`IMPLEMENTATION.md`](./specs/release-reading-content/IMPLEMENTATION.md)
 - **先理解系统怎么拼起来**：看 [`architecture.md`](./architecture.md)
 - **先核对仓库合并与 GitHub 保护规则**：看 [`repository-governance.md`](./repository-governance.md)
 - **先在本地跑起来**：看 [`../docs-site/docs/quick-start.md`](../docs-site/docs/quick-start.md)

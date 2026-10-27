@@ -494,7 +494,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95, 96, 97, 98, 99, 100, 101] {
+        for version in [93_i64, 94, 95, 96, 97, 98, 99, 100, 101, 102] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -904,7 +904,7 @@ mod tests {
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(
-            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]"
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102]"
         ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(

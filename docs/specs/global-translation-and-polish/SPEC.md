@@ -6,6 +6,8 @@
 
 本主题将 Release、公告和通知的翻译与润色统一为全局工作与结果模型。它复用既有调度器的批处理、租约、恢复和诊断能力，但拥有全局身份、请求关联、结果投影、旧事实保留、切换和回滚合同。日报生成和日报内容处理不在范围内。
 
+Release 的正文价值、差异依据与阅读规则由 [Release 阅读内容与变更依据](../release-reading-content/SPEC.md) 维护；全局化不能用通用润色替代该领域行为。本主题仍维护唯一写入者、授权、冻结来源与结果发布边界，日报仅作为 Release 结果的消费方。
+
 ## Requirements
 
 - REQ-GTP-IDENTITY: Release、公告和通知的翻译与润色必须按 `(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version)` 形成唯一全局工作身份。模型路由、模型档案和配置指纹不属于工作或结果身份；`scope_user_id`、请求者、请求模式、来源和重试触发者也不得参与去重。首个目标语言为 `zh-CN`；每用户模型、提示词、语言或密钥配置不属于本主题。
@@ -13,7 +15,7 @@
 - REQ-GTP-OWNERSHIP: 调度器拥有全局持久化边界：授权后的请求只能通过调度器 admission/retry command 在同一 SQLite writer 事务中创建或重新排队工作项；调度 worker 是尝试事件、模型调用和结果投影的唯一写入者。所有既有翻译或润色入口必须成为调度请求适配器，保留 `async`、`wait`、`stream` 交付语义；遗留 `sync` 入口映射为有界 `wait`，到期返回可轮询的 pending 快照。全局 worker 只能消费冻结源快照，不得使用任一请求者的 OAuth 身份或可变用户上下文；任何直接模型调用或直接终态缓存写入都不得绕过调度器。
 - REQ-GTP-AUTHORIZATION: 请求者关联必须记录调用者或系统生产者、授权时刻、请求来源和关联的全局工作项。资源访问控制始终在请求、轮询、读取结果和重试时检查；全局共享不得向未获授权者暴露私有资源、输出、请求关联或诊断信息。
 - REQ-GTP-RESULTS: 只有通过输出契约和业务校验的内容可以发布为结果投影。工作与结果投影都按 `(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version)` 保持唯一身份，且不区分模型；结果投影的发布源哈希必须与身份中的 `source_hash` 一致。来源更新创建新工作项并在六十秒去抖后提交；旧的已发布结果在刷新期间保持可读，直到新投影原子替换。删除的来源必须取消或抑制未完成工作，且不得发布结果。
-- REQ-GTP-OUTPUT: 全局内容处理的规范模型响应是一个 JSON 对象，声明的 `target_slots` 必须直接位于顶层，并通过既有非空字段与 Markdown 结构校验后才能发布。未声明的标量元数据会被忽略且不持久化；未知对象/数组包装、重复 JSON key、多层、歧义、缺字段和非法 JSON 必须记录为 `output_contract_invalid`。运行时最多归一化一层 Markdown JSON 代码围栏或一层 `output` 对象包装。首次 `finish_reason=length` 只在同一尝试内使用同一路由与配置快照追加一次 `max_tokens=6000` 的 `length_recovery` 调用；再次截断记录 `output_truncated`，不在本次尝试内追加调用。provider 成功不等于业务输出成功，API wire shape 不变。
+- REQ-GTP-OUTPUT: 全局内容处理的规范模型响应是一个 JSON 对象，声明的 `target_slots` 必须直接位于顶层，并通过对应 pipeline / variant 的合法取值、内容与结构校验后才能发布。翻译应保留原文的信息与结构；Release 润色必须允许经过业务判断的仅标题或无有效变更信息结果，不得为了满足非空字段强迫生成伪摘要，其具体编码与消费者必须同步定义。未声明的标量元数据会被忽略且不持久化；未知对象/数组包装、重复 JSON key、多层、歧义、缺字段和非法 JSON 必须记录为 `output_contract_invalid`。运行时最多归一化一层 Markdown JSON 代码围栏或一层 `output` 对象包装。首次 `finish_reason=length` 只在同一尝试内使用同一路由与配置快照追加一次 `max_tokens=6000` 的 `length_recovery` 调用；再次截断记录 `output_truncated`，不在本次尝试内追加调用。provider 成功不等于业务输出成功，本主题保持既有 API wire shape；领域结果编码的后续变化须显式同步对应合同。
 - REQ-GTP-CACHE-HIT: 命中源哈希与全局工作身份一致的当前有效结果投影时，不论其由哪个模型生成，若没有保留的当前工作项，调度器必须创建状态为 `ready`、`cache_hit=true`、尝试次数为零的全局工作项并关联请求者。该工作项只记录真实缓存命中，不得由旧事实或无效输出创建。
 - REQ-GTP-LIFECYCLE: 工作项状态限定为 `queued`、`running`、`ready`、`failed`、`not_applicable`、`deferred_provider`、`blocked_config`、`cancelled` 或 `superseded`，并且每个状态转换必须符合数据库合同。`blocked_config` 是可恢复的等待状态，不是永久失败；配置更新后由调度器重新验证并在有效时排队。客户端将其显示为 pending，继续轮询原请求并显示“等待模型配置恢复，恢复后会自动继续”；不得将其作为终态错误提供手动重试入口，API wire shape 不变。手动重试复用原工作项、追加新尝试并受五分钟冷却限制；结构化瞬态失败、`output_contract_invalid` 和 `output_truncated` 在 retry window 内按既有一、五、十五、六十、二百四十分钟间隔自动恢复，最长二十四小时；每次尝试最多执行一次截断恢复。调度器维持既有租约和并发边界，手动重试优先级为三，同时至少保留一个后台执行名额。
 - REQ-GTP-ADMISSION: `superseded` 是不可重开的终态；重复 source admission 必须幂等并记录独立准入事实。规范来源 adapter 必须把来源更新时间及等价权威 tie-break revision 写入冻结 source snapshot 的非身份元数据；同步到达时间、legacy ingest timestamp 和 `source_hash` 不得作为 source revision，缺少权威 upstream revision 的来源必须 fail closed。每个 provider 请求前必须在 SQLite writer 事务内验证 live lease、source existence 和 source currentness，并写入 provider-admission 事实；已知旧 source 不得调用 provider，准入拒绝或准入检查异常都不得遗留已落库的 running 调用，准入后源变化的调用不得发布结果或安排旧 source 恢复。启动与 recovery reconciliation 只能无 provider 地收口旧非运行工作。
@@ -29,6 +31,7 @@
 - REQ-GTP-IDENTITY-MIGRATION: 升级到模型无关身份时，必须保留既有尝试、模型调用和请求者关联的可追溯性。对同一新投影身份存在多个模型专属有效投影的情况，选择最近发布的有效投影作为唯一当前投影，其他投影不得继续参与当前结果读取。对既有 `blocked_config` 工作，只为没有源哈希完全匹配的有效当前投影的身份自动排入一次恢复；已有匹配投影时保留结果且不重跑。恢复使用常规调度器、并发、优先级和 provider 防护，不得合成尝试历史。
 - REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY: 模型无关身份升级先发布只扩展 schema 的兼容版本；它保留现有模型专属身份行为，不回填或改写既有工作、投影和尝试数据。后续身份切换版本使用该 schema，执行可暂停、幂等且可观察的身份与投影回填，不增加新的数据库迁移。升级期间的新 admission 必须在创建工作项的同一事务内注册规范身份和成员映射；全局 worker 在回填完成前不得 claim 工作。回填重新扫描未映射工作，不能仅因已越过 ID 游标就漏掉晚到记录。兼容版本必须能打开切换后的 schema 并作为回退目标；缺少该扩展迁移的更旧版本不受支持。结构变更与历史回填是分开的操作，各自具有完成信号和暂停点。
 - REQ-GTP-NAMING: 所有面向用户和管理员的功能名称保持“翻译”和“润色”。本主题不得以“完整翻译”“智能变更摘要”或任何替代名称重命名现有能力。
+- REQ-GTP-READING: Release polishing 在发布结果前必须满足 [Release 阅读内容与变更依据](../release-reading-content/SPEC.md) 的领域内容规则。字段非空与 provider 成功不能代替变更价值判断；正文不足时的受控差异分析及无有效变更信息结论必须在全局调度边界内承接，不得回落到 legacy writer。具体响应编码变更必须与本主题的输出合同和消费者同步演进，不能仅靠模型额外返回未声明字段。
 - REQ-GTP-OBSERVABILITY: 每次尝试审计必须记录尝试级配置指纹与路由快照、提供方调用标识、时长、令牌、成本、稳定错误码与脱敏摘要，并保持尝试到实际模型调用的精确归因。原始密钥、提示词、完整响应和未脱敏上游错误不进入常规管理读取或长期尝试审计。
 
 ## Non-goals
@@ -43,8 +46,9 @@
 - VER-GTP-GLOBAL-DEDUP: covers: REQ-GTP-IDENTITY, REQ-GTP-OWNERSHIP, REQ-GTP-AUTHORIZATION。以同一规范资源的多用户并发请求、不同资源、不同来源快照和无权访问者组合验证：只有一个全局工作与结果，worker 不使用请求者身份，且每个请求者关联和访问边界都正确。
 - VER-GTP-NOTIFICATION-SOURCE: covers: REQ-GTP-NOTIFICATION-SOURCE。以跨用户同一线程的不同标题、仓库和更新时间组合验证：最新行决定规范来源与源快照；相同更新时间始终由稳定平局规则选出同一来源；访问控制不因来源选择而改变。
 - VER-GTP-LIFECYCLE: covers: REQ-GTP-RESULTS, REQ-GTP-CACHE-HIT, REQ-GTP-LIFECYCLE, REQ-GTP-CONFIGURATION, REQ-GTP-RETRY-COORDINATION, REQ-GTP-PROVIDER-GUARD。验证来源变更、删除、有效与无效输出、跨模型当前结果命中生成零次尝试的 `ready` 工作项、持久路由更新先于 claim 时 `attempt_started` 记录新路由且与 claim 同事务排序、路由更新先于 admission 时新工作使用当前配置、运行中尝试固定其配置快照、后续尝试使用新配置、无效配置进入 `blocked_config` 后只由配置更新事件唤醒、已有有效结果不因配置变化重跑、完整批次中存在其他活动工作的 blocked identity 不导致恢复扫描空转、五分钟冷却、并发手动重试 `409`、熔断下的 `deferred_provider`、优先级与至少一个后台名额。
-- VER-GTP-OUTPUT: covers: REQ-GTP-OUTPUT, REQ-GTP-RESULTS, REQ-GTP-OBSERVABILITY。以 prompt 审计和真实内容处理执行路径验证顶层声明字段、裸 JSON、单层代码围栏、单层 `output` 包装、未知或多层包装拒绝、缺字段与歧义拒绝、非空字段与 Markdown 校验；以顺序 mock provider 验证首次截断只追加一次 6000-token recovery、两次调用均进入精确审计关联、再次截断记录 `output_truncated` 且不发生第三次调用。
+- VER-GTP-OUTPUT: covers: REQ-GTP-OUTPUT, REQ-GTP-RESULTS, REQ-GTP-OBSERVABILITY。以 prompt 审计和真实内容处理执行路径验证顶层声明字段、裸 JSON、单层代码围栏、单层 `output` 包装、未知或多层包装拒绝、缺字段与歧义拒绝、各 pipeline / variant 的内容与结构校验，并区分非法缺字段、合法仅标题与无有效变更信息结果；以顺序 mock provider 验证首次截断只追加一次 6000-token recovery、两次调用均进入精确审计关联、再次截断记录 `output_truncated` 且不发生第三次调用。
 - VER-GTP-ADMIN: covers: REQ-GTP-ADMIN-READS, REQ-GTP-LEGACY, REQ-GTP-NAMING, REQ-GTP-OBSERVABILITY。验证管理 GET 无写入，旧缓存不会被伪造成工作项，`legacy_cached` 与 `legacy_conflict` 有可追溯来源，诊断安全字段正确，界面始终显示“翻译”和“润色”。
+- VER-GTP-READING: covers: REQ-GTP-READING。从实际 global Release 请求入口输入占位发布正文，验证受控差异分析与内容结论能被 Feed 和日报一致消费，无直接 legacy writer、伪摘要、作者 / PR 流水账或未声明字段丢失导致的结论错配。
 - VER-GTP-ADMIN-READ-BUDGET: covers: REQ-GTP-ADMIN-READ-BUDGET, REQ-GTP-NOTIFICATION-SOURCE。以生产形状的通知、遗留工作项和全局工作项夹具验证四类列表：总数与页码精确、状态筛选在分页前完成、跨用户同一通知线程使用规范来源、超过三十一天被拒绝、超时与并发饱和返回可重试 `503`，且释放读取容量。
 - VER-GTP-ADMIN-ACTIVITY: covers: REQ-GTP-ADMIN-ACTIVITY, REQ-GTP-ADMIN-READS, REQ-GTP-NOTIFICATION-SOURCE。验证四种来源时间和规范化、UTC 十二小时边界、单格与 summary 数量一致、既有 lane 显示状态及综合状态优先级、无读写副作用，以及生产形状查询计划和读取延迟预算。
 - VER-GTP-CUTOVER: covers: REQ-GTP-CUTOVER, REQ-GTP-COMPATIBILITY。以旧事实混合、运行中旧批次、切换冻结、全局写入启用和切换版本降级到兼容版本的数据库副本验证：旧行未改变，转换无双写，兼容版本可启动且旧写入者失效，更旧版本被部署检查拒绝。

@@ -175,3 +175,91 @@ export const RetainedPolishProjectionAnnouncement: Story = {
 		await expect(canvas.getByRole("tab", { name: "润色" })).toBeVisible();
 	},
 };
+
+const releaseReadingDetail: ReleaseDetailResponse = {
+	release_id: "383114066",
+	repo_full_name: "octo-rill/example",
+	repo_visual: null,
+	tag_name: "v0.86.5",
+	previous_tag_name: "v0.86.4",
+	name: "v0.86.5",
+	body: "Release v0.86.5",
+	html_url: "https://github.com/octo-rill/example/releases/tag/v0.86.5",
+	published_at: "2026-09-10T13:40:00Z",
+	is_prerelease: 0,
+	is_draft: 0,
+	translated: null,
+	smart: {
+		lang: "zh-CN",
+		status: "ready",
+		title: "提升定时日志清理的批次上限",
+		summary: "- 每轮最多处理 10 批，仍受 20 秒运行时限制。",
+		request_id: "request-release-reading",
+		auto_translate: true,
+		reading: {
+			version: "v0.86.5",
+			outcome: "changes",
+			title: "提升定时日志清理的批次上限",
+			changes: [
+				{
+					text: "每轮最多处理 10 批，仍受 20 秒运行时限制。",
+					versions: ["v0.86.5"],
+				},
+			],
+			machine_materials: [{ label: "Compare SHA", value: "base..head" }],
+		},
+	},
+};
+
+export const ReleaseReadingShowsChangesAndFoldsMachineMaterial: Story = {
+	args: {
+		target: {
+			releaseId: releaseReadingDetail.release_id,
+			locator: null,
+			fromTab: "all",
+		},
+		onClose: fn(),
+		onResolvedDetail: fn(),
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string"
+						? input
+						: input instanceof Request
+							? input.url
+							: input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/api/releases/383114066/detail")) {
+					return new Response(JSON.stringify(releaseReadingDetail), {
+						status: 200,
+					});
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return <Story />;
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement.ownerDocument.body);
+		await waitFor(() =>
+			expect(
+				canvas.getByText("每轮最多处理 10 批，仍受 20 秒运行时限制。"),
+			).toBeVisible(),
+		);
+		const details = canvasElement.ownerDocument.body.querySelector("details");
+		expect(details).not.toBeNull();
+		expect(details).not.toHaveAttribute("open", "");
+		await expect(canvas.getByText("Compare SHA")).not.toBeVisible();
+	},
+};

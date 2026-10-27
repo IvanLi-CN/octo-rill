@@ -1,10 +1,12 @@
 # Release Feed 三 Tabs 与润色版本变化卡片
 
+Release 正文价值、变更依据、来源链接与机器材料边界由 [Release 阅读内容与变更依据](../release-reading-content/SPEC.md) 统一维护。本主题继续维护阅读模式与卡片交互；无正文的紧凑条目不等于把已有变化藏入折叠区，历史交付不代表 global 内容链路已经满足领域规则。
+
 ## 背景 / 问题陈述
 
 当前 Dashboard release feed 只有“原文 / 翻译”二选一，且中文内容本质上仍是直译，无法帮助用户快速理解“这个版本到底改了什么”。
 
-对于大量 GitHub Release，正文可能为空、只有一句模板话术、或者只有链接；这类内容即使翻译出来，也不足以承担版本变化导读。我们需要把 feed 卡片升级为一个更适合快速浏览版本变化的阅读面：优先展示润色后的中文要点，必要时再按需分析 compare diff；若仍无法提炼出有效版本信息，则卡片收敛为仅保留版本号与元信息的折叠样式。
+对于大量 GitHub Release，正文可能为空、只有一句模板话术、或者只有链接；这类内容即使翻译出来，也不足以承担版本变化导读。我们需要把 feed 卡片升级为一个更适合快速浏览版本变化的阅读面：优先展示润色后的中文要点，必要时再按需分析 compare diff；若仍无法提炼出有效版本信息，则保留版本号与元信息的最简发布记录。
 
 ## 目标 / 非目标
 
@@ -14,8 +16,8 @@
 - 顶部新增页面级默认显示模式控制器（原文 / 翻译 / 润色），用于决定当前 release feed 的全局默认阅读 lane，并持久化到浏览器。
 - AI 可用时页面级默认显示模式优先为 `润色`；缺数据时进入可见区即自动生成。
 - 新 release 在 sync 流程完成后，`润色` 需像 `翻译` 一样走后台预生成，优先命中缓存而不是等首次可见时才补算。
-- `润色` 内容专门服务于“帮助快速理解版本变化”，输出纯要点列表，不做长段落直译。
-- 润色工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 按需拉 compare diff`，`仍无价值 -> 折叠为仅版本号卡片`。
+- `润色` 内容专门服务于“帮助快速理解版本变化”，按事实组织简洁正文或要点；标题已承载全部有效信息时可以省略正文，不为凑列表而重复内容。
+- 润色工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 分析适合的 compare diff`，`仍无有效变更信息 -> 保留最简发布记录`。
 - 新增独立的 `release_smart` 调度/缓存语义，与现有 release 翻译缓存隔离。
 - 卡片内 lane selector 改为 icon-only，但保留 tooltip 与可访问标签。
 - 当 `翻译` / `润色` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
@@ -35,10 +37,10 @@
 - Dashboard release card header tabs 与卡片正文状态机。
 - Dashboard 顶部页面级 lane selector、`localStorage` 持久化与“立即切全页”切换语义。
 - `release_smart` 的请求校验、缓存映射、批处理解析与 `/api/feed` smart lane。
-- release body -> diff fallback -> insufficient collapse 的 LLM 工作流。
+- release body -> diff fallback -> insufficient 紧凑条目的 LLM 工作流。
 - compare diff 的按需精简 payload builder。
 - 翻译 / 润色 lane 的原文回退展示与 option 呼吸态。
-- 仅版本号折叠卡片样式。
+- 无正文的最简发布记录样式。
 - Release detail 弹窗的三态 segmented control、默认 `润色` 状态、smart 缺失按需生成与原文 fallback。
 - 本地 SQLite 运行时稳定性修复，避免 smart/translation 后台任务把桌面预览拖进 `database is locked` 自锁状态。
 - Storybook 状态覆盖、Playwright 回归、spec visual evidence。
@@ -57,15 +59,14 @@
 - 新增 `smart` lane：
   - `status` 允许 `ready | missing | disabled | error | insufficient`
   - `title` 为可选中文标题；为空时前端回退原始 title
-  - `summary` 为 Markdown 列表
+  - `summary` 为可读的 Markdown 正文或要点，不作为日报反向解析事实的唯一结构
   - `auto_translate` 语义与现有 translated lane 对齐，用于前端决定是否自动排队/保留旧结果
 
 ### 翻译/生成请求语义
 
 - 新 kind：`release_smart`
-- 固定 variant：`feed_card`
-- entity_type：`release_smart`
-- target slots：`title_zh` + `body_md`
+- 遗留请求 variant 为 `feed_card`，entity_type 为 `release_smart`；global Release 阅读使用 `smart_public`（公开原文）或 `smart_authorized`（授权差异）变体，不能把两者与遗留缓存、响应映射混作同一合同。
+- global Release smart 当前声明的 target slots 为 `title_zh` + `summary_md`，实际响应与持久化映射必须遵循全局输出合同；下文 body-first JSON 描述遗留推理语义，不能通过额外返回未声明的 `valuable` 字段就认为 global 已具备相同能力。
 
 ### `/api/releases/{id}/detail` release detail 扩展
 
@@ -73,11 +74,11 @@
 - 新增 additive 字段 `smart`，结构与 `/api/feed` 的 smart lane 语义一致：
   - `status` 允许 `ready | missing | disabled | error | insufficient`
   - `title` 为可选中文标题；为空时前端回退原始 release 标题
-  - `summary` 为 Markdown 要点正文；缺失或生成中时详情弹窗继续展示原文正文
+  - `summary` 为可读 Markdown 正文或要点；缺失或生成中时详情弹窗继续展示原文正文
   - `auto_translate` 继续用于判断是否允许自动补算或重试
 - 详情弹窗的 smart cache 判定使用 `release_smart/feed_card` source hash，不新增 entity_type、kind 或数据库迁移。
 
-### Smart terminal mapping
+### Smart terminal mapping（遗留适配）
 
 - 底层继续使用 `missing` terminal state 表示“无有效版本信息”。
 - `error_text` 使用稳定 reason code：`no_valuable_version_info`。
@@ -104,7 +105,7 @@
 ### 2. Diff fallback
 
 - 仅在正文被判定为 `valuable=false` 时触发。
-- compare base 取同仓库上一条 release tag；若无上一条 release，则直接结束为 `insufficient`。
+- compare base 必须适合该 Release 的发布系列、通道与提交关系，不得机械采用同仓库按发布时间相邻的 tag；没有合适且可用的比较范围时，不推断变化，也不把拉取失败判成 `insufficient`。
 - 程序生成精简 diff payload，包含：
   - compare range
   - commits subject 摘要
@@ -114,11 +115,11 @@
 - GitHub OAuth 登录默认申请 `public_repo`；对于历史旧 token 触发的 public compare scope 错误，后端需先回退匿名 compare 再决定终态，避免把可恢复的公共仓库错误直接暴露成失败卡片。
 - 若 GitHub compare 拉取失败（鉴权 / 限流 / 网络 / 404），smart lane 进入 `error`，允许重试。
 
-### 3. Collapse
+### 3. 最简发布记录
 
 - 当 body 与 diff 都无法提供有价值的版本变化说明时：
   - smart lane 状态变为 `insufficient`
-  - 卡片进入仅版本号折叠样式
+  - 卡片保留版本号与元信息的紧凑条目，不创建隐藏可读内容的折叠区
   - 不再渲染正文区与 tabs
   - 保留 repo / version / 时间 / GitHub 跳转
   - 若该卡片已有 reaction 数据，底部 reaction footer 仍保留
@@ -144,7 +145,7 @@
 - 翻译 / 润色 tab 缺数据：用户首次切入该 tab 时，`missing` lane 仍允许按需补算；但若 lane 已明确是 `error + auto_translate=false`，tab 切换只能展示当前终态，不能偷偷再发一次无效重试请求。
 - 若 smart lane 处于 `error` 且用户点击 `重试润色`，错误态 action 按钮必须立刻进入 spinning/loading，并在请求完成前保持 disabled，避免重复点击。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
-- 润色 ready 内容必须是纯要点列表，不得退化为原文直译。
+- 润色 ready 内容必须说明实际变化及必要条件，不得退化为原文直译；可读段落与列表都不应被消费者误判为缺失。
 - Release detail 弹窗打开时默认选中 `润色`；当 smart ready 时显示润色标题和正文，当 smart missing 或可自动重试错误时触发 `/api/translate/results` 按需补算，并在生成期间继续显示原文。
 - Release detail 弹窗仍保留 `原文`、`翻译`、`润色` 三个明确入口；`GitHub` 与 `关闭` 动作保持在弹窗头部右侧，不被阅读模式切换遮挡。
 
@@ -192,7 +193,7 @@
 
 - Given release 正文可直接说明版本变化
   When smart 生成完成
-  Then 卡片展示 1-4 条中文要点，不拉 compare diff。
+  Then 卡片展示简洁且有依据的中文正文或要点，不为补字数重复标题或版本，不拉 compare diff。
 
 - Given release 正文没有有效内容，但 compare diff 能说明变化
   When smart 生成完成
@@ -200,7 +201,7 @@
 
 - Given release 正文与 diff 都没有有效版本信息
   When smart 终态返回
-  Then 卡片切为仅版本号折叠样式，不显示正文区。
+  Then 卡片保留最简发布记录，不显示不存在的正文，也不创建内容折叠区。
 
 - Given public release 之前因为旧 OAuth scope 落下 `repo scope required; re-login via GitHub OAuth` 错误
   When 用户重新打开 feed 或 sync 再次触发 smart 预热
@@ -232,7 +233,7 @@
 
 - Given 用户在 `润色失败` 卡片上点击 `重试润色`
   When 本次 smart 终态实际返回 `insufficient`
-  Then 卡片直接收敛为仅版本号折叠样式，不额外冒出全局 boot error。
+  Then 卡片直接收敛为最简发布记录，不额外冒出全局 boot error。
 
 - Given 用户在 `润色失败` 卡片上点击 `重试润色`
   When 请求仍在进行中
@@ -257,6 +258,20 @@
 - E2E：扩展 `web/e2e/release-detail.spec.ts` 覆盖三 tabs 与 insufficient 卡片。
 - UI-affecting 变更必须补 Storybook 稳定场景，并提供视觉证据。
 - 本地开发运行时不得因为单进程内多个 SQLite pool 连接相互争抢写锁而频繁出现 `database is locked`；对桌面预览场景，SQLite 访问应串行化，保证 smart 生成与后台 worker 同时开启时页面仍可稳定打开。
+
+## Requirements
+
+- REQ-SMART-READING: 三种阅读模式必须保持各自含义；润色内容与消费必须满足 [统一阅读内容合同](../release-reading-content/SPEC.md)，仅对有价值机器材料提供内容折叠，不按测试 / CI 标签隐藏可读变化。
+- REQ-SMART-INSUFFICIENT: body 与可用 diff 仍不足以说明变化时保留最简发布记录，不补伪摘要；处理尚未完成或失败不得映射为无有效变更信息。
+
+## Verification
+
+- VER-SMART-READING: covers: REQ-SMART-READING。以三态阅读场景验证原文与翻译仍可核对完整信息，润色直接呈现有效变化和必要条件，没有额外来源区，高价值内容不在折叠区。
+- VER-SMART-INSUFFICIENT: covers: REQ-SMART-INSUFFICIENT。分别检查已核查但无信息、排队、compare 失败与有效段落，只有无信息结论进入最简发布记录，且不出现伪摘要或内容折叠。
+
+## Related ADRs
+
+None
 
 ## Visual Evidence
 
@@ -326,9 +341,9 @@
 - source_type: `ui_demo`
   story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartInsufficient`
   state: `smart-insufficient`
-  evidence_note: 验证 body 与 diff 都没有有效版本信息时，卡片收敛为仅版本号折叠样式，不再渲染 tabs 与正文区。
+  evidence_note: 验证 body 与 diff 都没有有效版本信息时，卡片保留无正文的最简发布记录，不再渲染 tabs 与正文区。
 
-  ![仅版本号折叠卡片](./assets/release-smart-insufficient-focused.png)
+  ![最简发布记录](./assets/release-smart-insufficient-focused.png)
 
 - source_type: `ui_demo`
   story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish ReleaseDetailSmartDefaultReady`
@@ -354,7 +369,6 @@
   evidence_surface: `component`
   evidence_binding_sha: `118fdfe`
   evidence_note: 验证同一卡片润色失败 toast 同时提供“重试润色”和“定位到卡片”，重复失败仍只保留一条提示。
-  PR: include
 
   ![润色失败 toast 操作](./assets/release-smart-failure-toast.png)
 
@@ -368,6 +382,5 @@
   evidence_surface: `component`
   evidence_binding_sha: `118fdfe`
   evidence_note: 验证失败卡片自身仍保留“重试润色”，toast 的重试入口与卡片 lane 复用同一请求语义。
-  PR: include
 
   ![润色失败卡片重试](./assets/release-smart-failure-card.png)

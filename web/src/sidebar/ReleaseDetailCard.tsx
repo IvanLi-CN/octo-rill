@@ -43,12 +43,45 @@ import {
 } from "@/lib/errorPresentation";
 import { normalizeReleaseId } from "@/lib/releaseId";
 import { cn } from "@/lib/utils";
+import type { ReleaseReading } from "@/releaseReading";
 
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
 const SMART_RESOLVE_MAX_WAIT_MS = 5_000;
 const RELEASE_FEED_BODY_MAX_CHARS = 3_000;
+
+function ReleaseReadingPanel({ reading }: { reading: ReleaseReading }) {
+	if (reading.outcome === "insufficient") {
+		return null;
+	}
+	return (
+		<div className="space-y-3">
+			<ul className="list-disc space-y-2 pl-5 text-sm leading-6">
+				{reading.changes.map((change, index) => (
+					<li key={`${change.text}-${index}`}>{change.text}</li>
+				))}
+			</ul>
+			{reading.machine_materials?.length ? (
+				<details className="rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+					<summary className="cursor-pointer select-none font-medium text-foreground/80">
+						核验材料
+					</summary>
+					<ul className="mt-2 space-y-1 font-mono">
+						{reading.machine_materials.map((material) => (
+							<li key={`${material.label}-${material.value}`}>
+								<span className="mr-2 text-muted-foreground">
+									{material.label}
+								</span>
+								<span className="break-all">{material.value}</span>
+							</li>
+						))}
+					</ul>
+				</details>
+			) : null}
+		</div>
+	);
+}
 
 type ReleaseDetailUiError = {
 	summary: string;
@@ -125,7 +158,12 @@ function hasTranslatedProjection(
 function hasSmartProjection(
 	smart: ReleaseDetailResponse["smart"] | null | undefined,
 ) {
-	return Boolean(smart?.title?.trim() || smart?.summary?.trim());
+	return Boolean(
+		smart?.title?.trim() ||
+			smart?.summary?.trim() ||
+			(smart?.reading?.outcome === "changes" &&
+				smart.reading.changes.length > 0),
+	);
 }
 
 function shouldResolveSmart(
@@ -184,6 +222,13 @@ function shouldFallbackToOriginal(
 		return false;
 	}
 	if (projection?.status === "ready") {
+		if (
+			"reading" in projection &&
+			projection.reading?.outcome === "changes" &&
+			projection.reading.changes.length > 0
+		) {
+			return false;
+		}
 		return !(projection.title?.trim() || projection.summary?.trim());
 	}
 	return (
@@ -672,6 +717,10 @@ export function ReleaseDetailCard(props: {
 		const smartBody = hasSmartProjection(activeDetail.smart)
 			? activeDetail.smart?.summary
 			: null;
+		const reading =
+			selectedLane === "smart" && activeDetail.smart?.status === "ready"
+				? (activeDetail.smart.reading ?? null)
+				: null;
 		const originalBody = activeDetail.body?.trim() ? activeDetail.body : null;
 		const body =
 			selectedLane === "translated"
@@ -684,7 +733,7 @@ export function ReleaseDetailCard(props: {
 						: originalBody
 					: originalBody;
 
-		return { title, body };
+		return { title, body, reading };
 	}, [activeDetail, selectedLane]);
 
 	if (!normalizedTarget || !activeTargetKey) {
@@ -960,7 +1009,9 @@ export function ReleaseDetailCard(props: {
 									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 									visualClassName="size-8"
 								/>
-								{display.body ? (
+								{display.reading ? (
+									<ReleaseReadingPanel reading={display.reading} />
+								) : display.body ? (
 									<div className="bg-muted/10 rounded-lg border p-4">
 										<Markdown content={display.body} />
 									</div>
