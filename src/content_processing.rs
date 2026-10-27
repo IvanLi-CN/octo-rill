@@ -3448,21 +3448,24 @@ fn validate_output(
                         .ok()
                 })
                 .unwrap_or_default();
-            let evidence_has_release_body =
-                evidence.iter().any(|entry| entry.kind == "release_body");
+            let evidence_has_release_body = evidence
+                .iter()
+                .any(|entry| matches!(entry.kind.as_str(), "release_body" | "release_text"));
             let evidence_has_compare = evidence.iter().any(|entry| {
                 matches!(
                     entry.kind.as_str(),
-                    "github_compare" | "github_compare_empty" | "baseline_unavailable"
+                    "github_compare" | "github_compare_empty"
                 )
             });
-            if evidence
-                .iter()
-                .any(|entry| entry.kind == "compare_unavailable")
-            {
-                anyhow::bail!(
-                    "reading evidence is unavailable; the result must remain in a processing failure state"
-                );
+            if evidence.iter().any(|entry| {
+                matches!(
+                    entry.kind.as_str(),
+                    "baseline_unavailable" | "compare_unavailable" | "github_compare_incomplete"
+                )
+            }) {
+                return Err(anyhow::Error::new(ReadingEvidenceUnavailable {
+                    message: "reading evidence is unavailable; the result must remain in a processing failure state".to_owned(),
+                }));
             }
             if !evidence_has_release_body && !evidence_has_compare {
                 anyhow::bail!("reading evidence is incomplete");
@@ -3621,6 +3624,19 @@ struct OutputValidationFailure {
     code: &'static str,
     message: String,
 }
+
+#[derive(Debug)]
+struct ReadingEvidenceUnavailable {
+    message: String,
+}
+
+impl std::fmt::Display for ReadingEvidenceUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReadingEvidenceUnavailable {}
 
 impl std::fmt::Display for OutputValidationFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3988,9 +4004,14 @@ async fn complete_global_output(
     ) {
         Ok(output) => output,
         Err(error) => {
+            let code = if error.downcast_ref::<ReadingEvidenceUnavailable>().is_some() {
+                "reading_evidence_unavailable"
+            } else {
+                "output_contract_invalid"
+            };
             return Err(anyhow::Error::new(OutputValidationFailure {
                 call_ids,
-                code: "output_contract_invalid",
+                code,
                 message: error.to_string(),
             }));
         }
@@ -4859,7 +4880,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
                 || matches!(
                     class.as_str(),
-                    "output_contract_invalid" | "output_truncated"
+                    "output_contract_invalid" | "output_truncated" | "reading_evidence_unavailable"
                 );
             let now = Utc::now();
             let next_retry = next_retry_at_for_failure(
@@ -9119,6 +9140,29 @@ mod tests {
         )
         .expect_err("failed compare evidence must remain a failure state");
         assert!(error.to_string().contains("evidence is unavailable"));
+    }
+
+    #[test]
+    fn release_reading_output_rejects_missing_or_incomplete_compare_evidence() {
+        for evidence in [
+            r#"[{"kind":"baseline_unavailable","reference":"v1.2.0"}]"#,
+            r#"[{"kind":"github_compare_incomplete","reference":"v1.1.0...v1.2.0"}]"#,
+        ] {
+            let error = validate_output(
+                r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.2.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[]}}"#,
+                &[
+                    "title_zh".to_owned(),
+                    "summary_md".to_owned(),
+                    "reading".to_owned(),
+                ],
+                &[translations::TranslationSourceBlock {
+                    slot: "reading_evidence_json".to_owned(),
+                    text: evidence.to_owned(),
+                }],
+            )
+            .expect_err("incomplete compare evidence must not become no-change");
+            assert!(error.to_string().contains("evidence is unavailable"));
+        }
     }
 
     #[test]

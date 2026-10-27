@@ -16924,7 +16924,77 @@ pub(crate) fn release_feed_body(body: Option<&str>) -> Option<String> {
 /// facts. This gate is deliberately conservative: compare evidence is only
 /// fetched for empty, template-only, version-only, or machine-metadata-only
 /// bodies, while a concrete PR subject or a prose change remains primary.
+fn release_title_has_actionable_content(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let normalized = lower
+        .strip_prefix("release ")
+        .or_else(|| lower.strip_prefix("version "))
+        .unwrap_or(&lower)
+        .trim();
+    let normalized_version = normalized
+        .trim_start_matches('v')
+        .trim_matches(|ch: char| matches!(ch, ':' | '：' | '-' | '_' | '(' | ')' | '[' | ']'));
+    if semver::Version::parse(normalized_version).is_ok() {
+        return false;
+    }
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower == "更新内容"
+        || lower == "主要更新"
+        || lower == "release notes"
+        || lower == "changes"
+    {
+        return false;
+    }
+    let change_verbs = [
+        "新增", "添加", "支持", "修复", "改进", "优化", "移除", "迁移", "限制", "兼容", "调整",
+        "增加", "减少", "更新", "提升", "推出", "引入", "重构", "改为",
+    ];
+    let has_change_verb = change_verbs.iter().any(|verb| lower.contains(verb));
+    if !has_change_verb && (lower.contains("版本发布") || lower.contains("版本发行")) {
+        return false;
+    }
+    let semver_tokens = lower
+        .split_whitespace()
+        .filter(|token| {
+            let token = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ':' | '：' | '-' | '_' | '(' | ')' | '[' | ']' | ',' | '，'
+                )
+            });
+            semver::Version::parse(token.trim_start_matches('v')).is_ok()
+        })
+        .count();
+    if semver_tokens > 0 && !has_change_verb {
+        let non_version_tokens = lower
+            .split_whitespace()
+            .filter(|token| {
+                let token = token.trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        ':' | '：' | '-' | '_' | '(' | ')' | '[' | ']' | ',' | '，'
+                    )
+                });
+                semver::Version::parse(token.trim_start_matches('v')).is_err()
+            })
+            .filter(|token| !matches!(*token, "release" | "version" | "released" | "发布"))
+            .count();
+        if non_version_tokens <= 1 {
+            return false;
+        }
+    }
+    trimmed.chars().count() >= 8
+}
+
 fn release_body_has_actionable_content(title: &str, body: &str) -> bool {
+    if release_title_has_actionable_content(title) {
+        return true;
+    }
     let title = title.trim().to_ascii_lowercase();
     let mut meaningful_lines = 0usize;
     for raw_line in body.replace("\r\n", "\n").lines() {
@@ -21548,11 +21618,12 @@ fn public_release_reading_source_hash(
         return None;
     }
     let evidence = vec![translations::ReleaseReadingEvidence {
-        kind: "release_body".to_owned(),
+        kind: "release_text".to_owned(),
         reference: release_id.to_string(),
-        scope: Some("body selected before compare fallback".to_owned()),
+        scope: Some("title/body selected before compare fallback".to_owned()),
     }];
-    let evidence_text = "Release body selected as the primary evidence; compare was not required.";
+    let evidence_text =
+        "Release title/body selected as the primary evidence; compare was not required.";
     let source_blocks = vec![
         translations::TranslationSourceBlock {
             slot: "metadata".to_owned(),
@@ -21682,33 +21753,35 @@ pub(crate) async fn global_release_request_item(
     let body = row.body.unwrap_or_default().replace("\r\n", "\n");
     let has_body = !body.trim().is_empty();
     let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
-    let (reading_evidence_text, reading_evidence) = if kind == "release_smart"
-        && !release_body_has_actionable_content(title.as_str(), body.as_str())
-    {
-        prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
-            state,
-            user_id,
-            repo_id: row.repo_id,
-            release_id,
-            repo_full_name: repo_full_name.as_str(),
-            tag_name: row.tag_name.as_str(),
-            is_prerelease: row.is_prerelease != 0,
-            published_at: row.published_at.as_deref(),
-            created_at: row.created_at.as_deref(),
-        })
-        .await?
-    } else if kind == "release_smart" {
-        (
-            "Release body selected as the primary evidence; compare was not required.".to_owned(),
-            vec![translations::ReleaseReadingEvidence {
-                kind: "release_body".to_owned(),
-                reference: release_id.to_string(),
-                scope: Some("body selected before compare fallback".to_owned()),
-            }],
-        )
-    } else {
-        (String::new(), Vec::new())
-    };
+    let has_actionable_release_text =
+        release_body_has_actionable_content(title.as_str(), body.as_str());
+    let (reading_evidence_text, reading_evidence) =
+        if kind == "release_smart" && !has_actionable_release_text {
+            prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
+                state,
+                user_id,
+                repo_id: row.repo_id,
+                release_id,
+                repo_full_name: repo_full_name.as_str(),
+                tag_name: row.tag_name.as_str(),
+                is_prerelease: row.is_prerelease != 0,
+                published_at: row.published_at.as_deref(),
+                created_at: row.created_at.as_deref(),
+            })
+            .await?
+        } else if kind == "release_smart" {
+            (
+                "Release title/body selected as the primary evidence; compare was not required."
+                    .to_owned(),
+                vec![translations::ReleaseReadingEvidence {
+                    kind: "release_text".to_owned(),
+                    reference: release_id.to_string(),
+                    scope: Some("title/body selected before compare fallback".to_owned()),
+                }],
+            )
+        } else {
+            (String::new(), Vec::new())
+        };
     let mut source_blocks = vec![
         translations::TranslationSourceBlock {
             slot: "metadata".to_owned(),
@@ -22948,6 +23021,8 @@ struct GitHubCompareResponse {
     merge_base_commit: Option<GitHubCompareCommitRef>,
     commits: Vec<GitHubCompareCommit>,
     files: Vec<GitHubCompareFile>,
+    #[serde(skip)]
+    pagination_truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22972,6 +23047,7 @@ struct ReleaseCompareSnapshot {
     merge_base_sha: Option<String>,
     head_sha: Option<String>,
     digest: String,
+    coverage_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23176,7 +23252,12 @@ fn summarize_patch_excerpt(patch: &str) -> Option<String> {
     }
 }
 
-fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
+struct CompareDigest {
+    text: String,
+    complete: bool,
+}
+
+fn build_compare_digest_with_coverage(compare: &GitHubCompareResponse) -> Option<CompareDigest> {
     let mut lines = Vec::new();
     if let Some(status) = compare.status.as_deref() {
         lines.push(format!("compare_status: {status}"));
@@ -23190,6 +23271,10 @@ fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
     if let Some(total_commits) = compare.total_commits {
         lines.push(format!("total_commits: {total_commits}"));
     }
+    let commit_truncated = compare
+        .total_commits
+        .is_some_and(|total| total > compare.commits.len() as i64)
+        || compare.commits.len() > 12;
 
     let commit_lines = compare
         .commits
@@ -23212,6 +23297,14 @@ fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
         lines.extend(commit_lines);
     }
 
+    let meaningful_file_count = compare
+        .files
+        .iter()
+        .filter(|file| !compare_file_is_noise(file))
+        .count();
+    let file_truncated = meaningful_file_count > 8 || compare.files.len() >= 300;
+    let complete = !compare.pagination_truncated && !commit_truncated && !file_truncated;
+    lines.push(format!("coverage_complete: {complete}"));
     let mut file_lines = Vec::new();
     let mut excerpt_lines = Vec::new();
     for file in compare
@@ -23246,11 +23339,20 @@ fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
     // file/commit change, not a digest for the model to interpret.
     if !lines.iter().any(|line| {
         line == "commit_subjects:" || line == "changed_files:" || line == "patch_excerpts:"
-    }) {
+    }) && complete
+    {
         None
     } else {
-        Some(lines.join("\n"))
+        Some(CompareDigest {
+            text: lines.join("\n"),
+            complete,
+        })
     }
+}
+
+#[cfg(test)]
+fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
+    build_compare_digest_with_coverage(compare).map(|digest| digest.text)
 }
 
 fn github_rest_compare_http_error(
@@ -23311,11 +23413,13 @@ async fn fetch_release_compare_digest_request(
     } else {
         (payload, None)
     };
-    Ok(build_compare_digest(&payload).map(|digest| {
-        comparison_mode
-            .map(|mode| format!("comparison_mode: {mode}\n{digest}"))
-            .unwrap_or(digest)
-    }))
+    Ok(build_compare_digest_with_coverage(&payload)
+        .filter(|digest| digest.complete)
+        .map(|digest| {
+            comparison_mode
+                .map(|mode| format!("comparison_mode: {mode}\n{}", digest.text))
+                .unwrap_or(digest.text)
+        }))
 }
 
 async fn fetch_release_compare_digest(
@@ -23536,14 +23640,15 @@ async fn fetch_release_compare_snapshot_request(
     } else {
         (payload, None)
     };
-    let digest = build_compare_digest(&payload).map(|digest| {
+    let digest = build_compare_digest_with_coverage(&payload).map(|digest| {
         comparison_mode
-            .map(|mode| format!("comparison_mode: {mode}\n{digest}"))
-            .unwrap_or(digest)
+            .map(|mode| format!("comparison_mode: {mode}\n{}", digest.text))
+            .unwrap_or(digest.text)
     });
     let Some(digest) = digest else {
         return Ok(None);
     };
+    let coverage_complete = digest.contains("coverage_complete: true");
     Ok(Some(ReleaseCompareSnapshot {
         base_tag: base_tag.to_owned(),
         head_tag: head_tag.to_owned(),
@@ -23551,6 +23656,7 @@ async fn fetch_release_compare_snapshot_request(
         merge_base_sha: payload.merge_base_commit.map(|commit| commit.sha),
         head_sha: payload.commits.last().map(|commit| commit.sha.clone()),
         digest,
+        coverage_complete,
     }))
 }
 
@@ -23588,10 +23694,17 @@ async fn fetch_release_compare_payload_request(
         let body = response.text().await.unwrap_or_default();
         return Err(github_rest_compare_http_error(status, &headers, &body));
     }
-    response
+    let pagination_truncated = response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("rel=\"next\""));
+    let mut payload = response
         .json::<GitHubCompareResponse>()
         .await
-        .map_err(ApiError::internal)
+        .map_err(ApiError::internal)?;
+    payload.pagination_truncated = pagination_truncated;
+    Ok(payload)
 }
 
 async fn fetch_release_compare_snapshot(
@@ -23714,6 +23827,19 @@ async fn prepare_release_reading_evidence(
             ));
         }
     };
+    if !snapshot.coverage_complete {
+        return Ok((
+            format!(
+                "Compare evidence for {}...{} was truncated or paginated; keep the Release reading pending or failed and do not infer a change.",
+                snapshot.base_tag, snapshot.head_tag
+            ),
+            vec![translations::ReleaseReadingEvidence {
+                kind: "github_compare_incomplete".to_owned(),
+                reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
+                scope: Some("compare coverage incomplete".to_owned()),
+            }],
+        ));
+    }
     let base_sha = snapshot.base_sha.as_deref().unwrap_or("unknown");
     let merge_base_sha = snapshot.merge_base_sha.as_deref().unwrap_or("unknown");
     let head_sha = snapshot.head_sha.as_deref().unwrap_or("unknown");
@@ -27515,6 +27641,8 @@ mod tests {
         admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
         admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
+        build_compare_digest_with_coverage,
+        release_reading_view_from_payload,
         build_feed_reaction_refresh_item, build_task_diagnostics, compare_requires_endpoint_diff,
         compact_dashboard_signatures,
         dashboard_readable_brief_public, dashboard_readable_feed, dashboard_readable_local_date,
@@ -37791,6 +37919,14 @@ body={}
     #[test]
     fn release_body_gate_keeps_concrete_changes_on_the_original_path() {
         assert!(release_body_has_actionable_content(
+            "CLI 4.8.0 更新：新增 GitHub 注解支持",
+            ""
+        ));
+        assert!(!release_body_has_actionable_content(
+            "Codex 0.165.0-alpha.1",
+            ""
+        ));
+        assert!(release_body_has_actionable_content(
             "CLI 4.8.0",
             "CLI 4.8.0 主要更新：支持 GitHub Actions 注解，并兼容 Devins 与 Replit Agent。"
         ));
@@ -37866,6 +38002,24 @@ body={}
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn release_reading_view_redacts_internal_evidence() {
+        let view = release_reading_view_from_payload(&serde_json::json!({
+            "reading": {
+                "version": "v1.2.0",
+                "outcome": "changes",
+                "title": "新增批处理",
+                "changes": [{"text": "每轮最多处理 10 批", "versions": []}],
+                "machine_materials": [{"label": "Base SHA", "value": "abc123"}],
+                "evidence": [{"kind": "github_compare", "reference": "v1.1.0...v1.2.0"}]
+            }
+        }))
+        .expect("validated reading view");
+        let serialized = serde_json::to_value(view).expect("serialize reading view");
+        assert!(serialized.get("evidence").is_none());
+        assert_eq!(serialized["machine_materials"][0]["label"], "Base SHA");
     }
 
     #[test]
@@ -38029,6 +38183,7 @@ body={}
                     patch: Some("+compiled".to_owned()),
                 },
             ],
+            pagination_truncated: false,
         })
         .expect("compare digest");
 
@@ -38055,9 +38210,34 @@ body={}
                 merge_base_commit: None,
                 commits: Vec::new(),
                 files: Vec::new(),
+                pagination_truncated: false,
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn build_compare_digest_marks_paginated_evidence_incomplete() {
+        let digest = build_compare_digest_with_coverage(&GitHubCompareResponse {
+            status: Some("ahead".to_owned()),
+            ahead_by: Some(1),
+            behind_by: Some(0),
+            total_commits: Some(1),
+            base_commit: None,
+            merge_base_commit: None,
+            commits: vec![GitHubCompareCommit {
+                sha: "abcdef123456".to_owned(),
+                commit: GitHubCompareCommitDetail {
+                    message: "feat: add release reading".to_owned(),
+                },
+            }],
+            files: Vec::new(),
+            pagination_truncated: true,
+        })
+        .expect("incomplete compare still needs an audit record");
+
+        assert!(!digest.complete);
+        assert!(digest.text.contains("coverage_complete: false"));
     }
 
     #[test]

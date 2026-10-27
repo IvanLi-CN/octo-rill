@@ -197,7 +197,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{Row, sqlite::SqlitePoolOptions};
 
     fn current_checksum(version: i64) -> Vec<u8> {
         MIGRATOR
@@ -869,6 +869,87 @@ mod tests {
         .execute(&pool)
         .await
         .expect("malformed result remains compatible with partial index maintenance");
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_migration_creates_tables_indexes_and_foreign_keys() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let pre_0102 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 101)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0102
+            .run(&pool)
+            .await
+            .expect("apply schema through migration 101");
+        run(&pool)
+            .await
+            .expect("apply release reading backfill migration");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 102 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 102"),
+            1
+        );
+        for table in [
+            "release_reading_backfill_runs",
+            "release_reading_backfill_items",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("check backfill table"),
+                1,
+                "migration 102 must create {table}"
+            );
+        }
+        for index in [
+            "idx_release_reading_backfill_runs_status",
+            "idx_release_reading_backfill_items_cursor",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                )
+                .bind(index)
+                .fetch_one(&pool)
+                .await
+                .expect("check backfill index"),
+                1,
+                "migration 102 must create {index}"
+            );
+        }
+        let foreign_keys = sqlx::query("PRAGMA foreign_key_list('release_reading_backfill_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill foreign keys");
+        assert_eq!(foreign_keys.len(), 2);
+        let foreign_key_tables = foreign_keys
+            .iter()
+            .map(|row| row.get::<String, _>("table"))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(foreign_key_tables.contains("release_reading_backfill_runs"));
+        assert!(foreign_key_tables.contains("repo_releases"));
     }
 
     #[tokio::test]

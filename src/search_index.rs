@@ -976,14 +976,14 @@ async fn refresh_user_lane(
               AND t.entity_type LIKE ? AND lower(t.entity_type) NOT LIKE '%smart%'
               AND lower(t.entity_id) IN (lower(?), lower(?))
             ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
-           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+           CASE WHEN ? = 1 THEN NULL ELSE (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
             FROM ai_translations t
             WHERE t.user_id = ? AND t.lang = 'zh-CN'
               AND t.status IN ('ready', 'disabled', 'missing')
               AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
               AND t.entity_type LIKE ? AND lower(t.entity_type) LIKE '%smart%'
               AND lower(t.entity_id) IN (lower(?), lower(?))
-            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1) END,
            COALESCE((SELECT MAX(t.updated_at) FROM ai_translations t
                      WHERE t.user_id = ? AND t.lang = 'zh-CN'
                        AND t.status IN ('ready', 'disabled', 'missing')
@@ -996,7 +996,8 @@ async fn refresh_user_lane(
                          AND t.status IN ('ready', 'disabled', 'missing')
                          AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
                          AND t.entity_type LIKE ?
-                         AND lower(t.entity_id) IN (lower(?), lower(?)))",
+                         AND lower(t.entity_id) IN (lower(?), lower(?))
+                         AND (? = 0 OR lower(t.entity_type) NOT LIKE '%smart%'))",
     )
     .bind(document_id)
     .bind(user_id)
@@ -1004,6 +1005,7 @@ async fn refresh_user_lane(
     .bind(&entity_pattern)
     .bind(entity_id)
     .bind(alternate_entity_id)
+    .bind((resource_type == "release") as i64)
     .bind(user_id)
     .bind(&entity_pattern)
     .bind(entity_id)
@@ -1018,6 +1020,7 @@ async fn refresh_user_lane(
     .bind(&entity_pattern)
     .bind(entity_id)
     .bind(alternate_entity_id)
+    .bind((resource_type == "release") as i64)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1226,6 +1229,27 @@ async fn refresh_content_projection(
             .execute(&mut **tx)
             .await?;
         updated_any |= result.rows_affected() > 0;
+    }
+    if resource_type == "release" {
+        // Legacy ai_translations triggers may have materialized a private
+        // smart lane before the shared release projection was introduced.
+        // Remove smart-only rows and clear the smart field on translated rows
+        // so an access change cannot leave private compare text searchable.
+        let deleted = sqlx::query(
+            "DELETE FROM search_document_user_lanes WHERE translated_text IS NULL AND document_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+        let cleared = sqlx::query(
+            "UPDATE search_document_user_lanes SET smart_text = NULL, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE document_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+        updated_any |= deleted.rows_affected() > 0 || cleared.rows_affected() > 0;
     }
     Ok(updated_any)
 }

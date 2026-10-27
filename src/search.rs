@@ -339,7 +339,7 @@ pub async fn query(
     );
     builder.push_bind(user_id);
     builder.push(
-        "), ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' AND rm.full_name IS NOT NULL AND rr.tag_name IS NOT NULL THEN '/' || rm.full_name || '/releases/tag/' || rr.tag_name ELSE CASE WHEN d.resource_type = 'release' THEN NULL ELSE d.target_path END END AS target_path, CASE WHEN d.resource_type = 'release' AND (rm.full_name IS NULL OR rr.tag_name IS NULL) THEN NULL ELSE d.target_url END AS target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+        "), ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, CASE WHEN d.resource_type = 'release' THEN d.smart_text ELSE COALESCE(ul.smart_text, d.smart_text) END AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' AND rm.full_name IS NOT NULL AND rr.tag_name IS NOT NULL THEN '/' || rm.full_name || '/releases/tag/' || rr.tag_name ELSE CASE WHEN d.resource_type = 'release' THEN NULL ELSE d.target_path END END AS target_path, CASE WHEN d.resource_type = 'release' AND (rm.full_name IS NULL OR rr.tag_name IS NULL) THEN NULL ELSE d.target_url END AS target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(
@@ -391,11 +391,11 @@ pub async fn query(
         builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
-        builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
+        builder.push(") OR (d.resource_type != 'release' AND d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
         builder.push_bind(user_id);
         builder.push(" AND search_document_user_lanes_fts_v2 MATCH ");
         builder.push_bind(fts_match_query);
-        builder.push(") OR ");
+        builder.push(")) OR ");
         builder.push("(");
         let fts_terms = parsed.terms.iter().filter(|term| term.chars().count() >= 3);
         for (index, term) in fts_terms.enumerate() {
@@ -405,7 +405,7 @@ pub async fn query(
             let pattern = format!("%{}%", escape_like(term));
             builder.push("lower(COALESCE(ul.translated_text, '')) LIKE lower(");
             builder.push_bind(pattern.clone());
-            builder.push(") ESCAPE char(92) OR lower(COALESCE(ul.smart_text, '')) LIKE lower(");
+            builder.push(") ESCAPE char(92) OR lower(CASE WHEN d.resource_type = 'release' THEN '' ELSE COALESCE(ul.smart_text, '') END) LIKE lower(");
             builder.push_bind(pattern);
             builder.push(") ESCAPE char(92)");
         }
@@ -431,7 +431,7 @@ pub async fn query(
         builder.push(" OR lower(COALESCE(ul.translated_text, '')) LIKE lower(");
         builder.push_bind(format!("%{}%", escape_like(term)));
         builder.push(") ESCAPE char(92)");
-        builder.push(" OR lower(COALESCE(ul.smart_text, '')) LIKE lower(");
+        builder.push(" OR lower(CASE WHEN d.resource_type = 'release' THEN '' ELSE COALESCE(ul.smart_text, '') END) LIKE lower(");
         builder.push_bind(format!("%{}%", escape_like(term)));
         builder.push(") ESCAPE char(92))");
     }
@@ -1072,8 +1072,10 @@ mod tests {
         let both_lanes = query(&state, "search-user", &parse_query("polished").unwrap())
             .await
             .expect("query smart release translation");
-        assert_eq!(both_lanes.len(), 1);
-        assert_eq!(both_lanes[0].matched_lane, "smart");
+        assert!(
+            both_lanes.is_empty(),
+            "legacy release smart translations must not be searchable"
+        );
         sqlx::query("DELETE FROM ai_translations WHERE id = 'search-release-smart'")
             .execute(&pool)
             .await
@@ -2857,6 +2859,20 @@ mod tests {
         let pool = setup_pool().await;
         sqlx::query(
             r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              title, summary, created_at, updated_at
+            ) VALUES ('search-private-reading-legacy-smart', 'search-user',
+                      'release_smart', 'private-reading', 'zh-CN',
+                      'legacy-private-reading-hash', 'ready', '内部差异', '私有代码依据',
+                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy private smart translation");
+        sqlx::query(
+            r#"
             INSERT INTO content_work_items (
               id, canonical_resource_type, canonical_resource_id, pipeline, variant,
               target_lang, source_hash, protocol_version, model_profile,
@@ -2905,6 +2921,34 @@ mod tests {
             .expect("read public search projection"),
             None,
             "authorized compare text must never enter the shared search projection"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_document_user_lanes WHERE document_id = 'release:private-reading' AND user_id = 'search-user'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count release user lane"),
+            0,
+            "legacy private smart translations must not populate a release user lane"
+        );
+
+        sqlx::query(
+            "INSERT INTO search_document_user_lanes (document_id, user_id, translated_text, smart_text, updated_at) VALUES ('release:private-reading', 'search-user', NULL, '私有代码依据', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stale release user lane");
+        let leaked = query(
+            &state,
+            "search-user",
+            &parse_query("私有代码依据").expect("parse private smart search"),
+        )
+        .await
+        .expect("query stale release lane");
+        assert!(
+            leaked.is_empty(),
+            "stale private release smart text must not be searchable"
         );
     }
 

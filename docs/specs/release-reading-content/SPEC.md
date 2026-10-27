@@ -101,7 +101,7 @@ OctoRill 为读者整理 GitHub 动态，润色与日报承担直接说明变化
   surface_selector: `[data-visual-evidence-surface]`
   target_selector: `[data-visual-evidence-target]`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `owner-approved`
   story_id_or_title: `Feed/FeedItemCard/Release Reading Shows Changes And Folds Machine Material`
   state: `changes visible, machine materials collapsed`
   evidence_note: `桌面卡片直接展示 10 批与 20 秒限制；核验材料保持折叠。`
@@ -117,7 +117,7 @@ OctoRill 为读者整理 GitHub 动态，润色与日报承担直接说明变化
   surface_selector: `[data-visual-evidence-surface]`
   target_selector: `[data-visual-evidence-target]`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `owner-approved`
   story_id_or_title: `Feed/FeedItemCard/Release Reading Mobile`
   state: `changes visible, machine materials collapsed`
   evidence_note: `移动卡片保持变化直显、折叠材料和标题换行，无横向溢出。`

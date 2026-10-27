@@ -5267,6 +5267,39 @@ fn parse_brief_smart_summary_bullets(summary: &str) -> Vec<String> {
         .collect()
 }
 
+/// Adapt the legacy per-user Release summary into the same structured facts
+/// consumed by the daily brief. This is a compatibility reader only; new
+/// Release readings are written through the global structured result path.
+fn legacy_release_reading_result(
+    release: &ReleaseDigest,
+    item: &api::TranslateBatchItem,
+    bullets: Vec<String>,
+) -> translations::ReleaseReadingResult {
+    translations::ReleaseReadingResult {
+        version: release.title.clone(),
+        outcome: "changes".to_owned(),
+        title: item
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned),
+        changes: bullets
+            .into_iter()
+            .map(|text| translations::ReleaseReadingChange {
+                text,
+                versions: Vec::new(),
+            })
+            .collect(),
+        machine_materials: Vec::new(),
+        evidence: vec![translations::ReleaseReadingEvidence {
+            kind: "legacy_summary".to_owned(),
+            reference: release.release_id.to_string(),
+            scope: Some("legacy compatibility projection".to_owned()),
+        }],
+    }
+}
+
 async fn load_brief_release_summary_states(
     state: &AppState,
     user_id: &str,
@@ -5298,6 +5331,10 @@ async fn load_brief_release_summary_states(
             api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
                 .await
                 .map_err(anyhow::Error::from)?;
+        let releases_by_id = releases
+            .iter()
+            .map(|release| (release.release_id, release))
+            .collect::<HashMap<_, _>>();
         let mut summary_states = HashMap::new();
         for item in items.items {
             let Ok(release_id) = item.id.parse::<i64>() else {
@@ -5310,10 +5347,20 @@ async fn load_brief_release_summary_states(
                         .as_deref()
                         .map(parse_brief_smart_summary_bullets)
                         .unwrap_or_default();
-                    if bullets.is_empty() {
+                    let Some(release) = releases_by_id.get(&release_id) else {
+                        continue;
+                    };
+                    let reading = legacy_release_reading_result(release, &item, bullets);
+                    if !reading.is_changes() || reading.changes.is_empty() {
                         BriefReleaseSummaryState::Incompatible
                     } else {
-                        BriefReleaseSummaryState::Ready(bullets)
+                        BriefReleaseSummaryState::Ready(
+                            reading
+                                .changes
+                                .into_iter()
+                                .map(|change| change.text)
+                                .collect(),
+                        )
                     }
                 }
                 "missing" => BriefReleaseSummaryState::Unavailable,

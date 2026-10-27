@@ -62,6 +62,7 @@ pub const TASK_WEBHOOK_PUSH_MANAGE: &str = "webhook.push.manage";
 pub const TASK_WEBHOOK_PUSH_AUDIT: &str = "webhook.push.audit";
 
 const RELEASE_READING_BACKFILL_BATCH_SIZE: i64 = 100;
+#[allow(dead_code)]
 const RELEASE_READING_BACKFILL_WINDOW_DAYS: i64 = 30;
 
 fn is_webhook_push_task_type(task_type: &str) -> bool {
@@ -867,6 +868,8 @@ struct ReleaseReadingBackfillRunRow {
     failed: i64,
     waiting: i64,
     skipped: i64,
+    #[allow(dead_code)]
+    lease_expires_at: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -880,13 +883,14 @@ struct ReleaseReadingBackfillItemRow {
 /// Freeze the first recent 30-day release set once, then let the normal task
 /// worker consume it. The run table is deliberately separate from job_tasks so
 /// a restart can recover the window and counters without moving the boundary.
+#[allow(dead_code)]
 pub async fn enqueue_release_reading_backfill_if_needed(
     state: &AppState,
 ) -> Result<Option<String>> {
     let latest = sqlx::query_as::<_, ReleaseReadingBackfillRunRow>(
         r#"
         SELECT id, window_start_utc, window_end_utc, status,
-               total, succeeded, failed, waiting, skipped
+               total, succeeded, failed, waiting, skipped, lease_expires_at
         FROM release_reading_backfill_runs
         ORDER BY created_at DESC, id DESC
         LIMIT 1
@@ -1078,15 +1082,48 @@ pub async fn enqueue_release_reading_backfill_if_needed(
             failed: 0,
             waiting: 0,
             skipped: 0,
+            lease_expires_at: None,
         }
     };
 
+    let mut run = run;
     if run.status == "running" {
-        return Ok(
-            find_inflight_task_by_type(state, TASK_RELEASE_READING_BACKFILL)
-                .await?
-                .map(|task| task.task_id),
-        );
+        if let Some(existing) =
+            find_inflight_task_by_type(state, TASK_RELEASE_READING_BACKFILL).await?
+        {
+            return Ok(Some(existing.task_id));
+        }
+        let lease_active = run
+            .lease_expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > Utc::now());
+        if lease_active {
+            return Ok(None);
+        }
+        let now = Utc::now().to_rfc3339();
+        let (_writer, mut tx) = state
+            .sqlite_writer
+            .begin_immediate_with_priority(
+                &state.pool,
+                "release_reading_backfill_recover_lease",
+                SqliteWritePriority::Background,
+            )
+            .await
+            .context("begin release reading backfill lease recovery")?;
+        sqlx::query(
+            "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, error_text = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(&now)
+        .bind(&run.id)
+        .execute(&mut *tx)
+        .await
+        .context("requeue expired release reading backfill lease")?;
+        tx.commit()
+            .await
+            .context("commit release reading backfill lease recovery")?;
+        run.status = "queued".to_owned();
+        run.lease_expires_at = None;
     }
     if let Some(existing) = find_inflight_task_by_type(state, TASK_RELEASE_READING_BACKFILL).await?
     {
@@ -4045,6 +4082,9 @@ async fn defer_task_after_sqlite_write_backpressure(
         }),
     )
     .await?;
+    if rescheduled && task.task_type == TASK_RELEASE_READING_BACKFILL {
+        reset_release_reading_backfill_run_after_backpressure(state, payload).await?;
+    }
     if rescheduled {
         tracing::warn!(
             task_id = task.id,
@@ -4055,6 +4095,37 @@ async fn defer_task_after_sqlite_write_backpressure(
         );
     }
     Ok(rescheduled)
+}
+
+async fn reset_release_reading_backfill_run_after_backpressure(
+    state: &AppState,
+    payload: &Value,
+) -> Result<()> {
+    let Some(run_id) = payload.get("run_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let now = Utc::now().to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_reading_backfill_requeue_backpressure",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin release reading backfill backpressure recovery")?;
+    sqlx::query(
+        "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(&now)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .context("requeue release reading backfill after sqlite backpressure")?;
+    tx.commit()
+        .await
+        .context("commit release reading backfill backpressure recovery")?;
+    Ok(())
 }
 
 async fn execute_task(
@@ -4821,7 +4892,7 @@ async fn finish_release_reading_backfill(
     let summary = sqlx::query_as::<_, ReleaseReadingBackfillRunRow>(
         r#"
         SELECT id, window_start_utc, window_end_utc, status,
-               total, succeeded, failed, waiting, skipped
+               total, succeeded, failed, waiting, skipped, lease_expires_at
         FROM release_reading_backfill_runs
         WHERE id = ?
         "#,
@@ -6615,7 +6686,8 @@ mod tests {
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
-        reschedule_task_if_owned, retry_candidate_is_retryable, rollback_scheduler_dispatch,
+        reschedule_task_if_owned, reset_release_reading_backfill_run_after_backpressure,
+        retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
@@ -11225,6 +11297,102 @@ mod tests {
         assert_eq!(payload["run_id"], "backfill-paused");
         assert_eq!(payload["window_start_utc"], "2026-09-27T00:00:00Z");
         assert_eq!(payload["window_end_utc"], "2026-10-27T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_requeues_an_expired_running_run() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped,
+              lease_owner, lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', 1, 0, 0, 0, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("backfill-expired")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("old-worker")
+        .bind("2026-10-27T00:01:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed expired release reading backfill");
+
+        let task_id = enqueue_release_reading_backfill_if_needed(state.as_ref())
+            .await
+            .expect("recover expired backfill")
+            .expect("backfill task id");
+        let (status, lease_owner, lease_expires_at): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, lease_owner, lease_expires_at FROM release_reading_backfill_runs WHERE id = ?",
+            )
+            .bind("backfill-expired")
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered backfill");
+
+        assert_eq!(status, "queued");
+        assert_eq!(lease_owner, None);
+        assert_eq!(lease_expires_at, None);
+        let queued_run: String = sqlx::query_scalar(
+            "SELECT json_extract(payload_json, '$.run_id') FROM job_tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered backfill task");
+        assert_eq!(queued_run, "backfill-expired");
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_backpressure_clears_its_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped,
+              lease_owner, lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', 1, 0, 0, 0, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("backfill-pressure")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("worker")
+        .bind("2099-10-27T00:01:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed backpressure release reading backfill");
+
+        reset_release_reading_backfill_run_after_backpressure(
+            state.as_ref(),
+            &serde_json::json!({"run_id": "backfill-pressure"}),
+        )
+        .await
+        .expect("requeue backpressure run");
+
+        let (status, lease_owner, lease_expires_at): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, lease_owner, lease_expires_at FROM release_reading_backfill_runs WHERE id = ?",
+            )
+            .bind("backfill-pressure")
+            .fetch_one(&pool)
+            .await
+            .expect("load backpressure recovery");
+        assert_eq!(status, "queued");
+        assert_eq!(lease_owner, None);
+        assert_eq!(lease_expires_at, None);
     }
 
     #[tokio::test]
