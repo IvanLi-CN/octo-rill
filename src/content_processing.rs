@@ -2993,7 +2993,7 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
         "response_contract": if is_release_reading {
-            "Return one JSON object with title_zh, summary_md, and reading directly at the top level. reading must be {version:string,outcome:'changes'|'insufficient',title:string|null,changes:[{text:string,versions:string[]}],machine_materials:[{label:string,value:string}],evidence:[]}. Return outcome='insufficient' only after the supplied release body and compare evidence have both been checked and no useful human-readable change remains. title_zh and summary_md are compatibility projections derived from the same reading facts; do not add links, author attribution, version-only repetition, or source sections."
+            "Return one JSON object with title_zh, summary_md, and reading directly at the top level. reading must be {version:string,outcome:'changes'|'insufficient',title:string|null,changes:[{text:string,versions:string[],references:[{url:string}]}],machine_materials:[{label:string,value:string}],evidence:[]}. references may contain only necessary GitHub pull request URLs; the server renders them as PR#number. Do not put links in prose. Return outcome='insufficient' only after the supplied release body and compare evidence have both been checked and no useful human-readable change remains. title_zh and summary_md are compatibility projections derived from the same reading facts; do not add author attribution, version-only repetition, or source sections."
         } else {
             "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
         }
@@ -3410,6 +3410,7 @@ fn validate_output(
             let mut parsed =
                 serde_json::from_value::<translations::ReleaseReadingResult>(value.clone())
                     .context("reading is not a valid ReleaseReadingResult")?;
+            parsed.normalize_references().map_err(anyhow::Error::msg)?;
             parsed.validate().map_err(anyhow::Error::msg)?;
             if let Some(expected_version) = source_blocks
                 .iter()

@@ -349,6 +349,17 @@ function ReleaseReadingContent(props: { reading: ReleaseReading }) {
 					return (
 						<li key={`${change.text}-${index}`}>
 							{change.text}
+							{change.references?.map((reference) => (
+								<a
+									className="ml-2 underline underline-offset-2"
+									href={reference.url}
+									key={`${reference.number}-${reference.url}`}
+									rel="noreferrer"
+									target="_blank"
+								>
+									{`PR#${reference.number}`}
+								</a>
+							))}
 							{versions ? (
 								<span className="ml-2 text-xs text-muted-foreground">
 									{`（${versions}）`}

@@ -5,6 +5,10 @@ export type ReleaseReading = {
 	changes: Array<{
 		text: string;
 		versions?: string[];
+		references?: Array<{
+			number: number;
+			url: string;
+		}>;
 	}>;
 	machine_materials?: Array<{
 		label: string;

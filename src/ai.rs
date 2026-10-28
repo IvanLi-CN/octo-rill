@@ -1316,6 +1316,7 @@ struct ReleaseRendered {
 struct BriefReleaseChange {
     text: String,
     versions: Vec<String>,
+    references: Vec<translations::ReleaseReadingReference>,
 }
 
 #[derive(Debug)]
@@ -5313,6 +5314,7 @@ fn legacy_release_reading_result(
             .map(|text| translations::ReleaseReadingChange {
                 text,
                 versions: Vec::new(),
+                references: Vec::new(),
             })
             .collect(),
         machine_materials: Vec::new(),
@@ -5386,6 +5388,7 @@ async fn load_brief_release_summary_states(
                                 .map(|change| BriefReleaseChange {
                                     text: change.text,
                                     versions: change.versions,
+                                    references: change.references,
                                 })
                                 .collect(),
                         }
@@ -5429,6 +5432,7 @@ async fn load_brief_release_summary_states(
                                 .map(|change| BriefReleaseChange {
                                     text: sanitize_bullet_text(change.text.trim()),
                                     versions: change.versions.clone(),
+                                    references: change.references.clone(),
                                 })
                                 .filter(|change| !change.text.is_empty())
                                 .take(4)
@@ -5437,6 +5441,34 @@ async fn load_brief_release_summary_states(
                     }
                 }
                 Some(reading) if reading.is_insufficient() => BriefReleaseSummaryState::NoValue,
+                None => {
+                    let changes = state
+                        .legacy_summary
+                        .as_deref()
+                        .map(parse_brief_smart_summary_bullets)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|text| BriefReleaseChange {
+                            text,
+                            versions: Vec::new(),
+                            references: Vec::new(),
+                        })
+                        .filter(|change| !change.text.is_empty())
+                        .take(4)
+                        .collect::<Vec<_>>();
+                    if changes.is_empty() {
+                        BriefReleaseSummaryState::NoValue
+                    } else {
+                        BriefReleaseSummaryState::Ready {
+                            version: releases
+                                .iter()
+                                .find(|release| release.release_id == *release_id)
+                                .map(|release| release.title.clone())
+                                .unwrap_or_else(|| "".to_owned()),
+                            changes,
+                        }
+                    }
+                }
                 _ => BriefReleaseSummaryState::Incompatible,
             },
             Some(state)
@@ -5563,9 +5595,38 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                                 .as_deref()
                                 .is_some_and(|current| current == versions[0])));
                     if show_versions {
-                        out.push_str(&format!("  - {}（{}）\n", bullet.text, versions.join("、")));
+                        let references = bullet
+                            .references
+                            .iter()
+                            .filter_map(|reference| {
+                                translations::release_reading_pr_number(&reference.url)
+                                    .map(|number| format!("[PR#{number}]({})", reference.url))
+                            })
+                            .collect::<Vec<_>>();
+                        let text = if references.is_empty() {
+                            bullet.text.clone()
+                        } else {
+                            format!("{} {}", bullet.text, references.join(" "))
+                        };
+                        out.push_str(&format!("  - {}（{}）\n", text, versions.join("、")));
                     } else {
-                        out.push_str(&format!("  - {}\n", bullet.text));
+                        let references = bullet
+                            .references
+                            .iter()
+                            .filter_map(|reference| {
+                                translations::release_reading_pr_number(&reference.url)
+                                    .map(|number| format!("[PR#{number}]({})", reference.url))
+                            })
+                            .collect::<Vec<_>>();
+                        if references.is_empty() {
+                            out.push_str(&format!("  - {}\n", bullet.text));
+                        } else {
+                            out.push_str(&format!(
+                                "  - {} {}\n",
+                                bullet.text,
+                                references.join(" ")
+                            ));
+                        }
                     }
                 }
 
@@ -6193,6 +6254,7 @@ async fn upsert_daily_brief_snapshot(
         generation_source: Option<String>,
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
+        updated_at: String,
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -6212,6 +6274,12 @@ async fn upsert_daily_brief_snapshot(
             .begin_immediate(&state.pool, "ai_brief_snapshot_refresh")
             .await
             .context("failed to begin refresh brief tx")?;
+        let existing_updated_at =
+            sqlx::query_scalar::<_, String>("SELECT updated_at FROM briefs WHERE id = ? LIMIT 1")
+                .bind(&existing_id)
+                .fetch_one(&mut *tx)
+                .await
+                .with_context(|| format!("failed to load brief snapshot version {existing_id}"))?;
         let overwritten = overwrite_brief_snapshot(
             tx.as_transaction_mut(),
             &existing_id,
@@ -6219,6 +6287,7 @@ async fn upsert_daily_brief_snapshot(
             built,
             generation_source,
             &now,
+            Some(existing_updated_at.as_str()),
         )
         .await
         .with_context(|| format!("failed to refresh brief snapshot {existing_id}"))?;
@@ -6294,7 +6363,8 @@ async fn upsert_daily_brief_snapshot(
               id,
               generation_source,
               effective_time_zone,
-              effective_local_boundary
+              effective_local_boundary,
+              updated_at
             FROM briefs
             WHERE user_id = ?
               AND window_start_utc = ?
@@ -6311,25 +6381,26 @@ async fn upsert_daily_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        let overwritten = overwrite_brief_snapshot(
-            tx.as_transaction_mut(),
-            &existing.id,
-            window,
-            built,
-            generation_source,
-            &now,
-        )
-        .await
-        .with_context(|| {
-            if is_normalized_snapshot {
-                format!("failed to refresh existing brief snapshot {}", existing.id)
-            } else {
+        let overwritten = if is_normalized_snapshot {
+            false
+        } else {
+            overwrite_brief_snapshot(
+                tx.as_transaction_mut(),
+                &existing.id,
+                window,
+                built,
+                generation_source,
+                &now,
+                Some(existing.updated_at.as_str()),
+            )
+            .await
+            .with_context(|| {
                 format!(
                     "failed to normalize conflicting legacy brief snapshot {}",
                     existing.id
                 )
-            }
-        })?;
+            })?
+        };
         tx.commit()
             .await
             .context("failed to commit brief snapshot overwrite")?;
@@ -6441,6 +6512,7 @@ async fn overwrite_brief_snapshot(
     built: &BuiltBriefContent,
     generation_source: &str,
     now: &str,
+    expected_updated_at: Option<&str>,
 ) -> Result<bool> {
     let existing_content =
         sqlx::query_scalar::<_, String>("SELECT content_markdown FROM briefs WHERE id = ? LIMIT 1")
@@ -6449,12 +6521,12 @@ async fn overwrite_brief_snapshot(
             .await
             .context("failed to load existing brief content before overwrite")?;
     if existing_content.as_deref().is_some_and(|content| {
-        !brief_has_processing_release_state(content)
-            && brief_has_processing_release_state(&built.content_markdown)
+        brief_content_is_canonical(content)
+            && brief_has_release_status_marker(&built.content_markdown)
     }) {
         return Ok(false);
     }
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE briefs
         SET date = ?,
@@ -6466,6 +6538,7 @@ async fn overwrite_brief_snapshot(
             content_markdown = ?,
             updated_at = ?
         WHERE id = ?
+          AND (? IS NULL OR updated_at = ?)
         "#,
     )
     .bind(&window.display_date)
@@ -6477,18 +6550,37 @@ async fn overwrite_brief_snapshot(
     .bind(&built.content_markdown)
     .bind(now)
     .bind(brief_id)
+    .bind(expected_updated_at)
+    .bind(expected_updated_at)
     .execute(&mut **tx)
     .await
     .context("failed to overwrite brief snapshot")?;
 
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
     replace_brief_memberships(tx, brief_id, &built.releases, now).await?;
     Ok(true)
 }
 
+#[cfg(test)]
 fn brief_has_processing_release_state(markdown: &str) -> bool {
     markdown
         .lines()
         .any(|line| line.contains("· 阅读内容处理中"))
+}
+
+fn brief_has_release_status_marker(markdown: &str) -> bool {
+    markdown.lines().any(|line| {
+        [
+            "· 阅读内容处理中",
+            "· 阅读内容处理失败",
+            "· 阅读内容格式不兼容",
+            "· 阅读内容暂不可用",
+        ]
+        .iter()
+        .any(|marker| line.contains(marker))
+    })
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -6858,6 +6950,7 @@ async fn refresh_existing_brief_snapshot(
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
         content_markdown: String,
+        updated_at: String,
     }
 
     let row = sqlx::query_as::<_, RefreshableBriefRow>(
@@ -6869,7 +6962,8 @@ async fn refresh_existing_brief_snapshot(
           window_end_utc,
           effective_time_zone,
           effective_local_boundary,
-          content_markdown
+          content_markdown,
+          updated_at
         FROM briefs
         WHERE id = ?
         LIMIT 1
@@ -6938,6 +7032,7 @@ async fn refresh_existing_brief_snapshot(
         &built,
         generation_source,
         &now,
+        Some(row.updated_at.as_str()),
     )
     .await
     .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
@@ -7365,6 +7460,7 @@ pub async fn recompute_legacy_brief_snapshot(
         user_daily_brief_time_zone: Option<String>,
         user_daily_brief_utc_time: String,
         content_markdown: String,
+        updated_at: String,
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -7373,6 +7469,7 @@ pub async fn recompute_legacy_brief_snapshot(
         generation_source: Option<String>,
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
+        updated_at: String,
     }
 
     let legacy = sqlx::query_as::<_, LegacyBriefRow>(
@@ -7387,7 +7484,8 @@ pub async fn recompute_legacy_brief_snapshot(
           users.daily_brief_local_time AS user_daily_brief_local_time,
           users.daily_brief_time_zone AS user_daily_brief_time_zone,
           users.daily_brief_utc_time AS user_daily_brief_utc_time,
-          briefs.content_markdown
+          briefs.content_markdown,
+          briefs.updated_at
         FROM briefs
         JOIN users ON users.id = briefs.user_id
         WHERE briefs.id = ?
@@ -7452,7 +7550,8 @@ pub async fn recompute_legacy_brief_snapshot(
           id,
           generation_source,
           effective_time_zone,
-          effective_local_boundary
+          effective_local_boundary,
+          updated_at
         FROM briefs
         WHERE user_id = ?
           AND window_start_utc = ?
@@ -7481,6 +7580,7 @@ pub async fn recompute_legacy_brief_snapshot(
                 &built,
                 "history_recompute",
                 &now,
+                Some(existing.updated_at.as_str()),
             )
             .await
             .context("failed to merge legacy brief snapshot into existing collision")?
@@ -7526,6 +7626,7 @@ pub async fn recompute_legacy_brief_snapshot(
         &built,
         "history_recompute",
         &now,
+        Some(legacy.updated_at.as_str()),
     )
     .await
     .context("failed to update legacy brief snapshot")?;
@@ -9958,6 +10059,7 @@ mod tests {
                 bullets: vec![BriefReleaseChange {
                     text: "修复若干问题".to_owned(),
                     versions: Vec::new(),
+                    references: Vec::new(),
                 }],
                 status_label: None,
             }],

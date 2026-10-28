@@ -20,6 +20,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
+use url::Url;
 
 use crate::{
     admin_runtime, ai, api, content_processing,
@@ -145,6 +146,13 @@ pub struct ReleaseReadingChange {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<ReleaseReadingReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReadingReference {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,6 +176,63 @@ impl ReleaseReadingResult {
 
     pub fn is_insufficient(&self) -> bool {
         self.outcome == "insufficient"
+    }
+
+    /// Normalize the only clickable references allowed in human-facing Release
+    /// reading content. Legacy model output may still contain `[PR#123](url)`
+    /// in the change text; move those links into the controlled reference
+    /// field so every projection can render the same label and URL safely.
+    pub fn normalize_references(&mut self) -> Result<(), &'static str> {
+        for change in &mut self.changes {
+            let mut text = String::with_capacity(change.text.len());
+            let mut references = change.references.clone();
+            let mut cursor = 0usize;
+            while let Some(open_offset) = change.text[cursor..].find('[') {
+                let open = cursor + open_offset;
+                text.push_str(&change.text[cursor..open]);
+                let Some(label_end_offset) = change.text[open + 1..].find(']') else {
+                    text.push_str(&change.text[open..]);
+                    cursor = change.text.len();
+                    break;
+                };
+                let label_end = open + 1 + label_end_offset;
+                let label = &change.text[open + 1..label_end];
+                let Some(target_start) = change.text[label_end + 1..].strip_prefix('(') else {
+                    text.push_str(&change.text[open..=label_end]);
+                    cursor = label_end + 1;
+                    continue;
+                };
+                let Some(target_end_offset) = target_start.find(')') else {
+                    return Err("reading change contains an incomplete reference");
+                };
+                let target_end = label_end + 1 + 1 + target_end_offset;
+                let url = target_start[..target_end_offset].trim();
+                let Some(label_number) = label
+                    .strip_prefix("PR#")
+                    .and_then(|value| value.parse::<u64>().ok().filter(|number| *number > 0))
+                else {
+                    return Err("reading change contains an unsupported link label");
+                };
+                let Some(url_number) = release_reading_pr_number(url) else {
+                    return Err("reading change contains an unsupported reference URL");
+                };
+                if label_number != url_number {
+                    return Err("reading PR reference label does not match its URL");
+                }
+                references.push(ReleaseReadingReference {
+                    url: url.to_owned(),
+                });
+                cursor = target_end + 1;
+            }
+            if cursor < change.text.len() {
+                text.push_str(&change.text[cursor..]);
+            }
+            change.text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            references.sort_by(|left, right| left.url.cmp(&right.url));
+            references.dedup_by(|left, right| left.url == right.url);
+            change.references = references;
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -196,6 +261,14 @@ impl ReleaseReadingResult {
         {
             return Err("reading.machine_materials must contain labels and values");
         }
+        if self
+            .changes
+            .iter()
+            .flat_map(|change| change.references.iter())
+            .any(|reference| release_reading_pr_number(&reference.url).is_none())
+        {
+            return Err("reading references must be GitHub pull request URLs");
+        }
         if self.is_changes() && self.changes.is_empty() {
             return Err("reading.changes must be non-empty for changes outcome");
         }
@@ -207,6 +280,22 @@ impl ReleaseReadingResult {
         }
         Ok(())
     }
+}
+
+pub fn release_reading_pr_number(raw: &str) -> Option<u64> {
+    let url = Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("github.com") | Some("www.github.com"))
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    if segments.len() != 4 || segments[2] != "pull" {
+        return None;
+    }
+    segments[3].parse::<u64>().ok().filter(|number| *number > 0)
 }
 
 fn release_reading_text_is_low_value(text: &str) -> bool {
@@ -8029,7 +8118,10 @@ fn normalize_request_items(
             .iter()
             .map(|slot| {
                 let slot = slot.trim();
-                if !matches!(slot, "title_zh" | "summary_md" | "body_md") {
+                let supports_release_reading = kind == "release_smart" && slot == "reading";
+                if !matches!(slot, "title_zh" | "summary_md" | "body_md")
+                    && !supports_release_reading
+                {
                     return Err(ApiError::bad_request(format!(
                         "unsupported target slot: {slot}"
                     )));
@@ -8788,6 +8880,7 @@ mod tests {
                 changes: vec![ReleaseReadingChange {
                     text: "新增批处理限制".to_owned(),
                     versions: vec!["v1.2.0".to_owned()],
+                    references: Vec::new(),
                 }],
                 machine_materials: Vec::new(),
                 evidence: Vec::new(),
@@ -8802,6 +8895,7 @@ mod tests {
             changes: vec![ReleaseReadingChange {
                 text: "v1.2.0".to_owned(),
                 versions: Vec::new(),
+                references: Vec::new(),
             }],
             machine_materials: Vec::new(),
             evidence: Vec::new(),
@@ -8809,6 +8903,67 @@ mod tests {
         assert!(
             result.validate().is_err(),
             "version-only change should reject"
+        );
+    }
+
+    #[test]
+    fn release_reading_references_are_structured_as_pr_numbers() {
+        let mut result = ReleaseReadingResult {
+            version: "v1.2.0".to_owned(),
+            outcome: "changes".to_owned(),
+            title: Some("提高批处理上限".to_owned()),
+            changes: vec![ReleaseReadingChange {
+                text: "每轮最多处理 10 批 [PR#673](https://github.com/IvanLi-CN/tavily-hikari/pull/673)".to_owned(),
+                versions: Vec::new(),
+                references: Vec::new(),
+            }],
+            machine_materials: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        result
+            .normalize_references()
+            .expect("valid pull request reference should normalize");
+        assert_eq!(result.changes[0].text, "每轮最多处理 10 批");
+        assert_eq!(
+            result.changes[0].references[0].url,
+            "https://github.com/IvanLi-CN/tavily-hikari/pull/673"
+        );
+        assert_eq!(
+            release_reading_pr_number(&result.changes[0].references[0].url),
+            Some(673)
+        );
+        assert!(result.validate().is_ok());
+    }
+
+    #[test]
+    fn release_reading_references_reject_non_pr_links() {
+        let mut result = ReleaseReadingResult {
+            version: "v1.2.0".to_owned(),
+            outcome: "changes".to_owned(),
+            title: Some("提高批处理上限".to_owned()),
+            changes: vec![ReleaseReadingChange {
+                text:
+                    "查看[发布原文](https://github.com/IvanLi-CN/tavily-hikari/releases/tag/v1.2.0)"
+                        .to_owned(),
+                versions: Vec::new(),
+                references: Vec::new(),
+            }],
+            machine_materials: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        assert_eq!(
+            result.normalize_references(),
+            Err("reading change contains an unsupported link label")
+        );
+        assert_eq!(
+            release_reading_pr_number("https://github.com/o/r/pull/0"),
+            None
+        );
+        assert_eq!(
+            release_reading_pr_number("http://github.com/o/r/pull/1"),
+            None
         );
     }
 
@@ -9159,6 +9314,32 @@ mod tests {
         }])
         .expect_err("unsupported kind should fail");
         assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn normalize_request_items_accepts_reading_only_for_release_smart() {
+        let mut item = sample_release_item("123");
+        item.target_slots = vec![
+            "title_zh".to_owned(),
+            "summary_md".to_owned(),
+            "reading".to_owned(),
+        ];
+        let normalized = normalize_request_items(&[item]).expect("release reading slot is valid");
+        assert_eq!(
+            normalized[0].target_slots.last().map(String::as_str),
+            Some("reading")
+        );
+
+        let mut non_release = sample_release_item("123");
+        non_release.kind = "release_detail".to_owned();
+        non_release.target_slots.push("reading".to_owned());
+        let error =
+            normalize_request_items(&[non_release]).expect_err("detail reading slot is invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported target slot: reading")
+        );
     }
 
     #[test]

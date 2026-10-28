@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -16500,6 +16500,14 @@ struct ReleaseReadingChangeView {
     text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     versions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    references: Vec<ReleaseReadingReferenceView>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ReleaseReadingReferenceView {
+    number: u64,
+    url: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -17902,6 +17910,12 @@ async fn read_global_release_smart_with_legacy_fallback(
     }) {
         return Ok(current);
     }
+    if input.variant == translations::RELEASE_READING_PUBLIC_VARIANT {
+        // Public Release pages may only consume the current public projection.
+        // Legacy `smart` rows do not carry enough provenance to prove that
+        // their text avoided private compare evidence.
+        return Ok(current);
+    }
     let legacy = content_processing::read_global_resource(
         state,
         "release",
@@ -18691,7 +18705,8 @@ fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>
     else {
         return (None, true);
     };
-    if reading.validate().is_err() {
+    let mut reading = reading;
+    if reading.normalize_references().is_err() || reading.validate().is_err() {
         return (None, true);
     }
     (
@@ -18705,6 +18720,18 @@ fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>
                 .map(|change| ReleaseReadingChangeView {
                     text: change.text,
                     versions: change.versions,
+                    references: change
+                        .references
+                        .into_iter()
+                        .filter_map(|reference| {
+                            translations::release_reading_pr_number(&reference.url).map(|number| {
+                                ReleaseReadingReferenceView {
+                                    number,
+                                    url: reference.url,
+                                }
+                            })
+                        })
+                        .collect(),
                 })
                 .collect(),
             machine_materials: reading
@@ -22079,9 +22106,7 @@ pub(crate) async fn global_release_request_item(
         "detail"
     } else if kind.ends_with("_smart") {
         if kind == "release_smart" {
-            if is_public_release
-                || release_body_has_actionable_content(title.as_str(), body.as_str())
-            {
+            if is_public_release {
                 translations::RELEASE_READING_PUBLIC_VARIANT
             } else {
                 translations::RELEASE_READING_AUTHORIZED_VARIANT
@@ -23269,6 +23294,7 @@ struct GitHubCompareResponse {
     total_commits: Option<i64>,
     base_commit: Option<GitHubCompareCommitRef>,
     merge_base_commit: Option<GitHubCompareCommitRef>,
+    head_commit: Option<GitHubCompareCommitRef>,
     commits: Vec<GitHubCompareCommit>,
     files: Vec<GitHubCompareFile>,
     #[serde(skip)]
@@ -23293,6 +23319,7 @@ struct ReleaseCompareBaselineRow {
 struct ReleaseCompareSnapshot {
     base_tag: String,
     head_tag: String,
+    relationship_status: String,
     base_sha: Option<String>,
     merge_base_sha: Option<String>,
     head_sha: Option<String>,
@@ -23300,14 +23327,14 @@ struct ReleaseCompareSnapshot {
     coverage_complete: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GitHubCompareCommit {
     sha: String,
     commit: GitHubCompareCommitDetail,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubCompareCommitDetail {
     message: String,
 }
@@ -23321,6 +23348,20 @@ struct GitHubCompareFile {
     deletions: Option<i64>,
     changes: Option<i64>,
     patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubTreeResponse {
+    tree: Vec<GitHubTreeEntry>,
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubTreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    sha: Option<String>,
 }
 
 fn value_as_bool(raw: &serde_json::Value) -> Option<bool> {
@@ -23611,6 +23652,9 @@ fn github_rest_compare_http_error(
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return github_reauth_required_error();
     }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return github_rate_limited_error();
+    }
     if status == reqwest::StatusCode::FORBIDDEN {
         let remaining = headers
             .get("x-ratelimit-remaining")
@@ -23627,6 +23671,24 @@ fn github_rest_compare_http_error(
         }
     }
     ApiError::internal(format!("github compare returned {status}: {body}"))
+}
+
+fn validate_github_compare_response(payload: &GitHubCompareResponse) -> Result<(), ApiError> {
+    if payload.status.is_none()
+        || payload.ahead_by.is_none()
+        || payload.behind_by.is_none()
+        || payload.total_commits.is_none()
+        || payload.base_commit.is_none()
+        || payload.head_commit.is_none()
+        || payload.ahead_by.is_some_and(|value| value < 0)
+        || payload.behind_by.is_some_and(|value| value < 0)
+        || payload.total_commits.is_some_and(|value| value < 0)
+    {
+        return Err(ApiError::internal(
+            "github compare response is incomplete or invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn should_retry_public_compare_without_auth(err: &ApiError) -> bool {
@@ -23758,6 +23820,15 @@ async fn select_release_compare_baseline_from_db(
         published_at: published_at.map(str::to_owned),
         created_at: created_at.map(str::to_owned),
     };
+    let candidates = release_compare_candidates_from_db(state, repo_id, release_id).await?;
+    Ok(select_release_compare_baseline(&current, &candidates))
+}
+
+async fn release_compare_candidates_from_db(
+    state: &AppState,
+    repo_id: i64,
+    release_id: i64,
+) -> Result<Vec<ReleaseCompareBaselineRow>, ApiError> {
     let candidates = sqlx::query_as::<_, ReleaseCompareBaselineRow>(
         "SELECT release_id, tag_name, is_prerelease, published_at, created_at FROM repo_releases WHERE repo_id = ? AND release_id <> ?",
     )
@@ -23766,7 +23837,7 @@ async fn select_release_compare_baseline_from_db(
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
-    Ok(select_release_compare_baseline(&current, &candidates))
+    Ok(candidates)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -23803,6 +23874,106 @@ async fn select_release_compare_baseline_for_release(
     .await
 }
 
+async fn fetch_github_tree_request(
+    state: &AppState,
+    repo_full_name: &str,
+    sha: &str,
+    access_token: Option<&str>,
+) -> Result<GitHubTreeResponse, ApiError> {
+    let url = format!(
+        "https://api.github.com/repos/{repo_full_name}/git/trees/{}?recursive=1",
+        urlencoding::encode(sha)
+    );
+    let mut request = state
+        .http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(ApiError::internal)?;
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(github_rest_compare_http_error(status, &headers, &body));
+    }
+    response
+        .json::<GitHubTreeResponse>()
+        .await
+        .map_err(ApiError::internal)
+}
+
+fn build_endpoint_tree_compare(
+    compare: &GitHubCompareResponse,
+    base_tree: GitHubTreeResponse,
+    head_tree: GitHubTreeResponse,
+) -> GitHubCompareResponse {
+    let base = base_tree
+        .tree
+        .into_iter()
+        .filter(|entry| entry.entry_type != "tree")
+        .map(|entry| (entry.path, (entry.entry_type, entry.sha)))
+        .collect::<BTreeMap<_, _>>();
+    let head = head_tree
+        .tree
+        .into_iter()
+        .filter(|entry| entry.entry_type != "tree")
+        .map(|entry| (entry.path, (entry.entry_type, entry.sha)))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = base.keys().cloned().collect::<BTreeSet<_>>();
+    paths.extend(head.keys().cloned());
+    let files = paths
+        .into_iter()
+        .filter_map(|path| {
+            let before = base.get(&path);
+            let after = head.get(&path);
+            (before != after).then(|| GitHubCompareFile {
+                filename: path,
+                status: Some(match (before, after) {
+                    (None, Some(_)) => "added".to_owned(),
+                    (Some(_), None) => "removed".to_owned(),
+                    _ => "modified".to_owned(),
+                }),
+                additions: None,
+                deletions: None,
+                changes: None,
+                patch: None,
+            })
+        })
+        .collect();
+    GitHubCompareResponse {
+        status: compare.status.clone(),
+        ahead_by: compare.ahead_by,
+        behind_by: compare.behind_by,
+        total_commits: compare.total_commits,
+        base_commit: compare
+            .base_commit
+            .as_ref()
+            .map(|commit| GitHubCompareCommitRef {
+                sha: commit.sha.clone(),
+            }),
+        merge_base_commit: compare.merge_base_commit.as_ref().map(|commit| {
+            GitHubCompareCommitRef {
+                sha: commit.sha.clone(),
+            }
+        }),
+        head_commit: compare
+            .head_commit
+            .as_ref()
+            .map(|commit| GitHubCompareCommitRef {
+                sha: commit.sha.clone(),
+            }),
+        commits: compare.commits.clone(),
+        files,
+        pagination_truncated: compare.pagination_truncated
+            || base_tree.truncated
+            || head_tree.truncated,
+    }
+}
+
 async fn fetch_release_compare_snapshot_request(
     state: &AppState,
     repo_full_name: &str,
@@ -23819,29 +23990,34 @@ async fn fetch_release_compare_snapshot_request(
         access_token,
     )
     .await?;
-    let (payload, comparison_mode) = if compare_requires_endpoint_diff(payload.status.as_deref()) {
-        // A three-dot response is merge-base-to-head and is not the net
-        // difference between two adjacent Release endpoints when history has
-        // diverged. Re-query the fixed endpoints with a two-dot comparison.
-        (
-            fetch_release_compare_payload_request(
-                state,
-                repo_full_name,
-                base_tag,
-                head_tag,
-                "..",
-                access_token,
-            )
-            .await?,
-            Some("two-dot"),
-        )
+    let relationship_status = payload.status.clone().unwrap_or_default();
+    let payload = if compare_requires_endpoint_diff(payload.status.as_deref()) {
+        let base_sha = payload
+            .base_commit
+            .as_ref()
+            .map(|commit| commit.sha.as_str())
+            .context("github compare response missing base SHA")
+            .map_err(ApiError::internal)?;
+        let head_sha = payload
+            .head_commit
+            .as_ref()
+            .map(|commit| commit.sha.as_str())
+            .context("github compare response missing head SHA")
+            .map_err(ApiError::internal)?;
+        let base_tree =
+            fetch_github_tree_request(state, repo_full_name, base_sha, access_token).await?;
+        let head_tree =
+            fetch_github_tree_request(state, repo_full_name, head_sha, access_token).await?;
+        build_endpoint_tree_compare(&payload, base_tree, head_tree)
     } else {
-        (payload, None)
+        payload
     };
     let digest = build_compare_digest_with_coverage(&payload).map(|digest| {
-        comparison_mode
-            .map(|mode| format!("comparison_mode: {mode}\n{}", digest.text))
-            .unwrap_or(digest.text)
+        if compare_requires_endpoint_diff(Some(relationship_status.as_str())) {
+            format!("comparison_mode: endpoint_tree\n{}", digest.text)
+        } else {
+            digest.text
+        }
     });
     let Some(digest) = digest else {
         return Ok(None);
@@ -23850,9 +24026,10 @@ async fn fetch_release_compare_snapshot_request(
     Ok(Some(ReleaseCompareSnapshot {
         base_tag: base_tag.to_owned(),
         head_tag: head_tag.to_owned(),
+        relationship_status,
         base_sha: payload.base_commit.map(|commit| commit.sha),
         merge_base_sha: payload.merge_base_commit.map(|commit| commit.sha),
-        head_sha: payload.commits.last().map(|commit| commit.sha.clone()),
+        head_sha: payload.head_commit.map(|commit| commit.sha),
         digest,
         coverage_complete,
     }))
@@ -23903,6 +24080,7 @@ async fn fetch_release_compare_payload_request(
         .json::<GitHubCompareResponse>()
         .await
         .map_err(ApiError::internal)?;
+    validate_github_compare_response(&payload)?;
     payload.pagination_truncated = pagination_truncated;
     Ok(payload)
 }
@@ -23965,7 +24143,8 @@ struct ReleaseReadingEvidenceRequest<'a> {
 async fn prepare_release_reading_evidence(
     request: ReleaseReadingEvidenceRequest<'_>,
 ) -> Result<(String, Vec<translations::ReleaseReadingEvidence>), ApiError> {
-    let Some(baseline) = select_release_compare_baseline_from_db(
+    let mut verified_snapshot = None;
+    let mut baseline = select_release_compare_baseline_from_db(
         request.state,
         request.repo_id,
         request.release_id,
@@ -23974,13 +24153,63 @@ async fn prepare_release_reading_evidence(
         request.published_at,
         request.created_at,
     )
-    .await?
-    else {
+    .await?;
+    if baseline.is_none() && parse_release_tag_version(request.tag_name).is_none() {
+        let candidates =
+            release_compare_candidates_from_db(request.state, request.repo_id, request.release_id)
+                .await?;
+        let mut candidates = candidates;
+        let current_sort = (
+            request
+                .published_at
+                .or(request.created_at)
+                .unwrap_or_default(),
+            request.release_id,
+        );
+        candidates.retain(|candidate| {
+            let candidate_sort = release_sort_key(candidate);
+            candidate_sort < current_sort
+        });
+        candidates.sort_by(|left, right| release_sort_key(right).cmp(&release_sort_key(left)));
+        for candidate in candidates {
+            match if request.public_only {
+                fetch_release_compare_snapshot_request(
+                    request.state,
+                    request.repo_full_name,
+                    candidate.tag_name.as_str(),
+                    request.tag_name,
+                    None,
+                )
+                .await
+            } else {
+                fetch_release_compare_snapshot(
+                    request.state,
+                    request.user_id,
+                    request.repo_full_name,
+                    candidate.tag_name.as_str(),
+                    request.tag_name,
+                )
+                .await
+            } {
+                Ok(Some(snapshot))
+                    if snapshot.relationship_status.eq_ignore_ascii_case("ahead") =>
+                {
+                    baseline = Some(candidate);
+                    verified_snapshot = Some(snapshot);
+                    break;
+                }
+                _ => continue,
+            };
+        }
+    }
+    let Some(baseline) = baseline else {
+        let reason = if parse_release_tag_version(request.tag_name).is_none() {
+            "No verifiable lower ancestor was found for this non-semantic Release tag. Use the release body only; do not infer a code change."
+        } else {
+            "No semver-verifiable lower release baseline was found. Use the release body only; do not infer a code change."
+        };
         return Ok((
-            format!(
-                "No semver-verifiable lower release baseline was found for {}. Use the release body only; do not infer a code change.",
-                request.tag_name
-            ),
+            reason.to_owned(),
             vec![translations::ReleaseReadingEvidence {
                 kind: "baseline_unavailable".to_owned(),
                 reference: request.tag_name.to_owned(),
@@ -23989,53 +24218,57 @@ async fn prepare_release_reading_evidence(
         ));
     };
 
-    let snapshot = match if request.public_only {
-        fetch_release_compare_snapshot_request(
-            request.state,
-            request.repo_full_name,
-            baseline.tag_name.as_str(),
-            request.tag_name,
-            None,
-        )
-        .await
+    let snapshot = if let Some(snapshot) = verified_snapshot {
+        snapshot
     } else {
-        fetch_release_compare_snapshot(
-            request.state,
-            request.user_id,
-            request.repo_full_name,
-            baseline.tag_name.as_str(),
-            request.tag_name,
-        )
-        .await
-    } {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => {
-            return Ok((
-                format!(
-                    "Compare completed for {}...{}, but it contained no readable changes after noise filtering. Do not invent a user-facing change.",
-                    baseline.tag_name, request.tag_name
-                ),
-                vec![translations::ReleaseReadingEvidence {
-                    kind: "github_compare_empty".to_owned(),
-                    reference: format!("{}...{}", baseline.tag_name, request.tag_name),
-                    scope: Some("compare completed; filtered digest was empty".to_owned()),
-                }],
-            ));
-        }
-        Err(error) => {
-            return Ok((
-                format!(
-                    "Compare evidence is unavailable for {}...{} ({}). Keep the Release reading pending or failed; do not infer a change.",
-                    baseline.tag_name,
-                    request.tag_name,
-                    error.code()
-                ),
-                vec![translations::ReleaseReadingEvidence {
-                    kind: "compare_unavailable".to_owned(),
-                    reference: format!("{}...{}", baseline.tag_name, request.tag_name),
-                    scope: Some(error.code().to_owned()),
-                }],
-            ));
+        match if request.public_only {
+            fetch_release_compare_snapshot_request(
+                request.state,
+                request.repo_full_name,
+                baseline.tag_name.as_str(),
+                request.tag_name,
+                None,
+            )
+            .await
+        } else {
+            fetch_release_compare_snapshot(
+                request.state,
+                request.user_id,
+                request.repo_full_name,
+                baseline.tag_name.as_str(),
+                request.tag_name,
+            )
+            .await
+        } {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Ok((
+                    format!(
+                        "Compare completed for {}...{}, but it contained no readable changes after noise filtering. Do not invent a user-facing change.",
+                        baseline.tag_name, request.tag_name
+                    ),
+                    vec![translations::ReleaseReadingEvidence {
+                        kind: "github_compare_empty".to_owned(),
+                        reference: format!("{}...{}", baseline.tag_name, request.tag_name),
+                        scope: Some("compare completed; filtered digest was empty".to_owned()),
+                    }],
+                ));
+            }
+            Err(error) => {
+                return Ok((
+                    format!(
+                        "Compare evidence is unavailable for {}...{} ({}). Keep the Release reading pending or failed; do not infer a change.",
+                        baseline.tag_name,
+                        request.tag_name,
+                        error.code()
+                    ),
+                    vec![translations::ReleaseReadingEvidence {
+                        kind: "compare_unavailable".to_owned(),
+                        reference: format!("{}...{}", baseline.tag_name, request.tag_name),
+                        scope: Some(error.code().to_owned()),
+                    }],
+                ));
+            }
         }
     };
     if !snapshot.coverage_complete {
@@ -24840,6 +25073,7 @@ pub async fn summarize_releases_smart_batch_for_user(
 pub(crate) struct GlobalReleaseReadingState {
     pub status: String,
     pub reading: Option<translations::ReleaseReadingResult>,
+    pub legacy_summary: Option<String>,
 }
 
 pub(crate) async fn read_global_release_reading_batch_for_user(
@@ -24862,6 +25096,12 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
             response.status.as_str(),
             "ready" | "completed" | "succeeded"
         );
+        let legacy_summary = response
+            .result
+            .get("summary_md")
+            .or_else(|| response.result.get("body_md"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let reading = current_ready
             .then(|| {
                 response
@@ -24869,7 +25109,11 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
                     .get("reading")
                     .cloned()
                     .and_then(|raw| {
-                        serde_json::from_value::<translations::ReleaseReadingResult>(raw).ok()
+                        let mut reading =
+                            serde_json::from_value::<translations::ReleaseReadingResult>(raw)
+                                .ok()?;
+                        reading.normalize_references().ok()?;
+                        Some(reading)
                     })
                     .filter(|reading| reading.validate().is_ok())
             })
@@ -24879,6 +25123,7 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
             GlobalReleaseReadingState {
                 status: response.status,
                 reading,
+                legacy_summary,
             },
         );
     }
@@ -27856,7 +28101,8 @@ mod tests {
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
         DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
         DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest, FeedRow, FeedScope,
-        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
+        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareCommitRef,
+        GitHubCompareFile, GitHubCompareResponse, GitHubTreeEntry, GitHubTreeResponse,
         ReleaseCompareBaselineRow,
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
         PublicReleaseReadingRevision, RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts,
@@ -27870,7 +28116,7 @@ mod tests {
         admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
         admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
-        build_compare_digest_with_coverage,
+        build_compare_digest_with_coverage, build_endpoint_tree_compare,
         release_reading_view_from_payload,
         build_feed_reaction_refresh_item, build_task_diagnostics, compare_requires_endpoint_diff,
         compact_dashboard_signatures,
@@ -27887,6 +28133,7 @@ mod tests {
         get_release_detail_by_repo_tag, get_repo_public_release_status,
         github_access_restricted_error, github_graphql_errors_to_api_error,
         github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        github_rest_compare_http_error, validate_github_compare_response,
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
         list_personal_repos, list_releases, llm_call_order_by_clause,
         load_admin_dashboard_today_live_snapshot, load_admin_llm_activity_response,
@@ -38368,6 +38615,7 @@ body={}
             total_commits: Some(2),
             base_commit: None,
             merge_base_commit: None,
+            head_commit: None,
             commits: vec![
                 GitHubCompareCommit {
                     sha: "abcdef123456".to_owned(),
@@ -38435,6 +38683,7 @@ body={}
                 total_commits: Some(0),
                 base_commit: None,
                 merge_base_commit: None,
+                head_commit: None,
                 commits: Vec::new(),
                 files: Vec::new(),
                 pagination_truncated: false,
@@ -38452,6 +38701,7 @@ body={}
             total_commits: Some(1),
             base_commit: None,
             merge_base_commit: None,
+            head_commit: None,
             commits: vec![GitHubCompareCommit {
                 sha: "abcdef123456".to_owned(),
                 commit: GitHubCompareCommitDetail {
@@ -38474,6 +38724,104 @@ body={}
         assert!(compare_requires_endpoint_diff(Some("BEHIND")));
         assert!(!compare_requires_endpoint_diff(Some("ahead")));
         assert!(!compare_requires_endpoint_diff(None));
+    }
+
+    #[test]
+    fn endpoint_tree_compare_uses_fixed_base_and_head_paths() {
+        let compare = GitHubCompareResponse {
+            status: Some("diverged".to_owned()),
+            ahead_by: Some(2),
+            behind_by: Some(1),
+            total_commits: Some(2),
+            base_commit: Some(GitHubCompareCommitRef {
+                sha: "base-sha".to_owned(),
+            }),
+            merge_base_commit: Some(GitHubCompareCommitRef {
+                sha: "merge-sha".to_owned(),
+            }),
+            head_commit: Some(GitHubCompareCommitRef {
+                sha: "head-sha".to_owned(),
+            }),
+            commits: Vec::new(),
+            files: Vec::new(),
+            pagination_truncated: false,
+        };
+        let merged = build_endpoint_tree_compare(
+            &compare,
+            GitHubTreeResponse {
+                tree: vec![
+                    GitHubTreeEntry {
+                        path: "src/changed.rs".to_owned(),
+                        entry_type: "blob".to_owned(),
+                        sha: Some("old-sha".to_owned()),
+                    },
+                    GitHubTreeEntry {
+                        path: "src/removed.rs".to_owned(),
+                        entry_type: "blob".to_owned(),
+                        sha: Some("removed-sha".to_owned()),
+                    },
+                ],
+                truncated: false,
+            },
+            GitHubTreeResponse {
+                tree: vec![
+                    GitHubTreeEntry {
+                        path: "src/changed.rs".to_owned(),
+                        entry_type: "blob".to_owned(),
+                        sha: Some("new-sha".to_owned()),
+                    },
+                    GitHubTreeEntry {
+                        path: "src/added.rs".to_owned(),
+                        entry_type: "blob".to_owned(),
+                        sha: Some("added-sha".to_owned()),
+                    },
+                ],
+                truncated: false,
+            },
+        );
+
+        let mut files = merged
+            .files
+            .into_iter()
+            .map(|file| (file.filename, file.status.expect("tree diff status")))
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                ("src/added.rs".to_owned(), "added".to_owned()),
+                ("src/changed.rs".to_owned(), "modified".to_owned()),
+                ("src/removed.rs".to_owned(), "removed".to_owned()),
+            ]
+        );
+        assert_eq!(merged.base_commit.expect("base endpoint").sha, "base-sha");
+        assert_eq!(merged.head_commit.expect("head endpoint").sha, "head-sha");
+    }
+
+    #[test]
+    fn github_compare_rejects_incomplete_payloads_and_classifies_rate_limits() {
+        let incomplete = GitHubCompareResponse {
+            status: Some("ahead".to_owned()),
+            ahead_by: Some(1),
+            behind_by: Some(0),
+            total_commits: Some(1),
+            base_commit: Some(GitHubCompareCommitRef {
+                sha: "base-sha".to_owned(),
+            }),
+            merge_base_commit: None,
+            head_commit: None,
+            commits: Vec::new(),
+            files: Vec::new(),
+            pagination_truncated: false,
+        };
+        assert!(validate_github_compare_response(&incomplete).is_err());
+
+        let error = github_rest_compare_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            "API rate limit exceeded",
+        );
+        assert_eq!(error.code(), "rate_limited");
     }
 
     #[test]
