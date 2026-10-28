@@ -1692,6 +1692,7 @@ export type ReleaseDetailSmart = {
 		| "disabled"
 		| "error"
 		| "insufficient"
+		| "incompatible"
 		| "not_applicable"
 		| "queued"
 		| "running"

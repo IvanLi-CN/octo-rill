@@ -306,6 +306,29 @@ export const ReleaseReadingInsufficientKeepsMinimalRecord: Story = {
 	},
 };
 
+export const ReleaseReadingIncompatibleShowsRetry: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="smart"
+			item={buildReleaseItem({
+				smart: {
+					lang: "zh-CN",
+					status: "incompatible",
+					title: null,
+					summary: null,
+				},
+			})}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("润色结果格式不兼容")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "重试润色" }),
+		).toBeVisible();
+	},
+};
+
 export const AnnouncementTranslatedMissing: Story = {
 	render: () => (
 		<FeedItemCardPreview

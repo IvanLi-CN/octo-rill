@@ -43,7 +43,10 @@ import {
 } from "@/lib/errorPresentation";
 import { normalizeReleaseId } from "@/lib/releaseId";
 import { cn } from "@/lib/utils";
-import type { ReleaseReading } from "@/releaseReading";
+import {
+	releaseReadingChangeVersions,
+	type ReleaseReading,
+} from "@/releaseReading";
 
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
@@ -58,9 +61,22 @@ function ReleaseReadingPanel({ reading }: { reading: ReleaseReading }) {
 	return (
 		<div className="space-y-3">
 			<ul className="list-disc space-y-2 pl-5 text-sm leading-6">
-				{reading.changes.map((change, index) => (
-					<li key={`${change.text}-${index}`}>{change.text}</li>
-				))}
+				{reading.changes.map((change, index) => {
+					const versions = releaseReadingChangeVersions(
+						reading.version,
+						change.versions,
+					);
+					return (
+						<li key={`${change.text}-${index}`}>
+							{change.text}
+							{versions ? (
+								<span className="ml-2 text-xs text-muted-foreground">
+									{`（${versions}）`}
+								</span>
+							) : null}
+						</li>
+					);
+				})}
 			</ul>
 			{reading.machine_materials?.length ? (
 				<details className="rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
@@ -158,6 +174,9 @@ function hasTranslatedProjection(
 function hasSmartProjection(
 	smart: ReleaseDetailResponse["smart"] | null | undefined,
 ) {
+	if (smart?.status === "incompatible") {
+		return false;
+	}
 	return Boolean(
 		smart?.title?.trim() ||
 			smart?.summary?.trim() ||
@@ -232,7 +251,9 @@ function shouldFallbackToOriginal(
 		return !(projection.title?.trim() || projection.summary?.trim());
 	}
 	return (
-		!isPendingDetailStatus(projection.status) && projection.status !== "error"
+		!isPendingDetailStatus(projection.status) &&
+		projection.status !== "error" &&
+		projection.status !== "incompatible"
 	);
 }
 
@@ -1009,7 +1030,22 @@ export function ReleaseDetailCard(props: {
 									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 									visualClassName="size-8"
 								/>
-								{display.reading ? (
+								{activeDetail.smart?.status === "incompatible" ? (
+									<ErrorStatePanel
+										title="润色结果格式不兼容"
+										summary="这条润色结果无法按当前阅读结构解析，请重新生成。"
+										actionLabel="重试润色"
+										onAction={() =>
+											onResolveSmart({
+												selectLane: true,
+												retryOnError: true,
+											})
+										}
+										disabled={smartResolving}
+										loading={smartResolving}
+										size="compact"
+									/>
+								) : display.reading ? (
 									<ReleaseReadingPanel reading={display.reading} />
 								) : display.body ? (
 									<div className="bg-muted/10 rounded-lg border p-4">

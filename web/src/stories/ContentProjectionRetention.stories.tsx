@@ -263,3 +263,63 @@ export const ReleaseReadingShowsChangesAndFoldsMachineMaterial: Story = {
 		await expect(canvas.getByText("Compare SHA")).not.toBeVisible();
 	},
 };
+
+export const ReleaseReadingIncompatibleShowsRetry: Story = {
+	args: {
+		target: {
+			releaseId: releaseReadingDetail.release_id,
+			locator: null,
+			fromTab: "all",
+		},
+		onClose: fn(),
+		onResolvedDetail: fn(),
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string"
+						? input
+						: input instanceof Request
+							? input.url
+							: input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/api/releases/383114066/detail")) {
+					return new Response(
+						JSON.stringify({
+							...releaseReadingDetail,
+							smart: {
+								...releaseReadingDetail.smart,
+								status: "incompatible",
+								title: null,
+								summary: null,
+								reading: null,
+							},
+						}),
+						{ status: 200 },
+					);
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return <Story />;
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement.ownerDocument.body);
+		await waitFor(() =>
+			expect(canvas.getByText("润色结果格式不兼容")).toBeVisible(),
+		);
+		await expect(
+			canvas.getByRole("button", { name: "重试润色" }),
+		).toBeVisible();
+	},
+};

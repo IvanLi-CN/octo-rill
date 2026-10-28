@@ -9013,11 +9013,17 @@ async fn build_release_detail_response(
                 .or_else(|| Some(translated_item(status, None, None, Some(false), None))),
             None => Some(translated_missing_item(true)),
         };
-        let smart_reading = smart
+        let (smart_reading, smart_reading_incompatible) = smart
             .as_ref()
-            .and_then(|(_, payload)| release_reading_view_from_payload(payload));
-        let smart_status = smart_status
-            .map(|status| smart_status_for_reading(status.as_str(), smart_reading.as_ref()));
+            .map(|(_, payload)| release_reading_payload_state(payload))
+            .unwrap_or((None, false));
+        let smart_status = smart_status.map(|status| {
+            smart_status_for_reading(
+                status.as_str(),
+                smart_reading.as_ref(),
+                smart_reading_incompatible,
+            )
+        });
         let mut smart = match smart_status.as_deref() {
             Some("ready") => smart_ready_item_with_reading(
                 project_string(&smart, "title_zh"),
@@ -10182,6 +10188,7 @@ struct PublicReleaseRow {
     smart_summary: Option<String>,
     smart_error_text: Option<String>,
     smart_reading: Option<ReleaseReadingView>,
+    smart_reading_incompatible: bool,
     global_mode: bool,
 }
 
@@ -10218,6 +10225,8 @@ struct PublicReleaseTranslationRow {
     error_text: Option<String>,
     #[sqlx(skip)]
     reading: Option<ReleaseReadingView>,
+    #[sqlx(skip)]
+    reading_incompatible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11589,10 +11598,13 @@ fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<SmartItem>
         .unwrap_or(&row.tag_name)
         .to_owned();
     if row.global_mode {
-        let status = row
-            .smart_status
-            .as_deref()
-            .map(|status| smart_status_for_reading(status, row.smart_reading.as_ref()));
+        let status = row.smart_status.as_deref().map(|status| {
+            smart_status_for_reading(
+                status,
+                row.smart_reading.as_ref(),
+                row.smart_reading_incompatible,
+            )
+        });
         return match status.as_deref() {
             Some("ready") => smart_ready_item_with_reading(
                 row.smart_title.clone(),
@@ -11877,18 +11889,25 @@ async fn load_public_release_translation_rows(
                     if *variant != translations::RELEASE_READING_PUBLIC_VARIANT {
                         continue;
                     }
-                    let Some(public_hash) = public_release_reading_source_hash(
-                        *release_id,
-                        repo_full_name,
-                        &base.tag_name,
-                        base.name.as_deref(),
-                        base.body.as_deref(),
-                        PublicReleaseReadingRevision {
-                            html_url: &base.html_url,
-                            updated_at: base.updated_at.as_str(),
-                            detected_at: base.detected_at.as_deref(),
+                    let Some(public_hash) = public_release_reading_source_hash_for_release(
+                        PublicReleaseReadingSourceRequest {
+                            state,
+                            release_id: *release_id,
+                            repo_full_name,
+                            tag_name: &base.tag_name,
+                            name: base.name.as_deref(),
+                            body: base.body.as_deref(),
+                            is_prerelease: base.is_prerelease != 0,
+                            published_at: base.published_at.as_deref(),
+                            revision: PublicReleaseReadingRevision {
+                                html_url: &base.html_url,
+                                updated_at: base.updated_at.as_str(),
+                                detected_at: base.detected_at.as_deref(),
+                            },
                         },
-                    ) else {
+                    )
+                    .await?
+                    else {
                         continue;
                     };
                     public_hash
@@ -11929,10 +11948,10 @@ async fn load_public_release_translation_rows(
                     .or_else(|| payload.get("summary_md"))
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.trim().is_empty());
-            let reading = if entity_type == "release_smart" {
-                release_reading_view_from_payload(&payload)
+            let (reading, reading_incompatible) = if entity_type == "release_smart" {
+                release_reading_payload_state(&payload)
             } else {
-                None
+                (None, false)
             };
             let display_status = if reading
                 .as_ref()
@@ -11946,6 +11965,8 @@ async fn load_public_release_translation_rows(
             ) && has_text
             {
                 "ready".to_owned()
+            } else if reading_incompatible && status == "ready" {
+                "incompatible".to_owned()
             } else {
                 status
             };
@@ -11975,6 +11996,7 @@ async fn load_public_release_translation_rows(
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     reading,
+                    reading_incompatible,
                 },
             );
         }
@@ -12102,6 +12124,7 @@ fn public_release_row_from_parts(
         smart_summary: smart.and_then(|row| row.summary.clone()),
         smart_error_text: smart.and_then(|row| row.error_text.clone()),
         smart_reading: smart.and_then(|row| row.reading.clone()),
+        smart_reading_incompatible: smart.is_some_and(|row| row.reading_incompatible),
         global_mode,
     }
 }
@@ -16448,7 +16471,7 @@ pub struct TranslatedItem {
 #[derive(Debug, Serialize, Clone)]
 pub struct SmartItem {
     lang: String,
-    status: String, // ready | missing | disabled | error | insufficient
+    status: String, // ready | missing | disabled | error | insufficient | incompatible
     title: Option<String>,
     summary: Option<String>,
     error_code: Option<String>,
@@ -16566,6 +16589,8 @@ struct FeedRow {
     smart_work_status: Option<String>,
     #[sqlx(skip)]
     smart_reading: Option<ReleaseReadingView>,
+    #[sqlx(skip)]
+    smart_reading_incompatible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18181,13 +18206,15 @@ async fn overlay_global_feed_processing(
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.trim().is_empty())
                 || payload.get("reading").is_some_and(Value::is_object);
-            let reading = release_reading_view_from_payload(&payload);
+            let (reading, reading_incompatible) = release_reading_payload_state(&payload);
             let display_status = if reading
                 .as_ref()
                 .is_some_and(|reading| reading.outcome == "insufficient")
                 && status == "ready"
             {
                 "insufficient".to_owned()
+            } else if reading_incompatible && status == "ready" {
+                "incompatible".to_owned()
             } else if matches!(
                 status.as_str(),
                 "queued" | "running" | "deferred_provider" | "blocked_config"
@@ -18212,6 +18239,7 @@ async fn overlay_global_feed_processing(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             row.smart_reading = reading;
+            row.smart_reading_incompatible = reading_incompatible;
             row.smart_error_text = payload
                 .get("error_detail")
                 .or_else(|| payload.get("error_summary"))
@@ -18654,35 +18682,58 @@ fn smart_item(
     }
 }
 
-fn release_reading_view_from_payload(payload: &Value) -> Option<ReleaseReadingView> {
-    let reading = payload.get("reading")?.clone();
-    let reading = serde_json::from_value::<translations::ReleaseReadingResult>(reading).ok()?;
-    reading.validate().ok()?;
-    Some(ReleaseReadingView {
-        version: reading.version,
-        outcome: reading.outcome,
-        title: reading.title,
-        changes: reading
-            .changes
-            .into_iter()
-            .map(|change| ReleaseReadingChangeView {
-                text: change.text,
-                versions: change.versions,
-            })
-            .collect(),
-        machine_materials: reading
-            .machine_materials
-            .into_iter()
-            .map(|material| ReleaseReadingMaterialView {
-                label: material.label,
-                value: material.value,
-            })
-            .collect(),
-    })
+fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>, bool) {
+    let Some(raw_reading) = payload.get("reading") else {
+        return (None, false);
+    };
+    let Ok(reading) =
+        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
+    else {
+        return (None, true);
+    };
+    if reading.validate().is_err() {
+        return (None, true);
+    }
+    (
+        Some(ReleaseReadingView {
+            version: reading.version,
+            outcome: reading.outcome,
+            title: reading.title,
+            changes: reading
+                .changes
+                .into_iter()
+                .map(|change| ReleaseReadingChangeView {
+                    text: change.text,
+                    versions: change.versions,
+                })
+                .collect(),
+            machine_materials: reading
+                .machine_materials
+                .into_iter()
+                .map(|material| ReleaseReadingMaterialView {
+                    label: material.label,
+                    value: material.value,
+                })
+                .collect(),
+        }),
+        false,
+    )
 }
 
-fn smart_status_for_reading(status: &str, reading: Option<&ReleaseReadingView>) -> String {
-    if status == "ready" && reading.is_some_and(|reading| reading.outcome == "insufficient") {
+#[cfg(test)]
+fn release_reading_view_from_payload(payload: &Value) -> Option<ReleaseReadingView> {
+    release_reading_payload_state(payload).0
+}
+
+fn smart_status_for_reading(
+    status: &str,
+    reading: Option<&ReleaseReadingView>,
+    reading_incompatible: bool,
+) -> String {
+    if status == "ready" && reading_incompatible {
+        "incompatible".to_owned()
+    } else if status == "ready" && reading.is_some_and(|reading| reading.outcome == "insufficient")
+    {
         "insufficient".to_owned()
     } else {
         status.to_owned()
@@ -18784,7 +18835,9 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
         "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => {
             Some(smart_item("insufficient", None, None, Some(false), None))
         }
-        "missing" | "error" => Some(smart_item(status, None, None, Some(false), error_text)),
+        "missing" | "error" | "incompatible" => {
+            Some(smart_item(status, None, None, Some(false), error_text))
+        }
         "failed" => Some(smart_item("error", None, None, Some(false), error_text)),
         "queued" | "running" | "not_applicable" | "deferred_provider" | "blocked_config"
         | "cancelled" | "superseded" => {
@@ -21721,6 +21774,144 @@ fn public_release_reading_source_hash(
     ))
 }
 
+/// Resolve the public Release reading identity using only public inputs. A
+/// tag-only Release must include an anonymous compare snapshot in its source
+/// identity; otherwise the public page could never consume the same result as
+/// the global public reading request.
+struct PublicReleaseReadingSourceRequest<'a> {
+    state: &'a AppState,
+    release_id: i64,
+    repo_full_name: &'a str,
+    tag_name: &'a str,
+    name: Option<&'a str>,
+    body: Option<&'a str>,
+    is_prerelease: bool,
+    published_at: Option<&'a str>,
+    revision: PublicReleaseReadingRevision<'a>,
+}
+
+async fn public_release_reading_source_hash_for_release(
+    request: PublicReleaseReadingSourceRequest<'_>,
+) -> Result<Option<String>, ApiError> {
+    let title = request
+        .name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(request.tag_name)
+        .to_owned();
+    let normalized_body = request.body.unwrap_or_default().replace("\r\n", "\n");
+    if release_body_has_actionable_content(title.as_str(), normalized_body.as_str()) {
+        return Ok(public_release_reading_source_hash(
+            request.release_id,
+            request.repo_full_name,
+            request.tag_name,
+            Some(title.as_str()),
+            Some(normalized_body.as_str()),
+            request.revision,
+        ));
+    }
+
+    let release_metadata = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT repo_id, created_at FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(request.release_id)
+    .fetch_optional(&request.state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some((repo_id, created_at)) = release_metadata else {
+        return Ok(None);
+    };
+    let (reading_compare, evidence) =
+        prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
+            state: request.state,
+            user_id: "public",
+            repo_id,
+            release_id: request.release_id,
+            repo_full_name: request.repo_full_name,
+            tag_name: request.tag_name,
+            is_prerelease: request.is_prerelease,
+            published_at: request.published_at,
+            created_at: created_at.as_deref(),
+            public_only: true,
+        })
+        .await?;
+    if evidence.iter().any(|item| {
+        matches!(
+            item.kind.as_str(),
+            "compare_unavailable" | "github_compare_incomplete"
+        )
+    }) {
+        return Ok(None);
+    }
+    let evidence_json = serde_json::to_string(&evidence).map_err(ApiError::internal)?;
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("{}\n{}", request.repo_full_name, request.tag_name),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title.clone(),
+        },
+    ];
+    if !normalized_body.trim().is_empty() {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: normalized_body.clone(),
+        });
+    }
+    source_blocks.extend([
+        translations::TranslationSourceBlock {
+            slot: "reading_contract".to_owned(),
+            text: "human_changes_direct; machine_materials_collapsible; no_source_section; no_version_repetition; no_author_attribution".to_owned(),
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_evidence_json".to_owned(),
+            text: evidence_json,
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_compare".to_owned(),
+            text: reading_compare.clone(),
+        },
+    ]);
+    let source_revision_parts = [
+        request.revision.html_url.to_owned(),
+        request.tag_name.to_owned(),
+        title,
+        normalized_body,
+        reading_compare,
+    ];
+    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(
+        &source_revision_parts
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    Ok(Some(content_processing::source_hash_for_item(
+        &translations::TranslationRequestItemInput {
+            producer_ref: String::new(),
+            kind: "release_smart".to_owned(),
+            variant: translations::RELEASE_READING_PUBLIC_VARIANT.to_owned(),
+            entity_id: request.release_id.to_string(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: with_source_revision(
+                source_blocks,
+                content_processing::authoritative_release_revision(
+                    request.revision.updated_at,
+                    request.revision.detected_at,
+                ),
+                Some(source_revision_tiebreak.as_str()),
+            ),
+            target_slots: vec![
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+        },
+    )))
+}
+
 fn global_announcement_source_hash(
     discussion_key: &str,
     repo_full_name: &str,
@@ -21813,7 +22004,7 @@ pub(crate) async fn global_release_request_item(
     .map_err(ApiError::internal)?
         != 0;
     let (reading_evidence_text, reading_evidence) =
-        if kind == "release_smart" && !has_actionable_release_text && !is_public_release {
+        if kind == "release_smart" && !has_actionable_release_text {
             prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
                 state,
                 user_id,
@@ -21824,6 +22015,7 @@ pub(crate) async fn global_release_request_item(
                 is_prerelease: row.is_prerelease != 0,
                 published_at: row.published_at.as_deref(),
                 created_at: row.created_at.as_deref(),
+                public_only: is_public_release,
             })
             .await?
         } else if kind == "release_smart" {
@@ -23767,6 +23959,7 @@ struct ReleaseReadingEvidenceRequest<'a> {
     is_prerelease: bool,
     published_at: Option<&'a str>,
     created_at: Option<&'a str>,
+    public_only: bool,
 }
 
 async fn prepare_release_reading_evidence(
@@ -23796,15 +23989,25 @@ async fn prepare_release_reading_evidence(
         ));
     };
 
-    let snapshot = match fetch_release_compare_snapshot(
-        request.state,
-        request.user_id,
-        request.repo_full_name,
-        baseline.tag_name.as_str(),
-        request.tag_name,
-    )
-    .await
-    {
+    let snapshot = match if request.public_only {
+        fetch_release_compare_snapshot_request(
+            request.state,
+            request.repo_full_name,
+            baseline.tag_name.as_str(),
+            request.tag_name,
+            None,
+        )
+        .await
+    } else {
+        fetch_release_compare_snapshot(
+            request.state,
+            request.user_id,
+            request.repo_full_name,
+            baseline.tag_name.as_str(),
+            request.tag_name,
+        )
+        .await
+    } {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return Ok((
@@ -27814,6 +28017,7 @@ mod tests {
             smart_title: None,
             smart_summary: None,
             smart_reading: None,
+            smart_reading_incompatible: false,
             smart_error_text: None,
             smart_work_status: None,
         }

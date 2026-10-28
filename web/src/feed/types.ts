@@ -19,6 +19,7 @@ export type SmartStatus =
 	| "disabled"
 	| "error"
 	| "insufficient"
+	| "incompatible"
 	| "queued"
 	| "running"
 	| "deferred_provider"

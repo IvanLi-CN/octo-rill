@@ -954,6 +954,14 @@ pub async fn enqueue_release_reading_backfill_if_needed(
             .await
             .context("begin paused release reading backfill resume")?;
         sqlx::query(
+            "UPDATE release_reading_backfill_items SET status = 'pending', error_text = NULL, updated_at = ? WHERE run_id = ? AND status = 'waiting'",
+        )
+        .bind(&now)
+        .bind(&latest.id)
+        .execute(&mut *tx)
+        .await
+        .context("reset paused release reading backfill items")?;
+        sqlx::query(
             "UPDATE release_reading_backfill_runs SET status = 'queued', error_text = NULL, updated_at = ? WHERE id = ? AND status = 'paused'",
         )
         .bind(&now)
@@ -984,6 +992,22 @@ pub async fn enqueue_release_reading_backfill_if_needed(
             )
             .await
             .context("begin release reading backfill seed")?;
+        let concurrent_run = sqlx::query_as::<_, ReleaseReadingBackfillRunRow>(
+            r#"
+            SELECT id, window_start_utc, window_end_utc, status,
+                   total, succeeded, failed, waiting, skipped, lease_expires_at
+            FROM release_reading_backfill_runs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .context("recheck release reading backfill seed")?;
+        if concurrent_run.is_some() {
+            tx.rollback().await.ok();
+            return Box::pin(enqueue_release_reading_backfill_if_needed(state)).await;
+        }
         let inserted = sqlx::query(
             r#"
             INSERT INTO release_reading_backfill_runs (
@@ -1122,11 +1146,7 @@ pub async fn enqueue_release_reading_backfill_if_needed(
         run.status = "queued".to_owned();
         run.lease_expires_at = None;
     }
-    if let Some(existing) = find_inflight_task_by_type(state, TASK_RELEASE_READING_BACKFILL).await?
-    {
-        return Ok(Some(existing.task_id));
-    }
-    let task = enqueue_task(
+    let task = enqueue_singleton_task_by_type(
         state,
         NewTask {
             task_type: TASK_RELEASE_READING_BACKFILL.to_owned(),
@@ -2318,6 +2338,7 @@ pub async fn find_inflight_task_by_type(
         FROM job_tasks
         WHERE task_type = ?
           AND status IN (?, ?)
+          AND (status = ? OR cancel_requested = 0)
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         "#,
@@ -2325,6 +2346,7 @@ pub async fn find_inflight_task_by_type(
     .bind(task_type)
     .bind(STATUS_QUEUED)
     .bind(STATUS_RUNNING)
+    .bind(STATUS_QUEUED)
     .fetch_optional(&state.pool)
     .await
     .context("failed to find inflight task by type")?;
@@ -2635,6 +2657,14 @@ pub async fn complete_task(
     .await
 }
 
+struct RescheduleTaskOptions<'a> {
+    retry_count: Option<u8>,
+    payload_json: Option<String>,
+    result: Value,
+    runtime_owner_id: Option<&'a str>,
+    release_backfill_run_id: Option<&'a str>,
+}
+
 pub(crate) async fn reschedule_task_if_owned(
     state: &AppState,
     task_id: &str,
@@ -2645,11 +2675,13 @@ pub(crate) async fn reschedule_task_if_owned(
         state,
         task_id,
         available_at,
-        None,
-        None,
-        result,
-        Some(state.runtime_owner_id.as_str()),
-        None,
+        RescheduleTaskOptions {
+            retry_count: None,
+            payload_json: None,
+            result,
+            runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+            release_backfill_run_id: None,
+        },
     )
     .await
 }
@@ -2665,11 +2697,13 @@ pub(crate) async fn reschedule_task_with_retry_count_if_owned(
         state,
         task_id,
         available_at,
-        Some(retry_count),
-        None,
-        result,
-        Some(state.runtime_owner_id.as_str()),
-        None,
+        RescheduleTaskOptions {
+            retry_count: Some(retry_count),
+            payload_json: None,
+            result,
+            runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+            release_backfill_run_id: None,
+        },
     )
     .await
 }
@@ -2686,11 +2720,13 @@ async fn reschedule_release_reading_backfill_with_retry_count_if_owned(
         state,
         task_id,
         available_at,
-        Some(retry_count),
-        None,
-        result,
-        Some(state.runtime_owner_id.as_str()),
-        Some(run_id),
+        RescheduleTaskOptions {
+            retry_count: Some(retry_count),
+            payload_json: None,
+            result,
+            runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+            release_backfill_run_id: Some(run_id),
+        },
     )
     .await
 }
@@ -2726,26 +2762,30 @@ async fn reschedule_task_with_payload_inner(
         state,
         task_id,
         available_at,
-        None,
-        Some(payload_json),
-        result,
-        runtime_owner_id,
-        None,
+        RescheduleTaskOptions {
+            retry_count: None,
+            payload_json: Some(payload_json),
+            result,
+            runtime_owner_id,
+            release_backfill_run_id: None,
+        },
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn reschedule_task_inner(
     state: &AppState,
     task_id: &str,
     available_at: DateTime<Utc>,
-    retry_count: Option<u8>,
-    payload_json: Option<String>,
-    result: Value,
-    runtime_owner_id: Option<&str>,
-    release_backfill_run_id: Option<&str>,
+    options: RescheduleTaskOptions<'_>,
 ) -> Result<bool> {
+    let RescheduleTaskOptions {
+        retry_count,
+        payload_json,
+        result,
+        runtime_owner_id,
+        release_backfill_run_id,
+    } = options;
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
     let (sqlite_write, mut tx) = state
@@ -2832,6 +2872,7 @@ async fn reschedule_task_inner(
                 tx.as_transaction_mut(),
                 run_id,
                 &now,
+                runtime_owner_id.context("release backfill reschedule missing runtime owner")?,
             )
             .await?;
         }
@@ -4161,12 +4202,14 @@ async fn reset_release_reading_backfill_run_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
     now: &str,
+    lease_owner: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
+        "UPDATE release_reading_backfill_runs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND lease_owner = ?",
     )
     .bind(now)
     .bind(run_id)
+    .bind(lease_owner)
     .execute(&mut **tx)
     .await
     .context("requeue release reading backfill after sqlite backpressure")?;
@@ -4191,8 +4234,13 @@ async fn reset_release_reading_backfill_run_after_backpressure(
         )
         .await
         .context("begin release reading backfill backpressure recovery")?;
-    reset_release_reading_backfill_run_in_transaction(tx.as_transaction_mut(), run_id, &now)
-        .await?;
+    reset_release_reading_backfill_run_in_transaction(
+        tx.as_transaction_mut(),
+        run_id,
+        &now,
+        state.runtime_owner_id.as_str(),
+    )
+    .await?;
     tx.commit()
         .await
         .context("commit release reading backfill backpressure recovery")?;
@@ -4885,11 +4933,16 @@ async fn update_release_reading_backfill_item(
         )
         .await
         .context("begin release reading backfill item update")?;
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE release_reading_backfill_items
         SET status = ?, error_text = ?, attempt_count = attempt_count + 1, updated_at = ?
         WHERE run_id = ? AND release_id = ?
+          AND EXISTS (
+            SELECT 1
+            FROM release_reading_backfill_runs
+            WHERE id = ? AND status = 'running' AND lease_owner = ?
+          )
         "#,
     )
     .bind(status)
@@ -4897,9 +4950,15 @@ async fn update_release_reading_backfill_item(
     .bind(&now)
     .bind(&item.run_id)
     .bind(item.release_id)
+    .bind(&item.run_id)
+    .bind(state.runtime_owner_id.as_str())
     .execute(&mut *tx)
     .await
     .context("persist release reading backfill item state")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err(anyhow!("release reading backfill lease lost"));
+    }
     sqlx::query(
         r#"
         UPDATE release_reading_backfill_runs
@@ -4946,26 +5005,27 @@ async fn finish_release_reading_backfill(
         )
         .await
         .context("begin release reading backfill finish")?;
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE release_reading_backfill_runs
         SET status = ?, error_text = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-        WHERE id = ?
+        WHERE id = ? AND status = 'running' AND lease_owner = ?
         "#,
     )
     .bind(status)
     .bind(error_text)
     .bind(&now)
     .bind(run_id)
+    .bind(state.runtime_owner_id.as_str())
     .execute(&mut *tx)
     .await
     .context("persist release reading backfill terminal state")?;
-    if error_text == Some("target_release_deleted") {
+    if updated.rows_affected() > 0 && error_text == Some("target_release_deleted") {
         sqlx::query(
             r#"
             UPDATE release_reading_backfill_runs
-            SET failed = MAX(
-                failed,
+            SET failed = failed + MAX(
+                0,
                 total - succeeded - failed - waiting - skipped
             )
             WHERE id = ?
@@ -6777,8 +6837,8 @@ mod tests {
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        finalize_sync_all_social_failure, finalize_task_if_owned, heartbeat_task_lease,
-        is_scheduled_task_type, load_due_daily_slot_users,
+        finalize_sync_all_social_failure, finalize_task_if_owned, finish_release_reading_backfill,
+        heartbeat_task_lease, is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
@@ -11464,7 +11524,7 @@ mod tests {
         .bind("2026-10-27T00:00:00Z")
         .bind("2026-09-27T00:00:00Z")
         .bind("2026-10-27T00:00:00Z")
-        .bind("worker")
+        .bind(state.runtime_owner_id.as_str())
         .bind("2099-10-27T00:01:00Z")
         .bind("2026-10-27T00:00:00Z")
         .bind("2026-10-27T00:00:00Z")
@@ -11490,6 +11550,50 @@ mod tests {
         assert_eq!(status, "queued");
         assert_eq!(lease_owner, None);
         assert_eq!(lease_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_deleted_targets_add_to_existing_failures() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped,
+              lease_owner, lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', 4, 1, 1, 1, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("backfill-deleted-targets")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind(state.runtime_owner_id.as_str())
+        .bind("2099-10-27T00:01:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed deleted target backfill");
+
+        finish_release_reading_backfill(
+            state.as_ref(),
+            "backfill-deleted-targets",
+            "failed",
+            Some("target_release_deleted"),
+        )
+        .await
+        .expect("finish deleted target backfill");
+
+        let (status, failed): (String, i64) =
+            sqlx::query_as("SELECT status, failed FROM release_reading_backfill_runs WHERE id = ?")
+                .bind("backfill-deleted-targets")
+                .fetch_one(&pool)
+                .await
+                .expect("load deleted target backfill");
+        assert_eq!(status, "failed");
+        assert_eq!(failed, 2);
     }
 
     #[tokio::test]

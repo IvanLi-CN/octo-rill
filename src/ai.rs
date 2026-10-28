@@ -1307,8 +1307,15 @@ struct ReleaseRendered {
     html_url: String,
     published_at: String,
     is_prerelease: bool,
-    bullets: Vec<String>,
+    reading_version: Option<String>,
+    bullets: Vec<BriefReleaseChange>,
     status_label: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BriefReleaseChange {
+    text: String,
+    versions: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1346,7 +1353,10 @@ struct BuiltBriefContent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BriefReleaseSummaryState {
-    Ready(Vec<String>),
+    Ready {
+        version: String,
+        changes: Vec<BriefReleaseChange>,
+    },
     NoValue,
     Unavailable,
     Pending,
@@ -5245,23 +5255,37 @@ async fn summarize_projects_with_ai(
 }
 
 fn parse_brief_smart_summary_bullets(summary: &str) -> Vec<String> {
-    summary
+    let lines = summary
         .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("- ")
-                .or_else(|| line.trim().strip_prefix("* "))
-        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let bullet_lines = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")))
+        .collect::<Vec<_>>();
+    let candidates = if bullet_lines.is_empty() {
+        lines
+    } else {
+        bullet_lines
+    };
+    candidates
+        .into_iter()
         .map(|line| sanitize_bullet_text(line.trim()))
         .filter(|line| !line.is_empty())
         .filter(|line| {
             let normalized = line.to_ascii_lowercase();
-            let low_value = normalized.starts_with("相关链接")
+            let version_only = normalized
+                .strip_prefix("release ")
+                .or_else(|| normalized.strip_prefix("version "))
+                .unwrap_or(&normalized)
+                .trim_start_matches('v');
+            !(normalized.starts_with("相关链接")
                 || normalized.starts_with("来源")
                 || normalized.starts_with("实现依据")
                 || normalized.starts_with("暂未生成")
-                || (normalized.starts_with("由 ") && normalized.contains("提交"));
-            !low_value
+                || (normalized.starts_with("由 ") && normalized.contains("提交"))
+                || semver::Version::parse(version_only).is_ok())
         })
         .take(4)
         .collect()
@@ -5354,13 +5378,17 @@ async fn load_brief_release_summary_states(
                     if !reading.is_changes() || reading.changes.is_empty() {
                         BriefReleaseSummaryState::Incompatible
                     } else {
-                        BriefReleaseSummaryState::Ready(
-                            reading
+                        BriefReleaseSummaryState::Ready {
+                            version: reading.version,
+                            changes: reading
                                 .changes
                                 .into_iter()
-                                .map(|change| change.text)
+                                .map(|change| BriefReleaseChange {
+                                    text: change.text,
+                                    versions: change.versions,
+                                })
                                 .collect(),
-                        )
+                        }
                     }
                 }
                 "missing" => BriefReleaseSummaryState::Unavailable,
@@ -5393,7 +5421,19 @@ async fn load_brief_release_summary_states(
                     if bullets.is_empty() {
                         BriefReleaseSummaryState::Incompatible
                     } else {
-                        BriefReleaseSummaryState::Ready(bullets)
+                        BriefReleaseSummaryState::Ready {
+                            version: reading.version.clone(),
+                            changes: reading
+                                .changes
+                                .iter()
+                                .map(|change| BriefReleaseChange {
+                                    text: sanitize_bullet_text(change.text.trim()),
+                                    versions: change.versions.clone(),
+                                })
+                                .filter(|change| !change.text.is_empty())
+                                .take(4)
+                                .collect(),
+                        }
                     }
                 }
                 Some(reading) if reading.is_insufficient() => BriefReleaseSummaryState::NoValue,
@@ -5429,7 +5469,7 @@ fn brief_release_state_label(state: &BriefReleaseSummaryState) -> Option<&'stati
         BriefReleaseSummaryState::Failed => Some("阅读内容处理失败"),
         BriefReleaseSummaryState::Incompatible => Some("阅读内容格式不兼容"),
         BriefReleaseSummaryState::Unavailable => Some("阅读内容暂不可用"),
-        BriefReleaseSummaryState::Ready(_) | BriefReleaseSummaryState::NoValue => None,
+        BriefReleaseSummaryState::Ready { .. } | BriefReleaseSummaryState::NoValue => None,
     }
 }
 
@@ -5445,7 +5485,7 @@ fn build_repo_rendered(
                 .get(&release.release_id)
                 .unwrap_or(&BriefReleaseSummaryState::Unavailable);
             let bullets = match state {
-                BriefReleaseSummaryState::Ready(bullets) => bullets.clone(),
+                BriefReleaseSummaryState::Ready { changes, .. } => changes.clone(),
                 BriefReleaseSummaryState::NoValue
                 | BriefReleaseSummaryState::Unavailable
                 | BriefReleaseSummaryState::Pending
@@ -5458,6 +5498,10 @@ fn build_repo_rendered(
                 html_url: release.html_url.clone(),
                 published_at: release.published_at.clone(),
                 is_prerelease: release.is_prerelease,
+                reading_version: match state {
+                    BriefReleaseSummaryState::Ready { version, .. } => Some(version.clone()),
+                    _ => None,
+                },
                 bullets,
                 status_label: brief_release_state_label(state),
             }
@@ -5506,7 +5550,23 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                 ));
 
                 for bullet in &release.bullets {
-                    out.push_str(&format!("  - {}\n", bullet));
+                    let versions = bullet
+                        .versions
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|version| !version.trim().is_empty())
+                        .collect::<Vec<_>>();
+                    let show_versions = !(versions.is_empty()
+                        || (versions.len() == 1
+                            && release
+                                .reading_version
+                                .as_deref()
+                                .is_some_and(|current| current == versions[0])));
+                    if show_versions {
+                        out.push_str(&format!("  - {}（{}）\n", bullet.text, versions.join("、")));
+                    } else {
+                        out.push_str(&format!("  - {}\n", bullet.text));
+                    }
                 }
 
                 out.push('\n');
@@ -6152,7 +6212,7 @@ async fn upsert_daily_brief_snapshot(
             .begin_immediate(&state.pool, "ai_brief_snapshot_refresh")
             .await
             .context("failed to begin refresh brief tx")?;
-        overwrite_brief_snapshot(
+        let overwritten = overwrite_brief_snapshot(
             tx.as_transaction_mut(),
             &existing_id,
             window,
@@ -6165,6 +6225,9 @@ async fn upsert_daily_brief_snapshot(
         tx.commit()
             .await
             .context("failed to commit refreshed brief snapshot")?;
+        if !overwritten {
+            return load_stored_brief_snapshot(state, &existing_id).await;
+        }
         return Ok(StoredBrief {
             id: existing_id,
             date,
@@ -6248,7 +6311,7 @@ async fn upsert_daily_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        overwrite_brief_snapshot(
+        let overwritten = overwrite_brief_snapshot(
             tx.as_transaction_mut(),
             &existing.id,
             window,
@@ -6270,6 +6333,9 @@ async fn upsert_daily_brief_snapshot(
         tx.commit()
             .await
             .context("failed to commit brief snapshot overwrite")?;
+        if !overwritten {
+            return load_stored_brief_snapshot(state, &existing.id).await;
+        }
         return Ok(StoredBrief {
             id: existing.id,
             date,
@@ -6375,7 +6441,19 @@ async fn overwrite_brief_snapshot(
     built: &BuiltBriefContent,
     generation_source: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    let existing_content =
+        sqlx::query_scalar::<_, String>("SELECT content_markdown FROM briefs WHERE id = ? LIMIT 1")
+            .bind(brief_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("failed to load existing brief content before overwrite")?;
+    if existing_content.as_deref().is_some_and(|content| {
+        !brief_has_processing_release_state(content)
+            && brief_has_processing_release_state(&built.content_markdown)
+    }) {
+        return Ok(false);
+    }
     sqlx::query(
         r#"
         UPDATE briefs
@@ -6403,7 +6481,14 @@ async fn overwrite_brief_snapshot(
     .await
     .context("failed to overwrite brief snapshot")?;
 
-    replace_brief_memberships(tx, brief_id, &built.releases, now).await
+    replace_brief_memberships(tx, brief_id, &built.releases, now).await?;
+    Ok(true)
+}
+
+fn brief_has_processing_release_state(markdown: &str) -> bool {
+    markdown
+        .lines()
+        .any(|line| line.contains("· 阅读内容处理中"))
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -6846,7 +6931,7 @@ async fn refresh_existing_brief_snapshot(
         .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
-    overwrite_brief_snapshot(
+    let overwritten = overwrite_brief_snapshot(
         tx.as_transaction_mut(),
         brief_id,
         &window,
@@ -6859,6 +6944,10 @@ async fn refresh_existing_brief_snapshot(
     tx.commit()
         .await
         .context("failed to commit targeted brief refresh")?;
+
+    if !overwritten {
+        return load_stored_brief_snapshot(state, brief_id).await;
+    }
 
     Ok(StoredBrief {
         id: brief_id.to_owned(),
@@ -7384,7 +7473,7 @@ pub async fn recompute_legacy_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        if !is_normalized_snapshot {
+        let overwritten = if !is_normalized_snapshot {
             overwrite_brief_snapshot(
                 tx.as_transaction_mut(),
                 &existing.id,
@@ -7394,8 +7483,10 @@ pub async fn recompute_legacy_brief_snapshot(
                 &now,
             )
             .await
-            .context("failed to merge legacy brief snapshot into existing collision")?;
-        }
+            .context("failed to merge legacy brief snapshot into existing collision")?
+        } else {
+            false
+        };
 
         sqlx::query(
             r#"
@@ -7410,7 +7501,7 @@ pub async fn recompute_legacy_brief_snapshot(
         tx.commit()
             .await
             .context("failed to commit legacy brief collision cleanup")?;
-        if is_normalized_snapshot {
+        if is_normalized_snapshot || !overwritten {
             return load_stored_brief_snapshot(state, &existing.id).await;
         }
         return Ok(StoredBrief {
@@ -7428,7 +7519,7 @@ pub async fn recompute_legacy_brief_snapshot(
                 .collect(),
         });
     }
-    overwrite_brief_snapshot(
+    let overwritten = overwrite_brief_snapshot(
         tx.as_transaction_mut(),
         &legacy.id,
         &target_window,
@@ -7441,6 +7532,10 @@ pub async fn recompute_legacy_brief_snapshot(
     tx.commit()
         .await
         .context("failed to commit legacy brief recompute")?;
+
+    if !overwritten {
+        return load_stored_brief_snapshot(state, &legacy.id).await;
+    }
 
     Ok(StoredBrief {
         id: legacy.id,
@@ -9529,6 +9624,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_brief_summary_accepts_prose_and_filters_metadata_lines() {
+        let summary = "v1.2.3\n新增批量导入，并说明兼容性限制。\n相关链接：#42\n由 alice 提交";
+        assert_eq!(
+            parse_brief_smart_summary_bullets(summary),
+            vec!["新增批量导入，并说明兼容性限制。"]
+        );
+    }
+
+    #[test]
+    fn processing_brief_state_is_distinguished_from_readable_content() {
+        assert!(brief_has_processing_release_state(
+            "- [v1.2.3](/?release=1) · 阅读内容处理中\n"
+        ));
+        assert!(!brief_has_processing_release_state(
+            "- [v1.2.3](/?release=1) · 新增批量导入\n"
+        ));
+    }
+
+    #[test]
     fn render_social_actor_list_reports_hidden_count_only() {
         let actors = (0..7)
             .map(|index| SocialActorRendered {
@@ -9840,7 +9954,11 @@ mod tests {
                 html_url: "https://github.com/acme/rocket/releases/tag/v1.0".to_owned(),
                 published_at: "2026-02-20T09:00:00Z".to_owned(),
                 is_prerelease: false,
-                bullets: vec!["修复若干问题".to_owned()],
+                reading_version: None,
+                bullets: vec![BriefReleaseChange {
+                    text: "修复若干问题".to_owned(),
+                    versions: Vec::new(),
+                }],
                 status_label: None,
             }],
         };
@@ -9866,6 +9984,7 @@ mod tests {
                 html_url: "https://github.com/acme/rocket/releases/tag/v1.0".to_owned(),
                 published_at: "2026-02-20T09:00:00Z".to_owned(),
                 is_prerelease: false,
+                reading_version: None,
                 bullets: Vec::new(),
                 status_label: Some("阅读内容处理中"),
             }],
@@ -10257,7 +10376,7 @@ mod tests {
             std::slice::from_ref(&release),
             &summary_states,
         );
-        assert_eq!(rendered.releases[0].bullets, Vec::<String>::new());
+        assert!(rendered.releases[0].bullets.is_empty());
         assert_eq!(rendered.releases[0].status_label, Some("阅读内容处理中"));
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
     }

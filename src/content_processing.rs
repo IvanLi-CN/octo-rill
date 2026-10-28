@@ -1898,7 +1898,6 @@ pub async fn read_global_resource_exact(
     .bind(resource_id)
     .bind(pipeline)
     .bind(variant)
-    .bind("zh-CN")
     .bind(GLOBAL_PROTOCOL_VERSION)
     .bind(expected_source_hash)
     .bind(&model_profile)

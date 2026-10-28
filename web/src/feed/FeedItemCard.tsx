@@ -60,7 +60,10 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { resolveRepoVisualCandidates, type RepoVisual } from "@/lib/repoVisual";
 import { cn } from "@/lib/utils";
 import type { DashboardTab } from "@/pages/DashboardControlBand";
-import type { ReleaseReading } from "@/releaseReading";
+import {
+	releaseReadingChangeVersions,
+	type ReleaseReading,
+} from "@/releaseReading";
 
 const REACTION_ITEMS: Array<{
 	content: ReactionContent;
@@ -338,9 +341,22 @@ function ReleaseReadingContent(props: { reading: ReleaseReading }) {
 	return (
 		<div className="space-y-3">
 			<ul className="list-disc space-y-2 pl-5 text-sm leading-6">
-				{reading.changes.map((change, index) => (
-					<li key={`${change.text}-${index}`}>{change.text}</li>
-				))}
+				{reading.changes.map((change, index) => {
+					const versions = releaseReadingChangeVersions(
+						reading.version,
+						change.versions,
+					);
+					return (
+						<li key={`${change.text}-${index}`}>
+							{change.text}
+							{versions ? (
+								<span className="ml-2 text-xs text-muted-foreground">
+									{`（${versions}）`}
+								</span>
+							) : null}
+						</li>
+					);
+				})}
 			</ul>
 			{reading.machine_materials?.length ? (
 				<details className="rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
@@ -386,6 +402,20 @@ function SmartLane(props: {
 					<OriginalLane item={item} />
 				)}
 			</div>
+		);
+	}
+
+	if (item.smart?.status === "incompatible") {
+		return (
+			<ErrorStatePanel
+				title="润色结果格式不兼容"
+				summary="这条润色结果无法按当前阅读结构解析，请重新生成。"
+				actionLabel="重试润色"
+				onAction={onSmartNow}
+				disabled={isSmartGenerating}
+				loading={isSmartGenerating}
+				size="compact"
+			/>
 		);
 	}
 

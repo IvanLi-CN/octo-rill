@@ -142,6 +142,7 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
         .iter()
         .map(|migration| migration.version)
         .collect::<HashSet<_>>();
+    let highest_known = migrator.iter().map(|migration| migration.version).max();
     let highest_applied = applied.iter().map(|migration| migration.version).max();
 
     for migration in applied {
@@ -159,6 +160,12 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
             continue;
         }
         let Some(checksum) = expected.get(&migration.version) else {
+            if highest_known.is_some_and(|version| migration.version > version) {
+                // Additive future migrations may leave tables/indexes an older
+                // binary does not know about. The normal missing-gap check
+                // below still rejects an unknown version inside our history.
+                continue;
+            }
             bail!(
                 "database migration {} is missing from the application",
                 migration.version
@@ -276,13 +283,6 @@ mod tests {
 
     #[test]
     fn unknown_or_dirty_history_is_rejected() {
-        let unknown = vec![AppliedMigration {
-            version: 999,
-            checksum: vec![0; 48],
-            success: 1,
-        }];
-        assert!(validate_history(Some(&unknown), &MIGRATOR).is_err());
-
         let dirty = vec![AppliedMigration {
             version: 80,
             checksum: current_checksum(80),
@@ -296,6 +296,30 @@ mod tests {
             success: 2,
         }];
         assert!(validate_history(Some(&invalid_success), &MIGRATOR).is_err());
+    }
+
+    #[test]
+    fn future_additive_history_is_accepted_for_older_binaries() {
+        let mut history = MIGRATOR
+            .iter()
+            .map(|migration| AppliedMigration {
+                version: migration.version,
+                checksum: migration.checksum.to_vec(),
+                success: 1,
+            })
+            .collect::<Vec<_>>();
+        let highest_known = MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("migration history is non-empty");
+        history.push(AppliedMigration {
+            version: highest_known + 1,
+            checksum: vec![0; 48],
+            success: 1,
+        });
+        validate_history(Some(&history), &MIGRATOR)
+            .expect("an older binary may read a database with additive future migrations");
     }
 
     #[test]
