@@ -931,8 +931,9 @@ pub async fn enqueue_release_reading_backfill_if_needed(
         .await
         .context("reset waiting release reading backfill items")?;
         sqlx::query(
-            "UPDATE release_reading_backfill_runs SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'waiting'",
+            "UPDATE release_reading_backfill_runs SET status = 'queued', waiting = (SELECT COUNT(*) FROM release_reading_backfill_items WHERE run_id = ? AND status = 'waiting'), updated_at = ? WHERE id = ? AND status = 'waiting'",
         )
+        .bind(&latest.id)
         .bind(&now)
         .bind(&latest.id)
         .execute(&mut *tx)
@@ -965,8 +966,9 @@ pub async fn enqueue_release_reading_backfill_if_needed(
         .await
         .context("reset paused release reading backfill items")?;
         sqlx::query(
-            "UPDATE release_reading_backfill_runs SET status = 'queued', error_text = NULL, updated_at = ? WHERE id = ? AND status = 'paused'",
+            "UPDATE release_reading_backfill_runs SET status = 'queued', waiting = (SELECT COUNT(*) FROM release_reading_backfill_items WHERE run_id = ? AND status = 'waiting'), error_text = NULL, updated_at = ? WHERE id = ? AND status = 'paused'",
         )
+        .bind(&latest.id)
         .bind(&now)
         .bind(&latest.id)
         .execute(&mut *tx)
@@ -11986,6 +11988,112 @@ mod tests {
                 .expect("load deleted target backfill");
         assert_eq!(status, "failed");
         assert_eq!(failed, 2);
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_resume_reconciles_deleted_waiting_targets() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'waiting', 2, 1, 0, 1, 0, ?, ?)
+            "#,
+        )
+        .bind("backfill-deleted-waiting")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed deleted waiting backfill");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-surviving")
+        .bind(721_i64)
+        .bind(7211_i64)
+        .bind("node-surviving")
+        .bind("v7.2.11")
+        .bind("surviving target")
+        .bind("body")
+        .bind("https://github.com/octo/surviving/releases/tag/v7.2.11")
+        .bind("2026-10-01T00:00:00Z")
+        .bind("2026-10-01T00:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind("2026-10-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed surviving release");
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_items (
+              run_id, release_id, authorized_user_id, published_at, status, updated_at
+            ) VALUES (?, ?, ?, ?, 'succeeded', ?)
+            "#,
+        )
+        .bind("backfill-deleted-waiting")
+        .bind(7211_i64)
+        .bind(Option::<String>::None)
+        .bind("2026-10-01T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed surviving backfill item");
+
+        let task_id = enqueue_release_reading_backfill_if_needed(state.as_ref())
+            .await
+            .expect("resume deleted waiting backfill")
+            .expect("resumed backfill task id");
+        let waiting: i64 =
+            sqlx::query_scalar("SELECT waiting FROM release_reading_backfill_runs WHERE id = ?")
+                .bind("backfill-deleted-waiting")
+                .fetch_one(&pool)
+                .await
+                .expect("load reconciled waiting counter");
+        assert_eq!(waiting, 0);
+
+        sqlx::query(
+            "UPDATE release_reading_backfill_runs SET status = 'running', lease_owner = ?, lease_task_id = ?, lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(&task_id)
+        .bind("2099-10-27T00:01:00Z")
+        .bind("backfill-deleted-waiting")
+        .execute(&pool)
+        .await
+        .expect("claim resumed deleted waiting backfill");
+        finish_release_reading_backfill(
+            state.as_ref(),
+            &task_id,
+            "backfill-deleted-waiting",
+            "failed",
+            Some("target_release_deleted"),
+        )
+        .await
+        .expect("finish deleted waiting backfill");
+
+        let (status, failed, waiting): (String, i64, i64) = sqlx::query_as(
+            "SELECT status, failed, waiting FROM release_reading_backfill_runs WHERE id = ?",
+        )
+        .bind("backfill-deleted-waiting")
+        .fetch_one(&pool)
+        .await
+        .expect("load deleted waiting backfill result");
+        assert_eq!(status, "failed");
+        assert_eq!(failed, 1);
+        assert_eq!(waiting, 0);
     }
 
     #[tokio::test]

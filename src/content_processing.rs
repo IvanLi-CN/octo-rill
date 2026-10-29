@@ -819,6 +819,14 @@ fn public_response(work: &WorkRow, request_id: &str, projection: Option<Value>) 
     })
 }
 
+fn request_status_for_projection(result: &Value, visible_status: &str) -> String {
+    if result.get("status").and_then(Value::as_str) == Some("incompatible") {
+        "incompatible".to_owned()
+    } else {
+        visible_status.to_owned()
+    }
+}
+
 fn active_response(work: &WorkRow, request_id: &str, projection: Option<Value>) -> Value {
     json!({
         "ok": false,
@@ -1684,8 +1692,9 @@ pub async fn get_request(
         (work.status.clone(), projection.unwrap_or_else(|| json!({})))
     };
     let mut response = public_response(&response_work, request_id, Some(projection));
-    response["status"] = Value::String(visible_status.clone());
-    response["result"]["status"] = Value::String(visible_status);
+    let response_status = request_status_for_projection(&response["result"], &visible_status);
+    response["status"] = Value::String(response_status.clone());
+    response["result"]["status"] = Value::String(response_status);
     response["result"]["producer_ref"] = authorization_probe.producer_ref.into();
     response["result"]["kind"] = Value::String(kind_for_work(&response_work));
     Ok(Some(response))
@@ -9225,6 +9234,16 @@ mod tests {
         assert_eq!(result["status"], "incompatible");
         assert_eq!(result["error_code"], "reading_incompatible");
         assert!(result["reading"].is_null());
+    }
+
+    #[test]
+    fn request_status_preserves_incompatible_projection_status() {
+        let result = json!({"status": "incompatible"});
+        assert_eq!(
+            request_status_for_projection(&result, "ready"),
+            "incompatible"
+        );
+        assert_eq!(request_status_for_projection(&json!({}), "ready"), "ready");
     }
 
     #[test]
