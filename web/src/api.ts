@@ -2015,7 +2015,8 @@ export type TranslationResultItem = {
 		| "deferred_provider"
 		| "blocked_config"
 		| "cancelled"
-		| "superseded";
+		| "superseded"
+		| "incompatible";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md: string | null;
@@ -2121,7 +2122,8 @@ export function mapTranslationResultToReleaseDetailSmart(
 		result.status !== "deferred_provider" &&
 		result.status !== "blocked_config" &&
 		result.status !== "cancelled" &&
-		result.status !== "superseded"
+		result.status !== "superseded" &&
+		result.status !== "incompatible"
 	) {
 		return null;
 	}
@@ -2132,22 +2134,25 @@ export function mapTranslationResultToReleaseDetailSmart(
 			retrySignal,
 		);
 	const status =
-		result.status === "ready" && result.reading?.outcome === "insufficient"
-			? "insufficient"
-			: result.status === "missing" &&
-					result.error === "no_valuable_version_info"
+		result.status === "incompatible"
+			? "incompatible"
+			: result.status === "ready" && result.reading?.outcome === "insufficient"
 				? "insufficient"
-				: (result.status === "error" || result.status === "failed") && retryable
-					? "missing"
-					: result.status === "failed"
-						? "error"
-						: result.status;
+				: result.status === "missing" &&
+						result.error === "no_valuable_version_info"
+					? "insufficient"
+					: (result.status === "error" || result.status === "failed") &&
+							retryable
+						? "missing"
+						: result.status === "failed"
+							? "error"
+							: result.status;
 	return {
 		lang: "zh-CN",
 		status,
 		title: result.title_zh,
 		summary: result.body_md ?? result.summary_md,
-		reading: result.reading,
+		reading: status === "incompatible" ? null : result.reading,
 		error_code: result.error_code,
 		error_summary: result.error_summary,
 		error_detail: result.error_detail,

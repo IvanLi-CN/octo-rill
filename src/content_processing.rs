@@ -546,7 +546,7 @@ struct AttemptRouteSnapshot {
     route_models: Vec<String>,
 }
 
-const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
+pub(crate) const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
 const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
 const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
 const GLOBAL_RECOVERY_BATCH_SIZE: usize = 100;
@@ -733,10 +733,25 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
     let mut result = projection
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    if let Some(reading) = result.get_mut("reading").and_then(Value::as_object_mut) {
-        // Evidence identifies private compare inputs and is retained only in
-        // the server-side projection for audit and freshness checks.
-        reading.remove("evidence");
+    let mut reading_incompatible = false;
+    if let Some(raw_reading) = result.get("reading").cloned() {
+        let normalized =
+            serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
+                .ok()
+                .and_then(|mut reading| {
+                    reading.normalize_references().ok()?;
+                    reading.evidence.clear();
+                    serde_json::to_value(reading).ok()
+                });
+        if let Some(normalized) = normalized {
+            result["reading"] = normalized;
+        } else {
+            reading_incompatible = true;
+            // Do not expose malformed or legacy machine material through the
+            // request API. The incompatible status remains visible so callers
+            // can request a controlled regeneration.
+            result["reading"] = Value::Null;
+        }
     }
     // Control metadata is server-owned. A persisted/model-provided field must
     // never be allowed to change the work identity or lifecycle state.
@@ -750,6 +765,12 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
     result["entity_id"] = Value::String(work.canonical_resource_id.clone());
     result["kind"] = Value::String(kind_for_work(work));
     result["variant"] = Value::String(work.variant.clone());
+    if reading_incompatible {
+        result["status"] = Value::String("incompatible".to_owned());
+        result["error_code"] = Value::String("reading_incompatible".to_owned());
+        result["error_summary"] =
+            Value::String("Release reading result is incompatible".to_owned());
+    }
     result
 }
 
@@ -1952,6 +1973,35 @@ pub async fn retry_request(
     user_id: &str,
     request_id: &str,
 ) -> Result<(StatusCode, Value), ApiError> {
+    retry_request_inner(state, user_id, request_id, false).await
+}
+
+pub(crate) async fn retry_incompatible_request(
+    state: &AppState,
+    user_id: &str,
+    request_id: &str,
+) -> Result<(StatusCode, Value), ApiError> {
+    retry_request_inner(state, user_id, request_id, true).await
+}
+
+pub(crate) fn release_reading_projection_is_incompatible(projection: &Value) -> bool {
+    let Some(raw_reading) = projection.get("reading") else {
+        return false;
+    };
+    let Ok(mut reading) =
+        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
+    else {
+        return true;
+    };
+    reading.normalize_references().is_err() || reading.validate().is_err()
+}
+
+async fn retry_request_inner(
+    state: &AppState,
+    user_id: &str,
+    request_id: &str,
+    allow_incompatible_ready: bool,
+) -> Result<(StatusCode, Value), ApiError> {
     // Manual retry is a scheduler command, serialized through the same writer
     // boundary as claims. The API layer delegates authorization and shaping.
     let breaker_open = provider_breaker_open(state).await;
@@ -2091,6 +2141,27 @@ pub async fn retry_request(
         let mut body = active_response(&row, &new_request_id, projection);
         body["result"]["producer_ref"] = Value::String(producer_ref.clone());
         return Ok((StatusCode::CONFLICT, body));
+    }
+    if allow_incompatible_ready
+        && row.status == "ready"
+        && matches!(
+            row.variant.as_str(),
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+                | translations::RELEASE_READING_PUBLIC_VARIANT
+        )
+        && projection
+            .as_ref()
+            .is_some_and(release_reading_projection_is_incompatible)
+    {
+        sqlx::query(
+            "UPDATE content_work_items SET status = 'failed', failure_class = 'output_contract_invalid', retry_after_at = NULL, finished_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'ready'",
+        )
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        row.status = "failed".to_owned();
+        row.retry_after_at = None;
     }
     if row.status != "failed" {
         tx.commit().await.map_err(ApiError::internal)?;
@@ -2993,7 +3064,7 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
         "response_contract": if is_release_reading {
-            "Return one JSON object with title_zh, summary_md, and reading directly at the top level. reading must be {version:string,outcome:'changes'|'insufficient',title:string|null,changes:[{text:string,versions:string[],references:[{url:string}]}],machine_materials:[{label:string,value:string}],evidence:[]}. references may contain only necessary GitHub pull request URLs; the server renders them as PR#number. Do not put links in prose. Return outcome='insufficient' only after the supplied release body and compare evidence have both been checked and no useful human-readable change remains. title_zh and summary_md are compatibility projections derived from the same reading facts; do not add author attribution, version-only repetition, or source sections."
+            "Return one JSON object with title_zh, summary_md, and reading directly at the top level. reading must be {version:string,outcome:'changes'|'insufficient',title:string|null,changes:[{text:string,versions:string[],references:[{label:string|null,url:string}]}],machine_materials:[{label:string,value:string}],evidence:[]}. references may contain only necessary GitHub pull request, migration, security, or operational links; PR links are rendered as PR#number and other links require a concise label. Do not put links in prose. Return outcome='insufficient' only after the supplied release body and compare evidence have both been checked and no useful human-readable change remains. title_zh and summary_md are compatibility projections derived from the same reading facts; do not add author attribution, version-only repetition, or source sections."
         } else {
             "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
         }
@@ -4118,6 +4189,21 @@ pub(crate) fn notification_source_revision_tiebreak(
 
 pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
     parts.join("\n")
+}
+
+pub(crate) fn release_source_revision_content_tiebreak(parts: &[&str]) -> String {
+    let evidence_rank = if parts.iter().any(|part| {
+        let normalized = part.to_ascii_lowercase();
+        normalized.contains("compare evidence is unavailable")
+            || normalized.contains("truncated or paginated")
+            || normalized.contains("compare_unavailable")
+            || normalized.contains("github_compare_incomplete")
+    }) {
+        0
+    } else {
+        1
+    };
+    format!("evidence_rank={evidence_rank}\n{}", parts.join("\n"))
 }
 
 pub(crate) fn announcement_source_revision_tiebreak(

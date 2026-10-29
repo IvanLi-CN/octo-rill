@@ -152,7 +152,11 @@ pub struct ReleaseReadingChange {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseReadingReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,7 +224,9 @@ impl ReleaseReadingResult {
                     return Err("reading PR reference label does not match its URL");
                 }
                 references.push(ReleaseReadingReference {
+                    label: Some(format!("PR#{url_number}")),
                     url: url.to_owned(),
+                    number: Some(url_number),
                 });
                 cursor = target_end + 1;
             }
@@ -230,6 +236,26 @@ impl ReleaseReadingResult {
             change.text = text.split_whitespace().collect::<Vec<_>>().join(" ");
             references.sort_by(|left, right| left.url.cmp(&right.url));
             references.dedup_by(|left, right| left.url == right.url);
+            for reference in &mut references {
+                if let Some(number) = release_reading_pr_number(&reference.url) {
+                    reference.number = Some(number);
+                    reference.label = Some(format!("PR#{number}"));
+                } else {
+                    let label = reference
+                        .label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .ok_or("reading non-PR references require a label")?;
+                    if !release_reading_reference_url_is_allowed(&reference.url)
+                        || release_reading_text_is_low_value(label)
+                    {
+                        return Err("reading contains an unsupported reference");
+                    }
+                    reference.label = Some(label.to_owned());
+                    reference.number = None;
+                }
+            }
             change.references = references;
         }
         Ok(())
@@ -265,9 +291,20 @@ impl ReleaseReadingResult {
             .changes
             .iter()
             .flat_map(|change| change.references.iter())
-            .any(|reference| release_reading_pr_number(&reference.url).is_none())
+            .any(|reference| {
+                if let Some(number) = release_reading_pr_number(&reference.url) {
+                    reference.number != Some(number)
+                        || reference.label.as_deref() != Some(format!("PR#{number}").as_str())
+                } else {
+                    reference.number.is_some()
+                        || reference.label.as_deref().is_none_or(|label| {
+                            label.trim().is_empty() || release_reading_text_is_low_value(label)
+                        })
+                        || !release_reading_reference_url_is_allowed(&reference.url)
+                }
+            })
         {
-            return Err("reading references must be GitHub pull request URLs");
+            return Err("reading references must be controlled labeled links");
         }
         if self.is_changes() && self.changes.is_empty() {
             return Err("reading.changes must be non-empty for changes outcome");
@@ -296,6 +333,20 @@ pub fn release_reading_pr_number(raw: &str) -> Option<u64> {
         return None;
     }
     segments[3].parse::<u64>().ok().filter(|number| *number > 0)
+}
+
+fn release_reading_reference_url_is_allowed(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw.trim()) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(
+            url.host_str(),
+            Some("github.com") | Some("www.github.com") | Some("docs.github.com")
+        )
+        && url.path() != "/"
 }
 
 fn release_reading_text_is_low_value(text: &str) -> bool {
@@ -2672,7 +2723,43 @@ pub async fn resolve_translation_results(
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &canonical_item)
                     .await?
             };
-            if req.retry_on_error && response.status == "failed" {
+            if req.retry_on_error
+                && response.status == "ready"
+                && matches!(
+                    item.variant.as_str(),
+                    RELEASE_READING_AUTHORIZED_VARIANT | RELEASE_READING_PUBLIC_VARIANT
+                )
+                && content_processing::release_reading_projection_is_incompatible(&response.result)
+            {
+                let (_retry_status, retry_body) = content_processing::retry_incompatible_request(
+                    state.as_ref(),
+                    &user_id,
+                    &response.request_id,
+                )
+                .await?;
+                response.request_id = retry_body
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.request_id.as_str())
+                    .to_owned();
+                response.work_item_id = retry_body
+                    .get("work_item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.work_item_id.as_str())
+                    .to_owned();
+                response.status = retry_body
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.status.as_str())
+                    .to_owned();
+                response.poll_url = retry_body
+                    .get("poll_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.poll_url.as_str())
+                    .to_owned();
+                response.result = retry_body.get("result").cloned().unwrap_or(response.result);
+                response.error = retry_body.get("error").cloned();
+            } else if req.retry_on_error && response.status == "failed" {
                 let (_retry_status, retry_body) = content_processing::retry_request(
                     state.as_ref(),
                     &user_id,
@@ -9319,6 +9406,7 @@ mod tests {
     #[test]
     fn normalize_request_items_accepts_reading_only_for_release_smart() {
         let mut item = sample_release_item("123");
+        item.kind = "release_smart".to_owned();
         item.target_slots = vec![
             "title_zh".to_owned(),
             "summary_md".to_owned(),

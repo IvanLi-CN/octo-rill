@@ -4720,10 +4720,18 @@ fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
 }
 
 fn release_block_has_summary_details(block: &BriefReleaseBlock) -> bool {
-    block
-        .detail_lines
-        .iter()
-        .any(|line| !line.starts_with("相关链接："))
+    block.detail_lines.iter().any(|line| {
+        !line.starts_with("相关链接：")
+            && !line.starts_with("来源：")
+            && !line.starts_with("实现依据：")
+            && !line.starts_with("发布原文：")
+            && !line.starts_with("阅读内容")
+    })
+}
+
+fn brief_has_readable_release_change(markdown: &str) -> bool {
+    extract_brief_release_blocks(markdown)
+        .is_some_and(|blocks| blocks.iter().any(release_block_has_summary_details))
 }
 
 fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
@@ -5394,6 +5402,9 @@ async fn load_brief_release_summary_states(
                         }
                     }
                 }
+                "missing" if item.error.as_deref() == Some(api::SMART_NO_VALUABLE_VERSION_INFO) => {
+                    BriefReleaseSummaryState::NoValue
+                }
                 "missing" => BriefReleaseSummaryState::Unavailable,
                 "queued" | "running" | "processing" | "deferred_provider" | "blocked_config" => {
                     BriefReleaseSummaryState::Pending
@@ -5412,6 +5423,9 @@ async fn load_brief_release_summary_states(
     let mut summary_states = HashMap::new();
     for release_id in &release_ids {
         let state = match readings.get(release_id) {
+            Some(state) if state.status == "ready" && state.reading_incompatible => {
+                BriefReleaseSummaryState::Incompatible
+            }
             Some(state) if state.status == "ready" => match state.reading.as_ref() {
                 Some(reading) if reading.is_changes() => {
                     let bullets = reading
@@ -5441,7 +5455,7 @@ async fn load_brief_release_summary_states(
                     }
                 }
                 Some(reading) if reading.is_insufficient() => BriefReleaseSummaryState::NoValue,
-                None => {
+                None if !state.reading_present => {
                     let changes = state
                         .legacy_summary
                         .as_deref()
@@ -5599,8 +5613,10 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                             .references
                             .iter()
                             .filter_map(|reference| {
-                                translations::release_reading_pr_number(&reference.url)
-                                    .map(|number| format!("[PR#{number}]({})", reference.url))
+                                reference
+                                    .label
+                                    .as_deref()
+                                    .map(|label| format!("[{label}]({})", reference.url))
                             })
                             .collect::<Vec<_>>();
                         let text = if references.is_empty() {
@@ -5614,8 +5630,10 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                             .references
                             .iter()
                             .filter_map(|reference| {
-                                translations::release_reading_pr_number(&reference.url)
-                                    .map(|number| format!("[PR#{number}]({})", reference.url))
+                                reference
+                                    .label
+                                    .as_deref()
+                                    .map(|label| format!("[{label}]({})", reference.url))
                             })
                             .collect::<Vec<_>>();
                         if references.is_empty() {
@@ -6522,6 +6540,8 @@ async fn overwrite_brief_snapshot(
             .context("failed to load existing brief content before overwrite")?;
     if existing_content.as_deref().is_some_and(|content| {
         brief_content_is_canonical(content)
+            && brief_has_readable_release_change(content)
+            && !brief_has_readable_release_change(&built.content_markdown)
             && brief_has_release_status_marker(&built.content_markdown)
     }) {
         return Ok(false);

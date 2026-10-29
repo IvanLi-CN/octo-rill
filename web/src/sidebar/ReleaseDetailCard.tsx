@@ -77,7 +77,8 @@ function ReleaseReadingPanel({ reading }: { reading: ReleaseReading }) {
 									rel="noreferrer"
 									target="_blank"
 								>
-									{`PR#${reference.number}`}
+									{reference.label ??
+										(reference.number ? `PR#${reference.number}` : "查看")}
 								</a>
 							))}
 							{versions ? (
@@ -1041,7 +1042,8 @@ export function ReleaseDetailCard(props: {
 									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 									visualClassName="size-8"
 								/>
-								{activeDetail.smart?.status === "incompatible" ? (
+								{selectedLane === "smart" &&
+								activeDetail.smart?.status === "incompatible" ? (
 									<ErrorStatePanel
 										title="润色结果格式不兼容"
 										summary="这条润色结果无法按当前阅读结构解析，请重新生成。"

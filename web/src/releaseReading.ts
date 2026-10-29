@@ -6,7 +6,8 @@ export type ReleaseReading = {
 		text: string;
 		versions?: string[];
 		references?: Array<{
-			number: number;
+			number?: number;
+			label?: string;
 			url: string;
 		}>;
 	}>;

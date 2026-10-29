@@ -28,8 +28,8 @@ use crate::release_links::{
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
 use crate::{
-    admin_runtime, ai, api_keys, briefs, content_processing, jobs, local_id,
-    search as search_service, sync, translations, webhook_push,
+    admin_runtime, ai, api_keys, briefs, content_identity_upgrade, content_processing, jobs,
+    local_id, search as search_service, sync, translations, webhook_push,
 };
 use crate::{
     error::ApiError,
@@ -16506,7 +16506,9 @@ struct ReleaseReadingChangeView {
 
 #[derive(Debug, Serialize, Clone)]
 struct ReleaseReadingReferenceView {
-    number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number: Option<u64>,
+    label: String,
     url: String,
 }
 
@@ -17021,6 +17023,9 @@ fn release_title_has_actionable_content(title: &str) -> bool {
         "增加", "减少", "更新", "提升", "推出", "引入", "重构", "改为",
     ];
     let has_change_verb = change_verbs.iter().any(|verb| lower.contains(verb));
+    if parse_release_tag_version(trimmed).is_some() && !has_change_verb {
+        return false;
+    }
     if !has_change_verb && (lower.contains("版本发布") || lower.contains("版本发行")) {
         return false;
     }
@@ -18634,7 +18639,7 @@ async fn build_feed_reaction_refresh_item(
     ))
 }
 
-const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
+pub(crate) const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
 const RELEASE_FEED_MARKDOWN_MISMATCH_ERROR: &str =
     "release translation failed to preserve markdown structure";
 const RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
@@ -18724,11 +18729,14 @@ fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>
                         .references
                         .into_iter()
                         .filter_map(|reference| {
-                            translations::release_reading_pr_number(&reference.url).map(|number| {
-                                ReleaseReadingReferenceView {
-                                    number,
-                                    url: reference.url,
-                                }
+                            let number = translations::release_reading_pr_number(&reference.url);
+                            let label = reference
+                                .label
+                                .or_else(|| number.map(|number| format!("PR#{number}")))?;
+                            Some(ReleaseReadingReferenceView {
+                                number,
+                                label,
+                                url: reference.url,
                             })
                         })
                         .collect(),
@@ -21770,7 +21778,7 @@ fn public_release_reading_source_hash(
         body.clone(),
         evidence_text.to_owned(),
     ];
-    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(
+    let source_revision_tiebreak = content_processing::release_source_revision_content_tiebreak(
         &source_revision_parts
             .iter()
             .map(String::as_str)
@@ -21817,6 +21825,43 @@ struct PublicReleaseReadingSourceRequest<'a> {
     revision: PublicReleaseReadingRevision<'a>,
 }
 
+fn source_snapshot_block_text<'a>(snapshot: &'a Value, slot: &str) -> Option<&'a str> {
+    snapshot
+        .get("source_blocks")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                (block.get("slot").and_then(Value::as_str) == Some(slot))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+}
+
+fn public_release_projection_matches_source_snapshot(
+    source_snapshot_json: &str,
+    repo_full_name: &str,
+    tag_name: &str,
+    title: &str,
+    body: &str,
+    revision: &PublicReleaseReadingRevision<'_>,
+) -> bool {
+    let Ok(snapshot) = serde_json::from_str::<Value>(source_snapshot_json) else {
+        return false;
+    };
+    let Some(observed_at) = content_processing::authoritative_release_revision(
+        revision.updated_at,
+        revision.detected_at,
+    ) else {
+        return false;
+    };
+    let metadata = format!("{repo_full_name}\n{tag_name}");
+    source_snapshot_block_text(&snapshot, "source_observed_at") == Some(observed_at)
+        && source_snapshot_block_text(&snapshot, "metadata") == Some(metadata.as_str())
+        && source_snapshot_block_text(&snapshot, "title") == Some(title)
+        && source_snapshot_block_text(&snapshot, "body_markdown").unwrap_or_default() == body
+}
+
 async fn public_release_reading_source_hash_for_release(
     request: PublicReleaseReadingSourceRequest<'_>,
 ) -> Result<Option<String>, ApiError> {
@@ -21836,6 +21881,42 @@ async fn public_release_reading_source_hash_for_release(
             Some(normalized_body.as_str()),
             request.revision,
         ));
+    }
+
+    // Reuse a valid public projection whose immutable source snapshot still
+    // matches this Release. This avoids repeating anonymous compare requests
+    // for the same empty-shell Release while preserving revision isolation.
+    if content_identity_upgrade::is_complete(&request.state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        && let Some((source_hash, payload_json, source_snapshot_json, work_status)) =
+            sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT i.source_hash, p.payload_json, w.source_snapshot_json, w.status FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id JOIN content_work_items w ON w.id = p.active_work_item_id WHERE i.canonical_resource_type = 'release' AND i.canonical_resource_id = ? AND i.pipeline = 'polishing' AND i.variant = ? AND i.target_lang = 'zh-CN' AND i.protocol_version = ? AND w.status IN ('ready', 'queued', 'running', 'deferred_provider', 'blocked_config') ORDER BY datetime(p.updated_at) DESC, p.updated_at DESC LIMIT 1",
+            )
+            .bind(request.release_id.to_string())
+            .bind(translations::RELEASE_READING_PUBLIC_VARIANT)
+            .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+            .fetch_optional(&request.state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        let payload = serde_json::from_str::<Value>(&payload_json).ok();
+        let projection_is_valid = work_status != "ready"
+            || payload
+                .as_ref()
+                .is_some_and(|payload| release_reading_payload_state(payload).0.is_some());
+        if projection_is_valid
+            && public_release_projection_matches_source_snapshot(
+                &source_snapshot_json,
+                request.repo_full_name,
+                request.tag_name,
+                title.as_str(),
+                normalized_body.as_str(),
+                &request.revision,
+            )
+        {
+            return Ok(Some(source_hash));
+        }
     }
 
     let release_metadata = sqlx::query_as::<_, (i64, Option<String>)>(
@@ -21862,12 +21943,7 @@ async fn public_release_reading_source_hash_for_release(
             public_only: true,
         })
         .await?;
-    if evidence.iter().any(|item| {
-        matches!(
-            item.kind.as_str(),
-            "compare_unavailable" | "github_compare_incomplete"
-        )
-    }) {
+    if release_reading_evidence_is_unavailable(&evidence) {
         return Ok(None);
     }
     let evidence_json = serde_json::to_string(&evidence).map_err(ApiError::internal)?;
@@ -21908,7 +21984,7 @@ async fn public_release_reading_source_hash_for_release(
         normalized_body,
         reading_compare,
     ];
-    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(
+    let source_revision_tiebreak = content_processing::release_source_revision_content_tiebreak(
         &source_revision_parts
             .iter()
             .map(String::as_str)
@@ -22030,6 +22106,16 @@ pub(crate) async fn global_release_request_item(
     .await
     .map_err(ApiError::internal)?
         != 0;
+    if kind == "release_smart" && !is_public_release && row.starred_repo_id.is_none() {
+        // A historical daily-brief membership is not current authorization
+        // for private compare evidence. Re-check the live visible-repository
+        // projection before selecting the authorized variant.
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release is no longer visible to this user",
+        ));
+    }
     let (reading_evidence_text, reading_evidence) =
         if kind == "release_smart" && !has_actionable_release_text {
             prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
@@ -22058,6 +22144,11 @@ pub(crate) async fn global_release_request_item(
         } else {
             (String::new(), Vec::new())
         };
+    if kind == "release_smart" && release_reading_evidence_is_unavailable(&reading_evidence) {
+        // Do not enqueue a model attempt against a frozen failure snapshot.
+        // The next request must re-collect the compare evidence first.
+        return Err(release_reading_evidence_unavailable_error());
+    }
     let mut source_blocks = vec![
         translations::TranslationSourceBlock {
             slot: "metadata".to_owned(),
@@ -22127,7 +22218,7 @@ pub(crate) async fn global_release_request_item(
         source_revision_parts.push(reading_evidence_text.as_str());
     }
     let source_revision_tiebreak =
-        content_processing::source_revision_content_tiebreak(&source_revision_parts);
+        content_processing::release_source_revision_content_tiebreak(&source_revision_parts);
     Ok(translations::TranslationRequestItemInput {
         producer_ref: producer_ref.to_owned(),
         kind: kind.to_owned(),
@@ -23286,7 +23377,6 @@ struct ReleaseSmartSummaryPayload {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GitHubCompareResponse {
     status: Option<String>,
     ahead_by: Option<i64>,
@@ -23328,7 +23418,6 @@ struct ReleaseCompareSnapshot {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GitHubCompareCommit {
     sha: String,
     commit: GitHubCompareCommitDetail,
@@ -23340,7 +23429,6 @@ struct GitHubCompareCommitDetail {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GitHubCompareFile {
     filename: String,
     status: Option<String>,
@@ -23350,18 +23438,19 @@ struct GitHubCompareFile {
     patch: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubTreeResponse {
     tree: Vec<GitHubTreeEntry>,
     truncated: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubTreeEntry {
     path: String,
     #[serde(rename = "type")]
     entry_type: String,
     sha: Option<String>,
+    mode: Option<String>,
 }
 
 fn value_as_bool(raw: &serde_json::Value) -> Option<bool> {
@@ -23545,6 +23634,7 @@ fn summarize_patch_excerpt(patch: &str) -> Option<String> {
 
 struct CompareDigest {
     text: String,
+    coverage_complete: bool,
 }
 
 fn build_compare_digest_with_coverage(compare: &GitHubCompareResponse) -> Option<CompareDigest> {
@@ -23635,6 +23725,7 @@ fn build_compare_digest_with_coverage(compare: &GitHubCompareResponse) -> Option
     } else {
         Some(CompareDigest {
             text: lines.join("\n"),
+            coverage_complete: complete,
         })
     }
 }
@@ -23679,7 +23770,7 @@ fn validate_github_compare_response(payload: &GitHubCompareResponse) -> Result<(
         || payload.behind_by.is_none()
         || payload.total_commits.is_none()
         || payload.base_commit.is_none()
-        || payload.head_commit.is_none()
+        || payload.merge_base_commit.is_none()
         || payload.ahead_by.is_some_and(|value| value < 0)
         || payload.behind_by.is_some_and(|value| value < 0)
         || payload.total_commits.is_some_and(|value| value < 0)
@@ -23734,6 +23825,16 @@ fn parse_release_tag_version(tag: &str) -> Option<(String, semver::Version)> {
         return Some((prefix, version));
     }
     None
+}
+
+fn release_tag_family_prefix(tag: &str) -> Option<String> {
+    let normalized = tag.trim().to_ascii_lowercase();
+    let prefix = normalized
+        .split(|character: char| character.is_ascii_digit())
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['-', '_', '.', '/', ' ', 'v']);
+    (!prefix.is_empty()).then(|| prefix.to_owned())
 }
 
 fn release_sort_key(row: &ReleaseCompareBaselineRow) -> (&str, i64) {
@@ -23906,6 +24007,96 @@ async fn fetch_github_tree_request(
         .map_err(ApiError::internal)
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubBlobResponse {
+    encoding: String,
+    content: String,
+}
+
+async fn fetch_github_blob_text_request(
+    state: &AppState,
+    repo_full_name: &str,
+    blob_sha: &str,
+    access_token: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let url = format!(
+        "https://api.github.com/repos/{repo_full_name}/git/blobs/{}",
+        urlencoding::encode(blob_sha)
+    );
+    let mut request = state
+        .http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(ApiError::internal)?;
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(github_rest_compare_http_error(status, &headers, &body));
+    }
+    let payload = response
+        .json::<GitHubBlobResponse>()
+        .await
+        .map_err(ApiError::internal)?;
+    if payload.encoding != "base64" {
+        return Ok(None);
+    }
+    let encoded = payload.content.replace(['\n', '\r'], "");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(ApiError::internal)?;
+    if bytes.len() > 32 * 1024 {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitResponse {
+    sha: String,
+}
+
+async fn fetch_github_commit_sha_request(
+    state: &AppState,
+    repo_full_name: &str,
+    reference: &str,
+    access_token: Option<&str>,
+) -> Result<String, ApiError> {
+    let url = format!(
+        "https://api.github.com/repos/{repo_full_name}/commits/{}",
+        urlencoding::encode(reference)
+    );
+    let mut request = state
+        .http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(ApiError::internal)?;
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(github_rest_compare_http_error(status, &headers, &body));
+    }
+    let payload = response
+        .json::<GitHubCommitResponse>()
+        .await
+        .map_err(ApiError::internal)?;
+    if payload.sha.trim().is_empty() {
+        return Err(ApiError::internal("github commit response is missing sha"));
+    }
+    Ok(payload.sha)
+}
+
 fn build_endpoint_tree_compare(
     compare: &GitHubCompareResponse,
     base_tree: GitHubTreeResponse,
@@ -23915,13 +24106,13 @@ fn build_endpoint_tree_compare(
         .tree
         .into_iter()
         .filter(|entry| entry.entry_type != "tree")
-        .map(|entry| (entry.path, (entry.entry_type, entry.sha)))
+        .map(|entry| (entry.path, (entry.entry_type, entry.sha, entry.mode)))
         .collect::<BTreeMap<_, _>>();
     let head = head_tree
         .tree
         .into_iter()
         .filter(|entry| entry.entry_type != "tree")
-        .map(|entry| (entry.path, (entry.entry_type, entry.sha)))
+        .map(|entry| (entry.path, (entry.entry_type, entry.sha, entry.mode)))
         .collect::<BTreeMap<_, _>>();
     let mut paths = base.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(head.keys().cloned());
@@ -23974,6 +24165,80 @@ fn build_endpoint_tree_compare(
     }
 }
 
+fn endpoint_blob_excerpt(content: &str) -> String {
+    content.lines().take(24).collect::<Vec<_>>().join("\n")
+}
+
+async fn enrich_endpoint_tree_compare(
+    state: &AppState,
+    repo_full_name: &str,
+    compare: &GitHubCompareResponse,
+    base_tree: GitHubTreeResponse,
+    head_tree: GitHubTreeResponse,
+    access_token: Option<&str>,
+) -> Result<GitHubCompareResponse, ApiError> {
+    let mut enriched = build_endpoint_tree_compare(compare, base_tree.clone(), head_tree.clone());
+    let base = base_tree
+        .tree
+        .into_iter()
+        .filter(|entry| entry.entry_type != "tree")
+        .map(|entry| (entry.path, (entry.sha, entry.mode)))
+        .collect::<BTreeMap<_, _>>();
+    let head = head_tree
+        .tree
+        .into_iter()
+        .filter(|entry| entry.entry_type != "tree")
+        .map(|entry| (entry.path, (entry.sha, entry.mode)))
+        .collect::<BTreeMap<_, _>>();
+    let mut enriched_count = 0usize;
+    for file in &mut enriched.files {
+        if compare_file_is_noise(file) {
+            continue;
+        }
+        enriched_count += 1;
+        if enriched_count > 8 {
+            enriched.pagination_truncated = true;
+            break;
+        }
+        let before = base.get(&file.filename);
+        let after = head.get(&file.filename);
+        let before_sha = before.and_then(|entry| entry.0.as_deref());
+        let after_sha = after.and_then(|entry| entry.0.as_deref());
+        if before.and_then(|entry| entry.1.as_deref()) != after.and_then(|entry| entry.1.as_deref())
+            && before_sha == after_sha
+        {
+            file.patch = Some("mode or file type changed".to_owned());
+            continue;
+        }
+        let before_text = match before_sha {
+            Some(sha) => {
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+            }
+            None => None,
+        };
+        let after_text = match after_sha {
+            Some(sha) => {
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+            }
+            None => None,
+        };
+        file.patch = match (before_text, after_text) {
+            (Some(before), Some(after)) => Some(format!(
+                "-{}\n+{}",
+                endpoint_blob_excerpt(&before),
+                endpoint_blob_excerpt(&after)
+            )),
+            (None, Some(after)) => Some(format!("+{}", endpoint_blob_excerpt(&after))),
+            (Some(before), None) => Some(format!("-{}", endpoint_blob_excerpt(&before))),
+            (None, None) => {
+                enriched.pagination_truncated = true;
+                None
+            }
+        };
+    }
+    Ok(enriched)
+}
+
 async fn fetch_release_compare_snapshot_request(
     state: &AppState,
     repo_full_name: &str,
@@ -23990,6 +24255,8 @@ async fn fetch_release_compare_snapshot_request(
         access_token,
     )
     .await?;
+    let head_sha =
+        fetch_github_commit_sha_request(state, repo_full_name, head_tag, access_token).await?;
     let relationship_status = payload.status.clone().unwrap_or_default();
     let payload = if compare_requires_endpoint_diff(payload.status.as_deref()) {
         let base_sha = payload
@@ -23998,39 +24265,45 @@ async fn fetch_release_compare_snapshot_request(
             .map(|commit| commit.sha.as_str())
             .context("github compare response missing base SHA")
             .map_err(ApiError::internal)?;
-        let head_sha = payload
-            .head_commit
-            .as_ref()
-            .map(|commit| commit.sha.as_str())
-            .context("github compare response missing head SHA")
-            .map_err(ApiError::internal)?;
         let base_tree =
             fetch_github_tree_request(state, repo_full_name, base_sha, access_token).await?;
         let head_tree =
-            fetch_github_tree_request(state, repo_full_name, head_sha, access_token).await?;
-        build_endpoint_tree_compare(&payload, base_tree, head_tree)
+            fetch_github_tree_request(state, repo_full_name, head_sha.as_str(), access_token)
+                .await?;
+        enrich_endpoint_tree_compare(
+            state,
+            repo_full_name,
+            &payload,
+            base_tree,
+            head_tree,
+            access_token,
+        )
+        .await?
     } else {
         payload
     };
     let digest = build_compare_digest_with_coverage(&payload).map(|digest| {
         if compare_requires_endpoint_diff(Some(relationship_status.as_str())) {
-            format!("comparison_mode: endpoint_tree\n{}", digest.text)
+            CompareDigest {
+                text: format!("comparison_mode: endpoint_tree\n{}", digest.text),
+                coverage_complete: digest.coverage_complete,
+            }
         } else {
-            digest.text
+            digest
         }
     });
     let Some(digest) = digest else {
         return Ok(None);
     };
-    let coverage_complete = digest.contains("coverage_complete: true");
+    let coverage_complete = digest.coverage_complete;
     Ok(Some(ReleaseCompareSnapshot {
         base_tag: base_tag.to_owned(),
         head_tag: head_tag.to_owned(),
         relationship_status,
         base_sha: payload.base_commit.map(|commit| commit.sha),
         merge_base_sha: payload.merge_base_commit.map(|commit| commit.sha),
-        head_sha: payload.head_commit.map(|commit| commit.sha),
-        digest,
+        head_sha: Some(head_sha),
+        digest: digest.text,
         coverage_complete,
     }))
 }
@@ -24140,6 +24413,27 @@ struct ReleaseReadingEvidenceRequest<'a> {
     public_only: bool,
 }
 
+const RELEASE_READING_EVIDENCE_UNAVAILABLE: &str = "release_reading_evidence_unavailable";
+
+fn release_reading_evidence_is_unavailable(
+    evidence: &[translations::ReleaseReadingEvidence],
+) -> bool {
+    evidence.iter().any(|item| {
+        matches!(
+            item.kind.as_str(),
+            "compare_unavailable" | "github_compare_incomplete"
+        )
+    })
+}
+
+fn release_reading_evidence_unavailable_error() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        RELEASE_READING_EVIDENCE_UNAVAILABLE,
+        "Release compare evidence is not ready; retry after the source can be read",
+    )
+}
+
 async fn prepare_release_reading_evidence(
     request: ReleaseReadingEvidenceRequest<'_>,
 ) -> Result<(String, Vec<translations::ReleaseReadingEvidence>), ApiError> {
@@ -24159,6 +24453,7 @@ async fn prepare_release_reading_evidence(
             release_compare_candidates_from_db(request.state, request.repo_id, request.release_id)
                 .await?;
         let mut candidates = candidates;
+        let current_family = release_tag_family_prefix(request.tag_name);
         let current_sort = (
             request
                 .published_at
@@ -24169,6 +24464,8 @@ async fn prepare_release_reading_evidence(
         candidates.retain(|candidate| {
             let candidate_sort = release_sort_key(candidate);
             candidate_sort < current_sort
+                && current_family.as_deref()
+                    == release_tag_family_prefix(&candidate.tag_name).as_deref()
         });
         candidates.sort_by(|left, right| release_sort_key(right).cmp(&release_sort_key(left)));
         for candidate in candidates {
@@ -25074,6 +25371,43 @@ pub(crate) struct GlobalReleaseReadingState {
     pub status: String,
     pub reading: Option<translations::ReleaseReadingResult>,
     pub legacy_summary: Option<String>,
+    pub reading_present: bool,
+    pub reading_incompatible: bool,
+}
+
+fn legacy_release_smart_source_hash(
+    input: &translations::TranslationRequestItemInput,
+) -> Option<String> {
+    let metadata = input
+        .source_blocks
+        .iter()
+        .find(|block| block.slot == "metadata")?
+        .text
+        .lines()
+        .collect::<Vec<_>>();
+    let repo_full_name = metadata.first()?.trim();
+    let tag_name = metadata.get(1)?.trim();
+    let title = input
+        .source_blocks
+        .iter()
+        .find(|block| block.slot == "title")
+        .map(|block| block.text.trim())
+        .filter(|value| !value.is_empty());
+    let body = input
+        .source_blocks
+        .iter()
+        .find(|block| block.slot == "body_markdown")
+        .map(|block| block.text.as_str());
+    let release_id = input.entity_id.parse::<i64>().ok()?;
+    Some(global_release_source_hash(
+        release_id,
+        repo_full_name,
+        tag_name,
+        title,
+        body,
+        "release_smart",
+        "smart",
+    ))
 }
 
 pub(crate) async fn read_global_release_reading_batch_for_user(
@@ -25083,29 +25417,59 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
 ) -> Result<HashMap<i64, GlobalReleaseReadingState>, ApiError> {
     let mut readings = HashMap::new();
     for release_id in release_ids {
-        let input = global_release_request_item(
+        let input = match global_release_request_item(
             state,
             user_id,
             *release_id,
             "release_smart",
             "api.brief.release_reading",
         )
-        .await?;
-        let (_, response) = content_processing::submit_item(state, user_id, "wait", &input).await?;
-        let current_ready = matches!(
-            response.status.as_str(),
-            "ready" | "completed" | "succeeded"
-        );
-        let legacy_summary = response
-            .result
+        .await
+        {
+            Ok(input) => input,
+            Err(error) if error.code() == RELEASE_READING_EVIDENCE_UNAVAILABLE => {
+                readings.insert(
+                    *release_id,
+                    GlobalReleaseReadingState {
+                        status: "failed".to_owned(),
+                        reading: None,
+                        legacy_summary: None,
+                        reading_present: false,
+                        reading_incompatible: false,
+                    },
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (_, response) =
+            content_processing::submit_item(state, user_id, "async", &input).await?;
+        let source_hash = content_processing::source_hash_for_item(&input);
+        let legacy_source_hash = legacy_release_smart_source_hash(&input);
+        let legacy_projection = if let Some(legacy_source_hash) = legacy_source_hash.as_deref() {
+            read_global_release_smart_with_legacy_fallback(
+                state,
+                input.entity_id.as_str(),
+                &input,
+                source_hash.as_str(),
+                legacy_source_hash,
+            )
+            .await?
+        } else {
+            None
+        };
+        let (status, result) =
+            legacy_projection.unwrap_or_else(|| (response.status.clone(), response.result.clone()));
+        let current_ready = matches!(status.as_str(), "ready" | "completed" | "succeeded");
+        let reading_present = result.get("reading").is_some();
+        let legacy_summary = result
             .get("summary_md")
-            .or_else(|| response.result.get("body_md"))
+            .or_else(|| result.get("body_md"))
             .and_then(Value::as_str)
             .map(str::to_owned);
         let reading = current_ready
             .then(|| {
-                response
-                    .result
+                result
                     .get("reading")
                     .cloned()
                     .and_then(|raw| {
@@ -25118,12 +25482,24 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
                     .filter(|reading| reading.validate().is_ok())
             })
             .flatten();
+        let reading_incompatible = current_ready && reading_present && reading.is_none();
+        let status = if (reading.is_some() || (!reading_present && legacy_summary.is_some()))
+            && matches!(
+                status.as_str(),
+                "queued" | "running" | "processing" | "deferred_provider" | "blocked_config"
+            ) {
+            "ready".to_owned()
+        } else {
+            status
+        };
         readings.insert(
             *release_id,
             GlobalReleaseReadingState {
-                status: response.status,
+                status,
                 reading,
                 legacy_summary,
+                reading_present,
+                reading_incompatible,
             },
         );
     }
@@ -38754,11 +39130,13 @@ body={}
                         path: "src/changed.rs".to_owned(),
                         entry_type: "blob".to_owned(),
                         sha: Some("old-sha".to_owned()),
+                        mode: Some("100644".to_owned()),
                     },
                     GitHubTreeEntry {
                         path: "src/removed.rs".to_owned(),
                         entry_type: "blob".to_owned(),
                         sha: Some("removed-sha".to_owned()),
+                        mode: Some("100644".to_owned()),
                     },
                 ],
                 truncated: false,
@@ -38769,11 +39147,13 @@ body={}
                         path: "src/changed.rs".to_owned(),
                         entry_type: "blob".to_owned(),
                         sha: Some("new-sha".to_owned()),
+                        mode: Some("100644".to_owned()),
                     },
                     GitHubTreeEntry {
                         path: "src/added.rs".to_owned(),
                         entry_type: "blob".to_owned(),
                         sha: Some("added-sha".to_owned()),
+                        mode: Some("100644".to_owned()),
                     },
                 ],
                 truncated: false,
@@ -38822,6 +39202,31 @@ body={}
             "API rate limit exceeded",
         );
         assert_eq!(error.code(), "rate_limited");
+    }
+
+    #[test]
+    fn github_compare_deserializes_snake_case_rest_fields_without_head_commit() {
+        let payload: GitHubCompareResponse = serde_json::from_value(serde_json::json!({
+            "status": "ahead",
+            "ahead_by": 1,
+            "behind_by": 0,
+            "total_commits": 1,
+            "base_commit": {"sha": "base-sha"},
+            "merge_base_commit": {"sha": "merge-sha"},
+            "commits": [{"sha": "head-sha", "commit": {"message": "feat: change"}}],
+            "files": [{"filename": "src/lib.rs", "status": "modified", "additions": 2, "deletions": 1, "changes": 3, "patch": "+new"}]
+        }))
+        .expect("GitHub compare REST payload should deserialize");
+        assert_eq!(payload.ahead_by, Some(1));
+        assert_eq!(
+            payload
+                .base_commit
+                .as_ref()
+                .map(|commit| commit.sha.as_str()),
+            Some("base-sha")
+        );
+        assert_eq!(payload.files[0].changes, Some(3));
+        assert!(validate_github_compare_response(&payload).is_ok());
     }
 
     #[test]
