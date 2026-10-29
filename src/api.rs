@@ -24179,6 +24179,14 @@ fn endpoint_blob_excerpt(content: &str) -> String {
     content.lines().take(24).collect::<Vec<_>>().join("\n")
 }
 
+fn endpoint_tree_blob_read_is_incomplete(
+    entry_present: bool,
+    blob_sha: Option<&str>,
+    content: Option<&str>,
+) -> bool {
+    entry_present && (blob_sha.is_none() || content.is_none())
+}
+
 async fn enrich_endpoint_tree_compare(
     state: &AppState,
     repo_full_name: &str,
@@ -24214,6 +24222,14 @@ async fn enrich_endpoint_tree_compare(
         let after = head.get(&file.filename);
         let before_sha = before.and_then(|entry| entry.0.as_deref());
         let after_sha = after.and_then(|entry| entry.0.as_deref());
+        if (before.is_some() && before_sha.is_none()) || (after.is_some() && after_sha.is_none()) {
+            // A tree entry without a blob SHA cannot be fetched or compared
+            // safely. Keep the file in the audit scope, but do not present a
+            // one-sided patch that could be mistaken for a complete add/remove.
+            enriched.pagination_truncated = true;
+            file.patch = None;
+            continue;
+        }
         if before.and_then(|entry| entry.1.as_deref()) != after.and_then(|entry| entry.1.as_deref())
             && before_sha == after_sha
         {
@@ -24232,6 +24248,22 @@ async fn enrich_endpoint_tree_compare(
             }
             None => None,
         };
+        if endpoint_tree_blob_read_is_incomplete(
+            before.is_some(),
+            before_sha,
+            before_text.as_deref(),
+        ) || endpoint_tree_blob_read_is_incomplete(
+            after.is_some(),
+            after_sha,
+            after_text.as_deref(),
+        ) {
+            // Unsupported encoding, an oversized blob, or invalid UTF-8 is
+            // incomplete evidence, not proof that the file exists on only one
+            // side of the comparison.
+            enriched.pagination_truncated = true;
+            file.patch = None;
+            continue;
+        }
         file.patch = match (before_text, after_text) {
             (Some(before), Some(after)) => Some(format!(
                 "-{}\n+{}",
@@ -39279,6 +39311,26 @@ body={}
         );
         assert_eq!(merged.base_commit.expect("base endpoint").sha, "base-sha");
         assert_eq!(merged.head_commit.expect("head endpoint").sha, "head-sha");
+    }
+
+    #[test]
+    fn endpoint_tree_blob_read_marks_missing_or_unreadable_content_incomplete() {
+        assert!(!super::endpoint_tree_blob_read_is_incomplete(
+            false, None, None
+        ));
+        assert!(super::endpoint_tree_blob_read_is_incomplete(
+            true, None, None
+        ));
+        assert!(super::endpoint_tree_blob_read_is_incomplete(
+            true,
+            Some("blob-sha"),
+            None
+        ));
+        assert!(!super::endpoint_tree_blob_read_is_incomplete(
+            true,
+            Some("blob-sha"),
+            Some("text")
+        ));
     }
 
     #[test]

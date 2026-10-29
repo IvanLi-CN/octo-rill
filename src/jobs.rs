@@ -4119,6 +4119,24 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             }
 
             let message = err.to_string();
+            if task.task_type == TASK_RELEASE_READING_BACKFILL
+                && let Some(run_id) = payload.get("run_id").and_then(Value::as_str)
+                && let Err(cleanup_error) = finish_release_reading_backfill(
+                    state.as_ref(),
+                    &task.id,
+                    run_id,
+                    "failed",
+                    Some("worker_error"),
+                )
+                .await
+            {
+                tracing::error!(
+                    task_id = task.id,
+                    run_id,
+                    ?cleanup_error,
+                    "failed to release release-reading backfill lease after worker error"
+                );
+            }
             let finalized = finalize_task_if_owned(
                 state.as_ref(),
                 &task.id,
@@ -5256,6 +5274,27 @@ async fn finish_release_reading_backfill(
     }))
 }
 
+async fn release_reading_backfill_response_is_current_ready(
+    state: &AppState,
+    response: &content_processing::GlobalSubmissionResponse,
+) -> Result<bool> {
+    if !matches!(
+        response.status.as_str(),
+        "ready" | "completed" | "succeeded"
+    ) || response.result.get("status").and_then(Value::as_str) == Some("incompatible")
+    {
+        return Ok(false);
+    }
+    let work_status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM content_work_items WHERE id = ? LIMIT 1",
+    )
+    .bind(&response.work_item_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("load release reading backfill response work status")?;
+    Ok(work_status.as_deref() == Some("ready"))
+}
+
 async fn execute_release_reading_backfill_task(
     state: &AppState,
     task_id: &str,
@@ -5427,14 +5466,26 @@ async fn execute_release_reading_backfill_task(
             };
             match result {
                 Ok(response)
-                    if matches!(
-                        response.status.as_str(),
-                        "ready" | "completed" | "succeeded"
-                    ) && response.result.get("status").and_then(Value::as_str)
-                        != Some("incompatible") =>
+                    if release_reading_backfill_response_is_current_ready(state, &response)
+                        .await? =>
                 {
                     update_release_reading_backfill_item(state, task_id, &item, "succeeded", None)
                         .await?;
+                }
+                Ok(response)
+                    if matches!(
+                        response.status.as_str(),
+                        "ready" | "completed" | "succeeded"
+                    ) =>
+                {
+                    update_release_reading_backfill_item(
+                        state,
+                        task_id,
+                        &item,
+                        "failed",
+                        Some("stale_result"),
+                    )
+                    .await?;
                 }
                 Ok(response)
                     if matches!(

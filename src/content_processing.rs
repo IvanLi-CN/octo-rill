@@ -827,6 +827,10 @@ fn request_status_for_projection(result: &Value, visible_status: &str) -> String
     }
 }
 
+fn submission_status_for_result(result: &Value, work_status: &str) -> String {
+    request_status_for_projection(result, work_status)
+}
+
 fn active_response(work: &WorkRow, request_id: &str, projection: Option<Value>) -> Value {
     json!({
         "ok": false,
@@ -1265,12 +1269,13 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &current.status);
         return Ok((
             StatusCode::CONFLICT,
             GlobalSubmissionResponse {
                 request_id: request_id.clone(),
                 work_item_id: current.id.clone(),
-                status: current.status.clone(),
+                status: response_status,
                 poll_url: format!("/api/translate/requests/{request_id}"),
                 result,
                 error: Some(json!({
@@ -1474,12 +1479,13 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &current.status);
         return Ok((
             StatusCode::CONFLICT,
             GlobalSubmissionResponse {
                 request_id: request_id.clone(),
                 work_item_id: current.id,
-                status: current.status,
+                status: response_status,
                 poll_url: format!("/api/translate/requests/{request_id}"),
                 result,
                 error: Some(json!({
@@ -1507,13 +1513,14 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &work.status);
         let poll_url = format!("/api/translate/requests/{existing_request_id}");
         return Ok((
             StatusCode::ACCEPTED,
             GlobalSubmissionResponse {
                 request_id: existing_request_id,
                 work_item_id: work.id.clone(),
-                status: work.status.clone(),
+                status: response_status,
                 poll_url,
                 result,
                 error: None,
@@ -1543,10 +1550,11 @@ async fn submit_item_with_admission(
     result["producer_ref"] = Value::String(item.producer_ref.clone());
     result["kind"] = Value::String(item.kind.clone());
     result["variant"] = Value::String(item.variant.clone());
+    let response_status = submission_status_for_result(&result, &work.status);
     let mut body = GlobalSubmissionResponse {
         request_id: request_id.clone(),
         work_item_id: work.id.clone(),
-        status: work.status.clone(),
+        status: response_status,
         poll_url: format!("/api/translate/requests/{request_id}"),
         result,
         error: None,
@@ -9241,6 +9249,10 @@ mod tests {
         let result = json!({"status": "incompatible"});
         assert_eq!(
             request_status_for_projection(&result, "ready"),
+            "incompatible"
+        );
+        assert_eq!(
+            submission_status_for_result(&result, "ready"),
             "incompatible"
         );
         assert_eq!(request_status_for_projection(&json!({}), "ready"), "ready");

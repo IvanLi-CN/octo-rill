@@ -1319,6 +1319,21 @@ struct BriefReleaseChange {
     references: Vec<translations::ReleaseReadingReference>,
 }
 
+fn brief_release_changes_from_reading(
+    reading: &translations::ReleaseReadingResult,
+) -> Vec<BriefReleaseChange> {
+    reading
+        .changes
+        .iter()
+        .map(|change| BriefReleaseChange {
+            text: sanitize_bullet_text(change.text.trim()),
+            versions: change.versions.clone(),
+            references: change.references.clone(),
+        })
+        .filter(|change| !change.text.is_empty())
+        .collect()
+}
+
 #[derive(Debug)]
 struct RepoRendered {
     full_name: String,
@@ -5428,29 +5443,13 @@ async fn load_brief_release_summary_states(
             }
             Some(state) if state.status == "ready" => match state.reading.as_ref() {
                 Some(reading) if reading.is_changes() => {
-                    let bullets = reading
-                        .changes
-                        .iter()
-                        .map(|change| sanitize_bullet_text(change.text.trim()))
-                        .filter(|bullet| !bullet.is_empty())
-                        .take(4)
-                        .collect::<Vec<_>>();
-                    if bullets.is_empty() {
+                    let changes = brief_release_changes_from_reading(reading);
+                    if changes.is_empty() {
                         BriefReleaseSummaryState::Incompatible
                     } else {
                         BriefReleaseSummaryState::Ready {
                             version: reading.version.clone(),
-                            changes: reading
-                                .changes
-                                .iter()
-                                .map(|change| BriefReleaseChange {
-                                    text: sanitize_bullet_text(change.text.trim()),
-                                    versions: change.versions.clone(),
-                                    references: change.references.clone(),
-                                })
-                                .filter(|change| !change.text.is_empty())
-                                .take(4)
-                                .collect(),
+                            changes,
                         }
                     }
                 }
@@ -7710,6 +7709,32 @@ mod tests {
         jobs,
         state::build_oauth_client,
     };
+
+    #[test]
+    fn brief_reading_keeps_all_structured_changes_for_daily_rendering() {
+        let reading = translations::ReleaseReadingResult {
+            version: "v1.2.3".to_owned(),
+            outcome: "changes".to_owned(),
+            title: Some("具体改动".to_owned()),
+            changes: (1..=6)
+                .map(|index| translations::ReleaseReadingChange {
+                    text: format!("变更 {index}"),
+                    versions: vec!["v1.2.3".to_owned()],
+                    references: Vec::new(),
+                })
+                .collect(),
+            machine_materials: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        let changes = brief_release_changes_from_reading(&reading);
+
+        assert_eq!(changes.len(), 6);
+        assert_eq!(
+            changes.last().map(|change| change.text.as_str()),
+            Some("变更 6")
+        );
+    }
 
     #[test]
     fn redacts_common_sensitive_diagnostic_markers() {
