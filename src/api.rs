@@ -20584,10 +20584,18 @@ fn global_release_batch_item_from_snapshot(
         .map(str::to_owned);
     let terminal = matches!(
         status,
-        "ready" | "failed" | "cancelled" | "superseded" | "not_applicable"
+        "ready" | "incompatible" | "failed" | "cancelled" | "superseded" | "not_applicable"
     );
     let (public_status, error) = match status {
         "ready" => ("ready", None),
+        "incompatible" => (
+            "error",
+            result
+                .get("error_summary")
+                .and_then(Value::as_str)
+                .or(Some("translation result is incompatible"))
+                .map(str::to_owned),
+        ),
         "not_applicable" => ("missing", None),
         "failed" | "cancelled" | "superseded" => (
             "error",
@@ -25377,6 +25385,119 @@ pub(crate) struct GlobalReleaseReadingState {
     pub reading_incompatible: bool,
 }
 
+fn release_reading_state_from_result(status: String, result: Value) -> GlobalReleaseReadingState {
+    let current_ready = matches!(status.as_str(), "ready" | "completed" | "succeeded");
+    let reading_present = result.get("reading").is_some();
+    let legacy_summary = result
+        .get("summary_md")
+        .or_else(|| result.get("body_md"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reading = current_ready
+        .then(|| {
+            result
+                .get("reading")
+                .cloned()
+                .and_then(|raw| {
+                    let mut reading =
+                        serde_json::from_value::<translations::ReleaseReadingResult>(raw).ok()?;
+                    reading.normalize_references().ok()?;
+                    Some(reading)
+                })
+                .filter(|reading| reading.validate().is_ok())
+        })
+        .flatten();
+    let reading_incompatible = current_ready && reading_present && reading.is_none();
+    let status = if (reading.is_some() || (!reading_present && legacy_summary.is_some()))
+        && matches!(
+            status.as_str(),
+            "queued" | "running" | "processing" | "deferred_provider" | "blocked_config"
+        ) {
+        "ready".to_owned()
+    } else {
+        status
+    };
+    GlobalReleaseReadingState {
+        status,
+        reading,
+        legacy_summary,
+        reading_present,
+        reading_incompatible,
+    }
+}
+
+async fn read_latest_release_reading_projection_for_user(
+    state: &AppState,
+    user_id: &str,
+    release_id: i64,
+) -> Result<Option<Value>, ApiError> {
+    let (_repo_id, visible_repo, public_release): (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+          r.repo_id,
+          EXISTS(
+            SELECT 1
+            FROM user_release_visible_repos v
+            WHERE v.user_id = ? AND v.repo_id = r.repo_id
+          ),
+          EXISTS(
+            SELECT 1
+            FROM user_release_visible_repos v
+            WHERE v.user_id = ? AND v.repo_id = r.repo_id AND v.is_private = 0
+          ) OR EXISTS(
+            SELECT 1
+            FROM public_repo_release_usage u
+            WHERE u.repo_id = r.repo_id
+              AND u.access_kind IN ('github_public', 'private_owner_published')
+              AND u.last_sync_status <> 'inaccessible'
+          )
+        FROM repo_releases r
+        WHERE r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "release not found"))?;
+    if public_release == 0 && visible_repo == 0 {
+        return Ok(None);
+    }
+    let variant = if public_release != 0 {
+        translations::RELEASE_READING_PUBLIC_VARIANT
+    } else {
+        translations::RELEASE_READING_AUTHORIZED_VARIANT
+    };
+    let payload = if content_identity_upgrade::is_complete(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        sqlx::query_scalar::<_, String>(
+            "SELECT p.payload_json FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id WHERE i.canonical_resource_type = 'release' AND i.canonical_resource_id = ? AND i.pipeline = 'polishing' AND i.variant = ? AND i.target_lang = 'zh-CN' AND i.protocol_version = ? ORDER BY julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1",
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = 'release' AND canonical_resource_id = ? AND pipeline = 'polishing' AND variant = ? AND target_lang = 'zh-CN' AND protocol_version = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    };
+    Ok(payload.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+}
+
 fn legacy_release_smart_source_hash(
     input: &translations::TranslationRequestItemInput,
 ) -> Option<String> {
@@ -25430,16 +25551,20 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
         {
             Ok(input) => input,
             Err(error) if error.code() == RELEASE_READING_EVIDENCE_UNAVAILABLE => {
-                readings.insert(
-                    *release_id,
-                    GlobalReleaseReadingState {
-                        status: "failed".to_owned(),
-                        reading: None,
-                        legacy_summary: None,
-                        reading_present: false,
-                        reading_incompatible: false,
-                    },
-                );
+                let state =
+                    read_latest_release_reading_projection_for_user(state, user_id, *release_id)
+                        .await?
+                        .map(|projection| {
+                            release_reading_state_from_result("ready".to_owned(), projection)
+                        })
+                        .unwrap_or(GlobalReleaseReadingState {
+                            status: "failed".to_owned(),
+                            reading: None,
+                            legacy_summary: None,
+                            reading_present: false,
+                            reading_incompatible: false,
+                        });
+                readings.insert(*release_id, state);
                 continue;
             }
             Err(error) => return Err(error),
@@ -25462,47 +25587,9 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
         };
         let (status, result) =
             legacy_projection.unwrap_or_else(|| (response.status.clone(), response.result.clone()));
-        let current_ready = matches!(status.as_str(), "ready" | "completed" | "succeeded");
-        let reading_present = result.get("reading").is_some();
-        let legacy_summary = result
-            .get("summary_md")
-            .or_else(|| result.get("body_md"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let reading = current_ready
-            .then(|| {
-                result
-                    .get("reading")
-                    .cloned()
-                    .and_then(|raw| {
-                        let mut reading =
-                            serde_json::from_value::<translations::ReleaseReadingResult>(raw)
-                                .ok()?;
-                        reading.normalize_references().ok()?;
-                        Some(reading)
-                    })
-                    .filter(|reading| reading.validate().is_ok())
-            })
-            .flatten();
-        let reading_incompatible = current_ready && reading_present && reading.is_none();
-        let status = if (reading.is_some() || (!reading_present && legacy_summary.is_some()))
-            && matches!(
-                status.as_str(),
-                "queued" | "running" | "processing" | "deferred_provider" | "blocked_config"
-            ) {
-            "ready".to_owned()
-        } else {
-            status
-        };
         readings.insert(
             *release_id,
-            GlobalReleaseReadingState {
-                status,
-                reading,
-                legacy_summary,
-                reading_present,
-                reading_incompatible,
-            },
+            release_reading_state_from_result(status, result),
         );
     }
     Ok(readings)
@@ -36693,6 +36780,20 @@ mod tests {
         let json = serde_json::to_value(response).expect("serialize response");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("ready"));
         assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("标题"));
+    }
+
+    #[test]
+    fn global_release_batch_item_treats_incompatible_as_terminal_error() {
+        let (terminal, item) = super::global_release_batch_item_from_snapshot(
+            1,
+            &json!({
+                "status": "incompatible",
+                "result": {"error_summary": "阅读内容格式不兼容"}
+            }),
+        );
+        assert!(terminal);
+        assert_eq!(item.status, "error");
+        assert!(item.error.is_some());
     }
 
     #[test]

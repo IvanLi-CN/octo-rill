@@ -6260,6 +6260,7 @@ async fn upsert_daily_brief_snapshot(
     window: &UserDailyWindow,
     built: &BuiltBriefContent,
     generation_source: &str,
+    allow_existing_refresh: bool,
 ) -> Result<StoredBrief> {
     #[derive(Debug, sqlx::FromRow)]
     struct UpsertedBriefRow {
@@ -6279,13 +6280,14 @@ async fn upsert_daily_brief_snapshot(
     let window_start = window.start_utc.to_rfc3339();
     let window_end = window.end_utc.to_rfc3339();
     let date = window.display_date.clone();
-    if let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
-        &state.pool,
-        user_id,
-        &window_start,
-        &window_end,
-    )
-    .await?
+    if allow_existing_refresh
+        && let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
+            &state.pool,
+            user_id,
+            &window_start,
+            &window_end,
+        )
+        .await?
     {
         let (_sqlite_write, mut tx) = state
             .sqlite_writer
@@ -7113,6 +7115,7 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     }
 
+    let had_existing_snapshot = existing_id.is_some();
     let brief_id = existing_id.unwrap_or_else(local_id::generate_local_id);
     let mut context = current_llm_call_context().unwrap_or(LlmCallContext {
         source: "daily_brief.polish".to_owned(),
@@ -7124,7 +7127,16 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
     });
     context.parent_brief_id = Some(brief_id.clone());
     let built = with_llm_call_context(context, build_brief_content(state, window, user_id)).await?;
-    upsert_daily_brief_snapshot(state, user_id, &brief_id, window, &built, generation_source).await
+    upsert_daily_brief_snapshot(
+        state,
+        user_id,
+        &brief_id,
+        window,
+        &built,
+        generation_source,
+        had_existing_snapshot,
+    )
+    .await
 }
 
 pub async fn generate_daily_brief_snapshot_for_key_date(
@@ -11590,6 +11602,7 @@ mod tests {
             &window,
             &built,
             "manual",
+            true,
         )
         .await
         .expect("refresh existing snapshot");
@@ -11736,6 +11749,7 @@ mod tests {
             &window,
             &built,
             "manual",
+            true,
         )
         .await
         .expect("normalize legacy placeholder");

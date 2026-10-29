@@ -21,7 +21,7 @@
 
 ## Verification
 
-- `cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 和 `cargo test --locked --all-targets`（1201 passed、3 ignored）已通过；证据不可用、compare 响应完整性、固定端点 tree/blob 差异、429 限流分类、受控 PR 引用、分页/分叉比较、非语义标签祖先、回填租约、失败重试窗口、删除目标失败计数、删除 waiting 目标后的计数恢复、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
+- `cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 和 `cargo test --locked --all-targets`（1202 passed、3 ignored）已通过；证据不可用时保留同 audience 的旧有效投影、compare 响应完整性、固定端点 tree/blob 差异、429 限流分类、受控 PR/安全引用、分页/分叉比较、非语义标签祖先、回填租约、失败重试窗口、删除目标失败计数、删除 waiting 目标后的计数恢复、日报首次生成并发保护、批量 incompatible 终态、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
 - `bun run build`、`bun run lint` 和 Storybook 测试已通过；桌面/移动 Storybook 元素证据已保存到 `assets/`，提交门禁为 `owner-approved`。
 - 两个授权账号、私有公开发布切换、GitHub 403/429 和完整回填替换仍属于合并前集成验证；当前 head 需等待新的 CI 与 Tier 4 正式审查结果。
 

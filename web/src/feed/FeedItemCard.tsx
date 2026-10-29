@@ -357,7 +357,8 @@ function ReleaseReadingContent(props: { reading: ReleaseReading }) {
 									rel="noreferrer"
 									target="_blank"
 								>
-									{`PR#${reference.number}`}
+									{reference.label ??
+										(reference.number ? `PR#${reference.number}` : "查看")}
 								</a>
 							))}
 							{versions ? (
