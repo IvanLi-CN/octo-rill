@@ -2944,17 +2944,19 @@ pub async fn admin_enqueue_release_reading_backfill(
     let task_id = jobs::enqueue_release_reading_backfill_if_needed(state.as_ref())
         .await
         .map_err(ApiError::internal)?;
-    let status = if task_id.is_some() {
-        "queued".to_owned()
-    } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT status FROM release_reading_backfill_runs ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        .unwrap_or_else(|| "idle".to_owned())
-    };
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM release_reading_backfill_runs ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .unwrap_or_else(|| {
+        if task_id.is_some() {
+            "queued".to_owned()
+        } else {
+            "idle".to_owned()
+        }
+    });
     Ok(Json(AdminReleaseReadingBackfillResponse {
         task_id,
         status,

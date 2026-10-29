@@ -740,6 +740,7 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
                 .ok()
                 .and_then(|mut reading| {
                     reading.normalize_references().ok()?;
+                    reading.validate().ok()?;
                     reading.evidence.clear();
                     serde_json::to_value(reading).ok()
                 });
@@ -772,6 +773,23 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
             Value::String("Release reading result is incompatible".to_owned());
     }
     result
+}
+
+fn release_request_variant_is_current(
+    work: &WorkRow,
+    canonical_item: &translations::TranslationRequestItemInput,
+) -> bool {
+    if work.canonical_resource_type != "release"
+        || work.pipeline != "polishing"
+        || !matches!(
+            work.variant.as_str(),
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+                | translations::RELEASE_READING_PUBLIC_VARIANT
+        )
+    {
+        return true;
+    }
+    work.variant == canonical_item.variant
 }
 
 fn kind_for_work(work: &WorkRow) -> String {
@@ -1617,7 +1635,15 @@ pub async fn get_request(
         source_blocks: Vec::new(),
         target_slots: Vec::new(),
     };
-    api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
+    let canonical_item =
+        api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
+    if !release_request_variant_is_current(&work, &canonical_item) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "translation request is no longer available for this audience",
+        ));
+    }
     let identity_upgrade_complete = content_identity_upgrade::is_complete(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -5332,7 +5358,9 @@ mod tests {
     use crate::observability::LoggingThresholds;
     use crate::session_store::{CoordinatedSessionLayer, CoordinatedSqliteSessionStore};
     use crate::state::{build_oauth_client, build_webauthn};
-    use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
+    use crate::translations::{
+        TranslationRequestItemInput, TranslationRuntimeConfig, TranslationSchedulerController,
+    };
     use axum::{
         Router,
         body::Body,
@@ -9145,6 +9173,74 @@ mod tests {
         )
         .expect("bodyless detail output is valid");
         assert_eq!(output["body_md"], Value::Null);
+    }
+
+    fn release_reading_work(variant: &str) -> WorkRow {
+        WorkRow {
+            id: "reading-work".to_owned(),
+            canonical_resource_type: "release".to_owned(),
+            canonical_resource_id: "release-1".to_owned(),
+            pipeline: "polishing".to_owned(),
+            variant: variant.to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            source_hash: "source-hash".to_owned(),
+            protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+            model_profile: "test-model".to_owned(),
+            source_snapshot_json: "{}".to_owned(),
+            configuration_fingerprint: "test-fingerprint".to_owned(),
+            status: "ready".to_owned(),
+            priority: 0,
+            cache_hit: 0,
+            token_estimate: 1,
+            batch_id: None,
+            attempt_count: 0,
+            next_retry_at: None,
+            retry_expires_at: None,
+            retry_after_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            lease_owner: None,
+            lease_expires_at: None,
+            attempt_configuration_snapshot_json: None,
+            attempt_route_snapshot_json: None,
+            attempt_configuration_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn request_result_marks_semantically_invalid_reading_incompatible() {
+        let work = release_reading_work(translations::RELEASE_READING_PUBLIC_VARIANT);
+        let result = request_result(
+            &work,
+            Some(json!({
+                "reading": {
+                    "version": "v1.0.0",
+                    "outcome": "changes",
+                    "changes": [],
+                    "machine_materials": [],
+                    "evidence": []
+                }
+            })),
+        );
+
+        assert_eq!(result["status"], "incompatible");
+        assert_eq!(result["error_code"], "reading_incompatible");
+        assert!(result["reading"].is_null());
+    }
+
+    #[test]
+    fn release_request_variant_must_match_current_audience() {
+        let work = release_reading_work(translations::RELEASE_READING_AUTHORIZED_VARIANT);
+        let public_item = TranslationRequestItemInput {
+            producer_ref: "test".to_owned(),
+            kind: "release_smart".to_owned(),
+            variant: translations::RELEASE_READING_PUBLIC_VARIANT.to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: Vec::new(),
+            target_slots: Vec::new(),
+        };
+        assert!(!release_request_variant_is_current(&work, &public_item));
     }
 
     #[test]

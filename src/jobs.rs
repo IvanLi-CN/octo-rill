@@ -5090,6 +5090,34 @@ async fn update_release_reading_backfill_item(
     .await
     .context("persist release reading backfill item state")?;
     if updated.rows_affected() == 0 {
+        let lease_is_owned = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM release_reading_backfill_runs WHERE id = ? AND status = 'running' AND lease_owner = ? AND lease_task_id = ?)",
+        )
+        .bind(&item.run_id)
+        .bind(state.runtime_owner_id.as_str())
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("check release reading backfill lease after missing item")?
+            != 0;
+        let item_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM release_reading_backfill_items WHERE run_id = ? AND release_id = ?)",
+        )
+        .bind(&item.run_id)
+        .bind(item.release_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("check release reading backfill item after missing item")?
+            != 0;
+        if lease_is_owned && !item_exists {
+            // A concurrent repo-release delete cascaded the target row. Keep
+            // the run lease and let the terminal sweep account for the missing
+            // target as failed instead of wedging the run until lease expiry.
+            tx.commit()
+                .await
+                .context("commit deleted release reading backfill target")?;
+            return Ok(());
+        }
         tx.rollback().await.ok();
         return Err(anyhow!("release reading backfill lease lost"));
     }
@@ -5400,7 +5428,8 @@ async fn execute_release_reading_backfill_task(
                     if matches!(
                         response.status.as_str(),
                         "ready" | "completed" | "succeeded"
-                    ) =>
+                    ) && response.result.get("status").and_then(Value::as_str)
+                        != Some("incompatible") =>
                 {
                     update_release_reading_backfill_item(state, task_id, &item, "succeeded", None)
                         .await?;
@@ -7060,22 +7089,22 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE,
-        SMART_NO_VALUABLE_VERSION_INFO, STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX,
-        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
-        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy,
-        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
-        TASK_RELEASE_READING_BACKFILL, TASK_RETRY_RECENT_FAILURES,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
-        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
-        current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
-        current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
-        dispatch_scheduled_task_atomic, enqueue_brief_history_recompute_if_needed,
-        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        enqueue_recent_failures_retry_if_due, enqueue_release_reading_backfill_if_needed,
-        enqueue_singleton_task_for_requester,
+        NewTask, ReleaseReadingBackfillItemRow, RetryTranslationCandidateRow,
+        SCHEDULER_DISPATCH_LANE, SMART_NO_VALUABLE_VERSION_INFO,
+        STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX, STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX,
+        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
+        SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy, TASK_BRIEF_DAILY_SLOT,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RELEASE_READING_BACKFILL,
+        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
+        TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
+        TASK_SYNC_SUBSCRIPTIONS, TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT,
+        TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor, cancel_task,
+        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
+        current_star_sync_delta_schedule_key, current_subscription_schedule_key,
+        defer_task_after_sqlite_write_backpressure, dispatch_scheduled_task_atomic,
+        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
+        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
+        enqueue_release_reading_backfill_if_needed, enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
@@ -7088,7 +7117,8 @@ mod tests {
         reschedule_task_if_owned, reset_release_reading_backfill_run_after_backpressure,
         retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
-        update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
+        update_daily_brief_hour_slot_dispatch, update_release_reading_backfill_item,
+        upsert_dispatch_state,
     };
     use axum::body::to_bytes;
     use chrono::{Duration, NaiveTime, TimeZone, Utc};
@@ -11956,6 +11986,117 @@ mod tests {
                 .expect("load deleted target backfill");
         assert_eq!(status, "failed");
         assert_eq!(failed, 2);
+    }
+
+    #[tokio::test]
+    async fn release_reading_backfill_missing_target_keeps_owned_lease_until_finish() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped,
+              lease_owner, lease_task_id, lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', 1, 0, 0, 0, 0, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("backfill-missing-target")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind(state.runtime_owner_id.as_str())
+        .bind("task-missing-target")
+        .bind("2099-10-27T00:01:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed missing-target backfill");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-missing-target")
+        .bind(720_i64)
+        .bind(7201_i64)
+        .bind("node-missing-target")
+        .bind("v7.2.1")
+        .bind("missing target")
+        .bind("body")
+        .bind("https://github.com/octo/missing-target/releases/tag/v7.2.1")
+        .bind("2026-10-01T00:00:00Z")
+        .bind("2026-10-01T00:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind("2026-10-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed missing-target release");
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_items (
+              run_id, release_id, authorized_user_id, published_at, status, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?)
+            "#,
+        )
+        .bind("backfill-missing-target")
+        .bind(7201_i64)
+        .bind(Option::<String>::None)
+        .bind("2026-10-01T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed missing-target item");
+        sqlx::query("DELETE FROM repo_releases WHERE release_id = ?")
+            .bind(7201_i64)
+            .execute(&pool)
+            .await
+            .expect("delete release and cascade missing target item");
+
+        let item = ReleaseReadingBackfillItemRow {
+            run_id: "backfill-missing-target".to_owned(),
+            release_id: 7201,
+            authorized_user_id: None,
+            published_at: "2026-10-01T00:00:00Z".to_owned(),
+        };
+        update_release_reading_backfill_item(
+            state.as_ref(),
+            "task-missing-target",
+            &item,
+            "failed",
+            Some("target_release_deleted"),
+        )
+        .await
+        .expect("missing target is accounted at terminal sweep");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM release_reading_backfill_runs WHERE id = ?")
+                .bind("backfill-missing-target")
+                .fetch_one(&pool)
+                .await
+                .expect("load missing-target run");
+        assert_eq!(status, "running");
+        finish_release_reading_backfill(
+            state.as_ref(),
+            "task-missing-target",
+            "backfill-missing-target",
+            "failed",
+            Some("target_release_deleted"),
+        )
+        .await
+        .expect("finish missing-target backfill");
+        let failed: i64 =
+            sqlx::query_scalar("SELECT failed FROM release_reading_backfill_runs WHERE id = ?")
+                .bind("backfill-missing-target")
+                .fetch_one(&pool)
+                .await
+                .expect("load missing-target failure count");
+        assert_eq!(failed, 1);
     }
 
     #[tokio::test]

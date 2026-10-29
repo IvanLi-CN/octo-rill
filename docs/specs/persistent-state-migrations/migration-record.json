@@ -13,8 +13,8 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0101 before listener bind",
-      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox, admin realtime task query indexes, and the recent subscription sync task index",
+      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0104 before listener bind",
+      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox, admin realtime task query indexes, recent subscription sync task index, and Release reading backfill state",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
     }
@@ -119,6 +119,36 @@
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 101,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 102,
+        "file": "migrations/0102_release_reading_backfill.sql",
+        "definition_checksum": "48e62912565706077596648ccfb96f6a760123b6040e05056d9d67d2e0fb4ee3",
+        "description": "Create the fixed-window Release reading backfill run and target tables with bounded cursor indexes and cascading target cleanup.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 102,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 103,
+        "file": "migrations/0103_release_reading_backfill_recovery.sql",
+        "definition_checksum": "4e9226c04aee2f5d42593a278800caf4eeea460958f6fbf192f58ad9bb9e8f55",
+        "description": "Index Release reading backfill targets by release for bounded deletion and recovery checks.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 103,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 104,
+        "file": "migrations/0104_release_reading_backfill_task_fence.sql",
+        "definition_checksum": "d559ef5899a76cf24a9c486566efad3fd7a1f1c6b2a06a320dc191115fcca813",
+        "description": "Add task-level lease fencing to Release reading backfill runs so retries and worker ownership are unambiguous.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 104,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],
