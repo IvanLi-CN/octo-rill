@@ -3094,6 +3094,81 @@ async fn prepare_release_reading_backfill_manual_retry(
     Ok(())
 }
 
+async fn cancel_queued_release_reading_backfill(
+    state: &AppState,
+    task_id: &str,
+    now: &str,
+) -> Result<bool> {
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_reading_backfill_cancel_queued",
+            SqliteWritePriority::Foreground,
+        )
+        .await
+        .context("begin queued release reading backfill cancellation")?;
+    let Some(payload_json) = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json FROM job_tasks WHERE id = ? AND task_type = ? AND status = ? LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(TASK_RELEASE_READING_BACKFILL)
+    .bind(STATUS_QUEUED)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load queued release reading backfill task")?
+    else {
+        tx.commit()
+            .await
+            .context("commit skipped queued release reading backfill cancellation")?;
+        return Ok(false);
+    };
+    let run_id = serde_json::from_str::<Value>(&payload_json)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("run_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let canceled = sqlx::query(
+        r#"
+        UPDATE job_tasks
+        SET status = ?, cancel_requested = 1, finished_at = ?, updated_at = ?
+        WHERE id = ? AND status = ? AND task_type = ?
+        "#,
+    )
+    .bind(STATUS_CANCELED)
+    .bind(now)
+    .bind(now)
+    .bind(task_id)
+    .bind(STATUS_QUEUED)
+    .bind(TASK_RELEASE_READING_BACKFILL)
+    .execute(&mut *tx)
+    .await
+    .context("cancel queued release reading backfill task")?;
+    if canceled.rows_affected() == 0 {
+        tx.commit()
+            .await
+            .context("commit raced queued release reading backfill cancellation")?;
+        return Ok(false);
+    }
+    if let Some(run_id) = run_id {
+        sqlx::query(
+            "UPDATE release_reading_backfill_runs SET status = 'paused', error_text = 'cancel_requested', lease_owner = NULL, lease_task_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting', 'paused')",
+        )
+        .bind(now)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .context("pause queued release reading backfill run")?;
+    }
+    tx.commit()
+        .await
+        .context("commit queued release reading backfill cancellation")?;
+    Ok(true)
+}
+
 pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
     let now = Utc::now().to_rfc3339();
 
@@ -3130,6 +3205,17 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
         return Ok(STATUS_QUEUED.to_owned());
     }
 
+    if cancel_queued_release_reading_backfill(state, task_id, now.as_str()).await? {
+        append_task_event(
+            state,
+            task_id,
+            "task.canceled",
+            json!({"task_id": task_id, "status": STATUS_CANCELED}),
+        )
+        .await?;
+        return Ok(STATUS_CANCELED.to_owned());
+    }
+
     let canceled_queued = state
         .sqlite_writer
         .write_foreground("job_task_cancel_queued", |_| async {
@@ -3138,7 +3224,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
                     UPDATE job_tasks
                     SET status = ?, cancel_requested = 1, finished_at = ?, updated_at = ?
                     WHERE id = ? AND status = ?
-                      AND task_type NOT IN (?, ?)
+                      AND task_type NOT IN (?, ?, ?)
                     "#,
             )
             .bind(STATUS_CANCELED)
@@ -3148,6 +3234,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(STATUS_QUEUED)
             .bind(TASK_WEBHOOK_PUSH_MANAGE)
             .bind(TASK_WEBHOOK_PUSH_AUDIT)
+            .bind(TASK_RELEASE_READING_BACKFILL)
             .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to cancel queued task")
@@ -5228,18 +5315,30 @@ async fn finish_release_reading_backfill(
         .fetch_one(&mut *tx)
         .await
         .context("load release reading backfill counters")?;
-        let accounted = counts
-            .0
-            .max(run_counts.1 + run_counts.2 + run_counts.3 + run_counts.4);
-        let missing = (run_counts.0 - accounted).max(0);
+        let accounted_before_delete = run_counts.1 + run_counts.2 + run_counts.3 + run_counts.4;
+        let missing = (run_counts.0
+            - if counts.0 > 0 {
+                counts.0
+            } else {
+                accounted_before_delete
+            })
+        .max(0);
+        let (succeeded, failed, waiting, skipped) = if counts.0 > 0 {
+            (counts.1, counts.2 + missing, counts.3, counts.4)
+        } else {
+            (0, run_counts.2 + missing, 0, 0)
+        };
         sqlx::query(
             r#"
             UPDATE release_reading_backfill_runs
-            SET failed = failed + ?
+            SET succeeded = ?, failed = ?, waiting = ?, skipped = ?
             WHERE id = ?
             "#,
         )
-        .bind(missing)
+        .bind(succeeded)
+        .bind(failed)
+        .bind(waiting)
+        .bind(skipped)
         .bind(run_id)
         .execute(&mut *tx)
         .await
@@ -12031,14 +12130,79 @@ mod tests {
         .await
         .expect("finish deleted target backfill");
 
-        let (status, failed): (String, i64) =
-            sqlx::query_as("SELECT status, failed FROM release_reading_backfill_runs WHERE id = ?")
-                .bind("backfill-deleted-targets")
-                .fetch_one(&pool)
-                .await
-                .expect("load deleted target backfill");
+        let (status, failed, waiting): (String, i64, i64) = sqlx::query_as(
+            "SELECT status, failed, waiting FROM release_reading_backfill_runs WHERE id = ?",
+        )
+        .bind("backfill-deleted-targets")
+        .fetch_one(&pool)
+        .await
+        .expect("load deleted target backfill");
         assert_eq!(status, "failed");
         assert_eq!(failed, 2);
+        assert_eq!(waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_release_reading_backfill_pauses_its_run() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-10-27T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO release_reading_backfill_runs (
+              id, started_at, window_start_utc, window_end_utc, status,
+              total, succeeded, failed, waiting, skipped, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'queued', 1, 0, 0, 0, 0, ?, ?)
+            "#,
+        )
+        .bind("backfill-cancel-queued")
+        .bind(now)
+        .bind("2026-09-27T00:00:00Z")
+        .bind("2026-10-27T00:00:00Z")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed queued backfill run");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, created_at, updated_at
+            ) VALUES (?, ?, 'queued', 'admin', ?, ?, ?)
+            "#,
+        )
+        .bind("task-cancel-queued-backfill")
+        .bind(TASK_RELEASE_READING_BACKFILL)
+        .bind(json!({"run_id": "backfill-cancel-queued"}).to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed queued backfill task");
+
+        assert_eq!(
+            cancel_task(state.as_ref(), "task-cancel-queued-backfill")
+                .await
+                .expect("cancel queued backfill"),
+            STATUS_CANCELED
+        );
+        let (task_status, run_status, error_text): (String, String, Option<String>) =
+            sqlx::query_as(
+                r#"
+                SELECT t.status, r.status, r.error_text
+                FROM job_tasks t
+                JOIN release_reading_backfill_runs r
+                  ON json_extract(t.payload_json, '$.run_id') = r.id
+                WHERE t.id = ?
+                "#,
+            )
+            .bind("task-cancel-queued-backfill")
+            .fetch_one(&pool)
+            .await
+            .expect("load canceled queued backfill");
+        assert_eq!(task_status, STATUS_CANCELED);
+        assert_eq!(run_status, "paused");
+        assert_eq!(error_text.as_deref(), Some("cancel_requested"));
     }
 
     #[tokio::test]

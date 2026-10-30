@@ -2724,7 +2724,7 @@ pub async fn resolve_translation_results(
                     .await?
             };
             if req.retry_on_error
-                && response.status == "ready"
+                && matches!(response.status.as_str(), "ready" | "incompatible")
                 && matches!(
                     item.variant.as_str(),
                     RELEASE_READING_AUTHORIZED_VARIANT | RELEASE_READING_PUBLIC_VARIANT

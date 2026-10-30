@@ -24510,6 +24510,7 @@ async fn prepare_release_reading_evidence(
                     == release_tag_family_prefix(&candidate.tag_name).as_deref()
         });
         candidates.sort_by(|left, right| release_sort_key(right).cmp(&release_sort_key(left)));
+        let mut candidate_compare_error = None;
         for candidate in candidates {
             match if request.public_only {
                 fetch_release_compare_snapshot_request(
@@ -24537,8 +24538,25 @@ async fn prepare_release_reading_evidence(
                     verified_snapshot = Some(snapshot);
                     break;
                 }
-                _ => continue,
+                Ok(_) => continue,
+                Err(error) => candidate_compare_error = Some(error),
             };
+        }
+        if baseline.is_none()
+            && let Some(error) = candidate_compare_error
+        {
+            return Ok((
+                format!(
+                    "Compare evidence is unavailable while verifying a lower baseline for {} ({}). Keep the Release reading pending or failed; do not infer a change.",
+                    request.tag_name,
+                    error.code()
+                ),
+                vec![translations::ReleaseReadingEvidence {
+                    kind: "compare_unavailable".to_owned(),
+                    reference: request.tag_name.to_owned(),
+                    scope: Some(error.code().to_owned()),
+                }],
+            ));
         }
     }
     let Some(baseline) = baseline else {
