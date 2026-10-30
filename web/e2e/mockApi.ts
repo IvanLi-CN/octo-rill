@@ -33,6 +33,19 @@ export function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
+export function mockUnavailableDashboardReadableFeed(route: Route) {
+	return json(
+		route,
+		{
+			error: {
+				code: "release_reading_evidence_unavailable",
+				message: "Release compare evidence is not ready",
+			},
+		},
+		503,
+	);
+}
+
 type MockUser = {
 	id: string;
 	github_user_id: number;

@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 
-import { buildMockMeResponse, json } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 test.describe.configure({ mode: "serial" });
 
@@ -434,6 +438,10 @@ test("dashboard live updates re-baselines when inbox polling is enabled later", 
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

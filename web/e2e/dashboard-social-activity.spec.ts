@@ -1,6 +1,10 @@
 import { type Locator, type Page, expect, test } from "@playwright/test";
 
-import { buildMockMeResponse, json } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 function socialPrimaryDesktop(page: Locator | Page, text: string) {
 	return page
@@ -1128,6 +1132,10 @@ test("switching social tabs clears stale feed items before the next dataset reso
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

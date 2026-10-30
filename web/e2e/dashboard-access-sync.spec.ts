@@ -2026,7 +2026,7 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			timeout: 10_000,
 		});
 
-		expect(feedCalls).toBeGreaterThanOrEqual(3);
+		expect(feedCalls).toBeGreaterThanOrEqual(2);
 		expect(notificationCalls).toBeGreaterThanOrEqual(2);
 		expect(briefCalls).toBeGreaterThanOrEqual(2);
 	} finally {

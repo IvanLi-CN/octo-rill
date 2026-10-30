@@ -1,6 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { buildMockMeResponse, json } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 const TWO_LINE_REPO = "acme/release-notes-for-mobile";
 const EXTREME_REPO =
@@ -52,6 +56,10 @@ async function installMocks(page: Page) {
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (request.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (request.method() === "GET" && pathname === "/api/feed") {
