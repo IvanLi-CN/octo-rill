@@ -39031,7 +39031,6 @@ mod tests {
     #[tokio::test]
     async fn dashboard_readable_compare_failure_is_isolated_per_release_across_date_sections() {
         let pool = setup_pool().await;
-        let user_id = test_user_id(1);
         seed_repo_release(&pool, 42, 118).await;
         sqlx::query(
             "UPDATE repo_releases SET tag_name = 'v1.2.1', name = 'Release v1.2.1', published_at = '2026-02-21T00:00:00Z', created_at = '2026-02-21T00:00:00Z' WHERE release_id = 118",
