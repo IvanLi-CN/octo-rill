@@ -2511,12 +2511,20 @@ test("failed access sync settles while the readable feed request is still pendin
 	page,
 }) => {
 	let markReadableRequestStarted: (() => void) | null = null;
-	let releaseReadableRequests: (() => void) | null = null;
+	let releaseInitialReadableRequest: (() => void) | null = null;
+	let markReplacementReadableRequestStarted: (() => void) | null = null;
+	let releaseReplacementReadableRequests: (() => void) | null = null;
 	const readableRequestStarted = new Promise<void>((resolve) => {
 		markReadableRequestStarted = resolve;
 	});
-	const readableRequestGate = new Promise<void>((resolve) => {
-		releaseReadableRequests = resolve;
+	const initialReadableRequestGate = new Promise<void>((resolve) => {
+		releaseInitialReadableRequest = resolve;
+	});
+	const replacementReadableRequestStarted = new Promise<void>((resolve) => {
+		markReplacementReadableRequestStarted = resolve;
+	});
+	const replacementReadableRequestGate = new Promise<void>((resolve) => {
+		releaseReplacementReadableRequests = resolve;
 	});
 	let feedCalls = 0;
 
@@ -2619,7 +2627,30 @@ test("failed access sync settles while the readable feed request is still pendin
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
 			markReadableRequestStarted?.();
-			await readableRequestGate;
+			if (feedCalls === 1) {
+				await initialReadableRequestGate;
+				return json(route, {
+					sections: [
+						{
+							id: "2026-04-09",
+							date: "2026-04-09",
+							kind: "raw",
+							item_count: 1,
+							brief: null,
+							items: [
+								buildReleaseFeedItem("failure-pending-item", {
+									title: "Stale response after failure",
+								}),
+							],
+							items_next_cursor: null,
+							supplemental_items: [],
+						},
+					],
+					next_cursor: null,
+				});
+			}
+			markReplacementReadableRequestStarted?.();
+			await replacementReadableRequestGate;
 			return json(route, {
 				sections: [
 					{
@@ -2706,12 +2737,18 @@ test("failed access sync settles while the readable feed request is still pendin
 			)
 			.toBe(0);
 		expect(feedCalls).toBeGreaterThanOrEqual(1);
-		releaseReadableRequests?.();
+		await replacementReadableRequestStarted;
+		expect(feedCalls).toBeGreaterThanOrEqual(2);
+		releaseReplacementReadableRequests?.();
 		await expect(page.getByText("Fresh after failure")).toBeVisible({
 			timeout: 8000,
 		});
+		releaseInitialReadableRequest?.();
+		await expect(page.getByText("Stale response after failure")).toHaveCount(0);
+		await expect(page.getByText("Fresh after failure")).toBeVisible();
 	} finally {
-		releaseReadableRequests?.();
+		releaseInitialReadableRequest?.();
+		releaseReplacementReadableRequests?.();
 	}
 });
 

@@ -185,12 +185,11 @@ export function useDashboardReadableSections(options?: {
 	const cursorCompletedRef = useRef(new Set<string>());
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
-	const clearContent = useCallback(() => {
+	const clearSectionData = useCallback((loadingInitial: boolean) => {
 		contentWriteGenerationRef.current += 1;
 		lifecycleGenerationRef.current += 1;
 		requestIdRef.current += 1;
 		refreshPriorityRef.current += 1;
-		legacyFallbackRef.current = false;
 		refreshInFlightRef.current = false;
 		cursorInFlightRef.current.clear();
 		cursorCompletedRef.current.clear();
@@ -200,13 +199,25 @@ export function useDashboardReadableSections(options?: {
 		detailsRef.current = {};
 		setSections([]);
 		setNextCursor(null);
-		setLoadingInitial(true);
+		setLoadingInitial(loadingInitial);
 		setLoadingRefresh(false);
 		setLoadingMore(false);
 		setError(null);
-		setLegacyFallback(false);
 		setDetails({});
 	}, []);
+	const clearContent = useCallback(
+		(options?: { preserveLegacyFallback?: boolean }) => {
+			const preserveLegacyFallback = options?.preserveLegacyFallback ?? false;
+			clearSectionData(!preserveLegacyFallback);
+			legacyFallbackRef.current = preserveLegacyFallback;
+			setLegacyFallback(preserveLegacyFallback);
+		},
+		[clearSectionData],
+	);
+	const clearContentPreservingMode = useCallback(
+		() => clearSectionData(false),
+		[clearSectionData],
+	);
 
 	const loadSections = useCallback(
 		async (
@@ -345,6 +356,13 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
+				if (
+					cause instanceof ApiError &&
+					(cause.status === 401 || cause.status === 403)
+				) {
+					clearContent();
+					setLoadingInitial(false);
+				}
 				const description = describeNetworkAwareError(
 					cause,
 					"可读动态加载失败，请稍后重试。",
@@ -364,7 +382,7 @@ export function useDashboardReadableSections(options?: {
 				}
 			}
 		},
-		[],
+		[clearContent],
 	);
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
@@ -719,6 +737,7 @@ export function useDashboardReadableSections(options?: {
 		details: visibleDetails,
 		stats,
 		clearContent,
+		clearContentPreservingMode,
 		loadInitial,
 		refresh,
 		loadMore,

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { apiGet } from "@/api";
+import { ApiError, apiGet } from "@/api";
 import {
 	buildDashboardScopeSignature,
 	type DashboardScope,
@@ -37,7 +37,14 @@ export type FeedLoadError = {
 	kind: NetworkErrorKind;
 	detail: string | null;
 	at: number;
+	authorizationDenied: boolean;
 };
+
+function isAuthorizationDenied(error: unknown) {
+	return (
+		error instanceof ApiError && (error.status === 401 || error.status === 403)
+	);
+}
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -173,21 +180,52 @@ export function useFeed(
 			}),
 		[scopeSignature, type, userId, viewerStateKey],
 	);
+	const clearCachedFeedContent = useCallback(() => {
+		queryClient.setQueryData<DashboardFeedQueryData>(queryKey, {
+			type,
+			scopeSignature,
+			items: [],
+			nextCursor: null,
+		});
+		queryClient.setQueriesData<DashboardFeedQueryData>(
+			{ queryKey: ["dashboard", "feed", { userId }] },
+			(current) =>
+				current ? { ...current, items: [], nextCursor: null } : current,
+		);
+	}, [queryClient, queryKey, scopeSignature, type, userId]);
 	const initialStateMatches = initialData?.type === type;
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [appendError, setAppendError] = useState<FeedLoadError | null>(null);
+	const [authorizationDenied, setAuthorizationDenied] = useState<{
+		queryKey: string;
+		error: ApiError;
+	} | null>(null);
+	const queryKeySignature = JSON.stringify(queryKey);
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
 		enabled,
+		retry: (failureCount, error) =>
+			!isAuthorizationDenied(error) && failureCount < 1,
 		queryFn: async ({ signal }) => {
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
-			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
-				signal,
-			});
+			let res: FeedResponse;
+			try {
+				res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
+					signal,
+				});
+				setAuthorizationDenied((current) =>
+					current?.queryKey === queryKeySignature ? null : current,
+				);
+			} catch (error) {
+				if (error instanceof ApiError && isAuthorizationDenied(error)) {
+					setAuthorizationDenied({ queryKey: queryKeySignature, error });
+				}
+				throw error;
+			}
 			return {
 				type,
 				scopeSignature,
@@ -210,28 +248,49 @@ export function useFeed(
 		staleTime: DASHBOARD_QUERY_STALE_MS,
 		gcTime: DASHBOARD_QUERY_MAX_AGE_MS,
 	});
+	const authorizationDeniedError =
+		authorizationDenied?.queryKey === queryKeySignature
+			? authorizationDenied.error
+			: null;
+	const feedAuthorizationDenied =
+		Boolean(authorizationDeniedError) || isAuthorizationDenied(query.error);
+	useEffect(() => {
+		if (!feedAuthorizationDenied || query.isFetching) return;
+		clearCachedFeedContent();
+	}, [clearCachedFeedContent, feedAuthorizationDenied, query.isFetching]);
 
 	const currentData = query.data ?? null;
 	const hasSuccessfulRead =
+		feedAuthorizationDenied ||
 		(queryClient.getQueryState<DashboardFeedQueryData>(queryKey)
 			?.dataUpdateCount ?? 0) > 0;
-	const currentItems = currentData?.items ?? [];
-	const currentNextCursor = currentData?.nextCursor ?? null;
+	const currentItems = feedAuthorizationDenied
+		? []
+		: (currentData?.items ?? []);
+	const currentNextCursor = feedAuthorizationDenied
+		? null
+		: (currentData?.nextCursor ?? null);
 	const currentLoadingInitial = enabled && !currentData && query.isPending;
 	const hasMore = Boolean(currentNextCursor);
-	const currentInitialError = query.error
-		? {
-				phase: "initial" as const,
-				...describeNetworkAwareError(query.error, "动态加载失败，请稍后重试。"),
-				at: query.errorUpdatedAt || Date.now(),
-			}
-		: null;
+	const currentInitialError =
+		(authorizationDeniedError ?? query.error)
+			? {
+					phase: "initial" as const,
+					...describeNetworkAwareError(
+						authorizationDeniedError ?? query.error,
+						"动态加载失败，请稍后重试。",
+					),
+					at: query.errorUpdatedAt || Date.now(),
+					authorizationDenied: feedAuthorizationDenied,
+				}
+			: null;
 	const currentError = appendError ?? currentInitialError;
 
 	useEffect(() => {
 		reqIdRef.current += 1;
 		setLoadingMore(false);
 		setAppendError(null);
+		setAuthorizationDenied(null);
 		setFreshKeys(new Set());
 	}, [queryKey]);
 
@@ -315,6 +374,10 @@ export function useFeed(
 			}));
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
+			const authorizationDenied = isAuthorizationDenied(err);
+			if (err instanceof ApiError && authorizationDenied) {
+				setAuthorizationDenied({ queryKey: queryKeySignature, error: err });
+			}
 			const description = describeNetworkAwareError(
 				err,
 				"更多动态加载失败，请稍后重试。",
@@ -325,6 +388,7 @@ export function useFeed(
 				kind: description.kind,
 				detail: description.detail,
 				at: Date.now(),
+				authorizationDenied,
 			});
 		} finally {
 			if (reqId === reqIdRef.current) {
@@ -337,6 +401,8 @@ export function useFeed(
 		loadingMore,
 		queryClient,
 		queryKey,
+		clearCachedFeedContent,
+		queryKeySignature,
 		scope,
 		scopeSignature,
 		type,

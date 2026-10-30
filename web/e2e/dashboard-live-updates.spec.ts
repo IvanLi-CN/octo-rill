@@ -541,3 +541,228 @@ test("dashboard live updates re-baselines when inbox polling is enabled later", 
 	await expect.poll(() => notificationUpdateTokens.length).toBeGreaterThan(0);
 	await expect(page.getByText("刚刚同步 · 1 条Inbox 内容")).toHaveCount(0);
 });
+
+test("dashboard discards live-update responses from before access sync", async ({
+	page,
+}) => {
+	const taskId = "task-live-update-stale";
+	let readableRequests = 0;
+	let updateRequests = 0;
+	let syncRequests = 0;
+	const updateRequestTokens: Array<string | null> = [];
+	let markHeldUpdateStarted: (() => void) | null = null;
+	let releaseHeldUpdate: (() => void) | null = null;
+	const heldUpdateStarted = new Promise<void>((resolve) => {
+		markHeldUpdateStarted = resolve;
+	});
+	const heldUpdateGate = new Promise<void>((resolve) => {
+		releaseHeldUpdate = resolve;
+	});
+
+	await page.addInitScript(
+		({ taskId }) => {
+			type TestWindow = Window & {
+				__failLiveUpdateSync?: () => void;
+			};
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				withCredentials = false;
+				onopen: ((this: EventSource, event: Event) => unknown) | null = null;
+				onmessage:
+					| ((this: EventSource, event: MessageEvent<string>) => unknown)
+					| null = null;
+				onerror: ((this: EventSource, event: Event) => unknown) | null = null;
+				private listeners = new Map<
+					string,
+					Set<(event: Event | MessageEvent<string>) => unknown>
+				>();
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					(window as TestWindow).__failLiveUpdateSync = () => {
+						const event = new MessageEvent("task.completed", {
+							data: JSON.stringify({
+								task_id: taskId,
+								status: "failed",
+								error: "access sync failed",
+							}),
+						});
+						for (const listener of this.listeners.get("task.completed") ?? []) {
+							listener.call(this as unknown as EventSource, event);
+						}
+					};
+				}
+
+				addEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					const current = this.listeners.get(type) ?? new Set();
+					current.add(listener);
+					this.listeners.set(type, current);
+				}
+
+				removeEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					this.readyState = 2;
+				}
+			}
+
+			Object.defineProperty(window, "EventSource", {
+				configurable: true,
+				writable: true,
+				value: MockEventSource,
+			});
+		},
+		{ taskId },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			readableRequests += 1;
+			return json(route, {
+				sections: [
+					{
+						id: "2026-04-30",
+						date: "2026-04-30",
+						kind: "raw",
+						item_count: 1,
+						brief: null,
+						items: [
+							buildReleaseFeedItem("live-baseline", "Access-rebased release"),
+						],
+						items_next_cursor: null,
+						supplemental_items: [],
+					},
+				],
+				next_cursor: null,
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, { items: [], next_cursor: null });
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			updateRequests += 1;
+			updateRequestTokens.push(url.searchParams.get("token"));
+			if (updateRequests === 2) {
+				markHeldUpdateStarted?.();
+				await heldUpdateGate;
+				return json(route, {
+					token: "stale-access-token",
+					lists: {
+						feed: {
+							changed: true,
+							new_count: 1,
+							latest_keys: ["release:stale-after-access"],
+						},
+						briefs: { changed: false, new_count: 0, latest_keys: [] },
+						notifications: { changed: false, new_count: 0, latest_keys: [] },
+					},
+				});
+			}
+			return json(route, {
+				token: "baseline-access-token",
+				lists: {
+					feed: { changed: false, new_count: 0, latest_keys: [] },
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+		if (req.method() === "POST" && pathname === "/api/sync/all") {
+			syncRequests += 1;
+			return json(route, { task_id: taskId });
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		return json(
+			route,
+			{ error: { code: "not_found", message: pathname } },
+			404,
+		);
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Access-rebased release")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	const readableRequestsBeforeSync = readableRequests;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	await expect.poll(() => updateRequests).toBeGreaterThanOrEqual(2);
+	await heldUpdateStarted;
+
+	await page.getByRole("banner").getByRole("button", { name: "同步" }).click();
+	await expect.poll(() => syncRequests).toBe(1);
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				Boolean(
+					(window as typeof window & { __failLiveUpdateSync?: () => void })
+						.__failLiveUpdateSync,
+				),
+			),
+		)
+		.toBe(true);
+	await page.evaluate(() => {
+		(
+			window as typeof window & { __failLiveUpdateSync?: () => void }
+		).__failLiveUpdateSync?.();
+	});
+	await expect
+		.poll(() => readableRequests)
+		.toBeGreaterThan(readableRequestsBeforeSync);
+	await expect(page.getByText("Access-rebased release")).toBeVisible();
+	releaseHeldUpdate?.();
+	await expect.poll(() => updateRequests).toBeGreaterThanOrEqual(3);
+	await expect
+		.poll(() => updateRequestTokens.at(-1))
+		.toBe("baseline-access-token");
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary="true"]'),
+	).toHaveCount(0);
+});

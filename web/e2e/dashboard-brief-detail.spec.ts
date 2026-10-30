@@ -194,6 +194,10 @@ async function installDashboardBriefMocks(
 			code: string;
 			message: string;
 		};
+		readableSectionPageFailureForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
 		readableSectionPageFailures?: Array<string | null>;
 		deferReadableSectionPageCursors?: Array<string | null>;
 		readableSectionItemsPage?: (
@@ -204,6 +208,10 @@ async function installDashboardBriefMocks(
 		readableSectionItemsFailures?: string[];
 		deferFeedPageCursors?: Array<string | null>;
 		feedPageFailureCursors?: Array<string | null>;
+		feedFailure?: { status: number; code: string; message: string };
+		dashboardUpdatesResponse?: (
+			requestNumber: number,
+		) => unknown | Promise<unknown>;
 		briefDetailFailureIds?: Set<string>;
 	},
 ) {
@@ -212,6 +220,7 @@ async function installDashboardBriefMocks(
 	const feedRequests: Array<string | null> = [];
 	const feedRequestUrls: string[] = [];
 	const readableSectionRequests: Array<string | null> = [];
+	let dashboardUpdateRequests = 0;
 	const readableSectionItemRequests: Array<{
 		sectionId: string;
 		cursor: string | null;
@@ -266,6 +275,18 @@ async function installDashboardBriefMocks(
 			const cursor = url.searchParams.get("cursor");
 			feedRequests.push(cursor);
 			feedRequestUrls.push(`${pathname}${url.search}`);
+			if (options?.feedFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: options.feedFailure.code,
+							message: options.feedFailure.message,
+						},
+					},
+					options.feedFailure.status,
+				);
+			}
 			if (deferredFeedPageCursors.has(cursor)) {
 				await new Promise<void>((resolve) => {
 					deferredFeedPageResolvers.set(cursor, resolve);
@@ -297,6 +318,22 @@ async function installDashboardBriefMocks(
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			const cursor = url.searchParams.get("cursor");
 			readableSectionRequests.push(cursor);
+			const requestFailure = options?.readableSectionPageFailureForRequest?.(
+				readableSectionRequests.length,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
 			if (options?.readableSectionPageFailure && cursor === null) {
 				const failure = options.readableSectionPageFailure;
 				return json(
@@ -378,6 +415,11 @@ async function installDashboardBriefMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			dashboardUpdateRequests += 1;
+			const response = await options?.dashboardUpdatesResponse?.(
+				dashboardUpdateRequests,
+			);
+			if (response) return json(route, response);
 			return json(route, {
 				token: "brief-token",
 				generated_at: "2026-04-30T10:00:00Z",
@@ -641,6 +683,194 @@ test("dashboard keeps generic readable failures visible without a legacy fallbac
 	});
 	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
 	await expect(tracker.getFeedRequestUrls()).toEqual([]);
+});
+
+test("dashboard hides readable release content when refresh authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+		Object.defineProperty(window.navigator, "onLine", {
+			configurable: true,
+			value: true,
+		});
+	});
+	const title = "Private release after readable authorization loss";
+	let updateRequests = 0;
+	let revokeReadableAccess = false;
+	let reportFeedChange = false;
+	let failReadableRequestsAfter = Number.POSITIVE_INFINITY;
+	let markDashboardUpdateStarted: (() => void) | null = null;
+	let releaseDashboardUpdate: (() => void) | null = null;
+	const dashboardUpdateStarted = new Promise<void>((resolve) => {
+		markDashboardUpdateStarted = resolve;
+	});
+	const dashboardUpdateGate = new Promise<void>((resolve) => {
+		releaseDashboardUpdate = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableRawSection({
+					id: "auth-revoked",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "auth-revoked-release",
+							ts: "2026-04-30T08:00:00Z",
+							tag: "auth-revoked",
+							title,
+						}),
+					],
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionPageFailureForRequest: (requestNumber) =>
+			revokeReadableAccess && requestNumber > failReadableRequestsAfter
+				? {
+						status: 403,
+						code: "unauthorized",
+						message: "read access revoked",
+					}
+				: null,
+		dashboardUpdatesResponse: async (requestNumber) => {
+			updateRequests += 1;
+			if (requestNumber === 1) {
+				markDashboardUpdateStarted?.();
+				await dashboardUpdateGate;
+			}
+			const changed = reportFeedChange;
+			reportFeedChange = false;
+			return {
+				token: `auth-refresh-${updateRequests}`,
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? ["release:auth-revoked-release"] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(title)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await dashboardUpdateStarted;
+	failReadableRequestsAfter = tracker.getReadableSectionRequests().length;
+	const readableRequestCountBeforeRefresh = failReadableRequestsAfter;
+	revokeReadableAccess = true;
+	reportFeedChange = true;
+	releaseDashboardUpdate?.();
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toHaveLength(readableRequestCountBeforeRefresh + 1);
+	await expect(
+		page.locator('[data-dashboard-readable-refresh-error="true"]'),
+	).toBeVisible();
+	await expect(page.getByText(title)).toHaveCount(0);
+});
+
+test("dashboard hides retained readable content when legacy fallback is unauthorized", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+		Object.defineProperty(window.navigator, "onLine", {
+			configurable: true,
+			value: true,
+		});
+	});
+	const title = "Private release before legacy authorization loss";
+	let updateRequests = 0;
+	let compareEvidenceUnavailable = false;
+	let reportFeedChange = false;
+	let failReadableRequestsAfter = Number.POSITIVE_INFINITY;
+	let markDashboardUpdateStarted: (() => void) | null = null;
+	let releaseDashboardUpdate: (() => void) | null = null;
+	const dashboardUpdateStarted = new Promise<void>((resolve) => {
+		markDashboardUpdateStarted = resolve;
+	});
+	const dashboardUpdateGate = new Promise<void>((resolve) => {
+		releaseDashboardUpdate = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableRawSection({
+					id: "legacy-auth-revoked",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "legacy-auth-revoked-release",
+							ts: "2026-04-30T08:00:00Z",
+							tag: "legacy-auth-revoked",
+							title,
+						}),
+					],
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionPageFailureForRequest: (requestNumber) =>
+			compareEvidenceUnavailable && requestNumber > failReadableRequestsAfter
+				? {
+						status: 503,
+						code: "release_reading_evidence_unavailable",
+						message: "compare evidence unavailable",
+					}
+				: null,
+		feedFailure: {
+			status: 403,
+			code: "unauthorized",
+			message: "feed access revoked",
+		},
+		dashboardUpdatesResponse: async (requestNumber) => {
+			updateRequests += 1;
+			if (requestNumber === 1) {
+				markDashboardUpdateStarted?.();
+				await dashboardUpdateGate;
+			}
+			const changed = reportFeedChange;
+			reportFeedChange = false;
+			return {
+				token: `legacy-auth-refresh-${updateRequests}`,
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? ["release:legacy-auth-revoked-release"] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(title)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await dashboardUpdateStarted;
+	failReadableRequestsAfter = tracker.getReadableSectionRequests().length;
+	const readableRequestCountBeforeRefresh = failReadableRequestsAfter;
+	compareEvidenceUnavailable = true;
+	reportFeedChange = true;
+	releaseDashboardUpdate?.();
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toHaveLength(readableRequestCountBeforeRefresh + 1);
+	await expect.poll(tracker.getFeedRequestUrls).toHaveLength(2);
+	await expect(
+		page.locator('[data-dashboard-readable-fallback-error="true"]'),
+	).toBeVisible();
+	await expect(page.getByText(title)).toHaveCount(0);
 });
 
 test("dashboard fetches covered raw releases only after switching a brief to list", async ({
