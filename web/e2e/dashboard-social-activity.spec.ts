@@ -146,6 +146,10 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 			);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
+
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			return json(route, {
 				items: [

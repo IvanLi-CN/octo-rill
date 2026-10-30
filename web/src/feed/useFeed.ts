@@ -212,6 +212,9 @@ export function useFeed(
 	});
 
 	const currentData = query.data ?? null;
+	const hasSuccessfulRead =
+		(queryClient.getQueryState<DashboardFeedQueryData>(queryKey)
+			?.dataUpdateCount ?? 0) > 0;
 	const currentItems = currentData?.items ?? [];
 	const currentNextCursor = currentData?.nextCursor ?? null;
 	const currentLoadingInitial = enabled && !currentData && query.isPending;
@@ -432,6 +435,7 @@ export function useFeed(
 
 	return {
 		items: currentItems,
+		hasSuccessfulRead,
 		freshKeys,
 		nextCursor: currentNextCursor,
 		hasMore,

@@ -1,6 +1,10 @@
 import { type Locator, type Page, expect, test } from "@playwright/test";
 
-import { buildMockMeResponse, json } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 function svgAvatarDataUrl(
 	label: string,
@@ -574,6 +578,10 @@ test.describe("mobile dashboard shell", () => {
 						is_admin: true,
 					}),
 				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
 			}
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
@@ -1190,6 +1198,10 @@ test.describe("mobile dashboard shell", () => {
 				);
 			}
 
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
+			}
+
 			if (req.method() === "GET" && pathname === "/api/feed") {
 				return json(route, {
 					items: [
@@ -1370,6 +1382,10 @@ test.describe("mobile dashboard shell", () => {
 				);
 			}
 
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
+			}
+
 			if (req.method() === "GET" && pathname === "/api/feed") {
 				return json(route, {
 					items: Array.from({ length: 12 }, (_, index) =>
@@ -1510,6 +1526,10 @@ test.describe("mobile dashboard shell", () => {
 				);
 			}
 
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
+			}
+
 			if (req.method() === "GET" && pathname === "/api/feed") {
 				return json(route, {
 					items: [
@@ -1641,6 +1661,10 @@ test.describe("mobile dashboard shell", () => {
 						is_admin: true,
 					}),
 				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
 			}
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
@@ -1936,6 +1960,10 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 						},
 					),
 				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+				return mockUnavailableDashboardReadableFeed(route);
 			}
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
@@ -2430,6 +2458,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	let announceNextUpdate = false;
 	let exactFallback = false;
 	let holdLegacyFallback = false;
+	let failLegacyRefresh = false;
 	let legacyFeedCalls = 0;
 	let releaseLegacyFeed: (() => void) | null = null;
 	const legacyFeedGate = new Promise<void>((resolve) => {
@@ -2466,6 +2495,41 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		},
 		{ taskId: "task-readable-refresh-error" },
 	);
+	await page.addInitScript(() => {
+		window.localStorage.setItem(
+			"octo-rill.dashboard-warm.v1",
+			JSON.stringify({
+				savedAt: Date.now(),
+				userId: "2f4k7m9p3x6c8v2a",
+				routeState: { tab: "all", activeReleaseId: null },
+				feedRequestType: "all",
+				feedItems: [
+					{
+						kind: "release",
+						ts: "2026-04-09T08:00:00Z",
+						id: "refresh-error-item",
+						repo_full_name: "owner/repo",
+						title: "Cached legacy release",
+						body: "cached body",
+						body_truncated: false,
+						subtitle: null,
+						reason: null,
+						subject_type: null,
+						html_url:
+							"https://github.com/owner/repo/releases/tag/vrefresh-error-item",
+						unread: null,
+						translated: null,
+						smart: null,
+						reactions: null,
+					},
+				],
+				nextCursor: null,
+				notifications: [],
+				briefs: [],
+				selectedBriefId: null,
+			}),
+		);
+	});
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -2535,9 +2599,16 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			legacyFeedCalls += 1;
 			if (holdLegacyFallback) await legacyFeedGate;
+			if (failLegacyRefresh) {
+				return json(
+					route,
+					{ error: { code: "upstream", message: "legacy refresh failed" } },
+					503,
+				);
+			}
 			return json(route, {
 				items: [
-					buildReleaseFeedItem("legacy-fallback", {
+					buildReleaseFeedItem("refresh-error-item", {
 						title: "Fallback legacy release",
 					}),
 				],
@@ -2614,9 +2685,24 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	await expect(
 		page.locator('[data-dashboard-new-content-notice="true"]'),
 	).toBeVisible();
+	const notice = page.locator('[data-dashboard-new-content-notice="true"]');
+	await notice.getByRole("button").click();
+	await expect(notice).toBeVisible();
 	await page.waitForTimeout(350);
-	expect(legacyFeedCalls).toBe(1);
 	releaseLegacyFeed?.();
+	await expect(page.getByText("Fallback legacy release")).toBeVisible();
+	await expect(page.getByText("Fresh release")).toHaveCount(0);
+
+	const updatesBeforeFailure = updatesCalls;
+	const legacyCallsBeforeFailure = legacyFeedCalls;
+	failLegacyRefresh = true;
+	announceNextUpdate = true;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	await expect.poll(() => updatesCalls).toBeGreaterThan(updatesBeforeFailure);
+	await expect
+		.poll(() => legacyFeedCalls)
+		.toBeGreaterThan(legacyCallsBeforeFailure);
+	await expect(page.getByText("动态刷新失败").first()).toBeVisible();
 	await expect(page.getByText("Fallback legacy release")).toBeVisible();
 	await expect(page.getByText("Fresh release")).toHaveCount(0);
 });
@@ -2791,6 +2877,9 @@ test("dashboard keeps access sync details closed until interaction", async ({
 			});
 		}
 
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			feedCalls += 1;
 			return json(route, { items: [], next_cursor: null });
@@ -3756,6 +3845,10 @@ test("dashboard reaction dialog keeps PAT status unknown when the PAT status fet
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

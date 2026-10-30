@@ -157,6 +157,7 @@ export function useDashboardReadableSections(options?: {
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<ReadableSectionsError | null>(null);
 	const [legacyFallback, setLegacyFallback] = useState(false);
+	const legacyFallbackRef = useRef(false);
 	const [details, setDetails] = useState<
 		Record<string, ReadableSectionDetails>
 	>({});
@@ -215,6 +216,7 @@ export function useDashboardReadableSections(options?: {
 			setLoadingMore(false);
 			setError(null);
 			if (!preserveContent) {
+				legacyFallbackRef.current = false;
 				setLegacyFallback(false);
 				setSections([]);
 				sectionsRef.current = [];
@@ -245,11 +247,13 @@ export function useDashboardReadableSections(options?: {
 					if (!endpointUnavailable) throw cause;
 					const superseded = rejectIfSuperseded();
 					if (superseded) return superseded;
+					legacyFallbackRef.current = true;
 					setLegacyFallback(true);
 					return "fallback";
 				}
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
+				legacyFallbackRef.current = false;
 				setLegacyFallback(false);
 				const nextSections = response.sections ?? [];
 				const previousSections = new Map(
@@ -382,6 +386,7 @@ export function useDashboardReadableSections(options?: {
 	useEffect(() => {
 		if (!enabled) {
 			lifecycleGenerationRef.current += 1;
+			legacyFallbackRef.current = false;
 			refreshInFlightRef.current = false;
 			setLoadingRefresh(false);
 			setLoadingInitial(false);
@@ -406,6 +411,7 @@ export function useDashboardReadableSections(options?: {
 		const requestId = requestIdRef.current;
 		const requestKey = `${requestId}:${cursor ?? ""}`;
 		if (
+			legacyFallbackRef.current ||
 			!cursor ||
 			refreshInFlightRef.current ||
 			loadingMore ||
@@ -423,7 +429,8 @@ export function useDashboardReadableSections(options?: {
 			const response = await apiGet<DashboardReadableFeedResponse>(
 				`/api/dashboard/feed?${params.toString()}`,
 			);
-			if (requestId !== requestIdRef.current) return;
+			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+				return;
 			cursorCompletedRef.current.add(requestKey);
 			setSections((current) => {
 				const byId = new Map(current.map((section) => [section.id, section]));
@@ -451,7 +458,8 @@ export function useDashboardReadableSections(options?: {
 					: null,
 			);
 		} catch (cause) {
-			if (requestId !== requestIdRef.current) return;
+			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+				return;
 			const description = describeNetworkAwareError(
 				cause,
 				"更多可读动态加载失败，请稍后重试。",
@@ -475,7 +483,7 @@ export function useDashboardReadableSections(options?: {
 
 	const loadSectionItems = useCallback(
 		async (sectionId: string, cursor?: string | null) => {
-			if (!enabled) return;
+			if (!enabled || legacyFallbackRef.current) return;
 			const requestId = requestIdRef.current;
 			const normalizedCursor = cursor ?? "__initial__";
 			const requestKey = `${requestId}:${sectionId}:${normalizedCursor}`;
@@ -505,7 +513,8 @@ export function useDashboardReadableSections(options?: {
 				const response = await apiGet<FeedResponse>(
 					`/api/dashboard/feed/sections/${encodeURIComponent(sectionId)}/items${suffix}`,
 				);
-				if (requestId !== requestIdRef.current) return;
+				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+					return;
 				detailCursorCompletedRef.current.add(requestKey);
 				setDetails((previous) => {
 					const before = previous[sectionId] ?? {
@@ -531,7 +540,8 @@ export function useDashboardReadableSections(options?: {
 					};
 				});
 			} catch (cause) {
-				if (requestId !== requestIdRef.current) return;
+				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+					return;
 				setDetails((previous) => ({
 					...previous,
 					[sectionId]: {
@@ -546,6 +556,20 @@ export function useDashboardReadableSections(options?: {
 				}));
 			} finally {
 				detailCursorInFlightRef.current.delete(requestKey);
+				if (requestId === requestIdRef.current && legacyFallbackRef.current) {
+					setDetails((previous) => {
+						const detail = previous[sectionId];
+						if (!detail?.loading) return previous;
+						return {
+							...previous,
+							[sectionId]: {
+								...detail,
+								loading: false,
+								refreshPending: false,
+							},
+						};
+					});
+				}
 			}
 		},
 		[enabled],
