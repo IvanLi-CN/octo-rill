@@ -620,7 +620,7 @@ test("dashboard falls back to the legacy feed for unavailable readable evidence"
 		timeout: 15_000,
 	});
 	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
-	await expect.poll(tracker.getFeedRequestUrls).toContain("/api/feed?limit=30");
+	await expect.poll(tracker.getFeedRequestUrls).toEqual(["/api/feed?limit=30"]);
 });
 
 test("dashboard keeps generic readable failures visible without a legacy fallback", async ({

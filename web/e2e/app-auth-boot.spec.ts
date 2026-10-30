@@ -1,17 +1,9 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
+import { buildMockMeResponse, json } from "./mockApi";
 
 function sleep(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
 }
 
 async function seedWarmDashboardCache(page: Page) {

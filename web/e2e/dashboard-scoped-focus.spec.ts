@@ -1,20 +1,6 @@
-import {
-	expect,
-	test,
-	type Locator,
-	type Page,
-	type Route,
-} from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
+import { buildMockMeResponse, json } from "./mockApi";
 
 async function expectRepositoryListGeometry(
 	panel: Locator,
