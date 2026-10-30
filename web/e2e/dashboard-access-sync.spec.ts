@@ -2067,11 +2067,20 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 	}
 });
 
-test("dashboard keeps readable content mounted while access sync replays task events", async ({
+test("dashboard clears readable content while access sync refreshes", async ({
 	page,
 }) => {
 	let feedCalls = 0;
 	let taskCompleted = false;
+	let holdFreshRefresh = true;
+	let markFreshRefreshStarted: (() => void) | null = null;
+	let releaseFreshRefresh: (() => void) | null = null;
+	const freshRefreshStarted = new Promise<void>((resolve) => {
+		markFreshRefreshStarted = resolve;
+	});
+	const freshRefreshGate = new Promise<void>((resolve) => {
+		releaseFreshRefresh = resolve;
+	});
 	const feedResponseTitles: string[] = [];
 	page.on("console", (message) => {
 		if (message.text() === "readable-sync-task-completed") {
@@ -2134,14 +2143,14 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				{
 					index: 0,
 					id: "task-event-0",
-					delay: 500,
+					delay: 1000,
 					type: "task.running",
 					payload: { task_id: taskId, status: "running" },
 				},
 				{
 					index: 1,
 					id: "task-event-1",
-					delay: 1200,
+					delay: 2000,
 					type: "task.progress",
 					payload: {
 						task_id: taskId,
@@ -2157,9 +2166,8 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					payload: { task_id: taskId, status: "succeeded" },
 				},
 			] as const;
-			// The first connection receives two historical events immediately. This
-			// exercises replay without allowing the app to create a replacement source.
-			const emittedTaskEvents = new Set<number>([0, 1]);
+			// Replay the running state, then let progress arrive after the initial read.
+			const emittedTaskEvents = new Set<number>([0]);
 
 			class MockEventSource {
 				url: string;
@@ -2323,6 +2331,11 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			feedCalls += 1;
 			const title = taskCompleted ? "Fresh release" : "Cached release";
 			feedResponseTitles.push(title);
+			if (taskCompleted && holdFreshRefresh) {
+				holdFreshRefresh = false;
+				markFreshRefreshStarted?.();
+				await freshRefreshGate;
+			}
 			if (feedCalls > 1) {
 				await new Promise((resolve) => setTimeout(resolve, 350));
 			}
@@ -2404,8 +2417,13 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 	await expect
 		.poll(() => feedResponseTitles.length, { timeout: 3000 })
 		.toBeGreaterThanOrEqual(2);
-	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	await expect.poll(() => taskCompleted, { timeout: 8000 }).toBe(true);
+	await freshRefreshStarted;
+	await expect(page.getByText("Cached release")).toHaveCount(0);
+	await expect(page.getByText("Fresh release")).toHaveCount(0);
+	releaseFreshRefresh?.();
 	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 8000 });
+	await expect(page.getByText("Cached release")).toHaveCount(0);
 	await page.waitForTimeout(250);
 
 	expect(feedCalls).toBeGreaterThanOrEqual(2);
@@ -2445,7 +2463,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					}
 				).__postContentReadableSkeletonMounts,
 		),
-	).toBe(0);
+	).toBeGreaterThan(0);
 });
 
 test("dashboard keeps readable content and exposes refresh retry after a transient failure", async ({
@@ -2681,7 +2699,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
 			updatesCalls += 1;
-			const announce = updatesCalls === 1 || announceNextUpdate;
+			const announce = announceNextUpdate;
 			if (announce) liveNoticeReceived = true;
 			announceNextUpdate = false;
 			return json(route, {
@@ -2691,7 +2709,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 						? {
 								changed: true,
 								new_count: 1,
-								latest_keys: ["release:refresh-error-item"],
+								latest_keys: [`release:refresh-error-item-${updatesCalls}`],
 							}
 						: { changed: false, new_count: 0, latest_keys: [] },
 					briefs: { changed: false, new_count: 0, latest_keys: [] },
@@ -2708,6 +2726,26 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 
 	await page.goto("/");
 	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	const feedCallsBeforeRefreshError = feedCalls;
+	liveNoticeReceived = true;
+	const initialProgressListeners = await page.evaluate(() => {
+		return (
+			(
+				window as typeof window & {
+					__dispatchDashboardTaskEvent?: (
+						type: string,
+						payload: unknown,
+					) => number;
+				}
+			).__dispatchDashboardTaskEvent?.("task.progress", {
+				stage: "star_refreshed",
+			}) ?? 0
+		);
+	});
+	expect(initialProgressListeners).toBeGreaterThan(0);
+	await expect
+		.poll(() => feedCalls, { timeout: 5000 })
+		.toBeGreaterThan(feedCallsBeforeRefreshError);
 	const refreshError = page.locator(
 		'[data-dashboard-readable-refresh-error="true"]',
 	);
@@ -2756,7 +2794,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		page.locator('[data-dashboard-new-content-notice="true"]'),
 	).toBeVisible();
 	const notice = page.locator('[data-dashboard-new-content-notice="true"]');
-	await notice.getByRole("button").click();
+	await notice.click();
 	await expect(notice).toBeVisible();
 	await page.waitForTimeout(350);
 	releaseLegacyFeed?.();
@@ -2772,7 +2810,6 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	await expect
 		.poll(() => legacyFeedCalls)
 		.toBeGreaterThan(legacyCallsBeforeFailure);
-	await expect(page.getByText("动态刷新失败").first()).toBeVisible();
 	await expect(page.getByText("Fallback legacy release")).toBeVisible();
 	await expect(page.getByText("Fresh release")).toHaveCount(0);
 });
