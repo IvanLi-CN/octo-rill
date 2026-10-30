@@ -18267,7 +18267,6 @@ async fn overlay_global_feed_processing(
 }
 
 fn mark_release_compare_unavailable(row: &mut FeedRow) {
-    clear_feed_row_processing_projection(row);
     row.release_compare_unavailable = true;
 }
 
@@ -24548,6 +24547,12 @@ fn release_feed_row_projection_result(
     row: &mut FeedRow,
     result: Result<translations::TranslationRequestItemInput, ApiError>,
 ) -> Result<Option<translations::TranslationRequestItemInput>, ApiError> {
+    if result
+        .as_ref()
+        .is_err_and(|error| release_feed_projection_should_fail_open(error))
+    {
+        return Ok(None);
+    }
     clear_feed_row_processing_projection(row);
     release_feed_projection_result(result)
 }
@@ -28750,7 +28755,8 @@ mod tests {
         list_personal_repos, list_releases, llm_call_order_by_clause,
         load_admin_dashboard_today_live_snapshot, load_admin_llm_activity_response,
         load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        map_job_action_error, map_public_compare_fallback_error,
+        mark_release_compare_unavailable, mark_translation_requested,
         markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
         me_get_api_keys, me_resume, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
@@ -38581,6 +38587,39 @@ mod tests {
     }
 
     #[test]
+    fn release_feed_row_projection_preserves_exact_failure_but_clears_other_errors() {
+        let exact = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            "compare evidence unavailable",
+        );
+        let mut preserved = test_feed_row(Some("R_node"));
+        preserved.trans_status = Some("ready".to_owned());
+        preserved.trans_title = Some("Existing title".to_owned());
+        assert!(
+            release_feed_row_projection_result(&mut preserved, Err(exact))
+                .expect("exact evidence error should fail open")
+                .is_none()
+        );
+        assert_eq!(preserved.trans_status.as_deref(), Some("ready"));
+        assert_eq!(preserved.trans_title.as_deref(), Some("Existing title"));
+
+        let other = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github_unavailable",
+            "GitHub unavailable",
+        );
+        let mut cleared = test_feed_row(Some("R_node"));
+        cleared.trans_status = Some("ready".to_owned());
+        cleared.trans_title = Some("Existing title".to_owned());
+        let error = release_feed_row_projection_result(&mut cleared, Err(other))
+            .expect_err("other errors must remain terminal");
+        assert_eq!(error.code(), "github_unavailable");
+        assert!(cleared.trans_status.is_none());
+        assert!(cleared.trans_title.is_none());
+    }
+
+    #[test]
     fn release_feed_projection_fail_open_preserves_original_release_fields() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
@@ -38628,6 +38667,7 @@ mod tests {
                 .expect("exact evidence error should be fail-open")
                 .is_none()
         );
+        mark_release_compare_unavailable(&mut row);
 
         let item = feed_item_from_row(row, true, None);
         assert_eq!(item.kind, "release");
@@ -38645,11 +38685,23 @@ mod tests {
             item.translated
                 .as_ref()
                 .map(|translated| translated.status.as_str()),
-            Some("missing")
+            Some("ready")
+        );
+        assert_eq!(
+            item.translated
+                .as_ref()
+                .and_then(|translated| translated.title.as_deref()),
+            Some("Private detail title")
         );
         assert_eq!(
             item.smart.as_ref().map(|smart| smart.status.as_str()),
-            Some("missing")
+            Some("error")
+        );
+        assert_eq!(
+            item.smart
+                .as_ref()
+                .and_then(|smart| smart.error_code.as_deref()),
+            Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
         );
     }
 
@@ -38848,7 +38900,14 @@ mod tests {
         assert_eq!(release.body.as_deref(), Some("- item"));
         assert_eq!(
             release.translated.as_ref().map(|item| item.status.as_str()),
-            Some("missing")
+            Some("ready")
+        );
+        assert_eq!(
+            release
+                .translated
+                .as_ref()
+                .and_then(|item| item.title.as_deref()),
+            Some("Private detail title")
         );
         let newer_release = feed
             .items

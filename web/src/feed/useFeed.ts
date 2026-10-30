@@ -180,19 +180,6 @@ export function useFeed(
 			}),
 		[scopeSignature, type, userId, viewerStateKey],
 	);
-	const clearCachedFeedContent = useCallback(() => {
-		queryClient.setQueryData<DashboardFeedQueryData>(queryKey, {
-			type,
-			scopeSignature,
-			items: [],
-			nextCursor: null,
-		});
-		queryClient.setQueriesData<DashboardFeedQueryData>(
-			{ queryKey: ["dashboard", "feed", { userId }] },
-			(current) =>
-				current ? { ...current, items: [], nextCursor: null } : current,
-		);
-	}, [queryClient, queryKey, scopeSignature, type, userId]);
 	const initialStateMatches = initialData?.type === type;
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [appendError, setAppendError] = useState<FeedLoadError | null>(null);
@@ -204,6 +191,28 @@ export function useFeed(
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
+	const invalidateRequests = useCallback(() => {
+		reqIdRef.current += 1;
+		void queryClient.cancelQueries({
+			queryKey: ["dashboard", "feed", { userId }],
+		});
+		setLoadingMore(false);
+		setAppendError(null);
+	}, [queryClient, userId]);
+	const clearCachedFeedContent = useCallback(() => {
+		invalidateRequests();
+		queryClient.setQueryData<DashboardFeedQueryData>(queryKey, {
+			type,
+			scopeSignature,
+			items: [],
+			nextCursor: null,
+		});
+		queryClient.setQueriesData<DashboardFeedQueryData>(
+			{ queryKey: ["dashboard", "feed", { userId }] },
+			(current) =>
+				current ? { ...current, items: [], nextCursor: null } : current,
+		);
+	}, [invalidateRequests, queryClient, queryKey, scopeSignature, type, userId]);
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
 		enabled,
@@ -284,7 +293,9 @@ export function useFeed(
 					authorizationDenied: feedAuthorizationDenied,
 				}
 			: null;
-	const currentError = appendError ?? currentInitialError;
+	const currentError = feedAuthorizationDenied
+		? currentInitialError
+		: (appendError ?? currentInitialError);
 
 	useEffect(() => {
 		reqIdRef.current += 1;
@@ -511,6 +522,7 @@ export function useFeed(
 		loadingMore,
 		error: currentError,
 		stats,
+		invalidateRequests,
 		loadInitial,
 		loadMore,
 		refresh,

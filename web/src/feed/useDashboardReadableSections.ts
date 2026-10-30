@@ -22,6 +22,7 @@ export type ReadableSectionsError = {
 	kind: NetworkErrorKind;
 	detail: string | null;
 	at: number;
+	authorizationDenied?: boolean;
 };
 
 export type ReadableSectionDetails = {
@@ -37,6 +38,12 @@ export type ReadableRefreshResult =
 	| "fallback"
 	| "superseded"
 	| "failed";
+
+function isAuthorizationDenied(error: unknown) {
+	return (
+		error instanceof ApiError && (error.status === 401 || error.status === 403)
+	);
+}
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -356,10 +363,8 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
-				if (
-					cause instanceof ApiError &&
-					(cause.status === 401 || cause.status === 403)
-				) {
+				const authorizationDenied = isAuthorizationDenied(cause);
+				if (authorizationDenied) {
 					clearContent();
 					setLoadingInitial(false);
 				}
@@ -368,9 +373,11 @@ export function useDashboardReadableSections(options?: {
 					"可读动态加载失败，请稍后重试。",
 				);
 				setError({
-					phase: preserveContent ? "refresh" : "initial",
+					phase:
+						authorizationDenied || !preserveContent ? "initial" : "refresh",
 					...description,
 					at: Date.now(),
+					authorizationDenied,
 				});
 				if (options?.throwOnError) throw cause;
 				return "failed";
@@ -536,16 +543,26 @@ export function useDashboardReadableSections(options?: {
 		} catch (cause) {
 			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
 				return;
+			const authorizationDenied = isAuthorizationDenied(cause);
+			if (authorizationDenied) {
+				clearContent();
+				setLoadingInitial(false);
+			}
 			const description = describeNetworkAwareError(
 				cause,
 				"更多可读动态加载失败，请稍后重试。",
 			);
-			setError({ phase: "append", ...description, at: Date.now() });
+			setError({
+				phase: authorizationDenied ? "initial" : "append",
+				...description,
+				at: Date.now(),
+				authorizationDenied,
+			});
 		} finally {
 			cursorInFlightRef.current.delete(requestKey);
 			if (requestId === requestIdRef.current) setLoadingMore(false);
 		}
-	}, [loadingInitial, loadingMore, nextCursor]);
+	}, [clearContent, loadingInitial, loadingMore, nextCursor]);
 
 	const retry = useCallback(async () => {
 		if (error?.phase === "append") {
@@ -618,6 +635,20 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
 					return;
+				if (isAuthorizationDenied(cause)) {
+					clearContent();
+					setLoadingInitial(false);
+					setError({
+						phase: "initial",
+						...describeNetworkAwareError(
+							cause,
+							"可读动态加载失败，请稍后重试。",
+						),
+						at: Date.now(),
+						authorizationDenied: true,
+					});
+					return;
+				}
 				setDetails((previous) => ({
 					...previous,
 					[sectionId]: {
@@ -648,7 +679,7 @@ export function useDashboardReadableSections(options?: {
 				}
 			}
 		},
-		[enabled],
+		[clearContent, enabled],
 	);
 
 	const applyToItems = useCallback(

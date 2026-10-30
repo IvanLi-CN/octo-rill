@@ -204,11 +204,24 @@ async function installDashboardBriefMocks(
 			sectionId: string,
 			cursor: string | null,
 		) => unknown;
+		readableSectionItemsFailureForRequest?: (
+			requestNumber: number,
+			sectionId: string,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
 		deferReadableSectionItems?: string[];
 		readableSectionItemsFailures?: string[];
 		deferFeedPageCursors?: Array<string | null>;
+		deferFeedPageForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => boolean;
 		feedPageFailureCursors?: Array<string | null>;
 		feedFailure?: { status: number; code: string; message: string };
+		feedFailureForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
 		dashboardUpdatesResponse?: (
 			requestNumber: number,
 		) => unknown | Promise<unknown>;
@@ -228,6 +241,7 @@ async function installDashboardBriefMocks(
 	const feedPageFailures = new Map<string | null, number>();
 	const deferredFeedPageCursors = new Set(options?.deferFeedPageCursors ?? []);
 	const deferredFeedPageResolvers = new Map<string | null, () => void>();
+	const deferredFeedPageRequestResolvers = new Map<number, () => void>();
 	const deferredReadableItemResolvers = new Map<string, () => void>();
 	const deferredReadablePageResolvers = new Map<string | null, () => void>();
 	const deferredReadableItems = new Set(
@@ -275,6 +289,27 @@ async function installDashboardBriefMocks(
 			const cursor = url.searchParams.get("cursor");
 			feedRequests.push(cursor);
 			feedRequestUrls.push(`${pathname}${url.search}`);
+			const requestFailure = options?.feedFailureForRequest?.(
+				feedRequests.length,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
+			if (options?.deferFeedPageForRequest?.(feedRequests.length, cursor)) {
+				await new Promise<void>((resolve) => {
+					deferredFeedPageRequestResolvers.set(feedRequests.length, resolve);
+				});
+			}
 			if (options?.feedFailure) {
 				return json(
 					route,
@@ -389,6 +424,23 @@ async function installDashboardBriefMocks(
 			const sectionId = decodeURIComponent(pathname.split("/").at(-2) ?? "");
 			const cursor = url.searchParams.get("cursor");
 			readableSectionItemRequests.push({ sectionId, cursor });
+			const requestFailure = options?.readableSectionItemsFailureForRequest?.(
+				readableSectionItemRequests.length,
+				sectionId,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
 			if (deferredReadableItems.has(sectionId)) {
 				await new Promise<void>((resolve) => {
 					deferredReadableItemResolvers.set(sectionId, resolve);
@@ -520,6 +572,8 @@ async function installDashboardBriefMocks(
 	return {
 		getFeedRequests: () => feedRequests.slice(),
 		getFeedRequestUrls: () => feedRequestUrls.slice(),
+		getDeferredFeedPageRequestNumbers: () =>
+			Array.from(deferredFeedPageRequestResolvers.keys()),
 		getReadableSectionRequests: () => readableSectionRequests.slice(),
 		getReadableSectionItemRequests: () => readableSectionItemRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
@@ -530,6 +584,14 @@ async function installDashboardBriefMocks(
 				throw new Error(`No deferred feed request for cursor ${cursor}`);
 			}
 			deferredFeedPageResolvers.delete(cursor);
+			resolve();
+		},
+		releaseFeedPageRequest: (requestNumber: number) => {
+			const resolve = deferredFeedPageRequestResolvers.get(requestNumber);
+			if (!resolve) {
+				throw new Error(`No deferred feed request number ${requestNumber}`);
+			}
+			deferredFeedPageRequestResolvers.delete(requestNumber);
 			resolve();
 		},
 		releaseReadableSectionItems: (sectionId: string) => {
@@ -770,10 +832,232 @@ test("dashboard hides readable release content when refresh authorization is rev
 	await expect
 		.poll(tracker.getReadableSectionRequests)
 		.toHaveLength(readableRequestCountBeforeRefresh + 1);
-	await expect(
-		page.locator('[data-dashboard-readable-refresh-error="true"]'),
-	).toBeVisible();
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
 	await expect(page.getByText(title)).toHaveCount(0);
+});
+
+test("dashboard clears readable releases and retries after pagination authorization is revoked", async ({
+	page,
+}) => {
+	const warmSnapshot = {
+		savedAt: Date.now(),
+		userId: "2f4k7m9p3x6c8v2a",
+		viewerStateKey: "00:00|Asia/Shanghai|480|0",
+		routeState: {
+			tab: "all",
+			scopeSignature: null,
+			selectedBriefId: null,
+			activeReleaseId: null,
+			activeReleaseLocatorKey: null,
+			activeAnnouncementLocatorKey: null,
+			lane: null,
+			releaseReturnTab: "briefs",
+		},
+		feedRequestType: "all",
+		feedItems: [
+			makeReleaseFeedItem({
+				id: "warm-readable-auth-release",
+				tag: "warm-readable-auth-release",
+				title: "Warm private readable feed snapshot",
+			}),
+		],
+		nextCursor: null,
+		notifications: [],
+		briefs: [],
+		selectedBriefId: null,
+	};
+	await page.addInitScript((snapshot) => {
+		window.localStorage.clear();
+		window.localStorage.setItem(
+			"octo-rill.dashboard-warm.v1",
+			JSON.stringify(snapshot),
+		);
+	}, warmSnapshot);
+	const privateTitle =
+		"Private release before readable page authorization loss";
+	const recoveredTitle = "Readable feed recovered after authorization retry";
+	let authorizationDenied = false;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: (cursor) => ({
+			sections: [
+				makeReadableRawSection({
+					id: "readable-auth-pagination",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "readable-auth-pagination-release",
+							tag: "readable-auth-pagination",
+							title: authorizationDenied ? recoveredTitle : privateTitle,
+						}),
+						...Array.from({ length: 12 }, (_, index) =>
+							makeReleaseFeedItem({
+								id: `readable-auth-pagination-filler-${index}`,
+								tag: `readable-auth-pagination-filler-${index}`,
+								title: `Readable pagination filler ${index}`,
+							}),
+						),
+					],
+				}),
+			],
+			next_cursor:
+				cursor === null && !authorizationDenied ? "readable-auth-page-2" : null,
+		}),
+		readableSectionPageFailureForRequest: (_requestNumber, cursor) => {
+			if (cursor !== "readable-auth-page-2" || authorizationDenied) return null;
+			authorizationDenied = true;
+			return {
+				status: 403,
+				code: "unauthorized",
+				message: "read access revoked",
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				window.localStorage.getItem("octo-rill.dashboard-warm.v1"),
+			),
+		)
+		.toContain("Warm private readable feed snapshot");
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toContain("readable-auth-page-2");
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				window.localStorage.getItem("octo-rill.dashboard-warm.v1"),
+			),
+		)
+		.toBeNull();
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+
+	await page.getByRole("button", { name: "重试" }).click();
+	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
+});
+
+test("dashboard clears visible section details after detail pagination authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Private section detail before authorization loss";
+	const privateBrief = "Private brief before detail authorization loss";
+	const privateItem = makeReleaseFeedItem({
+		id: "detail-auth-pagination-release",
+		tag: "detail-auth-pagination",
+		title: privateTitle,
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableBriefSection({
+					id: "detail-auth-pagination",
+					date: "2026-04-30",
+					content: `## ${privateBrief}`,
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionItemsPage: (_sectionId, cursor) =>
+			cursor === null
+				? { items: [privateItem], next_cursor: "detail-auth-page-2" }
+				: { items: [privateItem], next_cursor: null },
+		readableSectionItemsFailureForRequest: (
+			_requestNumber,
+			_sectionId,
+			cursor,
+		) =>
+			cursor === "detail-auth-page-2"
+				? {
+						status: 403,
+						code: "unauthorized",
+						message: "read access revoked",
+					}
+				: null,
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateBrief)).toBeVisible({ timeout: 15_000 });
+	const section = page.locator(
+		'[data-readable-section-id="section-detail-auth-pagination"]',
+	);
+	await section
+		.locator("[data-readable-section-header='true']")
+		.getByRole("button", { name: "列表" })
+		.click();
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionItemRequests).toContainEqual({
+		sectionId: "section-detail-auth-pagination",
+		cursor: "detail-auth-page-2",
+	});
+
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect(page.getByText(privateBrief)).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+});
+
+test("dashboard clears legacy releases and retries after pagination authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Private release before legacy page authorization loss";
+	const recoveredTitle = "Legacy feed recovered after authorization retry";
+	let authorizationDenied = false;
+	let deniedLegacyRequestNumber = 0;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedFailureForRequest: (requestNumber, cursor) => {
+			if (cursor !== "legacy-auth-page-2") return null;
+			authorizationDenied = true;
+			deniedLegacyRequestNumber ||= requestNumber;
+			return {
+				status: 403,
+				code: "unauthorized",
+				message: "feed access revoked",
+			};
+		},
+		deferFeedPageForRequest: (_requestNumber, cursor) =>
+			authorizationDenied && cursor === null,
+		feedPage: (cursor) => ({
+			items:
+				cursor === null
+					? [
+							makeReleaseFeedItem({
+								id: "legacy-auth-pagination-release",
+								tag: "legacy-auth-pagination",
+								title: authorizationDenied ? recoveredTitle : privateTitle,
+							}),
+						]
+					: [],
+			nextCursor:
+				cursor === null && !authorizationDenied ? "legacy-auth-page-2" : null,
+		}),
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(tracker.getFeedRequests).toContain("legacy-auth-page-2");
+	await expect.poll(() => deniedLegacyRequestNumber).toBeGreaterThan(0);
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	const retry = page.getByRole("button", { name: "重试加载" });
+	await expect(retry).toBeVisible();
+	await expect(retry).toBeDisabled();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+	for (const requestNumber of tracker.getDeferredFeedPageRequestNumbers()) {
+		tracker.releaseFeedPageRequest(requestNumber);
+	}
+	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
 });
 
 test("dashboard hides retained readable content when legacy fallback is unauthorized", async ({
