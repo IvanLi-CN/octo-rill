@@ -29,6 +29,7 @@ import {
 import { openAppEventSource } from "@/demo/eventSource";
 import {
 	buildDashboardWarmViewerStateKey,
+	clearDashboardWarmSnapshot,
 	persistDashboardWarmSnapshot,
 	type DashboardWarmSnapshot,
 } from "@/auth/startupCache";
@@ -1664,6 +1665,11 @@ export function Dashboard(props: {
 	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
+	const [accessContextKey, setAccessContextKey] = useState("stable");
+	const advanceAccessContext = useCallback((taskId: string) => {
+		clearDashboardWarmSnapshot();
+		setAccessContextKey(`${taskId}:${Date.now()}`);
+	}, []);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
 		TaskStreamState[]
 	>([]);
@@ -1776,18 +1782,22 @@ export function Dashboard(props: {
 				}
 			: null;
 	const viewerStateKey = buildDashboardWarmViewerStateKey(me);
+	const readableViewerStateKey = `${viewerStateKey}|access:${accessContextKey}`;
 	const readableMode = !scopedMode && tab === "all";
 	const readableSections = useDashboardReadableSections({
 		userId: me.user.id,
-		viewerStateKey,
+		viewerStateKey: readableViewerStateKey,
 		enabled: readableMode,
 	});
 	const readableSectionsActive =
 		readableMode && !readableSections.legacyFallback;
 	const feed = useFeed(feedRequestType, {
 		userId: me.user.id,
-		viewerStateKey,
-		initialData: readableSectionsActive ? null : warmFeedData,
+		viewerStateKey: readableViewerStateKey,
+		initialData:
+			readableSectionsActive || accessContextKey !== "stable"
+				? null
+				: warmFeedData,
 		scope,
 		enabled: !readableSectionsActive,
 	});
@@ -3531,6 +3541,7 @@ export function Dashboard(props: {
 					payload.status !== "succeeded"
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
+				readableSections.clearContent();
 				if (payload.status === "succeeded") {
 					setAccessSyncLifecycle("refreshing");
 					startQueuedCompletionTimer();
@@ -3570,6 +3581,7 @@ export function Dashboard(props: {
 							resolvedError,
 							"同步已完成，但页面刷新失败，请稍后重试。",
 						);
+						advanceAccessContext(completedTaskId);
 						source.close();
 						settleTaskWaiterRef.current(completedTaskId, resolvedError);
 						setAccessTaskStream((current) =>
@@ -3586,6 +3598,7 @@ export function Dashboard(props: {
 						detail: "页面内容已刷新",
 					}));
 				} else {
+					await readableSections.loadInitial();
 					setAccessSyncStage("failed");
 					setAccessSyncLifecycle("failed");
 					setAccessSyncProgress((current) => ({
@@ -3599,6 +3612,7 @@ export function Dashboard(props: {
 					}
 				}
 				if (streamSettled) return;
+				advanceAccessContext(completedTaskId);
 				streamSettled = true;
 				clearReconnectTimer();
 				clearCompletionTimer();
@@ -3640,7 +3654,12 @@ export function Dashboard(props: {
 			source.removeEventListener("task.recovered_failed", onCompleted);
 			source.close();
 		};
-	}, [accessTaskStream]);
+	}, [
+		accessTaskStream,
+		advanceAccessContext,
+		readableSections.clearContent,
+		readableSections.loadInitial,
+	]);
 
 	useEffect(() => {
 		if (refreshTaskStreams.length === 0) return;

@@ -150,6 +150,7 @@ export function useDashboardReadableSections(options?: {
 		() => `${userId}:${viewerStateKey ?? ""}`,
 		[userId, viewerStateKey],
 	);
+	const [stateSignature, setStateSignature] = useState(signature);
 	const [sections, setSections] = useState<DashboardReadableSection[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(true);
@@ -177,6 +178,27 @@ export function useDashboardReadableSections(options?: {
 	const cursorCompletedRef = useRef(new Set<string>());
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
+	const clearContent = useCallback(() => {
+		lifecycleGenerationRef.current += 1;
+		requestIdRef.current += 1;
+		refreshPriorityRef.current += 1;
+		legacyFallbackRef.current = false;
+		refreshInFlightRef.current = false;
+		cursorInFlightRef.current.clear();
+		cursorCompletedRef.current.clear();
+		detailCursorInFlightRef.current.clear();
+		detailCursorCompletedRef.current.clear();
+		sectionsRef.current = [];
+		detailsRef.current = {};
+		setSections([]);
+		setNextCursor(null);
+		setLoadingInitial(true);
+		setLoadingRefresh(false);
+		setLoadingMore(false);
+		setError(null);
+		setLegacyFallback(false);
+		setDetails({});
+	}, []);
 
 	const loadSections = useCallback(
 		async (
@@ -423,8 +445,10 @@ export function useDashboardReadableSections(options?: {
 			sectionsRef.current = [];
 			setNextCursor(null);
 			setDetails({});
+			setStateSignature(signature);
 			return;
 		}
+		setStateSignature(signature);
 		void loadInitial();
 		return () => {
 			lifecycleGenerationRef.current += 1;
@@ -647,10 +671,14 @@ export function useDashboardReadableSections(options?: {
 		[applyToItems],
 	);
 
+	const stateCurrent = stateSignature === signature;
+	const visibleSections = stateCurrent ? sections : [];
+	const visibleDetails = stateCurrent ? details : {};
 	const stats = useMemo(() => {
-		const items = sections.flatMap((section) => [
+		const items = visibleSections.flatMap((section) => [
 			...(section.items ?? []),
 			...(section.supplemental_items ?? []),
+			...(visibleDetails[section.id]?.items ?? []),
 		]);
 		return {
 			total: items.length,
@@ -659,19 +687,20 @@ export function useDashboardReadableSections(options?: {
 			followers: items.filter((item) => item.kind === "follower_received")
 				.length,
 		};
-	}, [sections]);
+	}, [visibleDetails, visibleSections]);
 
 	return {
-		sections,
-		nextCursor,
-		hasMore: Boolean(nextCursor),
-		loadingInitial,
-		loadingRefresh,
-		loadingMore,
-		error,
-		legacyFallback,
-		details,
+		sections: visibleSections,
+		nextCursor: stateCurrent ? nextCursor : null,
+		hasMore: stateCurrent && Boolean(nextCursor),
+		loadingInitial: !stateCurrent || loadingInitial,
+		loadingRefresh: stateCurrent && loadingRefresh,
+		loadingMore: stateCurrent && loadingMore,
+		error: stateCurrent ? error : null,
+		legacyFallback: stateCurrent && legacyFallback,
+		details: visibleDetails,
 		stats,
+		clearContent,
 		loadInitial,
 		refresh,
 		loadMore,

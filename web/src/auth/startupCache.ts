@@ -194,9 +194,13 @@ export function clearStartupAuth() {
 	removeStorageRecord(AUTH_CACHE_KEY);
 }
 
+export function clearDashboardWarmSnapshot() {
+	removeStorageRecord(DASHBOARD_CACHE_KEY);
+}
+
 export function clearAllWarmStartupCaches() {
 	clearStartupAuth();
-	removeStorageRecord(DASHBOARD_CACHE_KEY);
+	clearDashboardWarmSnapshot();
 	removeStorageRecord(ADMIN_USERS_CACHE_KEY);
 	clearDashboardQueryCache();
 }
