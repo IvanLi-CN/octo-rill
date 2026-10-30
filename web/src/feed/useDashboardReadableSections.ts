@@ -187,6 +187,8 @@ export function useDashboardReadableSections(options?: {
 				onQueue?: (cancel: () => void) => void;
 			},
 		) => {
+			if (preserveContent && legacyFallbackRef.current) return "fallback";
+
 			const requestId = ++requestIdRef.current;
 			let cancelled = false;
 			const cancelRefresh = () => {
@@ -203,6 +205,26 @@ export function useDashboardReadableSections(options?: {
 				if (!isSuperseded()) return null;
 				if (options?.throwOnError) throw new Error("刷新已取消");
 				return "superseded";
+			};
+			const enterLegacyFallback = () => {
+				if (legacyFallbackRef.current) return;
+				legacyFallbackRef.current = true;
+				requestIdRef.current += 1;
+				refreshInFlightRef.current = false;
+				cursorInFlightRef.current.clear();
+				detailCursorInFlightRef.current.clear();
+				setLegacyFallback(true);
+				setLoadingInitial(false);
+				setLoadingRefresh(false);
+				setLoadingMore(false);
+				setDetails((current) =>
+					Object.fromEntries(
+						Object.entries(current).map(([sectionId, detail]) => [
+							sectionId,
+							{ ...detail, loading: false },
+						]),
+					),
+				);
 			};
 			refreshInFlightRef.current = preserveContent;
 			cursorInFlightRef.current.clear();
@@ -247,8 +269,7 @@ export function useDashboardReadableSections(options?: {
 					if (!endpointUnavailable) throw cause;
 					const superseded = rejectIfSuperseded();
 					if (superseded) return superseded;
-					legacyFallbackRef.current = true;
-					setLegacyFallback(true);
+					enterLegacyFallback();
 					return "fallback";
 				}
 				const superseded = rejectIfSuperseded();
@@ -323,6 +344,9 @@ export function useDashboardReadableSections(options?: {
 			onStart?: (cancel: () => void) => void;
 			onQueue?: (cancel: () => void) => void;
 		}) => {
+			if (legacyFallbackRef.current) {
+				return Promise.resolve<ReadableRefreshResult>("fallback");
+			}
 			const generation = lifecycleGenerationRef.current;
 			const priority = options?.throwOnError
 				? ++refreshPriorityRef.current
@@ -349,6 +373,7 @@ export function useDashboardReadableSections(options?: {
 					) {
 						return Promise.reject(new Error("刷新已取消"));
 					}
+					if (legacyFallbackRef.current) return "fallback";
 					return loadSections(true, {
 						...options,
 						onStart: (cancel) =>
@@ -373,6 +398,7 @@ export function useDashboardReadableSections(options?: {
 						if (options?.throwOnError) throw new Error("刷新已取消");
 						return "superseded";
 					}
+					if (legacyFallbackRef.current) return "fallback";
 					const result = await loadSections(true, options);
 					return result;
 				},
