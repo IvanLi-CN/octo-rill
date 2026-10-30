@@ -17948,8 +17948,13 @@ async fn overlay_global_feed_processing(
         return Ok(());
     }
 
+    let mut release_compare_unavailable = false;
     for row in rows.iter_mut() {
         if !matches!(row.kind.as_str(), "release" | "announcement") {
+            continue;
+        }
+        if row.kind == "release" && release_compare_unavailable {
+            clear_feed_row_processing_projection(row);
             continue;
         }
         let resource_type = if row.kind == "release" {
@@ -18026,7 +18031,12 @@ async fn overlay_global_feed_processing(
                 .await,
             )? {
                 Some(input) => Some(input),
-                None => continue,
+                None => {
+                    // A readable dashboard page can contain thousands of releases.
+                    // Stop issuing Compare requests for this response after one fails.
+                    release_compare_unavailable = true;
+                    continue;
+                }
             }
         } else {
             clear_feed_row_processing_projection(row);
@@ -38677,12 +38687,19 @@ mod tests {
         let user_id = test_user_id(1);
         seed_repo_release(&pool, 42, 119).await;
         seed_repo_release(&pool, 42, 120).await;
+        seed_repo_release(&pool, 42, 121).await;
         sqlx::query(
             "UPDATE repo_releases SET tag_name = 'v1.2.2', name = 'Release v1.2.2', body = '- previous body', published_at = '2026-02-22T00:00:00Z', created_at = '2026-02-22T00:00:00Z' WHERE release_id = 119",
         )
         .execute(&pool)
         .await
         .expect("seed previous release tag");
+        sqlx::query(
+            "UPDATE repo_releases SET tag_name = 'v1.2.4', name = 'Release v1.2.4', published_at = '2026-02-24T00:00:00Z', created_at = '2026-02-24T00:00:00Z' WHERE release_id = 121",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next release tag");
         seed_star(&pool, 42).await;
         seed_social_event(
             &pool,
@@ -38813,6 +38830,13 @@ mod tests {
             release.translated.as_ref().map(|item| item.status.as_str()),
             Some("missing")
         );
+        let newer_release = feed
+            .items
+            .iter()
+            .find(|item| item.kind == "release" && item.id == "121")
+            .expect("newer failed Compare release remains in feed");
+        assert_eq!(newer_release.title.as_deref(), Some("Release v1.2.4"));
+        assert_eq!(newer_release.body.as_deref(), Some("- item"));
         assert_eq!(
             release.smart.as_ref().map(|item| item.status.as_str()),
             Some("missing")

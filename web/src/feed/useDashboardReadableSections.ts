@@ -32,7 +32,11 @@ export type ReadableSectionDetails = {
 	refreshPending?: boolean;
 };
 
-export type ReadableRefreshResult = "applied" | "superseded" | "failed";
+export type ReadableRefreshResult =
+	| "applied"
+	| "fallback"
+	| "superseded"
+	| "failed";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -242,7 +246,7 @@ export function useDashboardReadableSections(options?: {
 					const superseded = rejectIfSuperseded();
 					if (superseded) return superseded;
 					setLegacyFallback(true);
-					return "applied";
+					return "fallback";
 				}
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;

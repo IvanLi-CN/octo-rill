@@ -1791,9 +1791,15 @@ export function Dashboard(props: {
 		scope,
 		enabled: !readableSectionsActive,
 	});
+	const readableSectionsVisible =
+		readableSectionsActive ||
+		(readableMode &&
+			readableSections.legacyFallback &&
+			readableSections.sections.length > 0 &&
+			(feed.loadingInitial || feed.error?.phase === "initial"));
 	const applyTranslationToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
-			if (readableSectionsActive) {
+			if (readableSectionsVisible) {
 				readableSections.applyTranslation(item, translated);
 			} else {
 				feed.applyTranslation(item, translated);
@@ -1801,31 +1807,31 @@ export function Dashboard(props: {
 		},
 		[
 			feed.applyTranslation,
-			readableSectionsActive,
+			readableSectionsVisible,
 			readableSections.applyTranslation,
 		],
 	);
 	const applySmartToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
-			if (readableSectionsActive) readableSections.applySmart(item, smart);
+			if (readableSectionsVisible) readableSections.applySmart(item, smart);
 			else feed.applySmart(item, smart);
 		},
-		[feed.applySmart, readableSectionsActive, readableSections.applySmart],
+		[feed.applySmart, readableSectionsVisible, readableSections.applySmart],
 	);
 	const applyReactionsToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
-			if (readableSectionsActive)
+			if (readableSectionsVisible)
 				readableSections.applyReactions(item, reactions);
 			else feed.applyReactions(item, reactions);
 		},
 		[
 			feed.applyReactions,
-			readableSectionsActive,
+			readableSectionsVisible,
 			readableSections.applyReactions,
 		],
 	);
 	const activeFeedItems = useMemo(() => {
-		if (!readableSectionsActive) return feed.items;
+		if (!readableSectionsVisible) return feed.items;
 		return readableSections.sections.flatMap((section) => [
 			...(section.items ?? []),
 			...(section.supplemental_items ?? []),
@@ -1833,7 +1839,7 @@ export function Dashboard(props: {
 		]);
 	}, [
 		feed.items,
-		readableSectionsActive,
+		readableSectionsVisible,
 		readableSections.details,
 		readableSections.sections,
 	]);
@@ -2902,7 +2908,7 @@ export function Dashboard(props: {
 		if (readableSectionsActive) {
 			void refreshFeed()
 				.then((result) => {
-					if (result === "superseded") {
+					if (result === "superseded" || result === "fallback") {
 						if (
 							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
 							hydratedKey
@@ -4336,7 +4342,7 @@ export function Dashboard(props: {
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
 		const rootReadable =
-			mode === "all" && !scopedMode && readableSectionsActive;
+			mode === "all" && !scopedMode && readableSectionsVisible;
 		const filteredItems = filterFeedItemsForTab(feed.items, mode, {
 			scoped: scopedMode,
 		});
@@ -4456,6 +4462,31 @@ export function Dashboard(props: {
 							>
 								<RefreshCcw className="size-4" />
 								重试刷新
+							</Button>
+						</div>
+					</div>
+				) : null}
+
+				{rootReadable &&
+				readableSections.legacyFallback &&
+				feed.error?.phase === "initial" ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-readable-fallback-error="true"
+						role="alert"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<p className="min-w-0">{feed.error.message}</p>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								disabled={feed.loadingInitial}
+								onClick={() => void feed.loadInitial()}
+							>
+								<RefreshCcw className="size-4" />
+								重试加载
 							</Button>
 						</div>
 					</div>
