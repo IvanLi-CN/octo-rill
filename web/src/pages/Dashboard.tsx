@@ -1796,7 +1796,7 @@ export function Dashboard(props: {
 		(readableMode &&
 			readableSections.legacyFallback &&
 			readableSections.sections.length > 0 &&
-			(feed.loadingInitial || feed.error?.phase === "initial"));
+			!feed.hasSuccessfulRead);
 	const readableSectionsVisibleRef = useRef(readableSectionsVisible);
 	readableSectionsVisibleRef.current = readableSectionsVisible;
 	const applyTranslationToActive = useCallback(
@@ -2829,6 +2829,7 @@ export function Dashboard(props: {
 	const revealFeedUpdates = useCallback(
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
+			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			if (readableSectionsActive) {
 				const result = await refreshFeed();
 				if (result !== "applied") return;
@@ -2836,7 +2837,19 @@ export function Dashboard(props: {
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
 			}
-			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+			if (readableSectionsVisible) {
+				const nextFreshKeys = Array.from(
+					new Set([...feed.freshKeys, ...freshKeys]),
+				);
+				await refreshFeed({
+					freshKeys: nextFreshKeys,
+					throwOnError: true,
+				});
+				scrollToFreshFeedTop(freshKeys);
+				dismissFeedBoundary(notice.boundaryId);
+				await checkDashboardUpdates({ emit: false, include: ["feed"] });
+				return;
+			}
 			const hasHydratedFreshItems = feed.items.some((item) =>
 				freshKeys.includes(feedItemKey(item)),
 			);
@@ -2861,6 +2874,7 @@ export function Dashboard(props: {
 			feed.items,
 			refreshFeed,
 			readableSectionsActive,
+			readableSectionsVisible,
 			scrollToFreshFeedTop,
 		],
 	);

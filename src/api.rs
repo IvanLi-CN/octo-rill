@@ -17449,7 +17449,6 @@ async fn fetch_feed_items(
     viewer_login: Option<&str>,
     limit: i64,
     time_window: Option<(&str, &str)>,
-    release_compare_unavailable: &mut bool,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
         WITH scoped_visible_repos AS (
@@ -17864,7 +17863,7 @@ async fn fetch_feed_items(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    overlay_global_feed_processing(state, user_id, &mut rows, release_compare_unavailable).await?;
+    overlay_global_feed_processing(state, user_id, &mut rows).await?;
     Ok(rows)
 }
 
@@ -17942,7 +17941,6 @@ async fn overlay_global_feed_processing(
     state: &AppState,
     user_id: &str,
     rows: &mut [FeedRow],
-    release_compare_unavailable: &mut bool,
 ) -> Result<(), ApiError> {
     if content_processing::current_mode(&state.pool)
         .await
@@ -17954,13 +17952,6 @@ async fn overlay_global_feed_processing(
 
     for row in rows.iter_mut() {
         if !matches!(row.kind.as_str(), "release" | "announcement") {
-            continue;
-        }
-        if row.kind == "release"
-            && *release_compare_unavailable
-            && release_feed_row_requires_compare(row)
-        {
-            mark_release_compare_unavailable(row);
             continue;
         }
         let resource_type = if row.kind == "release" {
@@ -18038,7 +18029,6 @@ async fn overlay_global_feed_processing(
             )? {
                 Some(input) => Some(input),
                 None => {
-                    *release_compare_unavailable = true;
                     mark_release_compare_unavailable(row);
                     continue;
                 }
@@ -18274,13 +18264,6 @@ async fn overlay_global_feed_processing(
         }
     }
     Ok(())
-}
-
-fn release_feed_row_requires_compare(row: &FeedRow) -> bool {
-    !release_body_has_actionable_content(
-        row.title.as_deref().unwrap_or(""),
-        row.release_body.as_deref().unwrap_or(""),
-    )
 }
 
 fn mark_release_compare_unavailable(row: &mut FeedRow) {
@@ -19405,7 +19388,6 @@ async fn fetch_dashboard_readable_rows_for_date(
     date: &str,
     time_zone: &str,
     limit: i64,
-    release_compare_unavailable: &mut bool,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let Some((start, end)) = dashboard_readable_date_window_utc(date, time_zone) else {
         return Ok(Vec::new());
@@ -19419,7 +19401,6 @@ async fn fetch_dashboard_readable_rows_for_date(
         None,
         limit,
         Some((start.as_str(), end.as_str())),
-        release_compare_unavailable,
     )
     .await
 }
@@ -19735,7 +19716,6 @@ pub async fn dashboard_readable_feed(
     )
     .await?;
     let mut sections = Vec::with_capacity(selected_dates.len());
-    let mut release_compare_unavailable = false;
     for date in &selected_dates {
         let brief = briefs
             .iter()
@@ -19752,7 +19732,6 @@ pub async fn dashboard_readable_feed(
             date,
             time_zone,
             fetch_limit,
-            &mut release_compare_unavailable,
         )
         .await?
         .into_iter()
@@ -19860,14 +19839,12 @@ pub async fn dashboard_readable_section_items(
     let fetch_limit = offset
         .saturating_add(DASHBOARD_READABLE_SECTION_ITEM_LIMIT + 1)
         .min(i64::MAX as usize) as i64;
-    let mut release_compare_unavailable = false;
     let rows = fetch_dashboard_readable_rows_for_date(
         state.as_ref(),
         &user_id,
         &section_date,
         preferences.time_zone.as_str(),
         fetch_limit,
-        &mut release_compare_unavailable,
     )
     .await?;
     let ai_enabled = state.config.ai.is_some();
@@ -19943,7 +19920,6 @@ pub async fn list_feed(
     };
 
     let db_started_at = Instant::now();
-    let mut release_compare_unavailable = false;
     let rows = fetch_feed_items(
         state.as_ref(),
         &user_id,
@@ -19953,7 +19929,6 @@ pub async fn list_feed(
         Some(viewer.login.as_str()),
         limit,
         None,
-        &mut release_compare_unavailable,
     )
     .await?;
     let db_elapsed = db_started_at.elapsed();
@@ -38827,13 +38802,16 @@ mod tests {
             .expect("read GitHub Compare mock address");
         let compare_requests = Arc::new(AtomicUsize::new(0));
         let observed_requests = compare_requests.clone();
-        let mock = Router::new().fallback(move || {
-            let observed_requests = observed_requests.clone();
-            async move {
-                observed_requests.fetch_add(1, Ordering::Relaxed);
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-        });
+        let mock = Router::new().route(
+            "/repos/openai/codex/compare/{compare_ref}",
+            axum::routing::get(move || {
+                let observed_requests = observed_requests.clone();
+                async move {
+                    observed_requests.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
         tokio::spawn(async move {
             axum::serve(listener, mock)
                 .await
@@ -38924,7 +38902,7 @@ mod tests {
                 .and_then(|item| item.error_code.as_deref()),
             Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
         );
-        assert_eq!(compare_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(compare_requests.load(Ordering::Relaxed), 2);
 
         let Json(second_feed) = list_feed(
             State(state),
@@ -38950,13 +38928,117 @@ mod tests {
                     .and_then(|smart| smart.error_code.as_deref())
                     == Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
         }));
-        assert_eq!(compare_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(compare_requests.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]
-    async fn dashboard_readable_compare_failure_is_bounded_across_date_sections() {
+    async fn compare_auth_failure_retries_public_endpoint_without_auth() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
+        let mut state = setup_state(pool.clone());
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("compare-auth-test-token")
+            .expect("encrypt Compare test token");
+        sqlx::query(
+            "UPDATE github_connections SET access_token_ciphertext = ?, access_token_nonce = ? WHERE user_id = ?",
+        )
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind(user_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("store encrypted Compare test token");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub Compare auth mock");
+        let address = listener
+            .local_addr()
+            .expect("read GitHub Compare auth mock address");
+        let authenticated_requests = Arc::new(AtomicUsize::new(0));
+        let observed_authenticated = authenticated_requests.clone();
+        let public_requests = Arc::new(AtomicUsize::new(0));
+        let observed_public = public_requests.clone();
+        let unexpected_auth_requests = Arc::new(AtomicUsize::new(0));
+        let observed_unexpected_auth = unexpected_auth_requests.clone();
+        let unexpected_compare_refs = Arc::new(AtomicUsize::new(0));
+        let observed_unexpected_compare_refs = unexpected_compare_refs.clone();
+        let mock = Router::new().route(
+            "/repos/openai/codex/compare/{compare_ref}",
+            axum::routing::get(
+                move |path: axum::extract::Path<String>, headers: axum::http::HeaderMap| {
+                    let observed_authenticated = observed_authenticated.clone();
+                    let observed_public = observed_public.clone();
+                    let observed_unexpected_auth = observed_unexpected_auth.clone();
+                    let observed_unexpected_compare_refs = observed_unexpected_compare_refs.clone();
+                    async move {
+                        if path.0 != "v1.2.2...v1.2.3" {
+                            observed_unexpected_compare_refs.fetch_add(1, Ordering::Relaxed);
+                            return StatusCode::BAD_REQUEST;
+                        }
+                        let authorization = headers
+                            .get(reqwest::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok());
+                        match authorization {
+                            Some("Bearer compare-auth-test-token") => {
+                                observed_authenticated.fetch_add(1, Ordering::Relaxed);
+                                StatusCode::UNAUTHORIZED
+                            }
+                            None => {
+                                observed_public.fetch_add(1, Ordering::Relaxed);
+                                StatusCode::NOT_FOUND
+                            }
+                            Some(_) => {
+                                observed_unexpected_auth.fetch_add(1, Ordering::Relaxed);
+                                StatusCode::BAD_REQUEST
+                            }
+                        }
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock)
+                .await
+                .expect("serve GitHub Compare auth mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("unique Compare auth test state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse GitHub Compare auth mock URL");
+
+        let error = match super::fetch_release_compare_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            "openai/codex",
+            "v1.2.2",
+            "v1.2.3",
+        )
+        .await
+        {
+            Ok(_) => panic!("private Compare auth failure should reach public fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "reauth_required");
+        assert_eq!(authenticated_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(public_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(unexpected_auth_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(unexpected_compare_refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_readable_compare_failure_is_isolated_per_release_across_date_sections() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 118).await;
+        sqlx::query(
+            "UPDATE repo_releases SET tag_name = 'v1.2.1', name = 'Release v1.2.1', published_at = '2026-02-21T00:00:00Z', created_at = '2026-02-21T00:00:00Z' WHERE release_id = 118",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed prior release baseline");
         for (release_id, timestamp) in [
             (119, "2026-02-22T00:00:00Z"),
             (120, "2026-02-23T00:00:00Z"),
@@ -39000,13 +39082,16 @@ mod tests {
             .expect("read GitHub Compare mock address");
         let compare_requests = Arc::new(AtomicUsize::new(0));
         let observed_requests = compare_requests.clone();
-        let mock = Router::new().fallback(move || {
-            let observed_requests = observed_requests.clone();
-            async move {
-                observed_requests.fetch_add(1, Ordering::Relaxed);
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-        });
+        let mock = Router::new().route(
+            "/repos/openai/codex/compare/{compare_ref}",
+            axum::routing::get(move || {
+                let observed_requests = observed_requests.clone();
+                async move {
+                    observed_requests.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
         tokio::spawn(async move {
             axum::serve(listener, mock)
                 .await
@@ -39018,21 +39103,30 @@ mod tests {
             .github_rest_api_base =
             Url::parse(&format!("http://{address}/")).expect("parse GitHub Compare mock URL");
 
-        let mut release_compare_unavailable = false;
-        for date in ["2026-02-24", "2026-02-23", "2026-02-22"] {
-            let rows = fetch_dashboard_readable_rows_for_date(
-                state.as_ref(),
-                user_id.as_str(),
-                date,
-                "UTC",
-                100,
-                &mut release_compare_unavailable,
-            )
-            .await
-            .expect("fetch readable date section after Compare failure");
-            assert_eq!(rows.len(), 1);
-            let item =
-                feed_item_from_row(rows.into_iter().next().expect("one release"), true, None);
+        let Json(feed) = dashboard_readable_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardReadableFeedQuery { cursor: None }),
+        )
+        .await
+        .expect("fetch readable feed after Compare failures");
+        let release_items = feed
+            .sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .filter(|item| item.kind == "release")
+            .collect::<Vec<_>>();
+        assert_eq!(release_items.len(), 3);
+        let mut release_ids = release_items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        release_ids.sort_unstable();
+        assert_eq!(release_ids, ["119", "120", "121"]);
+        for item in release_items {
+            assert!(item.title.as_deref().is_some());
+            assert_eq!(item.body.as_deref(), Some("- item"));
             assert_eq!(
                 item.smart
                     .as_ref()
@@ -39040,7 +39134,7 @@ mod tests {
                 Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
             );
         }
-        assert_eq!(compare_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(compare_requests.load(Ordering::Relaxed), 3);
     }
 
     #[test]
