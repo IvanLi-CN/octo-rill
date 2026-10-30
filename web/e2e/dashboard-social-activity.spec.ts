@@ -1,20 +1,6 @@
-import {
-	type Locator,
-	type Page,
-	type Route,
-	expect,
-	test,
-} from "@playwright/test";
+import { type Locator, type Page, expect, test } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
+import { buildMockMeResponse, json } from "./mockApi";
 
 function socialPrimaryDesktop(page: Locator | Page, text: string) {
 	return page

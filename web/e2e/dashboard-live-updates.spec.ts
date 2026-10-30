@@ -1,16 +1,8 @@
-import { type Route, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
+import { buildMockMeResponse, json } from "./mockApi";
 
 test.describe.configure({ mode: "serial" });
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
 
 function buildReleaseFeedItem(id: string, title: string) {
 	return {

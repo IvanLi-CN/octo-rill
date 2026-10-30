@@ -226,7 +226,6 @@ export function useDashboardReadableSections(options?: {
 					),
 				);
 			}
-			let usedLegacyFallback = false;
 			try {
 				let response: DashboardReadableFeedResponse;
 				try {
@@ -240,35 +239,14 @@ export function useDashboardReadableSections(options?: {
 						cause instanceof ApiError &&
 						cause.code === "release_reading_evidence_unavailable";
 					if (!endpointUnavailable) throw cause;
-					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
 					const superseded = rejectIfSuperseded();
 					if (superseded) return superseded;
-					usedLegacyFallback = true;
-					const legacyItems = legacy.items ?? [];
-					const firstTimestamp =
-						legacyItems[0]?.ts ?? new Date(0).toISOString();
-					response = {
-						sections:
-							legacyItems.length > 0
-								? [
-										{
-											id: "legacy-feed",
-											date: firstTimestamp.slice(0, 10),
-											kind: "raw",
-											item_count: legacyItems.length,
-											brief: null,
-											items: legacyItems,
-											items_next_cursor: null,
-											supplemental_items: [],
-										},
-									]
-								: [],
-						next_cursor: legacy.next_cursor ?? null,
-					};
+					setLegacyFallback(true);
+					return "applied";
 				}
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
-				setLegacyFallback(usedLegacyFallback);
+				setLegacyFallback(false);
 				const nextSections = response.sections ?? [];
 				const previousSections = new Map(
 					sectionsRef.current.map((section) => [section.id, section]),
