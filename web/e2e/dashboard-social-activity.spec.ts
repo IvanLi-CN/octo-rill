@@ -361,6 +361,10 @@ test("dashboard keeps social cards inline on mobile widths without horizontal ov
 			);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
+
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			return json(route, {
 				items: [

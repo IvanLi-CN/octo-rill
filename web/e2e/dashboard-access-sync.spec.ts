@@ -2729,16 +2729,18 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
 	await readableFallbackStarted;
 	const progressListeners = await page.evaluate(() => {
-		(
-			window as typeof window & {
-				__dispatchDashboardTaskEvent?: (
-					type: string,
-					payload: unknown,
-				) => number;
-			}
-		).__dispatchDashboardTaskEvent?.("task.progress", {
-			stage: "star_refreshed",
-		}) ?? 0;
+		return (
+			(
+				window as typeof window & {
+					__dispatchDashboardTaskEvent?: (
+						type: string,
+						payload: unknown,
+					) => number;
+				}
+			).__dispatchDashboardTaskEvent?.("task.progress", {
+				stage: "star_refreshed",
+			}) ?? 0
+		);
 	});
 	expect(progressListeners).toBeGreaterThan(0);
 	await page.waitForTimeout(100);
