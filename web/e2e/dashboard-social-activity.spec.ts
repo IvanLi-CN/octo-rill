@@ -585,6 +585,10 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 			);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
+
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			return json(route, {
 				items: [
