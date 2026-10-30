@@ -2514,6 +2514,8 @@ test("failed access sync settles while the readable feed request is still pendin
 	let releaseInitialReadableRequest: (() => void) | null = null;
 	let markReplacementReadableRequestStarted: (() => void) | null = null;
 	let releaseReplacementReadableRequests: (() => void) | null = null;
+	let failedAccessSyncDispatched = false;
+	let preFailureReadableRequests = 0;
 	const readableRequestStarted = new Promise<void>((resolve) => {
 		markReadableRequestStarted = resolve;
 	});
@@ -2627,7 +2629,8 @@ test("failed access sync settles while the readable feed request is still pendin
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
 			markReadableRequestStarted?.();
-			if (feedCalls === 1) {
+			if (!failedAccessSyncDispatched) {
+				preFailureReadableRequests += 1;
 				await initialReadableRequestGate;
 				return json(route, {
 					sections: [
@@ -2713,6 +2716,10 @@ test("failed access sync settles while the readable feed request is still pendin
 				),
 			)
 			.toBeGreaterThan(0);
+		await expect
+			.poll(() => preFailureReadableRequests)
+			.toBeGreaterThanOrEqual(2);
+		failedAccessSyncDispatched = true;
 		const deliveredListeners = await page.evaluate(() => {
 			const state = window as typeof window & {
 				__dispatchAccessTaskEvent?: (type: string, payload: unknown) => number;
@@ -2759,11 +2766,11 @@ test("dashboard discards warm feed and reaction responses after successful acces
 	let syncAllCalls = 0;
 	let readableRefreshHeld = false;
 	let reactionRefreshCalls = 0;
-	let oldReactionResponseReturned = false;
 	let markReadableRefreshStarted: (() => void) | null = null;
 	let releaseReadableRefresh: (() => void) | null = null;
 	let markInitialReactionStarted: (() => void) | null = null;
 	let releaseInitialReaction: (() => void) | null = null;
+	let markInitialReactionResponseCompleted: (() => void) | null = null;
 	const readableRefreshStarted = new Promise<void>((resolve) => {
 		markReadableRefreshStarted = resolve;
 	});
@@ -2775,6 +2782,9 @@ test("dashboard discards warm feed and reaction responses after successful acces
 	});
 	const initialReactionGate = new Promise<void>((resolve) => {
 		releaseInitialReaction = resolve;
+	});
+	const initialReactionResponseCompleted = new Promise<void>((resolve) => {
+		markInitialReactionResponseCompleted = resolve;
 	});
 
 	await page.addInitScript(
@@ -2949,20 +2959,28 @@ test("dashboard discards warm feed and reaction responses after successful acces
 			});
 		}
 		if (req.method() === "POST" && pathname === "/api/feed/reactions/refresh") {
-			reactionRefreshCalls += 1;
+			const requestNumber = ++reactionRefreshCalls;
 			const request = req.postDataJSON() as { release_ids: string[] };
-			if (reactionRefreshCalls === 1) {
+			if (requestNumber === 1) {
 				markInitialReactionStarted?.();
 				await initialReactionGate;
-				oldReactionResponseReturned = true;
 			}
-			const plus1 = reactionRefreshCalls === 1 ? 1 : 12;
-			return json(route, {
-				items: request.release_ids.map((release_id) => ({
-					release_id,
-					reactions: buildReactionFooterReady(plus1),
-				})),
-			});
+			const plus1 = requestNumber === 1 ? 1 : 12;
+			try {
+				await json(route, {
+					items: request.release_ids.map((release_id) => ({
+						release_id,
+						reactions: buildReactionFooterReady(plus1),
+					})),
+				});
+			} catch {
+				// Access refresh may abort the old request before the response is sent.
+			} finally {
+				if (requestNumber === 1) {
+					markInitialReactionResponseCompleted?.();
+				}
+			}
+			return;
 		}
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
 			return json(route, {
@@ -3060,10 +3078,13 @@ test("dashboard discards warm feed and reaction responses after successful acces
 		).toHaveAttribute("data-reaction-count", "12");
 
 		releaseInitialReaction?.();
-		await expect
-			.poll(() => oldReactionResponseReturned, { timeout: 3000 })
-			.toBe(true);
-		await page.waitForTimeout(150);
+		await initialReactionResponseCompleted;
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+				),
+		);
 		await expect(
 			page.locator('[data-reaction-trigger="plus1"]'),
 		).toHaveAttribute("data-reaction-count", "12");

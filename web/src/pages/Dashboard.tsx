@@ -1827,15 +1827,24 @@ export function Dashboard(props: {
 		initialAccessPending || readableSections.loadingInitial;
 	const readableSectionsVisibleRef = useRef(readableSectionsVisible);
 	readableSectionsVisibleRef.current = readableSectionsVisible;
+	const feedAuthorizationDenied = Boolean(feed.error?.authorizationDenied);
+	const readableAuthorizationDenied = Boolean(
+		readableSections.error?.authorizationDenied,
+	);
 	useEffect(() => {
-		if (!feed.error?.authorizationDenied) return;
+		if (!feedAuthorizationDenied && !readableAuthorizationDenied) return;
 		clearDashboardWarmSnapshot();
 		setWarmFeedSnapshotValid(false);
-		readableSections.clearContentPreservingMode();
+		feed.invalidateRequests();
+		clearDashboardFeedQueryCache(me.user.id);
+		if (feedAuthorizationDenied) {
+			readableSections.clearContentPreservingMode();
+		}
 	}, [
-		feed.error?.authorizationDenied,
-		feed.error?.phase,
-		feed.error?.message,
+		feedAuthorizationDenied,
+		feed.invalidateRequests,
+		me.user.id,
+		readableAuthorizationDenied,
 		readableSections.clearContentPreservingMode,
 	]);
 	const applyTranslationToActive = useCallback(
@@ -4400,6 +4409,20 @@ export function Dashboard(props: {
 		);
 	}, [releaseReturnTab, routeSelectedBriefId, scope, setRouteState]);
 
+	useEffect(() => {
+		if (
+			(feedAuthorizationDenied || readableAuthorizationDenied) &&
+			activeReleaseTarget
+		) {
+			onCloseReleaseDetail();
+		}
+	}, [
+		activeReleaseTarget,
+		feedAuthorizationDenied,
+		onCloseReleaseDetail,
+		readableAuthorizationDenied,
+	]);
+
 	const onCloseAnnouncementDetail = useCallback(() => {
 		setRouteState(
 			{
@@ -5262,7 +5285,11 @@ export function Dashboard(props: {
 				</Tabs>
 
 				<ReleaseDetailCard
-					target={activeReleaseTarget}
+					target={
+						feedAuthorizationDenied || readableAuthorizationDenied
+							? null
+							: activeReleaseTarget
+					}
 					onClose={onCloseReleaseDetail}
 					onResolvedDetail={onReleaseDetailResolved}
 				/>
