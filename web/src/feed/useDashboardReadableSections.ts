@@ -234,12 +234,11 @@ export function useDashboardReadableSections(options?: {
 						"/api/dashboard/feed",
 					);
 				} catch (cause) {
-					// Keep rolling deployments and older test fixtures usable while the
-					// readable endpoint is introduced. A successful readable response
-					// always remains the only normal root-feed path.
+					// Older deployments can explicitly signal that readable evidence is
+					// unavailable. Other API failures must remain visible to the user.
 					const endpointUnavailable =
-						(cause instanceof ApiError && cause.status === 404) ||
-						cause instanceof TypeError;
+						cause instanceof ApiError &&
+						cause.code === "release_reading_evidence_unavailable";
 					if (!endpointUnavailable) throw cause;
 					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
 					const superseded = rejectIfSuperseded();
