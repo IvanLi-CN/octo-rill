@@ -546,7 +546,7 @@ struct AttemptRouteSnapshot {
     route_models: Vec<String>,
 }
 
-const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
+pub(crate) const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
 const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
 const GLOBAL_RECOVERY_CADENCE: Duration = Duration::from_secs(1);
 const GLOBAL_RECOVERY_BATCH_SIZE: usize = 100;
@@ -733,6 +733,27 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
     let mut result = projection
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
+    let mut reading_incompatible = false;
+    if let Some(raw_reading) = result.get("reading").cloned() {
+        let normalized =
+            serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
+                .ok()
+                .and_then(|mut reading| {
+                    reading.normalize_references().ok()?;
+                    reading.validate().ok()?;
+                    reading.evidence.clear();
+                    serde_json::to_value(reading).ok()
+                });
+        if let Some(normalized) = normalized {
+            result["reading"] = normalized;
+        } else {
+            reading_incompatible = true;
+            // Do not expose malformed or legacy machine material through the
+            // request API. The incompatible status remains visible so callers
+            // can request a controlled regeneration.
+            result["reading"] = Value::Null;
+        }
+    }
     // Control metadata is server-owned. A persisted/model-provided field must
     // never be allowed to change the work identity or lifecycle state.
     result["status"] = Value::String(work.status.clone());
@@ -745,7 +766,30 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
     result["entity_id"] = Value::String(work.canonical_resource_id.clone());
     result["kind"] = Value::String(kind_for_work(work));
     result["variant"] = Value::String(work.variant.clone());
+    if reading_incompatible {
+        result["status"] = Value::String("incompatible".to_owned());
+        result["error_code"] = Value::String("reading_incompatible".to_owned());
+        result["error_summary"] =
+            Value::String("Release reading result is incompatible".to_owned());
+    }
     result
+}
+
+fn release_request_variant_is_current(
+    work: &WorkRow,
+    canonical_item: &translations::TranslationRequestItemInput,
+) -> bool {
+    if work.canonical_resource_type != "release"
+        || work.pipeline != "polishing"
+        || !matches!(
+            work.variant.as_str(),
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+                | translations::RELEASE_READING_PUBLIC_VARIANT
+        )
+    {
+        return true;
+    }
+    work.variant == canonical_item.variant
 }
 
 fn kind_for_work(work: &WorkRow) -> String {
@@ -758,7 +802,9 @@ fn kind_for_work(work: &WorkRow) -> String {
     }
     match work.variant.as_str() {
         "detail" => format!("{}_detail", work.canonical_resource_type),
-        "smart" => format!("{}_smart", work.canonical_resource_type),
+        "smart" | "smart_public" | "smart_authorized" => {
+            format!("{}_smart", work.canonical_resource_type)
+        }
         _ => format!("{}_summary", work.canonical_resource_type),
     }
 }
@@ -771,6 +817,18 @@ fn public_response(work: &WorkRow, request_id: &str, projection: Option<Value>) 
         "poll_url": format!("/api/translate/requests/{request_id}"),
         "result": request_result(work, projection),
     })
+}
+
+fn request_status_for_projection(result: &Value, visible_status: &str) -> String {
+    if result.get("status").and_then(Value::as_str) == Some("incompatible") {
+        "incompatible".to_owned()
+    } else {
+        visible_status.to_owned()
+    }
+}
+
+fn submission_status_for_result(result: &Value, work_status: &str) -> String {
+    request_status_for_projection(result, work_status)
 }
 
 fn active_response(work: &WorkRow, request_id: &str, projection: Option<Value>) -> Value {
@@ -1211,12 +1269,13 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &current.status);
         return Ok((
             StatusCode::CONFLICT,
             GlobalSubmissionResponse {
                 request_id: request_id.clone(),
                 work_item_id: current.id.clone(),
-                status: current.status.clone(),
+                status: response_status,
                 poll_url: format!("/api/translate/requests/{request_id}"),
                 result,
                 error: Some(json!({
@@ -1420,12 +1479,13 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &current.status);
         return Ok((
             StatusCode::CONFLICT,
             GlobalSubmissionResponse {
                 request_id: request_id.clone(),
                 work_item_id: current.id,
-                status: current.status,
+                status: response_status,
                 poll_url: format!("/api/translate/requests/{request_id}"),
                 result,
                 error: Some(json!({
@@ -1453,13 +1513,14 @@ async fn submit_item_with_admission(
         result["producer_ref"] = Value::String(item.producer_ref.clone());
         result["kind"] = Value::String(item.kind.clone());
         result["variant"] = Value::String(item.variant.clone());
+        let response_status = submission_status_for_result(&result, &work.status);
         let poll_url = format!("/api/translate/requests/{existing_request_id}");
         return Ok((
             StatusCode::ACCEPTED,
             GlobalSubmissionResponse {
                 request_id: existing_request_id,
                 work_item_id: work.id.clone(),
-                status: work.status.clone(),
+                status: response_status,
                 poll_url,
                 result,
                 error: None,
@@ -1489,10 +1550,11 @@ async fn submit_item_with_admission(
     result["producer_ref"] = Value::String(item.producer_ref.clone());
     result["kind"] = Value::String(item.kind.clone());
     result["variant"] = Value::String(item.variant.clone());
+    let response_status = submission_status_for_result(&result, &work.status);
     let mut body = GlobalSubmissionResponse {
         request_id: request_id.clone(),
         work_item_id: work.id.clone(),
-        status: work.status.clone(),
+        status: response_status,
         poll_url: format!("/api/translate/requests/{request_id}"),
         result,
         error: None,
@@ -1589,7 +1651,15 @@ pub async fn get_request(
         source_blocks: Vec::new(),
         target_slots: Vec::new(),
     };
-    api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
+    let canonical_item =
+        api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
+    if !release_request_variant_is_current(&work, &canonical_item) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "translation request is no longer available for this audience",
+        ));
+    }
     let identity_upgrade_complete = content_identity_upgrade::is_complete(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -1630,8 +1700,9 @@ pub async fn get_request(
         (work.status.clone(), projection.unwrap_or_else(|| json!({})))
     };
     let mut response = public_response(&response_work, request_id, Some(projection));
-    response["status"] = Value::String(visible_status.clone());
-    response["result"]["status"] = Value::String(visible_status);
+    let response_status = request_status_for_projection(&response["result"], &visible_status);
+    response["status"] = Value::String(response_status.clone());
+    response["result"]["status"] = Value::String(response_status);
     response["result"]["producer_ref"] = authorization_probe.producer_ref.into();
     response["result"]["kind"] = Value::String(kind_for_work(&response_work));
     Ok(Some(response))
@@ -1820,6 +1891,99 @@ pub async fn read_global_resource(
     Ok(Some((status, payload)))
 }
 
+/// Read a projection for a public source identity without falling back to a
+/// retained projection from another source hash. Public Release pages must
+/// never inherit content derived from a private compare snapshot.
+pub async fn read_global_resource_exact(
+    state: &AppState,
+    resource_type: &str,
+    resource_id: &str,
+    pipeline: &str,
+    variant: &str,
+    expected_source_hash: &str,
+) -> Result<Option<(String, Value)>, ApiError> {
+    if content_identity_upgrade::is_complete(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        let key = content_identity_upgrade::ContentWorkIdentity {
+            canonical_resource_type: resource_type.to_owned(),
+            canonical_resource_id: resource_id.to_owned(),
+            pipeline: pipeline.to_owned(),
+            variant: variant.to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            source_hash: expected_source_hash.to_owned(),
+            protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+        };
+        let identity_id =
+            content_identity_upgrade::identity_id_for(&key).map_err(ApiError::internal)?;
+        let payload = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
+        )
+        .bind(&identity_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        let status = work_for_identity(&state.pool, &key)
+            .await?
+            .map(|work| work.status);
+        if payload.is_none() && status.is_none() {
+            return Ok(None);
+        }
+        return Ok(Some((
+            if payload.is_some() {
+                "ready".to_owned()
+            } else {
+                status.unwrap_or_else(|| "ready".to_owned())
+            },
+            payload.unwrap_or_else(|| json!({})),
+        )));
+    }
+
+    let model_profile = current_model_profile(state).await;
+    let current = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, status FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? AND model_profile = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(pipeline)
+    .bind(variant)
+    .bind(expected_source_hash)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(&model_profile)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let payload = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND protocol_version = ? AND source_hash = ? ORDER BY CASE WHEN model_profile = ? THEN 0 ELSE 1 END, datetime(updated_at) DESC, id DESC LIMIT 1",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(pipeline)
+    .bind(variant)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(expected_source_hash)
+    .bind(&model_profile)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if payload.is_none() && current.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((
+        if payload.is_some() {
+            "ready".to_owned()
+        } else {
+            current
+                .map(|(_, status)| status)
+                .unwrap_or_else(|| "ready".to_owned())
+        },
+        payload.unwrap_or_else(|| json!({})),
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn latest_request_id_for_resource(
     state: &AppState,
@@ -1851,6 +2015,35 @@ pub async fn retry_request(
     state: &AppState,
     user_id: &str,
     request_id: &str,
+) -> Result<(StatusCode, Value), ApiError> {
+    retry_request_inner(state, user_id, request_id, false).await
+}
+
+pub(crate) async fn retry_incompatible_request(
+    state: &AppState,
+    user_id: &str,
+    request_id: &str,
+) -> Result<(StatusCode, Value), ApiError> {
+    retry_request_inner(state, user_id, request_id, true).await
+}
+
+pub(crate) fn release_reading_projection_is_incompatible(projection: &Value) -> bool {
+    let Some(raw_reading) = projection.get("reading") else {
+        return false;
+    };
+    let Ok(mut reading) =
+        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
+    else {
+        return true;
+    };
+    reading.normalize_references().is_err() || reading.validate().is_err()
+}
+
+async fn retry_request_inner(
+    state: &AppState,
+    user_id: &str,
+    request_id: &str,
+    allow_incompatible_ready: bool,
 ) -> Result<(StatusCode, Value), ApiError> {
     // Manual retry is a scheduler command, serialized through the same writer
     // boundary as claims. The API layer delegates authorization and shaping.
@@ -1991,6 +2184,27 @@ pub async fn retry_request(
         let mut body = active_response(&row, &new_request_id, projection);
         body["result"]["producer_ref"] = Value::String(producer_ref.clone());
         return Ok((StatusCode::CONFLICT, body));
+    }
+    if allow_incompatible_ready
+        && row.status == "ready"
+        && matches!(
+            row.variant.as_str(),
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+                | translations::RELEASE_READING_PUBLIC_VARIANT
+        )
+        && projection
+            .as_ref()
+            .is_some_and(release_reading_projection_is_incompatible)
+    {
+        sqlx::query(
+            "UPDATE content_work_items SET status = 'failed', failure_class = 'output_contract_invalid', retry_after_at = NULL, finished_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'ready'",
+        )
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        row.status = "failed".to_owned();
+        row.retry_after_at = None;
     }
     if row.status != "failed" {
         tx.commit().await.map_err(ApiError::internal)?;
@@ -2874,7 +3088,11 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
 }
 
 fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
-    let system = if pipeline == "polishing" {
+    let is_release_reading =
+        pipeline == "polishing" && snapshot.target_slots.iter().any(|slot| slot == "reading");
+    let system = if is_release_reading {
+        "你是严谨的 Release 阅读内容整理助手。只输出一个 JSON 对象，不要解释。顶层必须直接包含 target_slots 列出的字段，不要使用 output、result 或 data 包装，不要输出 Markdown 代码围栏。reading.changes 只放人类需要直接阅读的真实变化、限制、兼容性影响和必要操作；reading.machine_materials 只放核验价值高但人类通常不需要阅读的哈希、manifest、文件范围等机器材料；禁止把功能、修复、迁移或操作建议放进 machine_materials。reading.evidence 由服务端覆盖，模型输出的该字段会被忽略。"
+    } else if pipeline == "polishing" {
         "你是严谨的技术内容润色助手。只输出一个 JSON 对象，不要解释。JSON 顶层必须直接包含 target_slots 列出的字段；不要使用 output、result 或 data 包装，也不要输出 Markdown 代码围栏。保留事实、链接、代码和 Markdown 结构。"
     } else {
         "你是严谨的技术文档翻译助手。只输出一个 JSON 对象，不要解释。JSON 顶层必须直接包含 target_slots 列出的字段；不要使用 output、result 或 data 包装，也不要输出 Markdown 代码围栏。保留事实、链接、代码和 Markdown 结构。"
@@ -2888,7 +3106,11 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
             })
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
-        "response_contract": "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
+        "response_contract": if is_release_reading {
+            "Return one JSON object with title_zh, summary_md, and reading directly at the top level. reading must be {version:string,outcome:'changes'|'insufficient',title:string|null,changes:[{text:string,versions:string[],references:[{label:string|null,url:string}]}],machine_materials:[{label:string,value:string}],evidence:[]}. references may contain only necessary GitHub pull request, migration, security, or operational links; PR links are rendered as PR#number and other links require a concise label. Do not put links in prose. Return outcome='insufficient' only after the supplied release body and compare evidence have both been checked and no useful human-readable change remains. title_zh and summary_md are compatibility projections derived from the same reading facts; do not add author attribution, version-only repetition, or source sections."
+        } else {
+            "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
+        }
     })
         .to_string();
     (system.to_owned(), user)
@@ -3291,12 +3513,93 @@ fn validate_output(
     let object = output
         .as_object()
         .ok_or_else(|| anyhow!("global content output is not an object"))?;
+    let mut reading = None;
     for slot in target_slots {
         let Some(value) = object.get(slot) else {
             return Err(anyhow!(
                 "global content output is missing target slot: {slot}"
             ));
         };
+        if slot == "reading" {
+            let mut parsed =
+                serde_json::from_value::<translations::ReleaseReadingResult>(value.clone())
+                    .context("reading is not a valid ReleaseReadingResult")?;
+            parsed.normalize_references().map_err(anyhow::Error::msg)?;
+            parsed.validate().map_err(anyhow::Error::msg)?;
+            if let Some(expected_version) = source_blocks
+                .iter()
+                .find(|block| block.slot == "metadata")
+                .and_then(|block| block.text.lines().nth(1))
+                .map(str::trim)
+                .filter(|version| !version.is_empty())
+                && parsed.version.trim() != expected_version
+            {
+                anyhow::bail!(
+                    "reading.version does not match the Release tag: expected {expected_version}"
+                );
+            }
+            if parsed.machine_materials.iter().any(|material| {
+                let label = material.label.to_ascii_lowercase();
+                let allowed_label = label.contains("sha")
+                    || label.contains("hash")
+                    || label.contains("manifest")
+                    || label.contains("identity")
+                    || label.contains("commit")
+                    || label.contains("file")
+                    || label.contains("coverage")
+                    || label.contains("compare")
+                    || label.contains("base")
+                    || label.contains("head");
+                !allowed_label || release_reading_material_value_has_human_prose(&material.value)
+            }) {
+                anyhow::bail!("reading.machine_materials contains human-readable content");
+            }
+            let evidence = source_blocks
+                .iter()
+                .find(|block| block.slot == "reading_evidence_json")
+                .and_then(|block| {
+                    serde_json::from_str::<Vec<translations::ReleaseReadingEvidence>>(&block.text)
+                        .ok()
+                })
+                .unwrap_or_default();
+            let evidence_has_release_body = evidence
+                .iter()
+                .any(|entry| matches!(entry.kind.as_str(), "release_body" | "release_text"));
+            let evidence_has_compare = evidence.iter().any(|entry| {
+                matches!(
+                    entry.kind.as_str(),
+                    "github_compare" | "github_compare_empty"
+                )
+            });
+            if evidence.iter().any(|entry| {
+                matches!(
+                    entry.kind.as_str(),
+                    "baseline_unavailable" | "compare_unavailable" | "github_compare_incomplete"
+                )
+            }) {
+                return Err(anyhow::Error::new(ReadingEvidenceUnavailable {
+                    message: "reading evidence is unavailable; the result must remain in a processing failure state".to_owned(),
+                }));
+            }
+            if !evidence_has_release_body && !evidence_has_compare {
+                anyhow::bail!("reading evidence is incomplete");
+            }
+            if parsed.is_changes()
+                && !evidence_has_release_body
+                && !evidence.iter().any(|entry| entry.kind == "github_compare")
+            {
+                anyhow::bail!("reading changes require readable Release or compare evidence");
+            }
+            parsed.evidence = evidence;
+            parsed.machine_materials = if parsed.is_changes() {
+                release_reading_machine_materials(&parsed.evidence)
+            } else {
+                Vec::new()
+            };
+            parsed.validate().map_err(anyhow::Error::msg)?;
+            reading = Some(parsed);
+            continue;
+        }
         let body_without_source = slot == "body_md"
             && !source_blocks
                 .iter()
@@ -3307,7 +3610,10 @@ fn validate_output(
                     "global content output target slot must be null or non-empty text: {slot}"
                 ));
             }
-        } else if value.as_str().is_none_or(|text| text.trim().is_empty()) {
+        } else if value.as_str().is_none_or(|text| text.trim().is_empty())
+            && !(target_slots.iter().any(|target| target == "reading")
+                && matches!(slot.as_str(), "title_zh" | "summary_md"))
+        {
             return Err(anyhow!(
                 "global content output target slot is missing text: {slot}"
             ));
@@ -3328,6 +3634,36 @@ fn validate_output(
             }
         }
     }
+    if let Some(reading) = reading {
+        let mut projection = target_slots
+            .iter()
+            .filter_map(|slot| object.get(slot).map(|value| (slot.clone(), value.clone())))
+            .collect::<serde_json::Map<_, _>>();
+        projection.insert(
+            "title_zh".to_owned(),
+            reading
+                .title
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        let summary = reading
+            .changes
+            .iter()
+            .map(|change| format!("- {}", change.text.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        projection.insert(
+            "summary_md".to_owned(),
+            if summary.is_empty() {
+                Value::Null
+            } else {
+                Value::String(summary)
+            },
+        );
+        projection.insert("reading".to_owned(), serde_json::to_value(reading)?);
+        return Ok(Value::Object(projection));
+    }
     // Persist only declared content slots. The model is not allowed to inject
     // lifecycle, identity, or other control fields into a result projection.
     let projection = target_slots
@@ -3337,12 +3673,84 @@ fn validate_output(
     Ok(Value::Object(projection))
 }
 
+fn release_reading_material_value_has_human_prose(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || value.chars().any(|character| {
+            matches!(character, '。' | '，' | '；' | '：' | '、')
+                || ('\u{4e00}'..='\u{9fff}').contains(&character)
+        })
+        || (value.split_whitespace().count() > 8 && value.chars().count() > 96)
+}
+
+fn release_reading_machine_materials(
+    evidence: &[translations::ReleaseReadingEvidence],
+) -> Vec<translations::ReleaseReadingMaterial> {
+    let mut materials = Vec::new();
+    let mut push = |label: &str, value: &str| {
+        let value = value.trim();
+        if value.is_empty()
+            || materials
+                .iter()
+                .any(|material: &translations::ReleaseReadingMaterial| {
+                    material.label == label && material.value == value
+                })
+        {
+            return;
+        }
+        materials.push(translations::ReleaseReadingMaterial {
+            label: label.to_owned(),
+            value: value.to_owned(),
+        });
+    };
+
+    for entry in evidence {
+        match entry.kind.as_str() {
+            "github_compare" | "github_compare_empty" => {
+                push("Compare", &entry.reference);
+                if let Some(scope) = entry.scope.as_deref() {
+                    for pair in scope.split(';') {
+                        let Some((key, value)) = pair.split_once('=') else {
+                            continue;
+                        };
+                        let label = match key.trim() {
+                            "base_sha" => "Base SHA",
+                            "merge_base_sha" => "Merge-base SHA",
+                            "head_sha" => "Head SHA",
+                            "base" => "Base",
+                            "head" => "Head",
+                            _ => continue,
+                        };
+                        push(label, value);
+                    }
+                }
+            }
+            "baseline_unavailable" => push("Baseline", &entry.reference),
+            _ => {}
+        }
+    }
+    materials
+}
+
 #[derive(Debug)]
 struct OutputValidationFailure {
     call_ids: Vec<String>,
     code: &'static str,
     message: String,
 }
+
+#[derive(Debug)]
+struct ReadingEvidenceUnavailable {
+    message: String,
+}
+
+impl std::fmt::Display for ReadingEvidenceUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReadingEvidenceUnavailable {}
 
 impl std::fmt::Display for OutputValidationFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3710,9 +4118,14 @@ async fn complete_global_output(
     ) {
         Ok(output) => output,
         Err(error) => {
+            let code = if error.downcast_ref::<ReadingEvidenceUnavailable>().is_some() {
+                "reading_evidence_unavailable"
+            } else {
+                "output_contract_invalid"
+            };
             return Err(anyhow::Error::new(OutputValidationFailure {
                 call_ids,
-                code: "output_contract_invalid",
+                code,
                 message: error.to_string(),
             }));
         }
@@ -3819,6 +4232,21 @@ pub(crate) fn notification_source_revision_tiebreak(
 
 pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
     parts.join("\n")
+}
+
+pub(crate) fn release_source_revision_content_tiebreak(parts: &[&str]) -> String {
+    let evidence_rank = if parts.iter().any(|part| {
+        let normalized = part.to_ascii_lowercase();
+        normalized.contains("compare evidence is unavailable")
+            || normalized.contains("truncated or paginated")
+            || normalized.contains("compare_unavailable")
+            || normalized.contains("github_compare_incomplete")
+    }) {
+        0
+    } else {
+        1
+    };
+    format!("evidence_rank={evidence_rank}\n{}", parts.join("\n"))
 }
 
 pub(crate) fn announcement_source_revision_tiebreak(
@@ -4581,7 +5009,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
                 || matches!(
                     class.as_str(),
-                    "output_contract_invalid" | "output_truncated"
+                    "output_contract_invalid" | "output_truncated" | "reading_evidence_unavailable"
                 );
             let now = Utc::now();
             let next_retry = next_retry_at_for_failure(
@@ -4947,7 +5375,9 @@ mod tests {
     use crate::observability::LoggingThresholds;
     use crate::session_store::{CoordinatedSessionLayer, CoordinatedSqliteSessionStore};
     use crate::state::{build_oauth_client, build_webauthn};
-    use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
+    use crate::translations::{
+        TranslationRequestItemInput, TranslationRuntimeConfig, TranslationSchedulerController,
+    };
     use axum::{
         Router,
         body::Body,
@@ -8760,6 +9190,228 @@ mod tests {
         )
         .expect("bodyless detail output is valid");
         assert_eq!(output["body_md"], Value::Null);
+    }
+
+    fn release_reading_work(variant: &str) -> WorkRow {
+        WorkRow {
+            id: "reading-work".to_owned(),
+            canonical_resource_type: "release".to_owned(),
+            canonical_resource_id: "release-1".to_owned(),
+            pipeline: "polishing".to_owned(),
+            variant: variant.to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            source_hash: "source-hash".to_owned(),
+            protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+            model_profile: "test-model".to_owned(),
+            source_snapshot_json: "{}".to_owned(),
+            configuration_fingerprint: "test-fingerprint".to_owned(),
+            status: "ready".to_owned(),
+            priority: 0,
+            cache_hit: 0,
+            token_estimate: 1,
+            batch_id: None,
+            attempt_count: 0,
+            next_retry_at: None,
+            retry_expires_at: None,
+            retry_after_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            lease_owner: None,
+            lease_expires_at: None,
+            attempt_configuration_snapshot_json: None,
+            attempt_route_snapshot_json: None,
+            attempt_configuration_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn request_result_marks_semantically_invalid_reading_incompatible() {
+        let work = release_reading_work(translations::RELEASE_READING_PUBLIC_VARIANT);
+        let result = request_result(
+            &work,
+            Some(json!({
+                "reading": {
+                    "version": "v1.0.0",
+                    "outcome": "changes",
+                    "changes": [],
+                    "machine_materials": [],
+                    "evidence": []
+                }
+            })),
+        );
+
+        assert_eq!(result["status"], "incompatible");
+        assert_eq!(result["error_code"], "reading_incompatible");
+        assert!(result["reading"].is_null());
+    }
+
+    #[test]
+    fn request_status_preserves_incompatible_projection_status() {
+        let result = json!({"status": "incompatible"});
+        assert_eq!(
+            request_status_for_projection(&result, "ready"),
+            "incompatible"
+        );
+        assert_eq!(
+            submission_status_for_result(&result, "ready"),
+            "incompatible"
+        );
+        assert_eq!(request_status_for_projection(&json!({}), "ready"), "ready");
+    }
+
+    #[test]
+    fn release_request_variant_must_match_current_audience() {
+        let work = release_reading_work(translations::RELEASE_READING_AUTHORIZED_VARIANT);
+        let public_item = TranslationRequestItemInput {
+            producer_ref: "test".to_owned(),
+            kind: "release_smart".to_owned(),
+            variant: translations::RELEASE_READING_PUBLIC_VARIANT.to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: Vec::new(),
+            target_slots: Vec::new(),
+        };
+        assert!(!release_request_variant_is_current(&work, &public_item));
+    }
+
+    #[test]
+    fn release_reading_output_derives_legacy_slots_and_server_evidence() {
+        let output = validate_output(
+            r#"{"title_zh":"v1.2.0 版本更新","summary_md":"- 相关链接：...","reading":{"version":"v1.2.0","outcome":"changes","title":"新增批处理","changes":[{"text":"每轮最多处理 10 批","versions":["v1.2.0"]}],"machine_materials":[{"label":"Compare SHA","value":"base..head"}],"evidence":[{"kind":"model","reference":"must be replaced"}]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[translations::TranslationSourceBlock {
+                slot: "reading_evidence_json".to_owned(),
+                text: r#"[{"kind":"github_compare","reference":"v1.1.0...v1.2.0","scope":"head=abc"}]"#.to_owned(),
+            }],
+        )
+        .expect("release reading output should validate");
+
+        assert_eq!(output["title_zh"], "新增批处理");
+        assert_eq!(output["summary_md"], "- 每轮最多处理 10 批");
+        assert_eq!(output["reading"]["evidence"][0]["kind"], "github_compare");
+        assert_eq!(
+            output["reading"]["evidence"][0]["reference"],
+            "v1.1.0...v1.2.0"
+        );
+        assert_eq!(
+            output["reading"]["machine_materials"][0]["label"],
+            "Compare"
+        );
+        assert_eq!(
+            output["reading"]["machine_materials"][0]["value"],
+            "v1.1.0...v1.2.0"
+        );
+    }
+
+    #[test]
+    fn release_reading_output_rejects_human_content_in_machine_materials() {
+        let error = validate_output(
+            r#"{"title_zh":"","summary_md":"","reading":{"version":"v1.2.0","outcome":"changes","changes":[{"text":"迁移配置"}],"machine_materials":[{"label":"迁移配置","value":"必须执行"}]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[],
+        )
+        .expect_err("human-readable change must not be folded");
+        assert!(error.to_string().contains("machine_materials"));
+    }
+
+    #[test]
+    fn release_reading_output_rejects_machine_materials_for_insufficient_result() {
+        let error = validate_output(
+            r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.2.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[{"label":"Compare SHA","value":"base..head"}]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[],
+        )
+        .expect_err("insufficient results keep the minimal release record");
+        assert!(error.to_string().contains("insufficient outcome"));
+    }
+
+    #[test]
+    fn release_reading_output_does_not_turn_compare_failure_into_insufficient() {
+        let error = validate_output(
+            r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.2.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[translations::TranslationSourceBlock {
+                slot: "reading_evidence_json".to_owned(),
+                text: r#"[{"kind":"compare_unavailable","reference":"v1.1.0...v1.2.0","scope":"rate_limited"}]"#.to_owned(),
+            }],
+        )
+        .expect_err("failed compare evidence must remain a failure state");
+        assert!(error.to_string().contains("evidence is unavailable"));
+    }
+
+    #[test]
+    fn release_reading_output_rejects_missing_or_incomplete_compare_evidence() {
+        for evidence in [
+            r#"[{"kind":"baseline_unavailable","reference":"v1.2.0"}]"#,
+            r#"[{"kind":"github_compare_incomplete","reference":"v1.1.0...v1.2.0"}]"#,
+        ] {
+            let error = validate_output(
+                r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.2.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[]}}"#,
+                &[
+                    "title_zh".to_owned(),
+                    "summary_md".to_owned(),
+                    "reading".to_owned(),
+                ],
+                &[translations::TranslationSourceBlock {
+                    slot: "reading_evidence_json".to_owned(),
+                    text: evidence.to_owned(),
+                }],
+            )
+            .expect_err("incomplete compare evidence must not become no-change");
+            assert!(error.to_string().contains("evidence is unavailable"));
+        }
+    }
+
+    #[test]
+    fn release_reading_output_accepts_a_completed_empty_compare_as_insufficient() {
+        let output = validate_output(
+            r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.2.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[translations::TranslationSourceBlock {
+                slot: "reading_evidence_json".to_owned(),
+                text: r#"[{"kind":"github_compare_empty","reference":"v1.1.0...v1.2.0","scope":"compare completed"}]"#.to_owned(),
+            }],
+        )
+        .expect("completed empty compare may produce an insufficient result");
+        assert_eq!(output["reading"]["outcome"], "insufficient");
+    }
+
+    #[test]
+    fn release_reading_output_rejects_a_model_version_mismatch() {
+        let error = validate_output(
+            r#"{"title_zh":null,"summary_md":null,"reading":{"version":"v1.1.0","outcome":"insufficient","title":null,"changes":[],"machine_materials":[]}}"#,
+            &[
+                "title_zh".to_owned(),
+                "summary_md".to_owned(),
+                "reading".to_owned(),
+            ],
+            &[translations::TranslationSourceBlock {
+                slot: "metadata".to_owned(),
+                text: "acme/demo\nv1.2.0".to_owned(),
+            }],
+        )
+        .expect_err("model must not change the Release version");
+        assert!(error.to_string().contains("does not match the Release tag"));
     }
 
     #[test]

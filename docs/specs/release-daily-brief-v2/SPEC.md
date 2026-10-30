@@ -1,5 +1,7 @@
 # Release 日报内容格式 V2 与历史快照修复
 
+正文价值、来源链接、机器材料折叠与处理状态的统一规则见 [Release 阅读内容与变更依据](../release-reading-content/SPEC.md)。本主题继续维护日报窗口、快照与格式；历史链接输出和提示式兜底不再作为内容目标，实现覆盖分别记录在两者的 `IMPLEMENTATION.md`。
+
 ## 背景 / 问题陈述
 
 - 当前 Release 日报正文仍以 `## 概览` 开头，并把时间窗口、项目数、预发布数等元数据直接堆进正文，导致内容主体被稀释。
@@ -15,7 +17,7 @@
 - 把日报正文收敛为内容本体：移除 `## 概览` 与正文中的时间窗口，只保留 `## 项目更新` 与 `## 获星与关注` 两个稳定章节。
 - 在同一窗口内同时汇总 Release、仓库获星与账号被关注，并采用紧凑摘要而不是完整社交卡片复刻。
 - 彻底消灭整篇日报被单层 markdown fence 包裹的落库结果，同时保留合法嵌套代码块。
-- 生成内容中的 related links 统一保存为 ` · ` 分隔的裸 GitHub URL；共享 Markdown 仅在链接文字等于 URL 时压缩：PR / Issue 用 `#123`，commit 用 7 位 SHA，release 用 tag，compare 用单段 percent-decoding 后的 `base...head`，标准 `#L<line>` 或 `#L<start>-L<end>` 直接追加，其它 GitHub 路径沿用紧凑 fallback。
+- 新生成正文不输出机械提取的 related links 行；共享 Markdown 的裸 GitHub URL 压缩仍用于原文、翻译与历史内容兼容，不构成新增来源链接的要求。
 - 为已存在的标准化 brief 提供原位刷新路径，并补一条历史内容修复任务，批量更新旧格式 / fenced-format 快照。
 - 同步更新 Storybook、测试、产品文档与视觉证据。
 
@@ -54,17 +56,18 @@
 
 - REQ-BRIEF-STRUCTURE: 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
-- `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
-- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只允许在确有可提炼变更时以连续的 `  - ...` 子 bullet 组成，低信息 release 只保留主行。
+- `## 项目更新` 继续按仓库分组，保留进入站内详情的 release 主链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`；legacy `/?tab=briefs&release=<release_id>` 继续可读，不额外复制 GitHub Release 原文入口。
+- `## 项目更新` 中的仓库标题保持 `### [owner/repo](...)`；发布主行与变更子要点层次清晰。同一项目多个版本可以合并说明变化，并保持每项变化所属版本明确；无有效变更信息的版本保留最简主行，不补子 bullet。
+- REQ-BRIEF-CONTENT: 日报内容必须遵循 [Release 阅读内容与变更依据](../release-reading-content/SPEC.md)，真实变化与必要限制直接可读，不增加来源区、机器材料或处理提示式子要点。
 - release 要点提取必须复用 `release_smart` 的事实链路：`body valuable -> 直接总结`，否则走 compare fallback；两者都无价值时，不得编造任何伪摘要或固定占位文案。
 - 日报 release 摘要必须通过 mode-aware 的 `summarize_releases_smart_batch_for_user` 路由：legacy 模式保持既有缓存/写入语义，global 模式提交全局内容工作；请求尚未 ready 时必须使用 deterministic fallback 继续生成日报，不得调用 legacy writer。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
-- REQ-GITHUB-LINKS: related links 的 canonical Markdown 必须使用 ` · ` 分隔的裸 GitHub URL，不得生成不存在的标题；前端显示时 PR / Issue 为 `#编号`，commit 为 7 位 SHA，release 为 tag，compare 为可读的 `base...head`，标准行号片段直接追加。人工 Markdown 标题、查询参数、非行号 fragment 与非 GitHub URL 保持其原有可见文字与 href。
+- REQ-GITHUB-LINKS: 新生成正文不得机械附加 related links 行。必要操作链接与确有阅读意义的引用可以保留，PR 引用明确使用 `PR#编号`。既有裸 URL 的前端紧凑展示保持兼容：PR / Issue 为 `#编号`，commit 为 7 位 SHA，release 为 tag，compare 为可读的 `base...head`，标准行号片段直接追加；明确的人工标题、查询参数、非行号 fragment 与非 GitHub URL 保持其文字与 href。
 - REQ-POLISH-CANONICAL: 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown；润色阶段也不得为零子 bullet 的 release 补写“发布 xxx”“版本发布”“更新要点”等空泛内容。
 - Release 要点生成与润色 prompt 必须声明默认使用简体中文整理日报内容，同时允许保留代码标识符、commit type、包名、API 名、项目名、版本号和原始标题等必要英文。
-- 当 AI 不可用或返回不可解析摘要时，deterministic fallback 不得直接复用原始 release notes 的英文 bullet；应输出中文提示式兜底，并保留 release 主链接与 GitHub Release 外链。
+- 当 AI 不可用或返回不可解析摘要时，deterministic fallback 不得直接复用原始 release notes 的英文 bullet，也不得把处理提示写成变化要点；保留发布记录与已有有效内容，处理状态在正文之外表达。
 - `brief.refresh_content` 与同窗口再生成必须把 `发布 <repo> <version>`、`版本发布`、`更新要点` 这类伪摘要纳入可刷新范围。
 - 已存在的标准化 brief 命中同一窗口时，重新生成必须更新原有行，而不是直接 no-op 复用旧内容。
 - 历史修复任务必须能够扫描并刷新命中旧格式签名的可重建 brief。
@@ -120,16 +123,16 @@ None
   When 正文渲染完成
   Then 正文中不再出现 `## 概览`、时间窗口或项目数统计，只保留 `## 项目更新` 与 `## 获星与关注`。
 
-- Given 某个 release body 中提取到了 PR、Issue 或 commit 链接
-  When 日报正文渲染相关链接
-  Then canonical 正文保存裸 URL，前端显示文本分别为 `#编号`、`#编号`、7 位 SHA，而不是完整 GitHub URL。
+- Given 某个 release body 中存在仅用于贡献归属的 PR、Issue 或 commit 链接
+  When 生成日报正文
+  Then 不机械提取“相关链接”行；有阅读意义且必须保留的 PR 引用明确写为 `PR#编号`。
 
-- Given 某个 release body 中提取到了 compare、编码 ref 或标准行号 fragment 链接
-  When 日报正文渲染相关链接
+- Given 历史日报包含裸 compare、编码 ref 或标准行号 fragment 链接
+  When 共享 Markdown 渲染这些历史链接
   Then compare 显示为解码后的 `base...head`，标准行号直接追加，query 与其它 fragment 仅保留在 href 中。
 
-- Given 某个 related GitHub URL 已经有人工 Markdown 标题
-  When 日报正文渲染相关链接
+- Given 某个必要 GitHub 链接已经有明确人工 Markdown 标题
+  When 日报正文渲染该链接
   Then 保留人工标题，不应用裸链接紧凑规则。
 
 - Given 某个 release body 无价值但 compare digest 提取到了明确变更
@@ -138,7 +141,7 @@ None
 
 - Given 某个 release 的 body 与 compare digest 都无价值
   When 日报正文渲染该 release
-  Then 该 release 仅保留主行与外链，不渲染任何子 bullet；润色后也保持零子 bullet。
+  Then 该 release 保留最简主行及现有详情入口，不另加来源外链，不渲染任何子 bullet；润色后也保持零子 bullet。
 
 - Given LLM 返回的润色结果是整篇 ` ```markdown ` fenced 文本
   When brief 内容落库
@@ -195,8 +198,9 @@ None
 ## Verification
 
 - VER-BRIEF-STRUCTURE covers: REQ-BRIEF-STRUCTURE; `cargo test` and the Dashboard / Release detail Storybook and Playwright scenarios verify the V2 body shape.
-- VER-GITHUB-LINKS covers: REQ-GITHUB-LINKS; `cargo test build_brief_content_from_digests_rejects_polish_adding_pseudo_summary_to_link_only_release`, `Components/Markdown / GithubAutolinks`, Dashboard stories, and `release-detail.spec.ts` verify bare URL canonical output and compact PR / Issue / commit / release / compare / line-anchor labels.
-- VER-POLISH-CANONICAL covers: REQ-POLISH-CANONICAL; Rust canonical validation tests verify deterministic fallback when polish changes related URLs into titled links.
+- VER-BRIEF-CONTENT covers: REQ-BRIEF-CONTENT; 以多版本、无有效变更信息、ready 段落与处理失败的输入验证内容归属、发布记录保留与真实状态区分，且不出现来源区或提示式子要点。
+- VER-GITHUB-LINKS covers: REQ-GITHUB-LINKS; 检查新生成日报没有机械 related links 行，必要 PR 引用明确为 `PR#编号`；`Components/Markdown / GithubAutolinks` 与既有链接场景继续检查历史裸 URL 的紧凑显示与人工标题兼容。
+- VER-POLISH-CANONICAL covers: REQ-POLISH-CANONICAL; 检查外层代码围栏剥离与 canonical 内容校验，且润色不得重加来源区或伪摘要。
 - VER-QUALITY-GATES covers: REQ-BRIEF-STRUCTURE, REQ-GITHUB-LINKS, REQ-POLISH-CANONICAL; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `web:lint`, `web:build`, `web:storybook-build`, and the targeted Playwright test provide the mechanical gate.
 
 ## Related ADRs

@@ -197,7 +197,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{Row, sqlite::SqlitePoolOptions};
 
     fn current_checksum(version: i64) -> Vec<u8> {
         MIGRATOR
@@ -494,7 +494,7 @@ mod tests {
             .await
             .expect("apply pending migration to existing v90 database");
 
-        for version in [93_i64, 94, 95, 96, 97, 98, 99, 100, 101] {
+        for version in [93_i64, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104] {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
@@ -872,6 +872,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_reading_backfill_migration_creates_tables_indexes_and_foreign_keys() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let pre_0102 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 101)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0102
+            .run(&pool)
+            .await
+            .expect("apply schema through migration 101");
+        run(&pool)
+            .await
+            .expect("apply release reading backfill migration");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 102 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 102"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 103 AND success = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read migration 103"),
+            1
+        );
+        for table in [
+            "release_reading_backfill_runs",
+            "release_reading_backfill_items",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("check backfill table"),
+                1,
+                "migration 102 must create {table}"
+            );
+        }
+        for index in [
+            "idx_release_reading_backfill_runs_status",
+            "idx_release_reading_backfill_items_cursor",
+            "idx_release_reading_backfill_items_release",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                )
+                .bind(index)
+                .fetch_one(&pool)
+                .await
+                .expect("check backfill index"),
+                1,
+                "migration 102 must create {index}"
+            );
+        }
+        let foreign_keys = sqlx::query("PRAGMA foreign_key_list('release_reading_backfill_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill foreign keys");
+        assert_eq!(foreign_keys.len(), 2);
+        let foreign_key_tables = foreign_keys
+            .iter()
+            .map(|row| row.get::<String, _>("table"))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(foreign_key_tables.contains("release_reading_backfill_runs"));
+        assert!(foreign_key_tables.contains("repo_releases"));
+
+        let run_columns = sqlx::query("PRAGMA table_info('release_reading_backfill_runs')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill run columns");
+        let run_column_names = run_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "id",
+            "started_at",
+            "window_start_utc",
+            "window_end_utc",
+            "status",
+            "total",
+            "succeeded",
+            "failed",
+            "waiting",
+            "skipped",
+            "lease_owner",
+            "lease_task_id",
+            "lease_expires_at",
+            "error_text",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                run_column_names.contains(required),
+                "missing run column {required}"
+            );
+        }
+        let item_columns = sqlx::query("PRAGMA table_info('release_reading_backfill_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("read backfill item columns");
+        let item_column_names = item_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "run_id",
+            "release_id",
+            "authorized_user_id",
+            "published_at",
+            "status",
+            "attempt_count",
+            "error_text",
+            "updated_at",
+        ] {
+            assert!(
+                item_column_names.contains(required),
+                "missing item column {required}"
+            );
+        }
+        let run_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'release_reading_backfill_runs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read run table definition");
+        assert!(run_sql.contains(
+            "CHECK (status IN ('queued', 'running', 'waiting', 'paused', 'succeeded', 'failed'))"
+        ));
+        let item_sql = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'release_reading_backfill_items'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read item table definition");
+        assert!(item_sql.contains("PRIMARY KEY (run_id, release_id)"));
+        assert!(item_sql.contains("ON DELETE CASCADE"));
+    }
+
+    #[tokio::test]
     async fn failed_pending_migration_reports_version_and_rolls_back() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -904,7 +1067,7 @@ mod tests {
             .expect_err("invalid pending migration must fail startup");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(
-            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]"
+            "failed to apply pending SQLx migrations: [91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104]"
         ));
         assert!(rendered.contains("failed to apply database migrations"));
         assert_eq!(

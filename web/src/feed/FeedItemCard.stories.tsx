@@ -82,7 +82,9 @@ function buildAnnouncementItem(
 	};
 }
 
-function buildReleaseItem(): ReleaseFeedItem {
+function buildReleaseItem(
+	overrides?: Partial<ReleaseFeedItem>,
+): ReleaseFeedItem {
 	return {
 		kind: "release",
 		ts: "2026-09-26T14:21:38Z",
@@ -101,6 +103,7 @@ function buildReleaseItem(): ReleaseFeedItem {
 		translated: null,
 		smart: null,
 		reactions: null,
+		...overrides,
 	};
 }
 
@@ -222,6 +225,107 @@ export const ReleaseTypeIconHiddenOnMobile: Story = {
 		);
 		await expect(canvas.getByText("openai/codex")).toBeVisible();
 		await expect(icon).not.toBeVisible();
+	},
+};
+
+export const ReleaseReadingShowsChangesAndFoldsMachineMaterial: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="smart"
+			item={buildReleaseItem({
+				smart: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "提升定时日志清理的批次上限",
+					summary: "- 每轮最多处理 10 批，仍受 20 秒运行时限制。",
+					reading: {
+						version: "v0.86.5",
+						outcome: "changes",
+						title: "提升定时日志清理的批次上限",
+						changes: [
+							{
+								text: "每轮最多处理 10 批，仍受 20 秒运行时限制。",
+								versions: ["v0.86.5"],
+							},
+						],
+						machine_materials: [{ label: "Compare SHA", value: "base..head" }],
+					},
+				},
+			})}
+		/>
+	),
+	globals: {
+		theme: "dark",
+		viewport: { value: "feedItemDesktop923" },
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("每轮最多处理 10 批，仍受 20 秒运行时限制。"),
+		).toBeVisible();
+		const details = canvasElement.querySelector("details");
+		expect(details).not.toBeNull();
+		expect(details).not.toHaveAttribute("open", "");
+		await expect(canvas.getByText("Compare SHA")).not.toBeVisible();
+	},
+};
+
+export const ReleaseReadingMobile: Story = {
+	...ReleaseReadingShowsChangesAndFoldsMachineMaterial,
+	globals: {
+		theme: "dark",
+		viewport: { value: "feedItemMobile393" },
+	},
+};
+
+export const ReleaseReadingInsufficientKeepsMinimalRecord: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="smart"
+			item={buildReleaseItem({
+				smart: {
+					lang: "zh-CN",
+					status: "ready",
+					title: null,
+					summary: null,
+					reading: {
+						version: "0.166.0-alpha.1",
+						outcome: "insufficient",
+						title: null,
+						changes: [],
+						machine_materials: [],
+					},
+				},
+			})}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.queryByText("没有可提炼的变化")).toBeNull();
+		await expect(canvas.getByText("0.159.0-alpha.4")).toBeVisible();
+	},
+};
+
+export const ReleaseReadingIncompatibleShowsRetry: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="smart"
+			item={buildReleaseItem({
+				smart: {
+					lang: "zh-CN",
+					status: "incompatible",
+					title: null,
+					summary: null,
+				},
+			})}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("润色结果格式不兼容")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "重试润色" }),
+		).toBeVisible();
 	},
 };
 

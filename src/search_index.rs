@@ -976,14 +976,14 @@ async fn refresh_user_lane(
               AND t.entity_type LIKE ? AND lower(t.entity_type) NOT LIKE '%smart%'
               AND lower(t.entity_id) IN (lower(?), lower(?))
             ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
-           (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
+           CASE WHEN ? = 1 THEN NULL ELSE (SELECT trim(COALESCE(t.title, '') || ' ' || COALESCE(t.summary, ''))
             FROM ai_translations t
             WHERE t.user_id = ? AND t.lang = 'zh-CN'
               AND t.status IN ('ready', 'disabled', 'missing')
               AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
               AND t.entity_type LIKE ? AND lower(t.entity_type) LIKE '%smart%'
               AND lower(t.entity_id) IN (lower(?), lower(?))
-            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1),
+            ORDER BY t.updated_at DESC, t.id DESC LIMIT 1) END,
            COALESCE((SELECT MAX(t.updated_at) FROM ai_translations t
                      WHERE t.user_id = ? AND t.lang = 'zh-CN'
                        AND t.status IN ('ready', 'disabled', 'missing')
@@ -996,7 +996,8 @@ async fn refresh_user_lane(
                          AND t.status IN ('ready', 'disabled', 'missing')
                          AND (t.title IS NOT NULL OR t.summary IS NOT NULL)
                          AND t.entity_type LIKE ?
-                         AND lower(t.entity_id) IN (lower(?), lower(?)))",
+                         AND lower(t.entity_id) IN (lower(?), lower(?))
+                         AND (? = 0 OR lower(t.entity_type) NOT LIKE '%smart%'))",
     )
     .bind(document_id)
     .bind(user_id)
@@ -1004,6 +1005,7 @@ async fn refresh_user_lane(
     .bind(&entity_pattern)
     .bind(entity_id)
     .bind(alternate_entity_id)
+    .bind((resource_type == "release") as i64)
     .bind(user_id)
     .bind(&entity_pattern)
     .bind(entity_id)
@@ -1018,6 +1020,7 @@ async fn refresh_user_lane(
     .bind(&entity_pattern)
     .bind(entity_id)
     .bind(alternate_entity_id)
+    .bind((resource_type == "release") as i64)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1201,15 +1204,18 @@ async fn refresh_content_projection(
         ("translation", "translated_text"),
         ("polishing", "smart_text"),
     ] {
+        let public_release_smart = (resource_type == "release" && pipeline == "polishing") as i64;
         let projection_text_query = if identity_upgrade_complete {
-            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' AND (? = 0 OR i.variant = ?) ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
         } else {
-            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' AND (? = 0 OR p.variant = ?) ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
         };
         let text = sqlx::query_scalar::<_, Option<String>>(projection_text_query)
             .bind(resource_type)
             .bind(resource_id)
             .bind(pipeline)
+            .bind(public_release_smart)
+            .bind(crate::translations::RELEASE_READING_PUBLIC_VARIANT)
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
@@ -1223,6 +1229,27 @@ async fn refresh_content_projection(
             .execute(&mut **tx)
             .await?;
         updated_any |= result.rows_affected() > 0;
+    }
+    if resource_type == "release" {
+        // Legacy ai_translations triggers may have materialized a private
+        // smart lane before the shared release projection was introduced.
+        // Remove smart-only rows and clear the smart field on translated rows
+        // so an access change cannot leave private compare text searchable.
+        let deleted = sqlx::query(
+            "DELETE FROM search_document_user_lanes WHERE translated_text IS NULL AND document_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+        let cleared = sqlx::query(
+            "UPDATE search_document_user_lanes SET smart_text = NULL, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE document_id IN (SELECT id FROM search_documents WHERE resource_type = ? AND resource_id = ?)",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .execute(&mut **tx)
+        .await?;
+        updated_any |= deleted.rows_affected() > 0 || cleared.rows_affected() > 0;
     }
     Ok(updated_any)
 }
@@ -2062,14 +2089,17 @@ async fn apply_content_projection_batch(
         let resource_id: String = row.get("canonical_resource_id");
         let pipeline: String = row.get("pipeline");
         let projection_text_query = if identity_upgrade_complete {
-            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' AND (? = 0 OR i.variant = ?) ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
         } else {
-            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' AND (? = 0 OR p.variant = ?) ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
         };
+        let public_release_smart = (resource_type == "release" && pipeline == "polishing") as i64;
         let text = sqlx::query_scalar::<_, Option<String>>(projection_text_query)
             .bind(&resource_type)
             .bind(&resource_id)
             .bind(&pipeline)
+            .bind(public_release_smart)
+            .bind(crate::translations::RELEASE_READING_PUBLIC_VARIANT)
             .fetch_optional(&mut **tx)
             .await?;
         let column = if pipeline == "polishing" {
@@ -2133,6 +2163,41 @@ async fn apply_translation_batch(tx: &mut Transaction<'_, Sqlite>, rowids: &[i64
         let Some(document_id) = document_id else {
             continue;
         };
+        if resource_type == "release" && is_smart {
+            // Legacy release smart rows may still be replayed by the
+            // translations backfill. They are user-scoped and may contain
+            // private compare facts, so remove both the lane and its FTS row
+            // instead of materializing them again.
+            sqlx::query(
+                "UPDATE search_document_user_lanes SET smart_text = NULL, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE document_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM search_document_user_lanes WHERE document_id = ? AND user_id = ? AND translated_text IS NULL",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM search_document_user_lanes_fts WHERE doc_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO search_document_user_lanes_fts (doc_id, user_id, translated_text, smart_text) SELECT document_id, user_id, COALESCE(translated_text, ''), COALESCE(smart_text, '') FROM search_document_user_lanes WHERE document_id = ? AND user_id = ?",
+            )
+            .bind(&document_id)
+            .bind(&user_id)
+            .execute(&mut **tx)
+            .await?;
+            continue;
+        }
         let text = title
             .into_iter()
             .chain(summary)
