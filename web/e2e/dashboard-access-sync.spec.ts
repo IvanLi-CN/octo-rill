@@ -176,10 +176,10 @@ async function installVisualViewportMock(page: Page) {
 	});
 }
 
-function buildReactionFooterReady() {
+function buildReactionFooterReady(plus1 = 4) {
 	return {
 		counts: {
-			plus1: 4,
+			plus1,
 			laugh: 1,
 			heart: 2,
 			hooray: 1,
@@ -2670,15 +2670,30 @@ test("failed access sync settles while the readable feed request is still pendin
 			page.locator('[data-readable-loading-initial="true"]'),
 		).toBeVisible();
 		await expect(page.getByText("Fresh after failure")).toHaveCount(0);
-		await page.evaluate(() => {
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as typeof window & {
+								__activeAccessTaskSources?: number;
+							}
+						).__activeAccessTaskSources ?? 0,
+				),
+			)
+			.toBeGreaterThan(0);
+		const deliveredListeners = await page.evaluate(() => {
 			const state = window as typeof window & {
 				__dispatchAccessTaskEvent?: (type: string, payload: unknown) => number;
 			};
-			state.__dispatchAccessTaskEvent?.("task.completed", {
-				status: "failed",
-				error: "access sync failed",
-			});
+			return (
+				state.__dispatchAccessTaskEvent?.("task.completed", {
+					status: "failed",
+					error: "access sync failed",
+				}) ?? 0
+			);
 		});
+		expect(deliveredListeners).toBeGreaterThan(0);
 		await expect
 			.poll(
 				() =>
@@ -2697,6 +2712,327 @@ test("failed access sync settles while the readable feed request is still pendin
 		});
 	} finally {
 		releaseReadableRequests?.();
+	}
+});
+
+test("dashboard discards warm feed and reaction responses after successful access refresh", async ({
+	page,
+}) => {
+	const taskId = "task-access-refresh-warm-cache";
+	let syncAllCalls = 0;
+	let readableRefreshHeld = false;
+	let reactionRefreshCalls = 0;
+	let oldReactionResponseReturned = false;
+	let markReadableRefreshStarted: (() => void) | null = null;
+	let releaseReadableRefresh: (() => void) | null = null;
+	let markInitialReactionStarted: (() => void) | null = null;
+	let releaseInitialReaction: (() => void) | null = null;
+	const readableRefreshStarted = new Promise<void>((resolve) => {
+		markReadableRefreshStarted = resolve;
+	});
+	const readableRefreshGate = new Promise<void>((resolve) => {
+		releaseReadableRefresh = resolve;
+	});
+	const initialReactionStarted = new Promise<void>((resolve) => {
+		markInitialReactionStarted = resolve;
+	});
+	const initialReactionGate = new Promise<void>((resolve) => {
+		releaseInitialReaction = resolve;
+	});
+
+	await page.addInitScript(
+		({ accessTaskId }) => {
+			type TestWindow = Window & {
+				__activeAccessTaskSources?: number;
+				__dispatchAccessTaskEvent?: (type: string, payload: unknown) => number;
+			};
+			const state = window as TestWindow;
+			window.localStorage.setItem(
+				"octo-rill.dashboard-warm.v1",
+				JSON.stringify({
+					savedAt: Date.now(),
+					userId: "2f4k7m9p3x6c8v2a",
+					routeState: { tab: "all", activeReleaseId: null },
+					feedRequestType: "all",
+					feedItems: [
+						{
+							kind: "release",
+							ts: "2026-04-09T08:00:00Z",
+							id: "access-refresh-release",
+							repo_full_name: "owner/repo",
+							title: "Cached release",
+							body: "content from before the access refresh",
+							body_truncated: false,
+							subtitle: null,
+							reason: null,
+							subject_type: null,
+							html_url:
+								"https://github.com/owner/repo/releases/tag/vaccess-refresh-release",
+							unread: null,
+							translated: null,
+							smart: null,
+							reactions: {
+								counts: {
+									plus1: 4,
+									laugh: 1,
+									heart: 2,
+									hooray: 1,
+									rocket: 1,
+									eyes: 0,
+								},
+								viewer: {
+									plus1: false,
+									laugh: false,
+									heart: false,
+									hooray: false,
+									rocket: false,
+									eyes: false,
+								},
+								status: "ready",
+							},
+						},
+					],
+					nextCursor: null,
+					notifications: [],
+					briefs: [],
+					selectedBriefId: null,
+				}),
+			);
+
+			const taskSources: MockEventSource[] = [];
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				onopen: ((event: Event) => unknown) | null = null;
+				private listeners = new Map<string, Set<(event: Event) => unknown>>();
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					if (!this.url.endsWith(`/api/tasks/${accessTaskId}/events`)) return;
+					taskSources.push(this);
+					state.__activeAccessTaskSources =
+						(state.__activeAccessTaskSources ?? 0) + 1;
+					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
+				}
+
+				addEventListener(type: string, listener: (event: Event) => unknown) {
+					const listeners = this.listeners.get(type) ?? new Set();
+					listeners.add(listener);
+					this.listeners.set(type, listeners);
+				}
+
+				removeEventListener(type: string, listener: (event: Event) => unknown) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					if (this.readyState === 2) return;
+					this.readyState = 2;
+					if (this.url.endsWith(`/api/tasks/${accessTaskId}/events`)) {
+						state.__activeAccessTaskSources = Math.max(
+							0,
+							(state.__activeAccessTaskSources ?? 1) - 1,
+						);
+					}
+				}
+
+				dispatch(type: string, payload: unknown) {
+					if (this.readyState === 2) return 0;
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+					});
+					const listeners = this.listeners.get(type) ?? new Set();
+					for (const listener of listeners) listener(event);
+					return listeners.size;
+				}
+			}
+
+			Object.defineProperty(window, "EventSource", {
+				configurable: true,
+				writable: true,
+				value: MockEventSource,
+			});
+			state.__dispatchAccessTaskEvent = (type, payload) =>
+				[...taskSources]
+					.reverse()
+					.find((source) => source.readyState !== 2)
+					?.dispatch(type, payload) ?? 0;
+		},
+		{ accessTaskId: taskId },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const { pathname } = new URL(req.url());
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+		if (req.method() === "POST" && pathname === "/api/sync/all") {
+			syncAllCalls += 1;
+			return json(route, { task_id: taskId });
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			if (syncAllCalls > 0 && !readableRefreshHeld) {
+				readableRefreshHeld = true;
+				markReadableRefreshStarted?.();
+				await readableRefreshGate;
+			}
+			return json(
+				route,
+				{
+					error: {
+						code: "release_reading_evidence_unavailable",
+						message: "compare evidence unavailable",
+					},
+				},
+				503,
+			);
+		}
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			const fresh = syncAllCalls > 0;
+			return json(route, {
+				items: [
+					buildReleaseFeedItem("access-refresh-release", {
+						title: fresh ? "Fresh release" : "Cached release",
+						reactions: buildReactionFooterReady(fresh ? 12 : 4),
+					}),
+				],
+				next_cursor: null,
+			});
+		}
+		if (req.method() === "POST" && pathname === "/api/feed/reactions/refresh") {
+			reactionRefreshCalls += 1;
+			const request = req.postDataJSON() as { release_ids: string[] };
+			if (reactionRefreshCalls === 1) {
+				markInitialReactionStarted?.();
+				await initialReactionGate;
+				oldReactionResponseReturned = true;
+			}
+			const plus1 = reactionRefreshCalls === 1 ? 1 : 12;
+			return json(route, {
+				items: request.release_ids.map((release_id) => ({
+					release_id,
+					reactions: buildReactionFooterReady(plus1),
+				})),
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: true,
+				masked_token: "ghp_****_test",
+				check: {
+					state: "valid",
+					message: null,
+					checked_at: "2026-04-09T08:00:00Z",
+				},
+				owner: null,
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			return json(route, {
+				token: "access-refresh-updates",
+				lists: {
+					feed: { changed: false, new_count: 0, latest_keys: [] },
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		return json(
+			route,
+			{ error: { code: "not_found", message: `unhandled ${pathname}` } },
+			404,
+		);
+	});
+
+	try {
+		await page.goto("/");
+		await expect(page.getByText("Cached release")).toBeVisible({
+			timeout: 8000,
+		});
+		await initialReactionStarted;
+		await expect.poll(() => reactionRefreshCalls).toBe(1);
+		await page
+			.getByRole("banner")
+			.getByRole("button", { name: "同步" })
+			.click();
+		await expect.poll(() => syncAllCalls).toBe(1);
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as typeof window & {
+								__activeAccessTaskSources?: number;
+							}
+						).__activeAccessTaskSources ?? 0,
+				),
+			)
+			.toBeGreaterThan(0);
+		const deliveredListeners = await page.evaluate(
+			() =>
+				(
+					window as typeof window & {
+						__dispatchAccessTaskEvent?: (
+							type: string,
+							payload: unknown,
+						) => number;
+					}
+				).__dispatchAccessTaskEvent?.("task.completed", {
+					task_id: "task-access-refresh-warm-cache",
+					status: "succeeded",
+				}) ?? 0,
+		);
+		expect(deliveredListeners).toBeGreaterThan(0);
+		await readableRefreshStarted;
+		await expect(
+			page.locator('[data-readable-loading-initial="true"]'),
+		).toBeVisible();
+		await expect(page.getByText("Cached release")).toHaveCount(0);
+
+		releaseReadableRefresh?.();
+		await expect(page.getByText("Fresh release")).toBeVisible({
+			timeout: 8000,
+		});
+		await expect(page.getByText("Cached release")).toHaveCount(0);
+		await expect
+			.poll(() => reactionRefreshCalls, { timeout: 5000 })
+			.toBeGreaterThan(1);
+		await expect(
+			page.locator('[data-reaction-trigger="plus1"]'),
+		).toHaveAttribute("data-reaction-count", "12");
+
+		releaseInitialReaction?.();
+		await expect
+			.poll(() => oldReactionResponseReturned, { timeout: 3000 })
+			.toBe(true);
+		await page.waitForTimeout(150);
+		await expect(
+			page.locator('[data-reaction-trigger="plus1"]'),
+		).toHaveAttribute("data-reaction-count", "12");
+	} finally {
+		releaseReadableRefresh?.();
+		releaseInitialReaction?.();
 	}
 });
 

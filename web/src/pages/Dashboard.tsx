@@ -1669,12 +1669,14 @@ export function Dashboard(props: {
 	const [initialAccessPending, setInitialAccessPending] = useState(
 		initialAccessTask !== null,
 	);
+	const [warmFeedSnapshotValid, setWarmFeedSnapshotValid] = useState(true);
 	const [accessContextKey, setAccessContextKey] = useState(
 		initialAccessTask ? `access:${initialAccessTask.taskId}` : "stable",
 	);
 	const advanceAccessContext = useCallback(
 		(taskId: string) => {
 			clearDashboardWarmSnapshot();
+			setWarmFeedSnapshotValid(false);
 			clearDashboardFeedQueryCache(me.user.id);
 			setAccessContextKey(`${taskId}:${Date.now()}`);
 		},
@@ -1805,7 +1807,9 @@ export function Dashboard(props: {
 		userId: me.user.id,
 		viewerStateKey: readableViewerStateKey,
 		initialData:
-			readableSectionsActive || accessContextKey !== "stable"
+			readableSectionsActive ||
+			accessContextKey !== "stable" ||
+			!warmFeedSnapshotValid
 				? null
 				: warmFeedData,
 		scope,
@@ -1974,10 +1978,16 @@ export function Dashboard(props: {
 	const lastFeedReactionRefreshByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
+	const feedReactionRefreshGenerationRef = useRef(0);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
 	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
+	const invalidateFeedReactionRefreshes = useCallback(() => {
+		feedReactionRefreshGenerationRef.current += 1;
+		reactionRefreshingKeysRef.current.clear();
+		lastFeedReactionRefreshByKeyRef.current.clear();
+	}, []);
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
 	>(
@@ -3281,6 +3291,7 @@ export function Dashboard(props: {
 		if (releaseIdsToRefresh.length === 0) {
 			return;
 		}
+		const requestGeneration = feedReactionRefreshGenerationRef.current;
 
 		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
 			itemKey({ kind: "release", id: releaseId }),
@@ -3311,6 +3322,8 @@ export function Dashboard(props: {
 			),
 		)
 			.then((results) => {
+				if (requestGeneration !== feedReactionRefreshGenerationRef.current)
+					return;
 				for (const result of results) {
 					if (result.status !== "fulfilled") {
 						const reason = result.reason;
@@ -3340,6 +3353,8 @@ export function Dashboard(props: {
 				}
 			})
 			.finally(() => {
+				if (requestGeneration !== feedReactionRefreshGenerationRef.current)
+					return;
 				for (const key of refreshingKeys) {
 					reactionRefreshingKeysRef.current.delete(key);
 				}
@@ -3497,6 +3512,7 @@ export function Dashboard(props: {
 			clearReconnectTimer();
 			clearCompletionTimer();
 			readableSections.clearContent();
+			invalidateFeedReactionRefreshes();
 			invalidatePendingTranslations();
 			invalidatePendingSmart();
 			setInitialAccessPending(false);
@@ -3615,11 +3631,13 @@ export function Dashboard(props: {
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
 				readableSections.clearContent();
+				invalidateFeedReactionRefreshes();
 				invalidatePendingTranslations();
 				invalidatePendingSmart();
 				clearDashboardWarmSnapshot();
+				setWarmFeedSnapshotValid(false);
 				clearDashboardFeedQueryCache(me.user.id);
-				setInitialAccessPending(false);
+				setInitialAccessPending(payload.status === "succeeded");
 				if (payload.status === "succeeded") {
 					setAccessSyncLifecycle("refreshing");
 					startQueuedCompletionTimer();
@@ -3660,6 +3678,7 @@ export function Dashboard(props: {
 							resolvedError,
 							"同步已完成，但页面刷新失败，请稍后重试。",
 						);
+						setInitialAccessPending(false);
 						advanceAccessContext(completedTaskId);
 						source.close();
 						settleTaskWaiterRef.current(completedTaskId, resolvedError);
@@ -3668,6 +3687,7 @@ export function Dashboard(props: {
 						);
 						return;
 					}
+					setInitialAccessPending(false);
 					setAccessSyncStage("completed");
 					setAccessSyncLifecycle("succeeded");
 					setAccessSyncProgress(() => ({
@@ -3738,6 +3758,7 @@ export function Dashboard(props: {
 		accessTaskStream,
 		advanceAccessContext,
 		readableSections.clearContent,
+		invalidateFeedReactionRefreshes,
 		invalidatePendingSmart,
 		invalidatePendingTranslations,
 		me.user.id,
