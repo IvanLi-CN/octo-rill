@@ -2525,9 +2525,12 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				}
 			).__dispatchDashboardTaskEvent = (type, payload) => {
 				return (
-					mockTaskEventSources
-						.find((source) =>
-							source.url.endsWith(`/api/tasks/${taskId}/events`),
+					[...mockTaskEventSources]
+						.reverse()
+						.find(
+							(source) =>
+								source.readyState !== 2 &&
+								source.url.endsWith(`/api/tasks/${taskId}/events`),
 						)
 						?.dispatch(type, payload) ?? 0
 				);
