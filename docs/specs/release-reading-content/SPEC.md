@@ -123,6 +123,19 @@ OctoRill 为读者整理 GitHub 动态，润色与日报承担直接说明变化
   evidence_note: `移动卡片保持变化直显、折叠材料和标题换行，无横向溢出。`
   image: ![Release reading mobile](./assets/release-reading-feed-mobile.png)
 
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1206x1200`
+  viewport_strategy: `devtools-emulate`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  submission_gate: `owner-approved`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish Feed Recovery / Original Release Visible`
+  state: `member dashboard with original Release selected`
+  evidence_note: `本地 mock Dashboard 展示可读的原始 Release 正文；精确错误码回退和通用 5xx 保持错误由 dashboard-brief-detail E2E 验证。`
+  image: ![Dashboard readable Release](./assets/dashboard-readable-fallback-desktop.png)
+
 ## Related ADRs
 
 - [ADR 0022: Release 阅读的私有差异依据边界](../../adr/0022-release-reading-private-evidence-boundary.md)
