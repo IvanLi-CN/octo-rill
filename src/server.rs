@@ -314,6 +314,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
         .route(
+            "/admin/jobs/release-reading/backfill",
+            post(api::admin_enqueue_release_reading_backfill),
+        )
+        .route(
             "/admin/jobs/webhook-push/runtime-config",
             get(webhook_push::admin_get_runtime_config)
                 .patch(webhook_push::admin_patch_runtime_config),

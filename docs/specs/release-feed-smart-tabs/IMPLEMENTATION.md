@@ -3,12 +3,16 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: 已交付
+- Implementation: 三态阅读交互与结构化 Release 阅读结果已接入；权限隔离和集成验证待完成。
 - Created: 2026-04-07
 - Last: 2026-06-29
 - Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, native title removed from card lane tooltip triggers, Dashboard page-level lane selector styling refreshed with Storybook evidence, upstream chat 403 release translation/polish failures are recoverable through foreground generation plus `retry.recent_failures`, release-smart canonical feed lookup now anchors on the target release before repo-local previous-tag resolution to avoid global visible-release sorting under translation load, Dashboard feed now auto-rescues retryable smart failures once per page session with a neutral waiting state, and the shared lane contract is reused by announcement reading in `announcement-discussion-reading`
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
+
+## 内容规则实现缺口
+
+本主题的历史交付包含遗留 body-first / diff fallback；当前 global 路径已接入 Release 专属 prompt、语义版本基线和结构化 `reading`。具体内容与剩余集成验证见 [统一阅读内容实现状态](../release-reading-content/IMPLEMENTATION.md)。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 

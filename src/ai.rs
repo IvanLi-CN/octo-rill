@@ -1307,8 +1307,31 @@ struct ReleaseRendered {
     html_url: String,
     published_at: String,
     is_prerelease: bool,
-    bullets: Vec<String>,
-    related_links: Vec<String>,
+    reading_version: Option<String>,
+    bullets: Vec<BriefReleaseChange>,
+    status_label: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BriefReleaseChange {
+    text: String,
+    versions: Vec<String>,
+    references: Vec<translations::ReleaseReadingReference>,
+}
+
+fn brief_release_changes_from_reading(
+    reading: &translations::ReleaseReadingResult,
+) -> Vec<BriefReleaseChange> {
+    reading
+        .changes
+        .iter()
+        .map(|change| BriefReleaseChange {
+            text: sanitize_bullet_text(change.text.trim()),
+            versions: change.versions.clone(),
+            references: change.references.clone(),
+        })
+        .filter(|change| !change.text.is_empty())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1344,14 +1367,17 @@ struct BuiltBriefContent {
     releases: Vec<ReleaseDigest>,
 }
 
-const BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET: &str =
-    "暂未生成变更摘要，请打开 Release 详情查看原文与润色。";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BriefReleaseSummaryState {
-    Ready(Vec<String>),
+    Ready {
+        version: String,
+        changes: Vec<BriefReleaseChange>,
+    },
     NoValue,
     Unavailable,
+    Pending,
+    Failed,
+    Incompatible,
 }
 
 #[derive(Debug, Clone)]
@@ -4409,7 +4435,7 @@ fn is_canonical_repo_heading_line(line: &str) -> bool {
 }
 
 fn is_canonical_release_line(line: &str) -> bool {
-    if !line.starts_with("- [") || !line.contains("[GitHub Release](") {
+    if !line.starts_with("- [") || line.contains("[GitHub Release](") {
         return false;
     }
 
@@ -4419,7 +4445,13 @@ fn is_canonical_release_line(line: &str) -> bool {
 }
 
 fn is_canonical_release_detail_line(line: &str) -> bool {
-    line.starts_with("  - ") && line.trim().len() > 3
+    if !line.starts_with("  - ") || line.trim().len() <= 3 {
+        return false;
+    }
+    let detail = line.trim_start_matches("  - ").trim();
+    !["相关链接：", "来源：", "实现依据：", "发布原文："]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
 }
 
 fn is_canonical_social_summary_line(line: &str) -> bool {
@@ -4704,32 +4736,17 @@ fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
 
 fn release_block_has_summary_details(block: &BriefReleaseBlock) -> bool {
     block.detail_lines.iter().any(|line| {
-        !line.starts_with("相关链接：") && line != BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET
+        !line.starts_with("相关链接：")
+            && !line.starts_with("来源：")
+            && !line.starts_with("实现依据：")
+            && !line.starts_with("发布原文：")
+            && !line.starts_with("阅读内容")
     })
 }
 
-fn release_block_has_related_links(block: &BriefReleaseBlock) -> bool {
-    block
-        .detail_lines
-        .iter()
-        .any(|line| line.starts_with("相关链接："))
-}
-
-fn release_block_related_links_are_bare_urls(block: &BriefReleaseBlock) -> bool {
-    block
-        .detail_lines
-        .iter()
-        .filter(|line| line.starts_with("相关链接："))
-        .all(|line| {
-            line.trim_start_matches("相关链接：")
-                .split(" · ")
-                .all(|link| {
-                    let link = link.trim();
-                    link.starts_with("https://github.com/")
-                        || link.starts_with("https://www.github.com/")
-                        || link.starts_with("https://raw.githubusercontent.com/")
-                })
-        })
+fn brief_has_readable_release_change(markdown: &str) -> bool {
+    extract_brief_release_blocks(markdown)
+        .is_some_and(|blocks| blocks.iter().any(release_block_has_summary_details))
 }
 
 fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
@@ -4751,10 +4768,6 @@ fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
                 && source_block.release_title == candidate_block.release_title
                 && release_block_has_summary_details(source_block)
                     == release_block_has_summary_details(candidate_block)
-                && release_block_has_related_links(source_block)
-                    == release_block_has_related_links(candidate_block)
-                && (!release_block_has_related_links(source_block)
-                    || release_block_related_links_are_bare_urls(candidate_block))
         })
 }
 
@@ -4833,75 +4846,6 @@ fn sanitize_bullet_text(raw: &str) -> String {
     }
 
     out.join(" ").trim().to_owned()
-}
-
-fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
-    fn push_link(
-        candidate: &str,
-        seen: &mut HashSet<String>,
-        out: &mut Vec<String>,
-        max_links: usize,
-    ) -> bool {
-        if !is_allowed_github_url(candidate) {
-            return false;
-        }
-        let Ok(url) = Url::parse(candidate) else {
-            return false;
-        };
-        let normalized = url.to_string();
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-        out.len() >= max_links
-    }
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    // Prefer explicit Markdown links first, e.g. [PR](https://github.com/...)
-    let mut i = 0usize;
-    while i < body.len() && out.len() < max_links {
-        let rest = &body[i..];
-
-        if rest.starts_with('[')
-            && let Some(text_end_rel) = rest.find("](")
-            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
-        {
-            let url_start = i + text_end_rel + 2;
-            let url_end = url_start + url_end_rel;
-            let target = body[url_start..url_end].trim();
-            if push_link(target, &mut seen, &mut out, max_links) {
-                return out;
-            }
-            i = url_end + 1;
-            continue;
-        }
-
-        let mut chars = rest.chars();
-        let ch = chars.next().expect("rest is non-empty");
-        i += ch.len_utf8();
-    }
-
-    for token in body.split_whitespace() {
-        let candidate = token.trim_matches(|c: char| {
-            matches!(
-                c,
-                ')' | '(' | '[' | ']' | '<' | '>' | ',' | ';' | '"' | '\'' | '.'
-            )
-        });
-        if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
-            continue;
-        }
-        if push_link(candidate, &mut seen, &mut out, max_links) {
-            break;
-        }
-    }
-    out
-}
-
-fn extract_fallback_bullets(body: &str, _max_bullets: usize) -> Vec<String> {
-    let _ = body;
-    vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
 }
 
 fn to_release_digest(rows: Vec<ReleaseRow>) -> Vec<ReleaseDigest> {
@@ -5335,17 +5279,74 @@ async fn summarize_projects_with_ai(
 }
 
 fn parse_brief_smart_summary_bullets(summary: &str) -> Vec<String> {
-    summary
+    let lines = summary
         .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("- ")
-                .or_else(|| line.trim().strip_prefix("* "))
-        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let bullet_lines = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")))
+        .collect::<Vec<_>>();
+    let candidates = if bullet_lines.is_empty() {
+        lines
+    } else {
+        bullet_lines
+    };
+    candidates
+        .into_iter()
         .map(|line| sanitize_bullet_text(line.trim()))
         .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let normalized = line.to_ascii_lowercase();
+            let version_only = normalized
+                .strip_prefix("release ")
+                .or_else(|| normalized.strip_prefix("version "))
+                .unwrap_or(&normalized)
+                .trim_start_matches('v');
+            !(normalized.starts_with("相关链接")
+                || normalized.starts_with("来源")
+                || normalized.starts_with("实现依据")
+                || normalized.starts_with("暂未生成")
+                || (normalized.starts_with("由 ") && normalized.contains("提交"))
+                || semver::Version::parse(version_only).is_ok())
+        })
         .take(4)
         .collect()
+}
+
+/// Adapt the legacy per-user Release summary into the same structured facts
+/// consumed by the daily brief. This is a compatibility reader only; new
+/// Release readings are written through the global structured result path.
+fn legacy_release_reading_result(
+    release: &ReleaseDigest,
+    item: &api::TranslateBatchItem,
+    bullets: Vec<String>,
+) -> translations::ReleaseReadingResult {
+    translations::ReleaseReadingResult {
+        version: release.title.clone(),
+        outcome: "changes".to_owned(),
+        title: item
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned),
+        changes: bullets
+            .into_iter()
+            .map(|text| translations::ReleaseReadingChange {
+                text,
+                versions: Vec::new(),
+                references: Vec::new(),
+            })
+            .collect(),
+        machine_materials: Vec::new(),
+        evidence: vec![translations::ReleaseReadingEvidence {
+            kind: "legacy_summary".to_owned(),
+            reference: release.release_id.to_string(),
+            scope: Some("legacy compatibility projection".to_owned()),
+        }],
+    }
 }
 
 async fn load_brief_release_summary_states(
@@ -5371,45 +5372,150 @@ async fn load_brief_release_summary_states(
     let legacy_route = content_processing::legacy_writer_route(state)
         .await
         .map_err(anyhow::Error::from)?;
-    let items = if legacy_route.is_some() {
+    if legacy_route.is_some() {
         translations::enqueue_release_smart_translation_requests(state, user_id, &release_ids)
             .await
             .map_err(anyhow::Error::from)?;
-        api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
-            .await
-            .map_err(anyhow::Error::from)?
-    } else {
-        api::summarize_releases_smart_batch_for_user(state, user_id, &release_ids)
-            .await
-            .map_err(anyhow::Error::from)?
-    };
-    let mut summary_states = HashMap::new();
-
-    for item in items.items {
-        let Ok(release_id) = item.id.parse::<i64>() else {
-            continue;
-        };
-        let state = match item.status.as_str() {
-            "ready" => {
-                let bullets = item
-                    .summary
-                    .as_deref()
-                    .map(parse_brief_smart_summary_bullets)
-                    .unwrap_or_default();
-                if bullets.is_empty() {
-                    BriefReleaseSummaryState::Unavailable
-                } else {
-                    BriefReleaseSummaryState::Ready(bullets)
+        let items =
+            api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
+                .await
+                .map_err(anyhow::Error::from)?;
+        let releases_by_id = releases
+            .iter()
+            .map(|release| (release.release_id, release))
+            .collect::<HashMap<_, _>>();
+        let mut summary_states = HashMap::new();
+        for item in items.items {
+            let Ok(release_id) = item.id.parse::<i64>() else {
+                continue;
+            };
+            let state = match item.status.as_str() {
+                "ready" => {
+                    let bullets = item
+                        .summary
+                        .as_deref()
+                        .map(parse_brief_smart_summary_bullets)
+                        .unwrap_or_default();
+                    let Some(release) = releases_by_id.get(&release_id) else {
+                        continue;
+                    };
+                    let reading = legacy_release_reading_result(release, &item, bullets);
+                    if !reading.is_changes() || reading.changes.is_empty() {
+                        BriefReleaseSummaryState::Incompatible
+                    } else {
+                        BriefReleaseSummaryState::Ready {
+                            version: reading.version,
+                            changes: reading
+                                .changes
+                                .into_iter()
+                                .map(|change| BriefReleaseChange {
+                                    text: change.text,
+                                    versions: change.versions,
+                                    references: change.references,
+                                })
+                                .collect(),
+                        }
+                    }
                 }
-            }
-            "missing" => BriefReleaseSummaryState::NoValue,
-            "disabled" | "error" => BriefReleaseSummaryState::Unavailable,
-            _ => BriefReleaseSummaryState::Unavailable,
-        };
-        summary_states.insert(release_id, state);
+                "missing" if item.error.as_deref() == Some(api::SMART_NO_VALUABLE_VERSION_INFO) => {
+                    BriefReleaseSummaryState::NoValue
+                }
+                "missing" => BriefReleaseSummaryState::Unavailable,
+                "queued" | "running" | "processing" | "deferred_provider" | "blocked_config" => {
+                    BriefReleaseSummaryState::Pending
+                }
+                "error" | "failed" | "cancelled" | "superseded" => BriefReleaseSummaryState::Failed,
+                "disabled" => BriefReleaseSummaryState::Unavailable,
+                _ => BriefReleaseSummaryState::Incompatible,
+            };
+            summary_states.insert(release_id, state);
+        }
+        return Ok(summary_states);
     }
-
+    let readings = api::read_global_release_reading_batch_for_user(state, user_id, &release_ids)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let mut summary_states = HashMap::new();
+    for release_id in &release_ids {
+        let state = match readings.get(release_id) {
+            Some(state) if state.status == "ready" && state.reading_incompatible => {
+                BriefReleaseSummaryState::Incompatible
+            }
+            Some(state) if state.status == "ready" => match state.reading.as_ref() {
+                Some(reading) if reading.is_changes() => {
+                    let changes = brief_release_changes_from_reading(reading);
+                    if changes.is_empty() {
+                        BriefReleaseSummaryState::Incompatible
+                    } else {
+                        BriefReleaseSummaryState::Ready {
+                            version: reading.version.clone(),
+                            changes,
+                        }
+                    }
+                }
+                Some(reading) if reading.is_insufficient() => BriefReleaseSummaryState::NoValue,
+                None if !state.reading_present => {
+                    let changes = state
+                        .legacy_summary
+                        .as_deref()
+                        .map(parse_brief_smart_summary_bullets)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|text| BriefReleaseChange {
+                            text,
+                            versions: Vec::new(),
+                            references: Vec::new(),
+                        })
+                        .filter(|change| !change.text.is_empty())
+                        .take(4)
+                        .collect::<Vec<_>>();
+                    if changes.is_empty() {
+                        BriefReleaseSummaryState::NoValue
+                    } else {
+                        BriefReleaseSummaryState::Ready {
+                            version: releases
+                                .iter()
+                                .find(|release| release.release_id == *release_id)
+                                .map(|release| release.title.clone())
+                                .unwrap_or_else(|| "".to_owned()),
+                            changes,
+                        }
+                    }
+                }
+                _ => BriefReleaseSummaryState::Incompatible,
+            },
+            Some(state)
+                if matches!(
+                    state.status.as_str(),
+                    "queued" | "running" | "processing" | "deferred_provider" | "blocked_config"
+                ) =>
+            {
+                BriefReleaseSummaryState::Pending
+            }
+            Some(state)
+                if matches!(
+                    state.status.as_str(),
+                    "failed" | "error" | "cancelled" | "superseded"
+                ) =>
+            {
+                BriefReleaseSummaryState::Failed
+            }
+            Some(_) => BriefReleaseSummaryState::Incompatible,
+            None => BriefReleaseSummaryState::Unavailable,
+        };
+        summary_states.insert(*release_id, state);
+    }
     Ok(summary_states)
+}
+
+fn brief_release_state_label(state: &BriefReleaseSummaryState) -> Option<&'static str> {
+    match state {
+        BriefReleaseSummaryState::Pending => Some("阅读内容处理中"),
+        BriefReleaseSummaryState::Failed => Some("阅读内容处理失败"),
+        BriefReleaseSummaryState::Incompatible => Some("阅读内容格式不兼容"),
+        BriefReleaseSummaryState::Unavailable => Some("阅读内容暂不可用"),
+        BriefReleaseSummaryState::Ready { .. } | BriefReleaseSummaryState::NoValue => None,
+    }
 }
 
 fn build_repo_rendered(
@@ -5420,22 +5526,29 @@ fn build_repo_rendered(
     let rendered = releases
         .iter()
         .map(|release| {
-            let bullets = match summary_states.get(&release.release_id) {
-                Some(BriefReleaseSummaryState::Ready(bullets)) => bullets.clone(),
-                Some(BriefReleaseSummaryState::NoValue) => Vec::new(),
-                Some(BriefReleaseSummaryState::Unavailable) | None => {
-                    extract_fallback_bullets(&release.body, 1)
-                }
+            let state = summary_states
+                .get(&release.release_id)
+                .unwrap_or(&BriefReleaseSummaryState::Unavailable);
+            let bullets = match state {
+                BriefReleaseSummaryState::Ready { changes, .. } => changes.clone(),
+                BriefReleaseSummaryState::NoValue
+                | BriefReleaseSummaryState::Unavailable
+                | BriefReleaseSummaryState::Pending
+                | BriefReleaseSummaryState::Failed
+                | BriefReleaseSummaryState::Incompatible => Vec::new(),
             };
-            let related_links = extract_github_links(&release.body, 3);
             ReleaseRendered {
                 release_id: release.release_id,
                 title: release.title.clone(),
                 html_url: release.html_url.clone(),
                 published_at: release.published_at.clone(),
                 is_prerelease: release.is_prerelease,
+                reading_version: match state {
+                    BriefReleaseSummaryState::Ready { version, .. } => Some(version.clone()),
+                    _ => None,
+                },
                 bullets,
-                related_links,
+                status_label: brief_release_state_label(state),
             }
         })
         .collect::<Vec<_>>();
@@ -5470,22 +5583,73 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                 let title = escape_markdown_link_text(&release.title);
 
                 out.push_str(&format!(
-                    "- [{}]({}) · {}{} · [GitHub Release]({})\n",
-                    title, internal_link, release.published_at, prerelease_mark, release.html_url
+                    "- [{}]({}) · {}{}{}\n",
+                    title,
+                    internal_link,
+                    release.published_at,
+                    prerelease_mark,
+                    release
+                        .status_label
+                        .map(|label| format!(" · {label}"))
+                        .unwrap_or_default()
                 ));
 
                 for bullet in &release.bullets {
-                    out.push_str(&format!("  - {}\n", bullet));
-                }
-
-                if !release.related_links.is_empty() {
-                    let links = release
-                        .related_links
+                    let versions = bullet
+                        .versions
                         .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    out.push_str(&format!("  - 相关链接：{}\n", links));
+                        .map(|version| version.trim())
+                        .filter(|version| !version.is_empty())
+                        .fold(Vec::<&str>::new(), |mut versions, version| {
+                            if !versions.contains(&version) {
+                                versions.push(version);
+                            }
+                            versions
+                        });
+                    let show_versions = !(versions.is_empty()
+                        || (versions.len() == 1
+                            && release
+                                .reading_version
+                                .as_deref()
+                                .is_some_and(|current| current.trim() == versions[0])));
+                    if show_versions {
+                        let references = bullet
+                            .references
+                            .iter()
+                            .filter_map(|reference| {
+                                reference
+                                    .label
+                                    .as_deref()
+                                    .map(|label| format!("[{label}]({})", reference.url))
+                            })
+                            .collect::<Vec<_>>();
+                        let text = if references.is_empty() {
+                            bullet.text.clone()
+                        } else {
+                            format!("{} {}", bullet.text, references.join(" "))
+                        };
+                        out.push_str(&format!("  - {}（{}）\n", text, versions.join("、")));
+                    } else {
+                        let references = bullet
+                            .references
+                            .iter()
+                            .filter_map(|reference| {
+                                reference
+                                    .label
+                                    .as_deref()
+                                    .map(|label| format!("[{label}]({})", reference.url))
+                            })
+                            .collect::<Vec<_>>();
+                        if references.is_empty() {
+                            out.push_str(&format!("  - {}\n", bullet.text));
+                        } else {
+                            out.push_str(&format!(
+                                "  - {} {}\n",
+                                bullet.text,
+                                references.join(" ")
+                            ));
+                        }
+                    }
                 }
 
                 out.push('\n');
@@ -5562,36 +5726,6 @@ fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseR
     }
 
     refs
-}
-
-fn parse_legacy_release_id_without_tab(target: &str) -> Option<i64> {
-    let base = Url::parse("https://octorill.local/").expect("valid local base url");
-    let joined = base.join(target.trim()).ok()?;
-
-    if joined.host_str() != Some("octorill.local") {
-        return None;
-    }
-
-    let mut release = None;
-    let mut has_tab = false;
-    for (key, value) in joined.query_pairs() {
-        match key.as_ref() {
-            "tab" => has_tab = true,
-            "release" => release = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-
-    if has_tab {
-        return None;
-    }
-
-    let raw_release = release?;
-    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-
-    raw_release.parse::<i64>().ok()
 }
 
 fn internal_release_ref_matches_digest(
@@ -5798,37 +5932,8 @@ fn preserves_social_summary_items(source: &str, candidate: &str) -> bool {
 }
 
 fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> String {
-    let link_targets = extract_markdown_link_targets(markdown);
-    let mut missing = releases
-        .iter()
-        .filter(|release| {
-            !link_targets.iter().any(|target| {
-                parse_legacy_release_id_without_tab(target).is_none()
-                    && parse_internal_release_ref(target).is_some_and(|reference| {
-                        internal_release_ref_matches_digest(&reference, release)
-                    })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if missing.is_empty() {
-        return markdown.to_owned();
-    }
-
-    missing.sort_by_key(|release| release.release_id);
-
-    let mut out = markdown.trim_end_matches('\n').to_owned();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str("## Release links\n");
-    for release in missing {
-        let label = escape_markdown_link_text(&format!("{}/{}", release.full_name, release.title));
-        let href = build_internal_brief_release_href_from_html_url(&release.html_url)
-            .unwrap_or_else(|| format!("/?tab=briefs&release={}", release.release_id));
-        out.push_str(&format!("- [{}]({})\n", label, href));
-    }
-    out
+    let _ = releases;
+    markdown.to_owned()
 }
 
 async fn polish_brief_markdown(
@@ -5866,7 +5971,7 @@ async fn polish_brief_markdown(
         }
     };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；相关链接行中的 GitHub URL 必须继续以裸 URL 形式出现，禁止改写成 `[标题](URL)`；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下若原本有摘要与“相关链接”，必须继续保持缩进两个空格的子 bullet `  - ...`；\n8) 若某条 release 原文没有任何子 bullet，润色后也必须保持没有子 bullet；禁止补写“发布 xxx”“版本发布”“更新要点”之类空泛内容；\n9) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n10) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n11) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留 release 条目的站内详情链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；日报只保留这个站内主入口，禁止新增或保留 GitHub Release、发布原文、compare 等重复入口；禁止新增“相关链接”“来源”“实现依据”区块；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下已有的真实变化保持为缩进两个空格的子 bullet `  - ...`；\n8) 若某条 release 原文没有任何子 bullet，润色后也必须保持没有子 bullet；禁止补写“发布 xxx”“版本发布”“更新要点”之类空泛内容；\n9) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n10) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n11) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -5943,7 +6048,13 @@ async fn build_brief_content_from_digests(
         });
     }
 
-    if let Some(polished) = polish_brief_markdown(state, &deterministic, &releases).await {
+    let has_processing_states = repos
+        .iter()
+        .flat_map(|repo| repo.releases.iter())
+        .any(|release| release.status_label.is_some());
+    if !has_processing_states
+        && let Some(polished) = polish_brief_markdown(state, &deterministic, &releases).await
+    {
         return Ok(BuiltBriefContent {
             content_markdown: reconcile_brief_release_links(&polished, &releases),
             releases,
@@ -6153,6 +6264,7 @@ async fn upsert_daily_brief_snapshot(
     window: &UserDailyWindow,
     built: &BuiltBriefContent,
     generation_source: &str,
+    allow_existing_refresh: bool,
 ) -> Result<StoredBrief> {
     #[derive(Debug, sqlx::FromRow)]
     struct UpsertedBriefRow {
@@ -6165,38 +6277,50 @@ async fn upsert_daily_brief_snapshot(
         generation_source: Option<String>,
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
+        updated_at: String,
     }
 
     let now = chrono::Utc::now().to_rfc3339();
     let window_start = window.start_utc.to_rfc3339();
     let window_end = window.end_utc.to_rfc3339();
     let date = window.display_date.clone();
-    if let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
-        &state.pool,
-        user_id,
-        &window_start,
-        &window_end,
-    )
-    .await?
+    if allow_existing_refresh
+        && let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
+            &state.pool,
+            user_id,
+            &window_start,
+            &window_end,
+        )
+        .await?
     {
         let (_sqlite_write, mut tx) = state
             .sqlite_writer
             .begin_immediate(&state.pool, "ai_brief_snapshot_refresh")
             .await
             .context("failed to begin refresh brief tx")?;
-        overwrite_brief_snapshot(
+        let existing_updated_at =
+            sqlx::query_scalar::<_, String>("SELECT updated_at FROM briefs WHERE id = ? LIMIT 1")
+                .bind(&existing_id)
+                .fetch_one(&mut *tx)
+                .await
+                .with_context(|| format!("failed to load brief snapshot version {existing_id}"))?;
+        let overwritten = overwrite_brief_snapshot(
             tx.as_transaction_mut(),
             &existing_id,
             window,
             built,
             generation_source,
             &now,
+            Some(existing_updated_at.as_str()),
         )
         .await
         .with_context(|| format!("failed to refresh brief snapshot {existing_id}"))?;
         tx.commit()
             .await
             .context("failed to commit refreshed brief snapshot")?;
+        if !overwritten {
+            return load_stored_brief_snapshot(state, &existing_id).await;
+        }
         return Ok(StoredBrief {
             id: existing_id,
             date,
@@ -6263,7 +6387,8 @@ async fn upsert_daily_brief_snapshot(
               id,
               generation_source,
               effective_time_zone,
-              effective_local_boundary
+              effective_local_boundary,
+              updated_at
             FROM briefs
             WHERE user_id = ?
               AND window_start_utc = ?
@@ -6280,28 +6405,32 @@ async fn upsert_daily_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        overwrite_brief_snapshot(
-            tx.as_transaction_mut(),
-            &existing.id,
-            window,
-            built,
-            generation_source,
-            &now,
-        )
-        .await
-        .with_context(|| {
-            if is_normalized_snapshot {
-                format!("failed to refresh existing brief snapshot {}", existing.id)
-            } else {
+        let overwritten = if is_normalized_snapshot {
+            false
+        } else {
+            overwrite_brief_snapshot(
+                tx.as_transaction_mut(),
+                &existing.id,
+                window,
+                built,
+                generation_source,
+                &now,
+                Some(existing.updated_at.as_str()),
+            )
+            .await
+            .with_context(|| {
                 format!(
                     "failed to normalize conflicting legacy brief snapshot {}",
                     existing.id
                 )
-            }
-        })?;
+            })?
+        };
         tx.commit()
             .await
             .context("failed to commit brief snapshot overwrite")?;
+        if !overwritten {
+            return load_stored_brief_snapshot(state, &existing.id).await;
+        }
         return Ok(StoredBrief {
             id: existing.id,
             date,
@@ -6407,8 +6536,23 @@ async fn overwrite_brief_snapshot(
     built: &BuiltBriefContent,
     generation_source: &str,
     now: &str,
-) -> Result<()> {
-    sqlx::query(
+    expected_updated_at: Option<&str>,
+) -> Result<bool> {
+    let existing_content =
+        sqlx::query_scalar::<_, String>("SELECT content_markdown FROM briefs WHERE id = ? LIMIT 1")
+            .bind(brief_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("failed to load existing brief content before overwrite")?;
+    if existing_content.as_deref().is_some_and(|content| {
+        brief_content_is_canonical(content)
+            && brief_has_readable_release_change(content)
+            && !brief_has_readable_release_change(&built.content_markdown)
+            && brief_has_release_status_marker(&built.content_markdown)
+    }) {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
         r#"
         UPDATE briefs
         SET date = ?,
@@ -6420,6 +6564,7 @@ async fn overwrite_brief_snapshot(
             content_markdown = ?,
             updated_at = ?
         WHERE id = ?
+          AND (? IS NULL OR updated_at = ?)
         "#,
     )
     .bind(&window.display_date)
@@ -6431,11 +6576,37 @@ async fn overwrite_brief_snapshot(
     .bind(&built.content_markdown)
     .bind(now)
     .bind(brief_id)
+    .bind(expected_updated_at)
+    .bind(expected_updated_at)
     .execute(&mut **tx)
     .await
     .context("failed to overwrite brief snapshot")?;
 
-    replace_brief_memberships(tx, brief_id, &built.releases, now).await
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
+    replace_brief_memberships(tx, brief_id, &built.releases, now).await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn brief_has_processing_release_state(markdown: &str) -> bool {
+    markdown
+        .lines()
+        .any(|line| line.contains("· 阅读内容处理中"))
+}
+
+fn brief_has_release_status_marker(markdown: &str) -> bool {
+    markdown.lines().any(|line| {
+        [
+            "· 阅读内容处理中",
+            "· 阅读内容处理失败",
+            "· 阅读内容格式不兼容",
+            "· 阅读内容暂不可用",
+        ]
+        .iter()
+        .any(|marker| line.contains(marker))
+    })
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -6805,6 +6976,7 @@ async fn refresh_existing_brief_snapshot(
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
         content_markdown: String,
+        updated_at: String,
     }
 
     let row = sqlx::query_as::<_, RefreshableBriefRow>(
@@ -6816,7 +6988,8 @@ async fn refresh_existing_brief_snapshot(
           window_end_utc,
           effective_time_zone,
           effective_local_boundary,
-          content_markdown
+          content_markdown,
+          updated_at
         FROM briefs
         WHERE id = ?
         LIMIT 1
@@ -6878,19 +7051,24 @@ async fn refresh_existing_brief_snapshot(
         .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
-    overwrite_brief_snapshot(
+    let overwritten = overwrite_brief_snapshot(
         tx.as_transaction_mut(),
         brief_id,
         &window,
         &built,
         generation_source,
         &now,
+        Some(row.updated_at.as_str()),
     )
     .await
     .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
     tx.commit()
         .await
         .context("failed to commit targeted brief refresh")?;
+
+    if !overwritten {
+        return load_stored_brief_snapshot(state, brief_id).await;
+    }
 
     Ok(StoredBrief {
         id: brief_id.to_owned(),
@@ -6941,6 +7119,7 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     }
 
+    let had_existing_snapshot = existing_id.is_some();
     let brief_id = existing_id.unwrap_or_else(local_id::generate_local_id);
     let mut context = current_llm_call_context().unwrap_or(LlmCallContext {
         source: "daily_brief.polish".to_owned(),
@@ -6952,7 +7131,16 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
     });
     context.parent_brief_id = Some(brief_id.clone());
     let built = with_llm_call_context(context, build_brief_content(state, window, user_id)).await?;
-    upsert_daily_brief_snapshot(state, user_id, &brief_id, window, &built, generation_source).await
+    upsert_daily_brief_snapshot(
+        state,
+        user_id,
+        &brief_id,
+        window,
+        &built,
+        generation_source,
+        had_existing_snapshot,
+    )
+    .await
 }
 
 pub async fn generate_daily_brief_snapshot_for_key_date(
@@ -7308,6 +7496,7 @@ pub async fn recompute_legacy_brief_snapshot(
         user_daily_brief_time_zone: Option<String>,
         user_daily_brief_utc_time: String,
         content_markdown: String,
+        updated_at: String,
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -7316,6 +7505,7 @@ pub async fn recompute_legacy_brief_snapshot(
         generation_source: Option<String>,
         effective_time_zone: Option<String>,
         effective_local_boundary: Option<String>,
+        updated_at: String,
     }
 
     let legacy = sqlx::query_as::<_, LegacyBriefRow>(
@@ -7330,7 +7520,8 @@ pub async fn recompute_legacy_brief_snapshot(
           users.daily_brief_local_time AS user_daily_brief_local_time,
           users.daily_brief_time_zone AS user_daily_brief_time_zone,
           users.daily_brief_utc_time AS user_daily_brief_utc_time,
-          briefs.content_markdown
+          briefs.content_markdown,
+          briefs.updated_at
         FROM briefs
         JOIN users ON users.id = briefs.user_id
         WHERE briefs.id = ?
@@ -7395,7 +7586,8 @@ pub async fn recompute_legacy_brief_snapshot(
           id,
           generation_source,
           effective_time_zone,
-          effective_local_boundary
+          effective_local_boundary,
+          updated_at
         FROM briefs
         WHERE user_id = ?
           AND window_start_utc = ?
@@ -7416,7 +7608,7 @@ pub async fn recompute_legacy_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        if !is_normalized_snapshot {
+        let overwritten = if !is_normalized_snapshot {
             overwrite_brief_snapshot(
                 tx.as_transaction_mut(),
                 &existing.id,
@@ -7424,10 +7616,13 @@ pub async fn recompute_legacy_brief_snapshot(
                 &built,
                 "history_recompute",
                 &now,
+                Some(existing.updated_at.as_str()),
             )
             .await
-            .context("failed to merge legacy brief snapshot into existing collision")?;
-        }
+            .context("failed to merge legacy brief snapshot into existing collision")?
+        } else {
+            false
+        };
 
         sqlx::query(
             r#"
@@ -7442,7 +7637,7 @@ pub async fn recompute_legacy_brief_snapshot(
         tx.commit()
             .await
             .context("failed to commit legacy brief collision cleanup")?;
-        if is_normalized_snapshot {
+        if is_normalized_snapshot || !overwritten {
             return load_stored_brief_snapshot(state, &existing.id).await;
         }
         return Ok(StoredBrief {
@@ -7460,19 +7655,24 @@ pub async fn recompute_legacy_brief_snapshot(
                 .collect(),
         });
     }
-    overwrite_brief_snapshot(
+    let overwritten = overwrite_brief_snapshot(
         tx.as_transaction_mut(),
         &legacy.id,
         &target_window,
         &built,
         "history_recompute",
         &now,
+        Some(legacy.updated_at.as_str()),
     )
     .await
     .context("failed to update legacy brief snapshot")?;
     tx.commit()
         .await
         .context("failed to commit legacy brief recompute")?;
+
+    if !overwritten {
+        return load_stored_brief_snapshot(state, &legacy.id).await;
+    }
 
     Ok(StoredBrief {
         id: legacy.id,
@@ -7514,6 +7714,61 @@ mod tests {
         jobs,
         state::build_oauth_client,
     };
+
+    #[test]
+    fn brief_reading_keeps_all_structured_changes_for_daily_rendering() {
+        let reading = translations::ReleaseReadingResult {
+            version: "v1.2.3".to_owned(),
+            outcome: "changes".to_owned(),
+            title: Some("具体改动".to_owned()),
+            changes: (1..=6)
+                .map(|index| translations::ReleaseReadingChange {
+                    text: format!("变更 {index}"),
+                    versions: vec!["v1.2.3".to_owned()],
+                    references: Vec::new(),
+                })
+                .collect(),
+            machine_materials: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        let changes = brief_release_changes_from_reading(&reading);
+
+        assert_eq!(changes.len(), 6);
+        assert_eq!(
+            changes.last().map(|change| change.text.as_str()),
+            Some("变更 6")
+        );
+    }
+
+    #[test]
+    fn daily_rendering_normalizes_component_versions() {
+        let repo = RepoRendered {
+            full_name: "acme/rocket".to_owned(),
+            releases: vec![ReleaseRendered {
+                release_id: 42,
+                title: "v1.2.0".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.2.0".to_owned(),
+                published_at: "2026-10-27T00:00:00Z".to_owned(),
+                is_prerelease: false,
+                reading_version: Some("v1.2.0".to_owned()),
+                bullets: vec![BriefReleaseChange {
+                    text: "拆分测试夹具".to_owned(),
+                    versions: vec![
+                        " v1.2.0 ".to_owned(),
+                        "v1.2.0".to_owned(),
+                        "v1.1.9".to_owned(),
+                    ],
+                    references: Vec::new(),
+                }],
+                status_label: None,
+            }],
+        };
+
+        let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
+        assert!(markdown.contains("拆分测试夹具（v1.2.0、v1.1.9）"));
+        assert!(!markdown.contains("v1.2.0、v1.2.0"));
+    }
 
     #[test]
     fn redacts_common_sensitive_diagnostic_markers() {
@@ -9522,26 +9777,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_github_links_filters_non_github() {
-        let links = extract_github_links(
-            "see https://github.com/acme/app/releases/tag/v1 and https://example.com/not-me",
-            5,
-        );
-        assert_eq!(links.len(), 1);
-        assert!(links[0].contains("github.com/acme/app"));
-    }
-
-    #[test]
-    fn extract_github_links_parses_markdown_links() {
-        let links = extract_github_links(
-            "- [PR #12](https://github.com/acme/app/pull/12)\n- [Doc](https://example.com/ignore)",
-            5,
-        );
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0], "https://github.com/acme/app/pull/12");
-    }
-
-    #[test]
     fn sanitize_markdown_links_strips_disallowed_bare_urls() {
         let markdown = "- details: https://example.com/acme/releases?foo=bar";
         let sanitized = sanitize_markdown_links(markdown);
@@ -9581,6 +9816,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_brief_summary_accepts_prose_and_filters_metadata_lines() {
+        let summary = "v1.2.3\n新增批量导入，并说明兼容性限制。\n相关链接：#42\n由 alice 提交";
+        assert_eq!(
+            parse_brief_smart_summary_bullets(summary),
+            vec!["新增批量导入，并说明兼容性限制。"]
+        );
+    }
+
+    #[test]
+    fn processing_brief_state_is_distinguished_from_readable_content() {
+        assert!(brief_has_processing_release_state(
+            "- [v1.2.3](/?release=1) · 阅读内容处理中\n"
+        ));
+        assert!(!brief_has_processing_release_state(
+            "- [v1.2.3](/?release=1) · 新增批量导入\n"
+        ));
+    }
+
+    #[test]
     fn render_social_actor_list_reports_hidden_count_only() {
         let actors = (0..7)
             .map(|index| SocialActorRendered {
@@ -9611,8 +9865,11 @@ mod tests {
         assert!(brief_content_needs_refresh(
             "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n"
         ));
+        assert!(brief_content_needs_refresh(
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n"
+        ));
         assert!(!brief_content_needs_refresh(
-            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n"
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z\n  - fix: keep formatting stable\n"
         ));
     }
 
@@ -9712,12 +9969,6 @@ mod tests {
                 .expect("load refresh candidates")
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn fallback_bullets_never_empty() {
-        let bullets = extract_fallback_bullets("", 3);
-        assert_eq!(bullets.len(), 1);
     }
 
     #[test]
@@ -9856,7 +10107,7 @@ mod tests {
             ),
         ];
         let out = reconcile_brief_release_links(markdown, &releases);
-        assert!(contains_all_release_links(&out, &releases));
+        assert_eq!(out, markdown);
     }
 
     #[test]
@@ -9869,21 +10120,7 @@ mod tests {
             "https://github.com/acme/rocket/releases/tag/v1.2.3",
         )];
         let out = reconcile_brief_release_links(markdown, &releases);
-        let expected = vec![
-            test_release_digest(
-                12,
-                "acme/rocket",
-                "v1.2.3",
-                "https://github.com/acme/rocket/releases/tag/v1.2.3",
-            ),
-            test_release_digest(
-                123,
-                "acme/rocket",
-                "v1.2.4",
-                "https://github.com/acme/rocket/releases/tag/v1.2.4",
-            ),
-        ];
-        assert!(contains_all_release_links(&out, &expected));
+        assert_eq!(out, markdown);
     }
 
     #[test]
@@ -9896,7 +10133,7 @@ mod tests {
             "https://github.com/acme/rocket/releases/tag/v1.2.3",
         )];
         let out = reconcile_brief_release_links(markdown, &releases);
-        assert!(out.contains("/acme/rocket/releases/tag/v1.2.3?from=briefs"));
+        assert_eq!(out, markdown);
     }
 
     #[test]
@@ -9909,8 +10146,13 @@ mod tests {
                 html_url: "https://github.com/acme/rocket/releases/tag/v1.0".to_owned(),
                 published_at: "2026-02-20T09:00:00Z".to_owned(),
                 is_prerelease: false,
-                bullets: vec!["修复若干问题".to_owned()],
-                related_links: Vec::new(),
+                reading_version: None,
+                bullets: vec![BriefReleaseChange {
+                    text: "修复若干问题".to_owned(),
+                    versions: Vec::new(),
+                    references: Vec::new(),
+                }],
+                status_label: None,
             }],
         };
 
@@ -9923,6 +10165,28 @@ mod tests {
             .expect("canonical brief href"),
         )));
         assert!(!markdown.contains("## 获星与关注"));
+    }
+
+    #[test]
+    fn build_brief_markdown_keeps_processing_state_outside_release_body() {
+        let repo = RepoRendered {
+            full_name: "acme/rocket".to_owned(),
+            releases: vec![ReleaseRendered {
+                release_id: 42,
+                title: "v1.0".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.0".to_owned(),
+                published_at: "2026-02-20T09:00:00Z".to_owned(),
+                is_prerelease: false,
+                reading_version: None,
+                bullets: Vec::new(),
+                status_label: Some("阅读内容处理中"),
+            }],
+        };
+
+        let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
+        assert!(markdown.contains("· 阅读内容处理中\n"));
+        assert!(!markdown.contains("[GitHub Release]"));
+        assert!(!markdown.contains("  - 阅读内容处理中"));
     }
 
     #[test]
@@ -9993,21 +10257,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fallback_bullets_use_chinese_guidance_instead_of_source_notes() {
-        let bullets = extract_fallback_bullets("- feat(api): add batch endpoint", 3);
-
-        assert_eq!(
-            bullets,
-            vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
-        );
-        assert!(
-            !bullets
-                .iter()
-                .any(|bullet| bullet.contains("feat(api): add batch endpoint"))
-        );
-    }
-
     #[tokio::test]
     async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_without_ai() {
         let state = setup_llm_state().await;
@@ -10031,11 +10280,7 @@ mod tests {
         .expect("build brief content");
 
         assert!(brief_content_is_canonical(&built.content_markdown));
-        assert!(
-            built
-                .content_markdown
-                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(!built.content_markdown.contains("暂未生成变更摘要"));
         assert!(
             !built
                 .content_markdown
@@ -10121,11 +10366,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].detail_lines.is_empty());
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
-        assert!(
-            !built
-                .content_markdown
-                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(!built.content_markdown.contains("暂未生成变更摘要"));
     }
 
     #[tokio::test]
@@ -10181,11 +10422,7 @@ mod tests {
                 .expect("build brief content");
 
         assert!(brief_content_is_canonical(&built.content_markdown));
-        assert!(
-            built
-                .content_markdown
-                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(!built.content_markdown.contains("暂未生成变更摘要"));
         assert!(
             !built
                 .content_markdown
@@ -10266,11 +10503,7 @@ mod tests {
                 .content_markdown
                 .contains("  - 修复批量接口返回值与错误提示不一致的问题")
         );
-        assert!(
-            !built
-                .content_markdown
-                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(!built.content_markdown.contains("暂未生成变更摘要"));
     }
 
     #[tokio::test]
@@ -10329,17 +10562,15 @@ mod tests {
         .expect("load legacy brief summary states");
         assert!(matches!(
             summary_states.get(&release.release_id),
-            Some(BriefReleaseSummaryState::Unavailable)
+            Some(BriefReleaseSummaryState::Pending)
         ));
         let rendered = build_repo_rendered(
             "acme/rocket",
             std::slice::from_ref(&release),
             &summary_states,
         );
-        assert_eq!(
-            rendered.releases[0].bullets,
-            vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
-        );
+        assert!(rendered.releases[0].bullets.is_empty());
+        assert_eq!(rendered.releases[0].status_label, Some("阅读内容处理中"));
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
     }
 
@@ -10395,17 +10626,13 @@ mod tests {
                 .expect("build brief content in global mode");
 
         assert!(brief_content_is_canonical(&built.content_markdown));
-        assert!(
-            built
-                .content_markdown
-                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(!built.content_markdown.contains("暂未生成变更摘要"));
         let queued_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = '42' AND pipeline = 'polishing' AND variant = 'smart' AND status = 'queued'",
+            "SELECT COUNT(*) FROM content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = '42' AND pipeline = 'polishing' AND variant = 'smart_public' AND status = 'queued'",
         )
         .fetch_one(&state.pool)
         .await
-        .expect("count queued global summary work");
+        .expect("count queued global release reading work");
         assert_eq!(queued_count, 1);
     }
 
@@ -10565,12 +10792,7 @@ mod tests {
         let blocks =
             extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
         assert_eq!(blocks.len(), 1);
-        assert!(
-            blocks[0]
-                .detail_lines
-                .iter()
-                .any(|line| line == BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
-        );
+        assert!(blocks[0].detail_lines.is_empty());
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
     }
 
@@ -10631,15 +10853,9 @@ mod tests {
             extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
         assert_eq!(blocks.len(), 1);
         assert!(!release_block_has_summary_details(&blocks[0]));
-        assert!(release_block_has_related_links(&blocks[0]));
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
-        assert!(built.content_markdown.contains("相关链接："));
-        assert!(
-            built
-                .content_markdown
-                .contains("https://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2")
-        );
-        assert!(!built.content_markdown.contains("[compare]("));
+        assert!(!built.content_markdown.contains("相关链接："));
+        assert!(!built.content_markdown.contains("v0.5.1...v0.5.2"));
     }
 
     #[tokio::test]
@@ -11445,6 +11661,7 @@ mod tests {
             &window,
             &built,
             "manual",
+            true,
         )
         .await
         .expect("refresh existing snapshot");
@@ -11591,6 +11808,7 @@ mod tests {
             &window,
             &built,
             "manual",
+            true,
         )
         .await
         .expect("normalize legacy placeholder");

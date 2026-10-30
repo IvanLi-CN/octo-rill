@@ -13,6 +13,7 @@ import {
 	type FeedItem,
 	type SmartItem,
 } from "@/feed/types";
+import type { ReleaseReading } from "@/releaseReading";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
@@ -117,7 +118,8 @@ function mapTranslationItemToFeedSmart(item: {
 		| "blocked_config"
 		| "not_applicable"
 		| "cancelled"
-		| "superseded";
+		| "superseded"
+		| "incompatible";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md?: string | null;
@@ -125,18 +127,21 @@ function mapTranslationItemToFeedSmart(item: {
 	error_code?: string | null;
 	error_summary?: string | null;
 	error_detail?: string | null;
+	reading?: ReleaseReading | null;
 }): SmartItem | null {
 	const summary = item.body_md ?? item.summary_md;
+	const reading = item.reading ?? null;
 	switch (item.status) {
 		case "ready":
 			return {
 				lang: "zh-CN",
-				status: "ready",
+				status: reading?.outcome === "insufficient" ? "insufficient" : "ready",
 				title: item.title_zh,
 				summary,
 				error_code: item.error_code ?? null,
 				error_summary: item.error_summary ?? null,
 				error_detail: item.error_detail ?? null,
+				reading,
 			};
 		case "disabled":
 			return {
@@ -189,6 +194,17 @@ function mapTranslationItemToFeedSmart(item: {
 			return {
 				lang: "zh-CN",
 				status: "error",
+				title: null,
+				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
+				auto_translate: false,
+			};
+		case "incompatible":
+			return {
+				lang: "zh-CN",
+				status: "incompatible",
 				title: null,
 				summary: null,
 				error_code: item.error_code ?? null,
@@ -366,7 +382,8 @@ function isTerminalTranslationResultStatus(
 		status === "missing" ||
 		status === "not_applicable" ||
 		status === "cancelled" ||
-		status === "superseded"
+		status === "superseded" ||
+		status === "incompatible"
 	);
 }
 

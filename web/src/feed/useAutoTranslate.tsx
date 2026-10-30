@@ -109,7 +109,8 @@ function mapTranslationItemToFeedTranslated(item: {
 		| "blocked_config"
 		| "not_applicable"
 		| "cancelled"
-		| "superseded";
+		| "superseded"
+		| "incompatible";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md?: string | null;
@@ -175,6 +176,7 @@ function mapTranslationItemToFeedTranslated(item: {
 			};
 		case "error":
 		case "failed":
+		case "incompatible":
 		case "cancelled":
 		case "superseded":
 			return {
@@ -352,7 +354,8 @@ function isTerminalTranslationResultStatus(
 		status === "missing" ||
 		status === "not_applicable" ||
 		status === "cancelled" ||
-		status === "superseded"
+		status === "superseded" ||
+		status === "incompatible"
 	);
 }
 

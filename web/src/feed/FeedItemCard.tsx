@@ -60,6 +60,10 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { resolveRepoVisualCandidates, type RepoVisual } from "@/lib/repoVisual";
 import { cn } from "@/lib/utils";
 import type { DashboardTab } from "@/pages/DashboardControlBand";
+import {
+	releaseReadingChangeVersions,
+	type ReleaseReading,
+} from "@/releaseReading";
 
 const REACTION_ITEMS: Array<{
 	content: ReactionContent;
@@ -329,6 +333,64 @@ function TranslatedLane(props: {
 	return <OriginalLane item={item} />;
 }
 
+function ReleaseReadingContent(props: { reading: ReleaseReading }) {
+	const { reading } = props;
+	if (reading.outcome === "insufficient") {
+		return null;
+	}
+	return (
+		<div className="space-y-3">
+			<ul className="list-disc space-y-2 pl-5 text-sm leading-6">
+				{reading.changes.map((change, index) => {
+					const versions = releaseReadingChangeVersions(
+						reading.version,
+						change.versions,
+					);
+					return (
+						<li key={`${change.text}-${index}`}>
+							{change.text}
+							{change.references?.map((reference) => (
+								<a
+									className="ml-2 underline underline-offset-2"
+									href={reference.url}
+									key={`${reference.number}-${reference.url}`}
+									rel="noreferrer"
+									target="_blank"
+								>
+									{reference.label ??
+										(reference.number ? `PR#${reference.number}` : "查看")}
+								</a>
+							))}
+							{versions ? (
+								<span className="ml-2 text-xs text-muted-foreground">
+									{`（${versions}）`}
+								</span>
+							) : null}
+						</li>
+					);
+				})}
+			</ul>
+			{reading.machine_materials?.length ? (
+				<details className="rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+					<summary className="cursor-pointer select-none font-medium text-foreground/80">
+						核验材料
+					</summary>
+					<ul className="mt-2 space-y-1 font-mono">
+						{reading.machine_materials.map((material) => (
+							<li key={`${material.label}-${material.value}`}>
+								<span className="mr-2 text-muted-foreground">
+									{material.label}
+								</span>
+								<span className="break-all">{material.value}</span>
+							</li>
+						))}
+					</ul>
+				</details>
+			) : null}
+		</div>
+	);
+}
+
 function SmartLane(props: {
 	item: ReadableFeedItem;
 	onSmartNow: () => void;
@@ -336,6 +398,9 @@ function SmartLane(props: {
 	isAutoRetrying: boolean;
 }) {
 	const { item, onSmartNow, isSmartGenerating, isAutoRetrying } = props;
+	if (item.smart?.status === "ready" && item.smart.reading) {
+		return <ReleaseReadingContent reading={item.smart.reading} />;
+	}
 
 	if (item.smart?.status === "blocked_config") {
 		return (
@@ -349,6 +414,20 @@ function SmartLane(props: {
 					<OriginalLane item={item} />
 				)}
 			</div>
+		);
+	}
+
+	if (item.smart?.status === "incompatible") {
+		return (
+			<ErrorStatePanel
+				title="润色结果格式不兼容"
+				summary="这条润色结果无法按当前阅读结构解析，请重新生成。"
+				actionLabel="重试润色"
+				onAction={onSmartNow}
+				disabled={isSmartGenerating}
+				loading={isSmartGenerating}
+				size="compact"
+			/>
 		);
 	}
 

@@ -1,6 +1,7 @@
 import { appendDemoRuntimeRequestMarker } from "@/demo/requestMarker";
 import { isDemoMode } from "@/demo/runtime";
 import type { RepoVisual } from "@/lib/repoVisual";
+import type { ReleaseReading } from "@/releaseReading";
 import { openAppEventSource } from "@/demo/eventSource";
 
 export class ApiError extends Error {
@@ -1691,6 +1692,7 @@ export type ReleaseDetailSmart = {
 		| "disabled"
 		| "error"
 		| "insufficient"
+		| "incompatible"
 		| "not_applicable"
 		| "queued"
 		| "running"
@@ -1705,6 +1707,7 @@ export type ReleaseDetailSmart = {
 	error_detail?: string | null;
 	request_id?: string | null;
 	auto_translate?: boolean;
+	reading?: ReleaseReading | null;
 };
 export type ReleaseDetailResponse = {
 	release_id: string;
@@ -1960,7 +1963,7 @@ export type TranslationRequestItemInput = {
 	target_lang: string;
 	max_wait_ms: number;
 	source_blocks: TranslationSourceBlock[];
-	target_slots: Array<"title_zh" | "summary_md" | "body_md">;
+	target_slots: Array<"title_zh" | "summary_md" | "body_md" | "reading">;
 };
 export type TranslationAsyncSingleSubmitRequest = {
 	mode: "async";
@@ -2012,10 +2015,12 @@ export type TranslationResultItem = {
 		| "deferred_provider"
 		| "blocked_config"
 		| "cancelled"
-		| "superseded";
+		| "superseded"
+		| "incompatible";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md: string | null;
+	reading?: ReleaseReading | null;
 	error: string | null;
 	error_code: string | null;
 	error_summary: string | null;
@@ -2117,7 +2122,8 @@ export function mapTranslationResultToReleaseDetailSmart(
 		result.status !== "deferred_provider" &&
 		result.status !== "blocked_config" &&
 		result.status !== "cancelled" &&
-		result.status !== "superseded"
+		result.status !== "superseded" &&
+		result.status !== "incompatible"
 	) {
 		return null;
 	}
@@ -2128,18 +2134,25 @@ export function mapTranslationResultToReleaseDetailSmart(
 			retrySignal,
 		);
 	const status =
-		result.status === "missing" && result.error === "no_valuable_version_info"
-			? "insufficient"
-			: (result.status === "error" || result.status === "failed") && retryable
-				? "missing"
-				: result.status === "failed"
-					? "error"
-					: result.status;
+		result.status === "incompatible"
+			? "incompatible"
+			: result.status === "ready" && result.reading?.outcome === "insufficient"
+				? "insufficient"
+				: result.status === "missing" &&
+						result.error === "no_valuable_version_info"
+					? "insufficient"
+					: (result.status === "error" || result.status === "failed") &&
+							retryable
+						? "missing"
+						: result.status === "failed"
+							? "error"
+							: result.status;
 	return {
 		lang: "zh-CN",
 		status,
 		title: result.title_zh,
 		summary: result.body_md ?? result.summary_md,
+		reading: status === "incompatible" ? null : result.reading,
 		error_code: result.error_code,
 		error_summary: result.error_summary,
 		error_detail: result.error_detail,
