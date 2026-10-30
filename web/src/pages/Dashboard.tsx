@@ -1827,6 +1827,17 @@ export function Dashboard(props: {
 		initialAccessPending || readableSections.loadingInitial;
 	const readableSectionsVisibleRef = useRef(readableSectionsVisible);
 	readableSectionsVisibleRef.current = readableSectionsVisible;
+	useEffect(() => {
+		if (!feed.error?.authorizationDenied) return;
+		clearDashboardWarmSnapshot();
+		setWarmFeedSnapshotValid(false);
+		readableSections.clearContentPreservingMode();
+	}, [
+		feed.error?.authorizationDenied,
+		feed.error?.phase,
+		feed.error?.message,
+		readableSections.clearContentPreservingMode,
+	]);
 	const applyTranslationToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
 			if (readableSectionsVisibleRef.current) {
@@ -4602,9 +4613,11 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
-				{rootReadable &&
+				{mode === "all" &&
+				!scopedMode &&
+				readableMode &&
 				!initialAccessPending &&
-				readableSections.legacyFallback &&
+				(readableSections.legacyFallback || feed.error?.authorizationDenied) &&
 				feed.error?.phase === "initial" ? (
 					<div
 						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
