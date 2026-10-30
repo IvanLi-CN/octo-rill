@@ -432,6 +432,19 @@ export function useAutoTranslate(params: {
 		task.deferred.resolve(null);
 	}, []);
 
+	const invalidatePendingResults = useCallback(() => {
+		for (const [key, task] of requestTasksRef.current) {
+			retireTask(key, task);
+		}
+		failedRef.current.clear();
+		retryCountRef.current.clear();
+		pollErrorCountRef.current.clear();
+		autoRetriedKeysRef.current.clear();
+		keyToElementRef.current.clear();
+		itemByKeyRef.current.clear();
+		bumpRender();
+	}, [bumpRender, retireTask]);
+
 	const scheduleViewportPlanRef = useRef<() => void>(() => {});
 	const schedulePendingPollRef = useRef<() => void>(() => {});
 
@@ -460,6 +473,7 @@ export function useAutoTranslate(params: {
 			task: TranslationTask,
 			translated: TranslatedItem,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			const mapped = mapTranslatedToTranslateResponse(translated);
 			if (!mapped) {
@@ -484,6 +498,7 @@ export function useAutoTranslate(params: {
 			task: TranslationTask,
 			error?: unknown,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			const retries = retryCountRef.current.get(candidate.key) ?? 0;
 			const keepsVisibleReady =
@@ -513,6 +528,7 @@ export function useAutoTranslate(params: {
 			translated: TranslatedItem | null,
 			error?: unknown,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			if (translated) {
 				onTranslated(
@@ -1127,6 +1143,7 @@ export function useAutoTranslate(params: {
 		register,
 		retryLoadedErrors,
 		translateNow,
+		invalidatePendingResults,
 		inFlightKeys,
 		autoRetryingKeys,
 	};

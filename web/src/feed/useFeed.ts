@@ -239,9 +239,10 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
+			force?: boolean;
 			onStart?: (cancel: () => void) => void;
 		}) => {
-			if (!enabled) return;
+			if (!enabled && !options?.force) return;
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
 			const cancelled = Symbol("feed-refresh-cancelled");
@@ -347,6 +348,7 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
+			force?: boolean;
 			onStart?: (cancel: () => void) => void;
 		}) => {
 			await loadInitial(options);

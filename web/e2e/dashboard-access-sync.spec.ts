@@ -1917,6 +1917,42 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 				completeDelayMs: 9000,
 			},
 		);
+		await page.addInitScript(() => {
+			window.localStorage.setItem(
+				"octo-rill.dashboard-warm.v1",
+				JSON.stringify({
+					savedAt: Date.now(),
+					userId: "2f4k7m9p3x6c8v2a",
+					viewerStateKey: "stable",
+					routeState: { tab: "all", activeReleaseId: null },
+					feedRequestType: "all",
+					feedItems: [
+						{
+							kind: "release",
+							ts: "2026-02-22T11:22:33Z",
+							id: "stale-private-release",
+							repo_full_name: "owner/repo",
+							title: "Cached release",
+							body: "private body from the previous access state",
+							body_truncated: false,
+							subtitle: null,
+							reason: null,
+							subject_type: null,
+							html_url:
+								"https://github.com/owner/repo/releases/tag/vstale-private-release",
+							unread: null,
+							translated: null,
+							smart: null,
+							reactions: null,
+						},
+					],
+					nextCursor: null,
+					notifications: [],
+					briefs: [],
+					selectedBriefId: null,
+				}),
+			);
+		});
 
 		await page.route("**/api/**", async (route) => {
 			const req = route.request();
@@ -2046,7 +2082,7 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		await expect(tooltip).toContainText("后台任务已启动");
 		await expect(tooltip).toContainText("0/4");
 
-		await expect(page.getByText("Cached release")).toBeVisible();
+		await expect(page.getByText("Cached release")).toHaveCount(0);
 		await expect(page.getByText("Fresh release")).toHaveCount(0, {
 			timeout: 200,
 		});
@@ -2107,7 +2143,9 @@ test("dashboard clears readable content while access sync refreshes", async ({
 			const contentReadyCallbacks: Array<() => void> = [];
 			const observeReadableState = () => {
 				const nextContentSeen = Boolean(
-					document.querySelector("[data-readable-section-list]"),
+					document.querySelector(
+						"[data-readable-section-list], [data-readable-loading-initial]",
+					),
 				);
 				if (!contentSeen && nextContentSeen) {
 					contentSeen = true;
@@ -2397,7 +2435,10 @@ test("dashboard clears readable content while access sync refreshes", async ({
 	});
 
 	await page.goto("/");
-	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	await expect(
+		page.locator('[data-readable-loading-initial="true"]'),
+	).toBeVisible({ timeout: 8000 });
+	await expect(page.getByText("Cached release")).toHaveCount(0);
 	const sourceStatsAtContent = await page.evaluate(() => {
 		const state = window as typeof window & {
 			__taskEventSourceCount?: number;
@@ -2466,6 +2507,199 @@ test("dashboard clears readable content while access sync refreshes", async ({
 	).toBeGreaterThan(0);
 });
 
+test("failed access sync settles while the readable feed request is still pending", async ({
+	page,
+}) => {
+	let markReadableRequestStarted: (() => void) | null = null;
+	let releaseReadableRequests: (() => void) | null = null;
+	const readableRequestStarted = new Promise<void>((resolve) => {
+		markReadableRequestStarted = resolve;
+	});
+	const readableRequestGate = new Promise<void>((resolve) => {
+		releaseReadableRequests = resolve;
+	});
+	let feedCalls = 0;
+
+	await page.addInitScript(
+		({ taskId }) => {
+			type TestWindow = Window & {
+				__activeAccessTaskSources?: number;
+				__dispatchAccessTaskEvent?: (type: string, payload: unknown) => number;
+			};
+			const state = window as TestWindow;
+			const sources: MockEventSource[] = [];
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				onopen: ((event: Event) => unknown) | null = null;
+				private listeners = new Map<string, Set<(event: Event) => unknown>>();
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					sources.push(this);
+					state.__activeAccessTaskSources =
+						(state.__activeAccessTaskSources ?? 0) + 1;
+					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
+				}
+
+				addEventListener(type: string, listener: (event: Event) => unknown) {
+					const listeners = this.listeners.get(type) ?? new Set();
+					listeners.add(listener);
+					this.listeners.set(type, listeners);
+				}
+
+				removeEventListener(type: string, listener: (event: Event) => unknown) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					if (this.readyState === 2) return;
+					this.readyState = 2;
+					if (this.url.endsWith(`/api/tasks/${taskId}/events`)) {
+						state.__activeAccessTaskSources = Math.max(
+							0,
+							(state.__activeAccessTaskSources ?? 1) - 1,
+						);
+					}
+				}
+
+				dispatch(type: string, payload: unknown) {
+					if (this.readyState === 2) return 0;
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+					});
+					const listeners = this.listeners.get(type) ?? new Set();
+					for (const listener of listeners) listener(event);
+					return listeners.size;
+				}
+			}
+
+			Object.defineProperty(window, "EventSource", {
+				configurable: true,
+				writable: true,
+				value: MockEventSource,
+			});
+			state.__dispatchAccessTaskEvent = (type, payload) =>
+				[...sources]
+					.reverse()
+					.find((source) => source.readyState !== 2)
+					?.dispatch(type, payload) ?? 0;
+		},
+		{ taskId: "task-readable-failure-pending" },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const { pathname } = new URL(req.url());
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: "task-readable-failure-pending",
+							task_type: "sync.access_refresh",
+							event_path: "/api/tasks/task-readable-failure-pending/events",
+							reason: "inactive_over_1h",
+						},
+					},
+				),
+			);
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			feedCalls += 1;
+			markReadableRequestStarted?.();
+			await readableRequestGate;
+			return json(route, {
+				sections: [
+					{
+						id: "2026-04-09",
+						date: "2026-04-09",
+						kind: "raw",
+						item_count: 1,
+						brief: null,
+						items: [
+							buildReleaseFeedItem("failure-pending-item", {
+								title: "Fresh after failure",
+							}),
+						],
+						items_next_cursor: null,
+						supplemental_items: [],
+					},
+				],
+				next_cursor: null,
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: { state: "idle", message: null, checked_at: null },
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		return json(
+			route,
+			{ error: { code: "not_found", message: `unhandled ${pathname}` } },
+			404,
+		);
+	});
+
+	try {
+		await page.goto("/");
+		await readableRequestStarted;
+		await expect(
+			page.locator('[data-readable-loading-initial="true"]'),
+		).toBeVisible();
+		await expect(page.getByText("Fresh after failure")).toHaveCount(0);
+		await page.evaluate(() => {
+			const state = window as typeof window & {
+				__dispatchAccessTaskEvent?: (type: string, payload: unknown) => number;
+			};
+			state.__dispatchAccessTaskEvent?.("task.completed", {
+				status: "failed",
+				error: "access sync failed",
+			});
+		});
+		await expect
+			.poll(
+				() =>
+					page.evaluate(
+						() =>
+							(window as typeof window & { __activeAccessTaskSources?: number })
+								.__activeAccessTaskSources ?? 0,
+					),
+				{ timeout: 1500 },
+			)
+			.toBe(0);
+		expect(feedCalls).toBeGreaterThanOrEqual(1);
+		releaseReadableRequests?.();
+		await expect(page.getByText("Fresh after failure")).toBeVisible({
+			timeout: 8000,
+		});
+	} finally {
+		releaseReadableRequests?.();
+	}
+});
+
 test("dashboard keeps readable content and exposes refresh retry after a transient failure", async ({
 	page,
 }) => {
@@ -2491,9 +2725,19 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	const legacyFeedGate = new Promise<void>((resolve) => {
 		releaseLegacyFeed = resolve;
 	});
+	let syncAllCalls = 0;
 	await page.addInitScript(
 		({ taskId }) => {
-			const mockTaskEventSources: MockEventSource[] = [];
+			type TestWindow = Window & {
+				__dashboardTaskProgressListeners?: number;
+				__dispatchDashboardTaskEvent?: (
+					type: string,
+					payload: unknown,
+				) => number;
+			};
+			const state = window as TestWindow;
+			const taskSources: MockEventSource[] = [];
+			state.__dashboardTaskProgressListeners = 0;
 			class MockEventSource {
 				readyState = 1;
 				url: string;
@@ -2502,19 +2746,30 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 
 				constructor(url: string | URL) {
 					this.url = String(url);
-					mockTaskEventSources.push(this);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					taskSources.push(this);
 					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
-					if (!String(url).endsWith(`/api/tasks/${taskId}/events`)) return;
 				}
 
 				addEventListener(type: string, listener: (event: Event) => unknown) {
 					const listeners = this.listeners.get(type) ?? new Set();
 					listeners.add(listener);
 					this.listeners.set(type, listeners);
+					if (type === "task.progress") {
+						state.__dashboardTaskProgressListeners =
+							(state.__dashboardTaskProgressListeners ?? 0) + 1;
+					}
 				}
 
 				removeEventListener(type: string, listener: (event: Event) => unknown) {
-					this.listeners.get(type)?.delete(listener);
+					const listeners = this.listeners.get(type);
+					if (!listeners?.delete(listener)) return;
+					if (type === "task.progress") {
+						state.__dashboardTaskProgressListeners = Math.max(
+							0,
+							(state.__dashboardTaskProgressListeners ?? 1) - 1,
+						);
+					}
 				}
 
 				close() {
@@ -2526,33 +2781,17 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 						data: JSON.stringify(payload),
 					});
 					const listeners = this.listeners.get(type) ?? [];
-					for (const listener of listeners) {
-						listener(event);
-					}
+					for (const listener of listeners) listener(event);
 					return listeners.size;
 				}
 			}
 
 			window.EventSource = MockEventSource as unknown as typeof EventSource;
-			(
-				window as typeof window & {
-					__dispatchDashboardTaskEvent?: (
-						type: string,
-						payload: unknown,
-					) => number;
-				}
-			).__dispatchDashboardTaskEvent = (type, payload) => {
-				return (
-					[...mockTaskEventSources]
-						.reverse()
-						.find(
-							(source) =>
-								source.readyState !== 2 &&
-								source.url.endsWith(`/api/tasks/${taskId}/events`),
-						)
-						?.dispatch(type, payload) ?? 0
-				);
-			};
+			state.__dispatchDashboardTaskEvent = (type, payload) =>
+				[...taskSources]
+					.reverse()
+					.find((source) => source.readyState !== 2)
+					?.dispatch(type, payload) ?? 0;
 		},
 		{ taskId: "task-readable-refresh-error" },
 	);
@@ -2598,26 +2837,20 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(
 				route,
-				buildMockMeResponse(
-					{
-						id: "2f4k7m9p3x6c8v2a",
-						github_user_id: 10,
-						login: "octo",
-						name: "Octo",
-						avatar_url: null,
-						email: null,
-						is_admin: false,
-					},
-					{
-						access_sync: {
-							task_id: "task-readable-refresh-error",
-							task_type: "sync.access_refresh",
-							event_path: "/api/tasks/task-readable-refresh-error/events",
-							reason: "inactive_over_1h",
-						},
-					},
-				),
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
 			);
+		}
+		if (req.method() === "POST" && pathname === "/api/sync/all") {
+			syncAllCalls += 1;
+			return json(route, { task_id: "task-readable-refresh-error" });
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
@@ -2726,10 +2959,24 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 
 	await page.goto("/");
 	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	await page.getByRole("banner").getByRole("button", { name: "同步" }).click();
+	await expect.poll(() => syncAllCalls).toBe(1);
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					(
+						window as typeof window & {
+							__dashboardTaskProgressListeners?: number;
+						}
+					).__dashboardTaskProgressListeners ?? 0,
+			),
+		)
+		.toBeGreaterThan(0);
 	const feedCallsBeforeRefreshError = feedCalls;
 	liveNoticeReceived = true;
-	const initialProgressListeners = await page.evaluate(() => {
-		return (
+	const initialProgressListeners = await page.evaluate(
+		() =>
 			(
 				window as typeof window & {
 					__dispatchDashboardTaskEvent?: (
@@ -2739,9 +2986,8 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				}
 			).__dispatchDashboardTaskEvent?.("task.progress", {
 				stage: "star_refreshed",
-			}) ?? 0
-		);
-	});
+			}) ?? 0,
+	);
 	expect(initialProgressListeners).toBeGreaterThan(0);
 	await expect
 		.poll(() => feedCalls, { timeout: 5000 })
@@ -2769,8 +3015,8 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	const callsBeforeFallback = feedCalls;
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
 	await readableFallbackStarted;
-	const progressListeners = await page.evaluate(() => {
-		return (
+	const progressListeners = await page.evaluate(
+		() =>
 			(
 				window as typeof window & {
 					__dispatchDashboardTaskEvent?: (
@@ -2780,9 +3026,8 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				}
 			).__dispatchDashboardTaskEvent?.("task.progress", {
 				stage: "star_refreshed",
-			}) ?? 0
-		);
-	});
+			}) ?? 0,
+	);
 	expect(progressListeners).toBeGreaterThan(0);
 	await page.waitForTimeout(100);
 	releaseReadableFallback?.();

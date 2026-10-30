@@ -168,6 +168,13 @@ export function useDashboardReadableSections(options?: {
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
 	const lifecycleGenerationRef = useRef(0);
+	const lastSignatureRef = useRef(signature);
+	const contentWriteGenerationRef = useRef(0);
+	if (lastSignatureRef.current !== signature) {
+		lastSignatureRef.current = signature;
+		contentWriteGenerationRef.current += 1;
+	}
+	const contentWriteGeneration = contentWriteGenerationRef.current;
 	const refreshQueueRef = useRef<Promise<ReadableRefreshResult | undefined>>(
 		Promise.resolve(undefined),
 	);
@@ -179,6 +186,7 @@ export function useDashboardReadableSections(options?: {
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
 	const clearContent = useCallback(() => {
+		contentWriteGenerationRef.current += 1;
 		lifecycleGenerationRef.current += 1;
 		requestIdRef.current += 1;
 		refreshPriorityRef.current += 1;
@@ -625,17 +633,27 @@ export function useDashboardReadableSections(options?: {
 		[enabled],
 	);
 
-	const applyToItems = useCallback((updater: (item: FeedItem) => FeedItem) => {
-		setSections((current) => updateItems(current, updater));
-		setDetails((current) =>
-			Object.fromEntries(
-				Object.entries(current).map(([id, detail]) => [
-					id,
-					{ ...detail, items: detail.items.map(updater) },
-				]),
-			),
-		);
-	}, []);
+	const applyToItems = useCallback(
+		(updater: (item: FeedItem) => FeedItem) => {
+			if (contentWriteGeneration !== contentWriteGenerationRef.current) return;
+			setSections((current) =>
+				contentWriteGeneration === contentWriteGenerationRef.current
+					? updateItems(current, updater)
+					: current,
+			);
+			setDetails((current) =>
+				contentWriteGeneration === contentWriteGenerationRef.current
+					? Object.fromEntries(
+							Object.entries(current).map(([id, detail]) => [
+								id,
+								{ ...detail, items: detail.items.map(updater) },
+							]),
+						)
+					: current,
+			);
+		},
+		[contentWriteGeneration],
+	);
 
 	const applyTranslation = useCallback(
 		(target: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
