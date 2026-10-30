@@ -1,6 +1,10 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
-import { buildMockMeResponse, json } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 async function expectRepositoryListGeometry(
 	panel: Locator,
@@ -332,6 +336,10 @@ async function installScopedFocusMocks(
 				route,
 				nextAssociatedItems.find((item) => item.full_name === fullName),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

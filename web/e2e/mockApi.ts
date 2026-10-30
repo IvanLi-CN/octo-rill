@@ -7,29 +7,10 @@ export const mockDashboardBootstrap = {
 };
 
 export function json(route: Route, payload: unknown, status = 200) {
-	const request = route.request();
-	const errorPayload =
-		typeof payload === "object" && payload !== null && "error" in payload
-			? (payload as { error?: { code?: string; message?: string } }).error
-			: undefined;
-	const isUnhandledReadableFeed =
-		request.method() === "GET" &&
-		new URL(request.url()).pathname === "/api/dashboard/feed" &&
-		status === 404 &&
-		errorPayload?.code === "not_found" &&
-		errorPayload.message === "unhandled GET /api/dashboard/feed";
-	const responsePayload = isUnhandledReadableFeed
-		? {
-				error: {
-					code: "release_reading_evidence_unavailable",
-					message: "Release compare evidence is not ready",
-				},
-			}
-		: payload;
 	return route.fulfill({
-		status: isUnhandledReadableFeed ? 503 : status,
+		status,
 		contentType: "application/json",
-		body: JSON.stringify(responsePayload),
+		body: JSON.stringify(payload),
 	});
 }
 

@@ -2427,6 +2427,14 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	let updatesCalls = 0;
 	let failRefresh = true;
 	let liveNoticeReceived = false;
+	let announceNextUpdate = false;
+	let exactFallback = false;
+	let holdLegacyFallback = false;
+	let legacyFeedCalls = 0;
+	let releaseLegacyFeed: (() => void) | null = null;
+	const legacyFeedGate = new Promise<void>((resolve) => {
+		releaseLegacyFeed = resolve;
+	});
 	await page.addInitScript(
 		({ taskId }) => {
 			class MockEventSource {
@@ -2489,6 +2497,18 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
 			if (liveNoticeReceived && failRefresh) {
+				if (exactFallback) {
+					return json(
+						route,
+						{
+							error: {
+								code: "release_reading_evidence_unavailable",
+								message: "compare evidence unavailable",
+							},
+						},
+						503,
+					);
+				}
 				return json(
 					route,
 					{ error: { code: "upstream", message: "temporary refresh failure" } },
@@ -2512,6 +2532,18 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				next_cursor: null,
 			});
 		}
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			legacyFeedCalls += 1;
+			if (holdLegacyFallback) await legacyFeedGate;
+			return json(route, {
+				items: [
+					buildReleaseFeedItem("legacy-fallback", {
+						title: "Fallback legacy release",
+					}),
+				],
+				next_cursor: null,
+			});
+		}
 		if (req.method() === "GET" && pathname === "/api/notifications") {
 			return json(route, []);
 		}
@@ -2530,18 +2562,19 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
 			updatesCalls += 1;
-			if (updatesCalls === 1) liveNoticeReceived = true;
+			const announce = updatesCalls === 1 || announceNextUpdate;
+			if (announce) liveNoticeReceived = true;
+			announceNextUpdate = false;
 			return json(route, {
 				token: `updates-token-${updatesCalls}`,
 				lists: {
-					feed:
-						updatesCalls === 1
-							? {
-									changed: true,
-									new_count: 1,
-									latest_keys: ["release:refresh-error-item"],
-								}
-							: { changed: false, new_count: 0, latest_keys: [] },
+					feed: announce
+						? {
+								changed: true,
+								new_count: 1,
+								latest_keys: ["release:refresh-error-item"],
+							}
+						: { changed: false, new_count: 0, latest_keys: [] },
 					briefs: { changed: false, new_count: 0, latest_keys: [] },
 					notifications: { changed: false, new_count: 0, latest_keys: [] },
 				},
@@ -2569,6 +2602,23 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	await page.waitForTimeout(250);
 	expect(feedCalls).toBe(callsBeforeRetry + 1);
 	expect(updatesCalls).toBeGreaterThanOrEqual(2);
+
+	exactFallback = true;
+	failRefresh = true;
+	holdLegacyFallback = true;
+	liveNoticeReceived = false;
+	announceNextUpdate = true;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	await expect.poll(() => legacyFeedCalls, { timeout: 10_000 }).toBe(1);
+	await expect(page.getByText("Fresh release")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-new-content-notice="true"]'),
+	).toBeVisible();
+	await page.waitForTimeout(350);
+	expect(legacyFeedCalls).toBe(1);
+	releaseLegacyFeed?.();
+	await expect(page.getByText("Fallback legacy release")).toBeVisible();
+	await expect(page.getByText("Fresh release")).toHaveCount(0);
 });
 
 test("dashboard keeps access sync details closed until interaction", async ({
