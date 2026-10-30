@@ -3,7 +3,7 @@
 ## Current Status
 
 - Lifecycle: active
-- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；正式审查发现的证据完整性、单侧不可读 blob、非语义基线 compare 失败、可见性切换、轮询 variant 隔离、提交/轮询不兼容状态、回填旧投影误计成功、排队取消、异常租约恢复、删除目标计数和旧私有搜索投影问题已修复，新的 CI/审查轮次仍待完成。
+- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；正式审查发现的证据完整性、单侧不可读 blob、非语义基线 compare 失败、公开基线候选变更后的旧投影复用、可见性切换、轮询 variant 隔离、提交/轮询不兼容状态、回填旧投影误计成功、回填成功竞态、排队取消、任务收尾后的续排、异常租约恢复、删除目标计数、日报版本归属去重和旧私有搜索投影问题已修复，新的 CI/审查轮次仍待完成。
 - 本主题不触发生产部署或生产回填启动；旧结果在新结果校验通过前继续可读。
 
 ## Implementation Coverage
@@ -14,14 +14,14 @@
 | --- | --- |
 | REQ-RC-READING、REQ-RC-EDITING | `ReleaseReadingResult` 固化版本、变化、无信息结论和机器材料；Release 专属 prompt/校验过滤归属尾句、版本复述、模板话术和来源区。 |
 | REQ-RC-VISIBILITY | Feed 与详情优先渲染结构化变化；仅服务端从冻结 evidence 派生的范围/SHA 等 `machine_materials` 使用原生 `details` 折叠，机器材料不进入日报。 |
-| REQ-RC-EVIDENCE | `src/api.rs` 冻结原文、语义版本基线、base/merge-base/head SHA、过滤后的 compare digest 和覆盖范围；标题中的具体变化也作为 `release_text` 事实，发布时间晚于当前 Release 的候选会被排除，`diverged`/`behind` 会改用固定两端 tree 比较，并在有限范围内补取两端 blob；公开仓库的版本号空壳 Release 只使用匿名 compare，稳定且修订一致的公共投影（包括处理中投影）可复用，不能复用授权用户的私有差异；非语义标签只接受可验证的较低祖先，候选基线核查失败不会伪装成无基线；legacy 路径复用语义基线，分页、截断、基线缺失、响应不完整、单侧 blob 不可读和比较失败保持可解释状态，不推断无变化，比较证据失败不会把同一冻结失败快照交给模型重试；需要保留的 PR 依据以服务端受控 `PR#编号` 引用呈现。 |
+| REQ-RC-EVIDENCE | `src/api.rs` 冻结原文、语义版本基线、base/merge-base/head SHA、过滤后的 compare digest 和覆盖范围；标题中的具体变化也作为 `release_text` 事实，发布时间晚于当前 Release 的候选会被排除，`diverged`/`behind` 会改用固定两端 tree 比较，并在有限范围内补取两端 blob；公开仓库的版本号空壳 Release 只使用匿名 compare，稳定且修订一致的公共投影（包括处理中投影）可复用，且把当前 compare 候选集合指纹写入公共源快照，候选集合变化时不会复用旧基线；不能复用授权用户的私有差异；非语义标签只接受可验证的较低祖先，候选基线核查失败不会伪装成无基线；legacy 路径复用语义基线，分页、截断、基线缺失、响应不完整、单侧 blob 不可读和比较失败保持可解释状态，不推断无变化，比较证据失败不会把同一冻结失败快照交给模型重试；需要保留的 PR 依据以服务端受控 `PR#编号` 引用呈现。 |
 | REQ-RC-CONSUMPTION | global projection 同时保存 `reading` 与兼容 title/summary；服务端按当前可见性选择 `smart_public` 与 `smart_authorized`，公开状态变化不会复用私有差异，旧授权请求轮询与提交响应也必须匹配当前 audience；结构化结果不兼容时 Feed、详情、日报和请求接口统一呈现 `incompatible` 事实；旧翻译接口提供可选 `reading` 字段；三个阅读面从同一事实消费，日报不再反解来源链接或提示式列表，并完整保留结构化变化，不静默截断；当前任务禁止在线或真实模型测试。 |
 | REQ-RC-STATES | `reading.outcome` 与工作 status 分离；合法 `insufficient` 保留最简发布记录，queued/running/failed/不兼容结果不伪装成无信息；提交和轮询保持不兼容状态，`retry_on_error` 可重新排队不兼容阅读；日报快照不会用较新的处理中结果覆盖已有可读内容。 |
-| REQ-RC-BRIEF | `build_repo_rendered` 和 `build_brief_markdown` 删除相关链接及占位 fallback；migration `0102`/`0103`/`0104` 冻结最近 30 天目标、提供按 release 的级联索引、批次恢复和 task 级租约栅栏。服务启动不自动创建回填；管理员显式入口、失败运行重试、过期租约、排队/运行取消、崩溃恢复、owner+task CAS 和 SQLite 退避会将运行恢复到可重试队列，活动运行返回持久化状态而非机械 `queued`，重试保持原窗口并保留成功/跳过项，暂停恢复会重置等待项，回填目标被删除时按 surviving items 重算并将缺失目标计入失败且不遗留活动租约；保留投影只能继续供人阅读，不能把旧结果计入新回填成功，worker 异常会先结束运行并释放租约。 |
+| REQ-RC-BRIEF | `build_repo_rendered` 和 `build_brief_markdown` 删除相关链接及占位 fallback，并在日报中裁剪、去重组件版本；migration `0102`/`0103`/`0104` 冻结最近 30 天目标、提供按 release 的级联索引、批次恢复和 task 级租约栅栏。服务启动不自动创建回填；管理员显式入口、失败运行重试、过期租约、排队/运行取消、崩溃恢复、owner+task CAS 和 SQLite 退避会将运行恢复到可重试队列，活动运行返回持久化状态而非机械 `queued`，重试保持原窗口并保留成功/跳过项，暂停恢复会重置等待项，回填目标被删除时按 surviving items 重算并将缺失目标计入失败且不遗留活动租约；回填成功在同一写事务内再次核验当前 work item，任务收尾发现运行已被并发恢复为 queued 时会补排匹配 run 的任务；保留投影只能继续供人阅读，不能把旧结果计入新回填成功，worker 异常会先结束运行并释放租约。 |
 
 ## Verification
 
-- `cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 和 `cargo test --locked --all-targets`（1205 passed、3 ignored）已通过；证据不可用时保留同 audience 的旧有效投影、compare 响应完整性、单侧 blob 不可读、非语义基线 compare 失败、固定端点 tree/blob 差异、429 限流分类、受控 PR/安全引用、分页/分叉比较、非语义标签祖先、回填旧投影成功分类、排队取消、worker 异常租约释放、删除目标失败计数、删除 waiting 目标后的计数恢复、日报首次生成并发保护、日报完整结构化变化、提交/轮询 incompatible 终态、`retry_on_error` 不兼容重试、批量 incompatible 终态、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
+- `cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 和 `cargo test --locked --all-targets`（待本轮修正完成后更新计数）已通过；证据不可用时保留同 audience 的旧有效投影、compare 响应完整性、单侧 blob 不可读、非语义基线 compare 失败、固定端点 tree/blob 差异、429 限流分类、受控 PR/安全引用、分页/分叉比较、非语义标签祖先、公共候选集合指纹、回填当前 ready 复核、回填成功竞态、任务收尾续排、排队取消、worker 异常租约释放、删除目标失败计数、删除 waiting 目标后的计数恢复、日报首次生成并发保护、日报版本去重、日报完整结构化变化、提交/轮询 incompatible 终态、`retry_on_error` 不兼容重试、批量 incompatible 终态、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
 - `bun run build`、`bun run lint` 和 Storybook 测试已通过；桌面/移动 Storybook 元素证据已保存到 `assets/`，提交门禁为 `owner-approved`。
 - 两个授权账号、私有公开发布切换、GitHub 403/429 和完整回填替换仍属于合并前集成验证；当前 head 需等待新的 CI 与 Tier 4 正式审查结果。
 

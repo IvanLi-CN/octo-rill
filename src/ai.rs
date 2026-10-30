@@ -5598,15 +5598,20 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                     let versions = bullet
                         .versions
                         .iter()
-                        .map(String::as_str)
-                        .filter(|version| !version.trim().is_empty())
-                        .collect::<Vec<_>>();
+                        .map(|version| version.trim())
+                        .filter(|version| !version.is_empty())
+                        .fold(Vec::<&str>::new(), |mut versions, version| {
+                            if !versions.contains(&version) {
+                                versions.push(version);
+                            }
+                            versions
+                        });
                     let show_versions = !(versions.is_empty()
                         || (versions.len() == 1
                             && release
                                 .reading_version
                                 .as_deref()
-                                .is_some_and(|current| current == versions[0])));
+                                .is_some_and(|current| current.trim() == versions[0])));
                     if show_versions {
                         let references = bullet
                             .references
@@ -7734,6 +7739,35 @@ mod tests {
             changes.last().map(|change| change.text.as_str()),
             Some("变更 6")
         );
+    }
+
+    #[test]
+    fn daily_rendering_normalizes_component_versions() {
+        let repo = RepoRendered {
+            full_name: "acme/rocket".to_owned(),
+            releases: vec![ReleaseRendered {
+                release_id: 42,
+                title: "v1.2.0".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.2.0".to_owned(),
+                published_at: "2026-10-27T00:00:00Z".to_owned(),
+                is_prerelease: false,
+                reading_version: Some("v1.2.0".to_owned()),
+                bullets: vec![BriefReleaseChange {
+                    text: "拆分测试夹具".to_owned(),
+                    versions: vec![
+                        " v1.2.0 ".to_owned(),
+                        "v1.2.0".to_owned(),
+                        "v1.1.9".to_owned(),
+                    ],
+                    references: Vec::new(),
+                }],
+                status_label: None,
+            }],
+        };
+
+        let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
+        assert!(markdown.contains("拆分测试夹具（v1.2.0、v1.1.9）"));
+        assert!(!markdown.contains("v1.2.0、v1.2.0"));
     }
 
     #[test]

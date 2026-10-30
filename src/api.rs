@@ -21848,12 +21848,38 @@ fn source_snapshot_block_text<'a>(snapshot: &'a Value, slot: &str) -> Option<&'a
         })
 }
 
+async fn release_compare_candidate_set_fingerprint(
+    state: &AppState,
+    repo_id: i64,
+    release_id: i64,
+) -> Result<String, ApiError> {
+    let mut candidates = release_compare_candidates_from_db(state, repo_id, release_id).await?;
+    candidates.sort_by_key(|candidate| candidate.release_id);
+    let canonical = candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "release_id": candidate.release_id,
+                "tag_name": candidate.tag_name,
+                "is_prerelease": candidate.is_prerelease,
+                "published_at": candidate.published_at,
+                "created_at": candidate.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let serialized = serde_json::to_string(&canonical).map_err(ApiError::internal)?;
+    Ok(ai::sha256_hex(&format!(
+        "release-compare-candidates\n{serialized}"
+    )))
+}
+
 fn public_release_projection_matches_source_snapshot(
     source_snapshot_json: &str,
     repo_full_name: &str,
     tag_name: &str,
     title: &str,
     body: &str,
+    candidate_set_fingerprint: &str,
     revision: &PublicReleaseReadingRevision<'_>,
 ) -> bool {
     let Ok(snapshot) = serde_json::from_str::<Value>(source_snapshot_json) else {
@@ -21870,6 +21896,8 @@ fn public_release_projection_matches_source_snapshot(
         && source_snapshot_block_text(&snapshot, "metadata") == Some(metadata.as_str())
         && source_snapshot_block_text(&snapshot, "title") == Some(title)
         && source_snapshot_block_text(&snapshot, "body_markdown").unwrap_or_default() == body
+        && source_snapshot_block_text(&snapshot, "reading_baseline_candidates")
+            == Some(candidate_set_fingerprint)
 }
 
 async fn public_release_reading_source_hash_for_release(
@@ -21893,9 +21921,24 @@ async fn public_release_reading_source_hash_for_release(
         ));
     }
 
+    let release_metadata = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT repo_id, created_at FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(request.release_id)
+    .fetch_optional(&request.state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some((repo_id, created_at)) = release_metadata else {
+        return Ok(None);
+    };
+    let candidate_set_fingerprint =
+        release_compare_candidate_set_fingerprint(request.state, repo_id, request.release_id)
+            .await?;
+
     // Reuse a valid public projection whose immutable source snapshot still
-    // matches this Release. This avoids repeating anonymous compare requests
-    // for the same empty-shell Release while preserving revision isolation.
+    // matches this Release and the current compare candidate set. This avoids
+    // repeating anonymous compare requests for the same empty-shell Release
+    // while preventing a stale baseline from being reused after sync.
     if content_identity_upgrade::is_complete(&request.state.pool)
         .await
         .map_err(ApiError::internal)?
@@ -21922,6 +21965,7 @@ async fn public_release_reading_source_hash_for_release(
                 request.tag_name,
                 title.as_str(),
                 normalized_body.as_str(),
+                candidate_set_fingerprint.as_str(),
                 &request.revision,
             )
         {
@@ -21929,16 +21973,6 @@ async fn public_release_reading_source_hash_for_release(
         }
     }
 
-    let release_metadata = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT repo_id, created_at FROM repo_releases WHERE release_id = ? LIMIT 1",
-    )
-    .bind(request.release_id)
-    .fetch_optional(&request.state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-    let Some((repo_id, created_at)) = release_metadata else {
-        return Ok(None);
-    };
     let (reading_compare, evidence) =
         prepare_release_reading_evidence(ReleaseReadingEvidenceRequest {
             state: request.state,
@@ -21986,6 +22020,10 @@ async fn public_release_reading_source_hash_for_release(
             slot: "reading_compare".to_owned(),
             text: reading_compare.clone(),
         },
+        translations::TranslationSourceBlock {
+            slot: "reading_baseline_candidates".to_owned(),
+            text: candidate_set_fingerprint.clone(),
+        },
     ]);
     let source_revision_parts = [
         request.revision.html_url.to_owned(),
@@ -21993,6 +22031,7 @@ async fn public_release_reading_source_hash_for_release(
         title,
         normalized_body,
         reading_compare,
+        candidate_set_fingerprint,
     ];
     let source_revision_tiebreak = content_processing::release_source_revision_content_tiebreak(
         &source_revision_parts
