@@ -189,6 +189,11 @@ async function installDashboardBriefMocks(
 			nextCursor: string | null;
 		};
 		readableSectionPage?: (cursor: string | null) => unknown;
+		readableSectionPageFailure?: {
+			status?: number;
+			code: string;
+			message: string;
+		};
 		readableSectionPageFailures?: Array<string | null>;
 		deferReadableSectionPageCursors?: Array<string | null>;
 		readableSectionItemsPage?: (
@@ -205,6 +210,7 @@ async function installDashboardBriefMocks(
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
 	const feedRequests: Array<string | null> = [];
+	const feedRequestUrls: string[] = [];
 	const readableSectionRequests: Array<string | null> = [];
 	const readableSectionItemRequests: Array<{
 		sectionId: string;
@@ -259,6 +265,7 @@ async function installDashboardBriefMocks(
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			const cursor = url.searchParams.get("cursor");
 			feedRequests.push(cursor);
+			feedRequestUrls.push(`${pathname}${url.search}`);
 			if (deferredFeedPageCursors.has(cursor)) {
 				await new Promise<void>((resolve) => {
 					deferredFeedPageResolvers.set(cursor, resolve);
@@ -290,6 +297,14 @@ async function installDashboardBriefMocks(
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			const cursor = url.searchParams.get("cursor");
 			readableSectionRequests.push(cursor);
+			if (options?.readableSectionPageFailure && cursor === null) {
+				const failure = options.readableSectionPageFailure;
+				return json(
+					route,
+					{ error: { code: failure.code, message: failure.message } },
+					failure.status ?? 500,
+				);
+			}
 			if (deferredReadablePages.has(cursor)) {
 				await new Promise<void>((resolve) => {
 					deferredReadablePageResolvers.set(cursor, resolve);
@@ -462,6 +477,7 @@ async function installDashboardBriefMocks(
 
 	return {
 		getFeedRequests: () => feedRequests.slice(),
+		getFeedRequestUrls: () => feedRequestUrls.slice(),
 		getReadableSectionRequests: () => readableSectionRequests.slice(),
 		getReadableSectionItemRequests: () => readableSectionItemRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
@@ -578,6 +594,53 @@ test("dashboard advances to the next readable section without a continuation sto
 	await expect(
 		page.getByRole("button", { name: "继续加载历史动态" }),
 	).toHaveCount(0);
+});
+
+test("dashboard falls back to the legacy feed for unavailable readable evidence", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const legacyItem = makeReleaseFeedItem({
+		id: "legacy-fallback",
+		ts: "2026-04-30T08:00:00Z",
+		tag: "legacy-fallback",
+		title: "Legacy fallback release appears",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedItems: [legacyItem],
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Legacy fallback release appears")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(tracker.getFeedRequestUrls).toContain("/api/feed?limit=30");
+});
+
+test("dashboard keeps generic readable failures visible without a legacy fallback", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 502,
+			code: "readable_page_failed",
+			message: "readable page failed",
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("readable page failed")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+	await expect(tracker.getFeedRequestUrls()).toEqual([]);
 });
 
 test("dashboard fetches covered raw releases only after switching a brief to list", async ({
