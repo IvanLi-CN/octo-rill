@@ -16603,6 +16603,8 @@ struct FeedRow {
     smart_reading: Option<ReleaseReadingView>,
     #[sqlx(skip)]
     smart_reading_incompatible: bool,
+    #[sqlx(skip)]
+    release_compare_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17447,6 +17449,7 @@ async fn fetch_feed_items(
     viewer_login: Option<&str>,
     limit: i64,
     time_window: Option<(&str, &str)>,
+    release_compare_unavailable: &mut bool,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
         WITH scoped_visible_repos AS (
@@ -17861,7 +17864,7 @@ async fn fetch_feed_items(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    overlay_global_feed_processing(state, user_id, &mut rows).await?;
+    overlay_global_feed_processing(state, user_id, &mut rows, release_compare_unavailable).await?;
     Ok(rows)
 }
 
@@ -17939,6 +17942,7 @@ async fn overlay_global_feed_processing(
     state: &AppState,
     user_id: &str,
     rows: &mut [FeedRow],
+    release_compare_unavailable: &mut bool,
 ) -> Result<(), ApiError> {
     if content_processing::current_mode(&state.pool)
         .await
@@ -17948,13 +17952,15 @@ async fn overlay_global_feed_processing(
         return Ok(());
     }
 
-    let mut release_compare_unavailable = false;
     for row in rows.iter_mut() {
         if !matches!(row.kind.as_str(), "release" | "announcement") {
             continue;
         }
-        if row.kind == "release" && release_compare_unavailable {
-            clear_feed_row_processing_projection(row);
+        if row.kind == "release"
+            && *release_compare_unavailable
+            && release_feed_row_requires_compare(row)
+        {
+            mark_release_compare_unavailable(row);
             continue;
         }
         let resource_type = if row.kind == "release" {
@@ -18032,9 +18038,8 @@ async fn overlay_global_feed_processing(
             )? {
                 Some(input) => Some(input),
                 None => {
-                    // A readable dashboard page can contain thousands of releases.
-                    // Stop issuing Compare requests for this response after one fails.
-                    release_compare_unavailable = true;
+                    *release_compare_unavailable = true;
+                    mark_release_compare_unavailable(row);
                     continue;
                 }
             }
@@ -18269,6 +18274,18 @@ async fn overlay_global_feed_processing(
         }
     }
     Ok(())
+}
+
+fn release_feed_row_requires_compare(row: &FeedRow) -> bool {
+    !release_body_has_actionable_content(
+        row.title.as_deref().unwrap_or(""),
+        row.release_body.as_deref().unwrap_or(""),
+    )
+}
+
+fn mark_release_compare_unavailable(row: &mut FeedRow) {
+    clear_feed_row_processing_projection(row);
+    row.release_compare_unavailable = true;
 }
 
 async fn fetch_visible_release_reaction_rows(
@@ -18912,6 +18929,14 @@ fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
     smart_item("missing", None, None, auto_translate, None)
 }
 
+fn smart_release_compare_unavailable_item() -> SmartItem {
+    let mut item = smart_item("error", None, None, Some(false), None);
+    item.error_code = Some(RELEASE_READING_EVIDENCE_UNAVAILABLE.to_owned());
+    item.error_summary = Some("差异证据暂时不可用".to_owned());
+    item.error_detail = Some("来源恢复可读后可以重试".to_owned());
+    item
+}
+
 #[cfg(test)]
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
     crate::translations::release_translation_error_is_retryable(error_text)
@@ -19133,6 +19158,8 @@ fn feed_item_from_row(
 
     let mut smart = if !ai_enabled {
         Some(smart_item("disabled", None, None, None, None))
+    } else if r.release_compare_unavailable {
+        Some(smart_release_compare_unavailable_item())
     } else {
         let refresh_in_flight = r.smart_source_hash.as_deref() != Some(smart_current_hash.as_str())
             && r.smart_status.as_deref() == Some("ready")
@@ -19378,6 +19405,7 @@ async fn fetch_dashboard_readable_rows_for_date(
     date: &str,
     time_zone: &str,
     limit: i64,
+    release_compare_unavailable: &mut bool,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let Some((start, end)) = dashboard_readable_date_window_utc(date, time_zone) else {
         return Ok(Vec::new());
@@ -19391,6 +19419,7 @@ async fn fetch_dashboard_readable_rows_for_date(
         None,
         limit,
         Some((start.as_str(), end.as_str())),
+        release_compare_unavailable,
     )
     .await
 }
@@ -19706,6 +19735,7 @@ pub async fn dashboard_readable_feed(
     )
     .await?;
     let mut sections = Vec::with_capacity(selected_dates.len());
+    let mut release_compare_unavailable = false;
     for date in &selected_dates {
         let brief = briefs
             .iter()
@@ -19722,6 +19752,7 @@ pub async fn dashboard_readable_feed(
             date,
             time_zone,
             fetch_limit,
+            &mut release_compare_unavailable,
         )
         .await?
         .into_iter()
@@ -19829,12 +19860,14 @@ pub async fn dashboard_readable_section_items(
     let fetch_limit = offset
         .saturating_add(DASHBOARD_READABLE_SECTION_ITEM_LIMIT + 1)
         .min(i64::MAX as usize) as i64;
+    let mut release_compare_unavailable = false;
     let rows = fetch_dashboard_readable_rows_for_date(
         state.as_ref(),
         &user_id,
         &section_date,
         preferences.time_zone.as_str(),
         fetch_limit,
+        &mut release_compare_unavailable,
     )
     .await?;
     let ai_enabled = state.config.ai.is_some();
@@ -19910,6 +19943,7 @@ pub async fn list_feed(
     };
 
     let db_started_at = Instant::now();
+    let mut release_compare_unavailable = false;
     let rows = fetch_feed_items(
         state.as_ref(),
         &user_id,
@@ -19919,6 +19953,7 @@ pub async fn list_feed(
         Some(viewer.login.as_str()),
         limit,
         None,
+        &mut release_compare_unavailable,
     )
     .await?;
     let db_elapsed = db_started_at.elapsed();
@@ -28867,6 +28902,7 @@ mod tests {
             smart_summary: None,
             smart_reading: None,
             smart_reading_incompatible: false,
+            release_compare_unavailable: false,
             smart_error_text: None,
             smart_work_status: None,
         }
@@ -38695,6 +38731,12 @@ mod tests {
         .await
         .expect("seed previous release tag");
         sqlx::query(
+            "UPDATE repo_releases SET name = 'v1.2.2 修复搜索缓存', body = '- 修复搜索缓存' WHERE release_id = 119",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed actionable release after unavailable Compare");
+        sqlx::query(
             "UPDATE repo_releases SET tag_name = 'v1.2.4', name = 'Release v1.2.4', published_at = '2026-02-24T00:00:00Z', created_at = '2026-02-24T00:00:00Z' WHERE release_id = 121",
         )
         .execute(&pool)
@@ -38804,7 +38846,7 @@ mod tests {
             Url::parse(&format!("http://{address}/")).expect("parse GitHub Compare mock URL");
 
         let Json(feed) = list_feed(
-            State(state),
+            State(state.clone()),
             setup_session(1).await,
             HeaderMap::new(),
             Query(FeedQuery {
@@ -38839,13 +38881,165 @@ mod tests {
         assert_eq!(newer_release.body.as_deref(), Some("- item"));
         assert_eq!(
             release.smart.as_ref().map(|item| item.status.as_str()),
-            Some("missing")
+            Some("error")
+        );
+        assert_eq!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|item| item.error_code.as_deref()),
+            Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
+        );
+        assert_eq!(
+            release.smart.as_ref().and_then(|item| item.auto_translate),
+            Some(false)
+        );
+        assert_eq!(
+            newer_release
+                .smart
+                .as_ref()
+                .and_then(|item| item.error_code.as_deref()),
+            Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
         );
         assert!(
             feed.items
                 .iter()
                 .any(|item| { item.kind == "repo_star_received" && item.id == "neighbor-event" })
         );
+
+        let actionable_release = feed
+            .items
+            .iter()
+            .find(|item| item.kind == "release" && item.id == "119")
+            .expect("actionable release remains independently projectable");
+        assert_eq!(
+            actionable_release.title.as_deref(),
+            Some("v1.2.2 修复搜索缓存")
+        );
+        assert_eq!(actionable_release.body.as_deref(), Some("- 修复搜索缓存"));
+        assert_ne!(
+            actionable_release
+                .smart
+                .as_ref()
+                .and_then(|item| item.error_code.as_deref()),
+            Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
+        );
+        assert_eq!(compare_requests.load(Ordering::Relaxed), 1);
+
+        let Json(second_feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("a later request can retry unavailable Compare evidence");
+        assert!(second_feed.items.iter().any(|item| {
+            item.kind == "release"
+                && item.id == "121"
+                && item
+                    .smart
+                    .as_ref()
+                    .and_then(|smart| smart.error_code.as_deref())
+                    == Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
+        }));
+        assert_eq!(compare_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn dashboard_readable_compare_failure_is_bounded_across_date_sections() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        for (release_id, timestamp) in [
+            (119, "2026-02-22T00:00:00Z"),
+            (120, "2026-02-23T00:00:00Z"),
+            (121, "2026-02-24T00:00:00Z"),
+        ] {
+            seed_repo_release(&pool, 42, release_id).await;
+            sqlx::query(
+                "UPDATE repo_releases SET published_at = ?, created_at = ?, updated_at = ? WHERE release_id = ?",
+            )
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("set release date");
+        }
+        sqlx::query(
+            "UPDATE repo_releases SET tag_name = 'v1.2.2', name = 'Release v1.2.2' WHERE release_id = 119",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed previous release tag");
+        sqlx::query(
+            "UPDATE repo_releases SET tag_name = 'v1.2.4', name = 'Release v1.2.4' WHERE release_id = 121",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next release tag");
+        seed_star(&pool, 42).await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("enable global processing mode");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub Compare mock");
+        let address = listener
+            .local_addr()
+            .expect("read GitHub Compare mock address");
+        let compare_requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = compare_requests.clone();
+        let mock = Router::new().fallback(move || {
+            let observed_requests = observed_requests.clone();
+            async move {
+                observed_requests.fetch_add(1, Ordering::Relaxed);
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, mock)
+                .await
+                .expect("serve GitHub Compare mock");
+        });
+        let mut state = setup_state_with_ai(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique readable-feed test state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse GitHub Compare mock URL");
+
+        let mut release_compare_unavailable = false;
+        for date in ["2026-02-24", "2026-02-23", "2026-02-22"] {
+            let rows = fetch_dashboard_readable_rows_for_date(
+                state.as_ref(),
+                user_id.as_str(),
+                date,
+                "UTC",
+                100,
+                &mut release_compare_unavailable,
+            )
+            .await
+            .expect("fetch readable date section after Compare failure");
+            assert_eq!(rows.len(), 1);
+            let item =
+                feed_item_from_row(rows.into_iter().next().expect("one release"), true, None);
+            assert_eq!(
+                item.smart
+                    .as_ref()
+                    .and_then(|smart| smart.error_code.as_deref()),
+                Some(RELEASE_READING_EVIDENCE_UNAVAILABLE)
+            );
+        }
         assert_eq!(compare_requests.load(Ordering::Relaxed), 1);
     }
 

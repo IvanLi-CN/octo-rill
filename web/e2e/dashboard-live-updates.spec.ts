@@ -67,6 +67,10 @@ test("dashboard live updates retain feed boundaries until they leave the viewpor
 			);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
+
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			feedRequests += 1;
 			const types = url.searchParams.get("types");
@@ -307,6 +311,10 @@ test("dashboard live updates do not place feed boundaries below processed existi
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

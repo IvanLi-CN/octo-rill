@@ -1797,38 +1797,33 @@ export function Dashboard(props: {
 			readableSections.legacyFallback &&
 			readableSections.sections.length > 0 &&
 			(feed.loadingInitial || feed.error?.phase === "initial"));
+	const readableSectionsVisibleRef = useRef(readableSectionsVisible);
+	readableSectionsVisibleRef.current = readableSectionsVisible;
 	const applyTranslationToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
-			if (readableSectionsVisible) {
+			if (readableSectionsVisibleRef.current) {
 				readableSections.applyTranslation(item, translated);
 			} else {
 				feed.applyTranslation(item, translated);
 			}
 		},
-		[
-			feed.applyTranslation,
-			readableSectionsVisible,
-			readableSections.applyTranslation,
-		],
+		[feed.applyTranslation, readableSections.applyTranslation],
 	);
 	const applySmartToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
-			if (readableSectionsVisible) readableSections.applySmart(item, smart);
+			if (readableSectionsVisibleRef.current)
+				readableSections.applySmart(item, smart);
 			else feed.applySmart(item, smart);
 		},
-		[feed.applySmart, readableSectionsVisible, readableSections.applySmart],
+		[feed.applySmart, readableSections.applySmart],
 	);
 	const applyReactionsToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
-			if (readableSectionsVisible)
+			if (readableSectionsVisibleRef.current)
 				readableSections.applyReactions(item, reactions);
 			else feed.applyReactions(item, reactions);
 		},
-		[
-			feed.applyReactions,
-			readableSectionsVisible,
-			readableSections.applyReactions,
-		],
+		[feed.applyReactions, readableSections.applyReactions],
 	);
 	const activeFeedItems = useMemo(() => {
 		if (!readableSectionsVisible) return feed.items;
@@ -2887,6 +2882,7 @@ export function Dashboard(props: {
 		const notice = activeFeedNotice;
 		if (
 			!notice ||
+			(readableSectionsVisible && readableSections.legacyFallback) ||
 			(readableSectionsActive
 				? readableSections.loadingInitial ||
 					readableSections.loadingRefresh ||
@@ -2986,7 +2982,9 @@ export function Dashboard(props: {
 		readableSections.loadingInitial,
 		readableSections.loadingRefresh,
 		readableSections.error?.phase,
+		readableSections.legacyFallback,
 		readableSectionsActive,
+		readableSectionsVisible,
 		refreshFeed,
 	]);
 
@@ -4553,56 +4551,78 @@ export function Dashboard(props: {
 				) : null}
 
 				{rootReadable ? (
-					<FeedReadableSectionList
-						sections={readableSections.sections}
-						details={readableSections.details}
-						error={readableSections.error}
-						loadingInitial={readableSections.loadingInitial}
-						loadingRefresh={readableSections.loadingRefresh}
-						loadingMore={readableSections.loadingMore}
-						hasMore={readableSections.hasMore}
-						onLoadMore={() => void readableSections.loadMore()}
-						onRetry={() => void readableSections.retry()}
-						onLoadSectionItems={(sectionId, cursor) => {
-							void readableSections.loadSectionItems(sectionId, cursor);
-						}}
-						feedCardProps={{
-							currentViewer: {
-								login: me.user.login,
-								avatar_url: me.user.avatar_url,
-								html_url: `https://github.com/${me.user.login}`,
-							},
-							sourceTab: mode,
-							currentScope: null,
-							translationInFlightKeys,
-							translationAutoRetryingKeys,
-							smartInFlightKeys,
-							smartAutoRetryingKeys,
-							registerItemRef: registerFeedItem,
-							selectedLaneByKey: Object.fromEntries(
-								activeFeedItems.map((item) => [
-									feedItemKey(item),
-									resolveLaneForItem(
-										item,
-										selectedLaneByKey,
-										pageDefaultLane,
-										allowReleaseItemLaneOverride,
-									),
-								]),
-							),
-							onSelectLane,
-							onTranslateNow,
-							onSmartNow,
-							reactionBusyKeys,
-							reactionErrorByKey,
-							onToggleReaction,
-							freshKeys: new Set(),
-						}}
-						onOpenReleaseFromBrief={onOpenReleaseDetail}
-						onOpenBrief={openBrief}
-						onCopyBrief={copyBrief}
-						onGenerateBriefForDate={onGenerateBriefForDate}
-					/>
+					<>
+						{readableSectionsVisible &&
+						readableSections.legacyFallback &&
+						activeFeedNotice ? (
+							<NewContentNotice
+								count={
+									activeFeedNotice.boundaryKeys.length ||
+									activeFeedNotice.newCount
+								}
+								label="动态"
+								onReveal={() => {
+									void revealFeedUpdates(activeFeedNotice).catch((error) => {
+										notifyGlobalError(
+											"新动态显示失败",
+											error,
+											"新动态显示失败，请稍后重试。",
+										);
+									});
+								}}
+							/>
+						) : null}
+						<FeedReadableSectionList
+							sections={readableSections.sections}
+							details={readableSections.details}
+							error={readableSections.error}
+							loadingInitial={readableSections.loadingInitial}
+							loadingRefresh={readableSections.loadingRefresh}
+							loadingMore={readableSections.loadingMore}
+							hasMore={readableSections.hasMore}
+							onLoadMore={() => void readableSections.loadMore()}
+							onRetry={() => void readableSections.retry()}
+							onLoadSectionItems={(sectionId, cursor) => {
+								void readableSections.loadSectionItems(sectionId, cursor);
+							}}
+							feedCardProps={{
+								currentViewer: {
+									login: me.user.login,
+									avatar_url: me.user.avatar_url,
+									html_url: `https://github.com/${me.user.login}`,
+								},
+								sourceTab: mode,
+								currentScope: null,
+								translationInFlightKeys,
+								translationAutoRetryingKeys,
+								smartInFlightKeys,
+								smartAutoRetryingKeys,
+								registerItemRef: registerFeedItem,
+								selectedLaneByKey: Object.fromEntries(
+									activeFeedItems.map((item) => [
+										feedItemKey(item),
+										resolveLaneForItem(
+											item,
+											selectedLaneByKey,
+											pageDefaultLane,
+											allowReleaseItemLaneOverride,
+										),
+									]),
+								),
+								onSelectLane,
+								onTranslateNow,
+								onSmartNow,
+								reactionBusyKeys,
+								reactionErrorByKey,
+								onToggleReaction,
+								freshKeys: new Set(),
+							}}
+							onOpenReleaseFromBrief={onOpenReleaseDetail}
+							onOpenBrief={openBrief}
+							onCopyBrief={copyBrief}
+							onGenerateBriefForDate={onGenerateBriefForDate}
+						/>
+					</>
 				) : (
 					<FeedGroupedList
 						mode={mode}
@@ -4770,7 +4790,7 @@ export function Dashboard(props: {
 	]);
 
 	useEffect(() => {
-		if (readableSectionsActive || feed.loadingInitial || sidebarLoading) {
+		if (readableSectionsVisible || feed.loadingInitial || sidebarLoading) {
 			return;
 		}
 		persistDashboardWarmSnapshot({
@@ -4795,7 +4815,7 @@ export function Dashboard(props: {
 		routeState,
 		sidebarLoading,
 		feedRequestType,
-		readableSectionsActive,
+		readableSectionsVisible,
 	]);
 
 	const showStartupSkeleton =
