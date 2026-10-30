@@ -2460,18 +2460,31 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	let holdLegacyFallback = false;
 	let failLegacyRefresh = false;
 	let legacyFeedCalls = 0;
+	let holdReadableFallback = false;
+	let markReadableFallbackStarted: (() => void) | null = null;
+	let releaseReadableFallback: (() => void) | null = null;
+	const readableFallbackStarted = new Promise<void>((resolve) => {
+		markReadableFallbackStarted = resolve;
+	});
+	const readableFallbackGate = new Promise<void>((resolve) => {
+		releaseReadableFallback = resolve;
+	});
 	let releaseLegacyFeed: (() => void) | null = null;
 	const legacyFeedGate = new Promise<void>((resolve) => {
 		releaseLegacyFeed = resolve;
 	});
 	await page.addInitScript(
 		({ taskId }) => {
+			const mockTaskEventSources: MockEventSource[] = [];
 			class MockEventSource {
 				readyState = 1;
+				url: string;
 				onopen: ((event: Event) => unknown) | null = null;
 				private listeners = new Map<string, Set<(event: Event) => unknown>>();
 
 				constructor(url: string | URL) {
+					this.url = String(url);
+					mockTaskEventSources.push(this);
 					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
 					if (!String(url).endsWith(`/api/tasks/${taskId}/events`)) return;
 				}
@@ -2489,9 +2502,36 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				close() {
 					this.readyState = 2;
 				}
+
+				dispatch(type: string, payload: unknown) {
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+					});
+					const listeners = this.listeners.get(type) ?? [];
+					for (const listener of listeners) {
+						listener(event);
+					}
+					return listeners.size;
+				}
 			}
 
 			window.EventSource = MockEventSource as unknown as typeof EventSource;
+			(
+				window as typeof window & {
+					__dispatchDashboardTaskEvent?: (
+						type: string,
+						payload: unknown,
+					) => number;
+				}
+			).__dispatchDashboardTaskEvent = (type, payload) => {
+				return (
+					mockTaskEventSources
+						.find((source) =>
+							source.url.endsWith(`/api/tasks/${taskId}/events`),
+						)
+						?.dispatch(type, payload) ?? 0
+				);
+			};
 		},
 		{ taskId: "task-readable-refresh-error" },
 	);
@@ -2560,6 +2600,11 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
+			if (holdReadableFallback && liveNoticeReceived && failRefresh) {
+				holdReadableFallback = false;
+				markReadableFallbackStarted?.();
+				await readableFallbackGate;
+			}
 			if (liveNoticeReceived && failRefresh) {
 				if (exactFallback) {
 					return json(
@@ -2679,8 +2724,28 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	holdLegacyFallback = true;
 	liveNoticeReceived = false;
 	announceNextUpdate = true;
+	holdReadableFallback = true;
+	const callsBeforeFallback = feedCalls;
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	await readableFallbackStarted;
+	const progressListeners = await page.evaluate(() => {
+		(
+			window as typeof window & {
+				__dispatchDashboardTaskEvent?: (
+					type: string,
+					payload: unknown,
+				) => number;
+			}
+		).__dispatchDashboardTaskEvent?.("task.progress", {
+			stage: "star_refreshed",
+		}) ?? 0;
+	});
+	expect(progressListeners).toBeGreaterThan(0);
+	await page.waitForTimeout(100);
+	releaseReadableFallback?.();
 	await expect.poll(() => legacyFeedCalls, { timeout: 10_000 }).toBe(1);
+	await page.waitForTimeout(150);
+	expect(feedCalls).toBe(callsBeforeFallback + 1);
 	await expect(page.getByText("Fresh release")).toBeVisible();
 	await expect(
 		page.locator('[data-dashboard-new-content-notice="true"]'),
