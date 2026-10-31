@@ -3,6 +3,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ApiError, apiGet } from "@/api";
 import {
+	applySmartIfSourceMatches,
+	applyTranslationIfSourceMatches,
+} from "@/feed/autoLaneRequests";
+import {
 	buildDashboardScopeSignature,
 	type DashboardScope,
 } from "@/dashboard/routeState";
@@ -13,11 +17,7 @@ import type {
 	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
-import {
-	isLaneCapableFeedItem,
-	isReleaseFeedItem,
-	isSocialFeedItem,
-} from "@/feed/types";
+import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -445,7 +445,11 @@ export function useFeed(
 	);
 
 	const applyTranslation = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			translated: TranslatedItem,
+		) => {
 			const key = itemKey(item);
 			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
 				current
@@ -453,11 +457,11 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isLaneCapableFeedItem(it)) return it;
-								return {
-									...it,
-									translated: { ...translated },
-								};
+								return applyTranslationIfSourceMatches(
+									it,
+									sourceKey,
+									translated,
+								);
 							}),
 						}
 					: current,
@@ -467,7 +471,11 @@ export function useFeed(
 	);
 
 	const applySmart = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			smart: SmartItem,
+		) => {
 			const key = itemKey(item);
 			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
 				current
@@ -475,11 +483,7 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isLaneCapableFeedItem(it)) return it;
-								return {
-									...it,
-									smart: { ...smart },
-								};
+								return applySmartIfSourceMatches(it, sourceKey, smart);
 							}),
 						}
 					: current,

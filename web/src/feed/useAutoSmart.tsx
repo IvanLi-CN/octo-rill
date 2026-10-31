@@ -6,9 +6,13 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
+import {
+	buildRequestSourceKey,
+	buildSmartRequestItem,
+	buildSmartSourceKey,
+} from "@/feed/autoLaneRequests";
 import { translationErrorIsRetryable } from "@/feed/retryableErrors";
 import {
-	isAnnouncementFeedItem,
 	isLaneCapableFeedItem,
 	type FeedItem,
 	type SmartItem,
@@ -21,7 +25,6 @@ const INITIAL_SMART_PREFETCH_COUNT = 12;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
 const BLOCKED_CONFIG_POLL_INTERVAL_MS = 30_000;
-const AUTO_SMART_MAX_WAIT_MS = 500;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 const REQUEST_PENDING_MAX_AGE_MS =
@@ -42,68 +45,6 @@ type SmartResolveResponse = {
 	title: string | null;
 	summary: string | null;
 };
-
-function buildReleaseSmartRequestItem(
-	item: FeedItem,
-): TranslationRequestItemInput {
-	const title = item.title?.trim() || `release:${item.id}`;
-	const body = item.body?.trim();
-	const metadata = [item.repo_full_name, title]
-		.filter((value): value is string => Boolean(value?.trim()))
-		.join("\n");
-	return {
-		producer_ref: `feed.smart:release:${item.id}`,
-		kind: "release_smart",
-		variant: "feed_card",
-		entity_id: item.id,
-		target_lang: "zh-CN",
-		max_wait_ms: AUTO_SMART_MAX_WAIT_MS,
-		source_blocks: [
-			{ slot: "title", text: title },
-			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
-			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
-		],
-		target_slots: ["title_zh", "body_md"],
-	};
-}
-
-function buildAnnouncementSmartRequestItem(
-	item: FeedItem,
-): TranslationRequestItemInput {
-	const title = item.title?.trim() || `announcement:${item.id}`;
-	const body = item.body?.trim();
-	const discussionNumber =
-		isAnnouncementFeedItem(item) && item.discussion_number
-			? `discussion_number=${item.discussion_number}`
-			: null;
-	const metadata = [item.repo_full_name, discussionNumber]
-		.filter((value): value is string => Boolean(value?.trim()))
-		.join("\n");
-	const entityId =
-		isAnnouncementFeedItem(item) && item.discussion_key
-			? item.discussion_key
-			: item.id;
-	return {
-		producer_ref: `feed.smart:announcement:${entityId}`,
-		kind: "announcement_smart",
-		variant: "feed_card",
-		entity_id: entityId,
-		target_lang: "zh-CN",
-		max_wait_ms: AUTO_SMART_MAX_WAIT_MS,
-		source_blocks: [
-			{ slot: "title", text: title },
-			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
-			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
-		],
-		target_slots: ["title_zh", "body_md"],
-	};
-}
-
-function buildSmartRequestItem(item: FeedItem): TranslationRequestItemInput {
-	return isAnnouncementFeedItem(item)
-		? buildAnnouncementSmartRequestItem(item)
-		: buildReleaseSmartRequestItem(item);
-}
 
 function mapTranslationItemToFeedSmart(item: {
 	status:
@@ -295,18 +236,6 @@ function createDeferred<T>(): Deferred<T> {
 	return { promise, resolve, reject };
 }
 
-function buildRequestSourceKey(item: TranslationRequestItemInput) {
-	return JSON.stringify({
-		producer_ref: item.producer_ref,
-		kind: item.kind,
-		variant: item.variant,
-		entity_id: item.entity_id,
-		target_lang: item.target_lang,
-		source_blocks: item.source_blocks,
-		target_slots: item.target_slots,
-	});
-}
-
 function intersectsViewportRange(
 	top: number,
 	bottom: number,
@@ -389,7 +318,11 @@ function isTerminalTranslationResultStatus(
 
 export function useAutoSmart(params: {
 	enabled: boolean;
-	onSmart: (item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => void;
+	onSmart: (
+		item: Pick<FeedItem, "kind" | "id">,
+		smart: SmartItem,
+		sourceKey: string,
+	) => void;
 }) {
 	const { enabled, onSmart } = params;
 
@@ -403,11 +336,12 @@ export function useAutoSmart(params: {
 
 	const keyToElementRef = useRef(new Map<string, HTMLElement>());
 	const itemByKeyRef = useRef(new Map<string, FeedItem>());
+	const sourceKeyByItemRef = useRef(new Map<string, string>());
 	const requestTasksRef = useRef(new Map<string, TranslationTask>());
-	const failedRef = useRef(new Set<string>());
+	const failedRef = useRef(new Map<string, string>());
 	const retryCountRef = useRef(new Map<string, number>());
 	const pollErrorCountRef = useRef(new Map<string, number>());
-	const autoRetriedKeysRef = useRef(new Set<string>());
+	const autoRetriedKeysRef = useRef(new Map<string, string>());
 
 	const [, forceRender] = useState(0);
 
@@ -424,7 +358,7 @@ export function useAutoSmart(params: {
 				item.smart.auto_translate !== false) ||
 				(item.smart?.status === "ready" &&
 					item.smart.auto_translate === true)) &&
-			!failedRef.current.has(keyOf(item)),
+			failedRef.current.get(keyOf(item)) !== buildSmartSourceKey(item),
 		[enabled],
 	);
 
@@ -434,7 +368,7 @@ export function useAutoSmart(params: {
 			isLaneCapableFeedItem(item) &&
 			item.smart?.status === "error" &&
 			feedSmartIsRetryable(item) &&
-			!autoRetriedKeysRef.current.has(keyOf(item)),
+			autoRetriedKeysRef.current.get(keyOf(item)) !== buildSmartSourceKey(item),
 		[enabled],
 	);
 
@@ -457,11 +391,31 @@ export function useAutoSmart(params: {
 		task.deferred.resolve(null);
 	}, []);
 
+	const rememberItemSource = useCallback(
+		(item: FeedItem, sourceKey: string) => {
+			const key = keyOf(item);
+			const previousSourceKey = sourceKeyByItemRef.current.get(key);
+			if (previousSourceKey !== undefined && previousSourceKey !== sourceKey) {
+				const existing = requestTasksRef.current.get(key);
+				if (existing && existing.sourceKey !== sourceKey) {
+					retireTask(key, existing);
+				}
+				failedRef.current.delete(key);
+				retryCountRef.current.delete(key);
+				pollErrorCountRef.current.delete(key);
+				autoRetriedKeysRef.current.delete(key);
+			}
+			sourceKeyByItemRef.current.set(key, sourceKey);
+		},
+		[retireTask],
+	);
+
 	const invalidatePendingResults = useCallback(() => {
 		for (const [key, task] of requestTasksRef.current) {
 			retireTask(key, task);
 		}
 		failedRef.current.clear();
+		sourceKeyByItemRef.current.clear();
 		retryCountRef.current.clear();
 		pollErrorCountRef.current.clear();
 		autoRetriedKeysRef.current.clear();
@@ -482,6 +436,7 @@ export function useAutoSmart(params: {
 			itemByKeyRef.current.set(key, item);
 			const requestItem = buildSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
+			rememberItemSource(item, sourceKey);
 			const existing = requestTasksRef.current.get(key);
 			if (existing) {
 				if (existing.sourceKey === sourceKey) {
@@ -498,7 +453,7 @@ export function useAutoSmart(params: {
 				bottom: 0,
 			};
 		},
-		[retireTask, shouldAutoSmart],
+		[rememberItemSource, retireTask, shouldAutoSmart],
 	);
 
 	const settleTaskPromise = useCallback(
@@ -530,11 +485,15 @@ export function useAutoSmart(params: {
 			clearTask(candidate.key, task);
 			const mapped = mapSmartToResolveResponse(smart);
 			if (!mapped) {
-				failedRef.current.add(candidate.key);
+				failedRef.current.set(candidate.key, candidate.sourceKey);
 			} else {
 				failedRef.current.delete(candidate.key);
 				retryCountRef.current.delete(candidate.key);
-				onSmart({ kind: candidate.item.kind, id: candidate.item.id }, smart);
+				onSmart(
+					{ kind: candidate.item.kind, id: candidate.item.id },
+					smart,
+					candidate.sourceKey,
+				);
 			}
 			settleTaskPromise(task, mapped);
 			scheduleViewportPlanRef.current();
@@ -559,7 +518,7 @@ export function useAutoSmart(params: {
 				if (keepsVisibleReady) {
 					retryCountRef.current.delete(candidate.key);
 				} else {
-					failedRef.current.add(candidate.key);
+					failedRef.current.set(candidate.key, candidate.sourceKey);
 					retryCountRef.current.delete(candidate.key);
 				}
 			} else {
@@ -582,9 +541,13 @@ export function useAutoSmart(params: {
 			clearTask(candidate.key, task);
 			const mapped = mapSmartToResolveResponse(smart);
 			if (smart) {
-				onSmart({ kind: candidate.item.kind, id: candidate.item.id }, smart);
+				onSmart(
+					{ kind: candidate.item.kind, id: candidate.item.id },
+					smart,
+					candidate.sourceKey,
+				);
 			}
-			failedRef.current.add(candidate.key);
+			failedRef.current.set(candidate.key, candidate.sourceKey);
 			retryCountRef.current.delete(candidate.key);
 			settleTaskPromise(task, mapped, error);
 			scheduleViewportPlanRef.current();
@@ -636,6 +599,7 @@ export function useAutoSmart(params: {
 							onSmart(
 								{ kind: candidate.item.kind, id: candidate.item.id },
 								pending,
+								candidate.sourceKey,
 							);
 						}
 						task.lastStatus = resolved.status;
@@ -855,6 +819,7 @@ export function useAutoSmart(params: {
 					itemByKeyRef.current.get(candidate.key) ?? candidate.item;
 				const requestItem = buildSmartRequestItem(latestItem);
 				const sourceKey = buildRequestSourceKey(requestItem);
+				rememberItemSource(latestItem, sourceKey);
 				const existing = requestTasksRef.current.get(candidate.key);
 				if (existing && existing.sourceKey === sourceKey) {
 					byKey.set(candidate.key, existing.promise);
@@ -913,6 +878,7 @@ export function useAutoSmart(params: {
 			resolveCandidateTasks,
 			schedulePendingPoll,
 			retireTask,
+			rememberItemSource,
 		],
 	);
 
@@ -949,12 +915,13 @@ export function useAutoSmart(params: {
 					continue;
 				}
 				const key = keyOf(item);
-				autoRetriedKeysRef.current.add(key);
+				const requestItem = buildSmartRequestItem(item);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				rememberItemSource(item, sourceKey);
+				autoRetriedKeysRef.current.set(key, sourceKey);
 				failedRef.current.delete(key);
 				retryCountRef.current.delete(key);
 				itemByKeyRef.current.set(key, item);
-				const requestItem = buildSmartRequestItem(item);
-				const sourceKey = buildRequestSourceKey(requestItem);
 				candidates.push({
 					key,
 					item,
@@ -969,7 +936,7 @@ export function useAutoSmart(params: {
 			}
 			await submitCandidates(candidates, { retryOnError: true });
 		},
-		[enabled, shouldAutoRetryLoadedError, submitCandidates],
+		[enabled, rememberItemSource, shouldAutoRetryLoadedError, submitCandidates],
 	);
 
 	const prepareCandidates = useCallback(() => {
@@ -1058,6 +1025,7 @@ export function useAutoSmart(params: {
 			const key = keyOf(item);
 			const requestItem = buildSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
+			rememberItemSource(item, sourceKey);
 			const existing = requestTasksRef.current.get(key);
 			if (existing && existing.sourceKey !== sourceKey) {
 				retireTask(key, existing);
@@ -1082,7 +1050,7 @@ export function useAutoSmart(params: {
 			resizeObserverRef.current?.observe(element);
 			scheduleViewportPlanRef.current();
 		},
-		[enabled, retireTask],
+		[enabled, rememberItemSource, retireTask],
 	);
 
 	const smartNow = useCallback(
@@ -1093,6 +1061,7 @@ export function useAutoSmart(params: {
 			const key = keyOf(item);
 			const requestItem = buildSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
+			rememberItemSource(item, sourceKey);
 			failedRef.current.delete(key);
 			retryCountRef.current.delete(key);
 
@@ -1145,7 +1114,13 @@ export function useAutoSmart(params: {
 				throw error;
 			}
 		},
-		[bumpRender, finalizeFailure, resolveCandidateTasks, retireTask],
+		[
+			bumpRender,
+			finalizeFailure,
+			rememberItemSource,
+			resolveCandidateTasks,
+			retireTask,
+		],
 	);
 
 	useEffect(() => {
