@@ -43,9 +43,12 @@ export type ReadableRefreshResult =
 	| "superseded"
 	| "failed";
 
-function isAuthorizationDenied(error: unknown) {
+function isProtectedFeedUnavailable(error: unknown) {
 	return (
-		error instanceof ApiError && (error.status === 401 || error.status === 403)
+		error instanceof ApiError &&
+		(error.status === 401 ||
+			error.status === 403 ||
+			(error.status === 404 && error.code === "not_found"))
 	);
 }
 
@@ -367,7 +370,7 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
-				const authorizationDenied = isAuthorizationDenied(cause);
+				const authorizationDenied = isProtectedFeedUnavailable(cause);
 				if (authorizationDenied) {
 					clearContent();
 					setLoadingInitial(false);
@@ -547,7 +550,7 @@ export function useDashboardReadableSections(options?: {
 		} catch (cause) {
 			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
 				return;
-			const authorizationDenied = isAuthorizationDenied(cause);
+			const authorizationDenied = isProtectedFeedUnavailable(cause);
 			if (authorizationDenied) {
 				clearContent();
 				setLoadingInitial(false);
@@ -639,7 +642,7 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
 					return;
-				if (isAuthorizationDenied(cause)) {
+				if (isProtectedFeedUnavailable(cause)) {
 					clearContent();
 					setLoadingInitial(false);
 					setError({
