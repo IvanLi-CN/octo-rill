@@ -191,8 +191,10 @@ export function useFeed(
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
+	const queryRequestSeqRef = useRef(0);
 	const invalidateRequests = useCallback(() => {
 		reqIdRef.current += 1;
+		queryRequestSeqRef.current += 1;
 		void queryClient.cancelQueries({
 			queryKey: ["dashboard", "feed", { userId }],
 		});
@@ -219,6 +221,9 @@ export function useFeed(
 		retry: (failureCount, error) =>
 			!isAuthorizationDenied(error) && failureCount < 1,
 		queryFn: async ({ signal }) => {
+			const requestSeq = ++queryRequestSeqRef.current;
+			const requestIsCurrent = () =>
+				requestSeq === queryRequestSeqRef.current && !signal.aborted;
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
 			let res: FeedResponse;
@@ -226,11 +231,17 @@ export function useFeed(
 				res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
 					signal,
 				});
-				setAuthorizationDenied((current) =>
-					current?.queryKey === queryKeySignature ? null : current,
-				);
+				if (requestIsCurrent()) {
+					setAuthorizationDenied((current) =>
+						current?.queryKey === queryKeySignature ? null : current,
+					);
+				}
 			} catch (error) {
-				if (error instanceof ApiError && isAuthorizationDenied(error)) {
+				if (
+					requestIsCurrent() &&
+					error instanceof ApiError &&
+					isAuthorizationDenied(error)
+				) {
 					setAuthorizationDenied({ queryKey: queryKeySignature, error });
 				}
 				throw error;

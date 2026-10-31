@@ -3441,6 +3441,8 @@ export function Dashboard(props: {
 		}
 		if (
 			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
 			feed.loadingInitial ||
 			feed.items.length === 0
 		) {
@@ -3452,9 +3454,11 @@ export function Dashboard(props: {
 	}, [
 		feed.items,
 		feed.loadingInitial,
+		feedAuthorizationDenied,
 		initialAccessPending,
 		notifyGlobalError,
 		primeSmart,
+		readableAuthorizationDenied,
 		tab,
 	]);
 
@@ -3464,6 +3468,8 @@ export function Dashboard(props: {
 		}
 		if (
 			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
 			feed.loadingInitial ||
 			feed.items.length === 0
 		) {
@@ -3486,8 +3492,10 @@ export function Dashboard(props: {
 	}, [
 		feed.items,
 		feed.loadingInitial,
+		feedAuthorizationDenied,
 		initialAccessPending,
 		notifyGlobalError,
+		readableAuthorizationDenied,
 		retryLoadedSmart,
 		retryLoadedTranslations,
 		tab,
@@ -4923,6 +4931,8 @@ export function Dashboard(props: {
 		}
 		if (
 			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
 			feed.loadingInitial ||
 			feed.items.length === 0
 		) {
@@ -4949,9 +4959,11 @@ export function Dashboard(props: {
 		allowReleaseItemLaneOverride,
 		feed.items,
 		feed.loadingInitial,
+		feedAuthorizationDenied,
 		initialAccessPending,
 		pageDefaultLane,
 		requestLaneIfNeeded,
+		readableAuthorizationDenied,
 		selectedLaneByKey,
 		tab,
 	]);

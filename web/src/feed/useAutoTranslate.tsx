@@ -991,6 +991,12 @@ export function useAutoTranslate(params: {
 	const register = useCallback(
 		(item: FeedItem) => (element: HTMLElement | null) => {
 			const key = keyOf(item);
+			const requestItem = buildSummaryRequestItem(item);
+			const sourceKey = buildRequestSourceKey(requestItem);
+			const existing = requestTasksRef.current.get(key);
+			if (existing && existing.sourceKey !== sourceKey) {
+				retireTask(key, existing);
+			}
 			itemByKeyRef.current.set(key, item);
 
 			const previous = keyToElementRef.current.get(key);
@@ -1011,7 +1017,7 @@ export function useAutoTranslate(params: {
 			resizeObserverRef.current?.observe(element);
 			scheduleViewportPlanRef.current();
 		},
-		[enabled],
+		[enabled, retireTask],
 	);
 
 	const translateNow = useCallback(

@@ -382,6 +382,8 @@ export function ReleaseDetailCard(props: {
 	const initialLane = normalizedTarget?.lane ?? null;
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const [detailTargetKey, setDetailTargetKey] = useState<string | null>(null);
+	const activeTargetKeyRef = useRef(activeTargetKey);
+	activeTargetKeyRef.current = activeTargetKey;
 	const translateRequestSeqRef = useRef(0);
 	const smartRequestSeqRef = useRef(0);
 	const loadRequestSeqRef = useRef(0);
@@ -396,6 +398,7 @@ export function ReleaseDetailCard(props: {
 			targetRelease: DashboardReleaseTarget,
 			options?: { resetDisplay?: boolean },
 		) => {
+			const targetKey = releaseTargetKey(targetRelease);
 			const requestSeq = loadRequestSeqRef.current + 1;
 			loadRequestSeqRef.current = requestSeq;
 			pendingTranslationRequestRef.current = null;
@@ -410,7 +413,11 @@ export function ReleaseDetailCard(props: {
 			}
 			void fetchReleaseDetail(targetRelease)
 				.then((response) => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					const requestId = response.translated?.request_id;
 					if (requestId) {
 						pendingTranslationRequestRef.current = {
@@ -423,7 +430,11 @@ export function ReleaseDetailCard(props: {
 					onResolvedDetail?.(response);
 				})
 				.catch((error) => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					setDetail(null);
 					setDetailTargetKey(null);
 					setLoadError(
@@ -431,7 +442,11 @@ export function ReleaseDetailCard(props: {
 					);
 				})
 				.finally(() => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					setLoading(false);
 				});
 		},
@@ -445,6 +460,8 @@ export function ReleaseDetailCard(props: {
 		setTranslating(false);
 		setSmartResolving(false);
 		if (!normalizedTarget || !activeTargetKey) {
+			loadRequestSeqRef.current += 1;
+			setLoading(false);
 			pendingTranslationRequestRef.current = null;
 			setDetail(null);
 			setDetailTargetKey(null);
