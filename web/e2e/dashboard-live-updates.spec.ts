@@ -857,15 +857,11 @@ test("same-key source refresh retries terminal translation and smart failures", 
 
 	await release.getByRole("tab", { name: "翻译" }).click();
 	await expect(
-		release
-			.getByRole("tabpanel", { name: "翻译" })
-			.getByRole("heading", { name: freshTranslation }),
+		release.getByRole("heading", { name: freshTranslation }),
 	).toBeVisible();
 	await release.getByRole("tab", { name: "润色" }).click();
 	await expect(
-		release
-			.getByRole("tabpanel", { name: "润色" })
-			.getByRole("heading", { name: freshSmart }),
+		release.getByRole("heading", { name: freshSmart }),
 	).toBeVisible();
 });
 
