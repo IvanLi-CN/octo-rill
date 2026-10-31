@@ -17952,6 +17952,7 @@ async fn overlay_global_feed_processing(
         if !matches!(row.kind.as_str(), "release" | "announcement") {
             continue;
         }
+        clear_feed_row_processing_projection(row);
         let resource_type = if row.kind == "release" {
             "release"
         } else {
@@ -18028,26 +18029,6 @@ async fn overlay_global_feed_processing(
         } else {
             None
         };
-
-        row.trans_source_hash = None;
-        row.trans_status = None;
-        row.trans_title = None;
-        row.trans_summary = None;
-        row.trans_error_text = None;
-        row.trans_work_status = None;
-        row.detail_trans_source_hash = None;
-        row.detail_trans_status = None;
-        row.detail_trans_title = None;
-        row.detail_trans_summary = None;
-        row.detail_trans_error_text = None;
-        row.detail_trans_work_status = None;
-        row.smart_source_hash = None;
-        row.smart_status = None;
-        row.smart_title = None;
-        row.smart_summary = None;
-        row.smart_error_text = None;
-        row.smart_work_status = None;
-        row.smart_reading = None;
 
         let global_hash_for_variant = |kind: &str, variant: &str| {
             if resource_type == "announcement" {
@@ -18275,6 +18256,28 @@ async fn overlay_global_feed_processing(
         }
     }
     Ok(())
+}
+
+fn clear_feed_row_processing_projection(row: &mut FeedRow) {
+    row.trans_source_hash = None;
+    row.trans_status = None;
+    row.trans_title = None;
+    row.trans_summary = None;
+    row.trans_error_text = None;
+    row.trans_work_status = None;
+    row.detail_trans_source_hash = None;
+    row.detail_trans_status = None;
+    row.detail_trans_title = None;
+    row.detail_trans_summary = None;
+    row.detail_trans_error_text = None;
+    row.detail_trans_work_status = None;
+    row.smart_source_hash = None;
+    row.smart_status = None;
+    row.smart_title = None;
+    row.smart_summary = None;
+    row.smart_error_text = None;
+    row.smart_work_status = None;
+    row.smart_reading = None;
 }
 
 async fn fetch_visible_release_reaction_rows(
@@ -28549,9 +28552,10 @@ mod tests {
         seed_global_feed_compare_failure_fixture(&pool).await;
 
         let mut state = setup_state(pool);
+        let (github_base_url, compare_requests) = spawn_test_github_compare_failure_server().await;
         Arc::get_mut(&mut state)
             .expect("unique dashboard feed test state")
-            .github_rest_api_base = spawn_test_github_compare_failure_server().await;
+            .github_rest_api_base = github_base_url;
 
         let Json(feed) = dashboard_readable_feed(
             State(state),
@@ -28575,6 +28579,7 @@ mod tests {
             .expect("raw release should remain in dashboard feed");
         assert_eq!(release.title.as_deref(), Some("v1.2.3"));
         assert_eq!(release.body.as_deref(), Some("Release-Identity: current"));
+        assert!(compare_requests.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
@@ -29188,14 +29193,28 @@ mod tests {
         Url::parse(&format!("http://{addr}/")).expect("parse test ai base url")
     }
 
-    async fn spawn_test_github_compare_failure_server() -> Url {
-        spawn_test_ai_server(Router::new().fallback(|| async {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"message": "compare unavailable"})),
-            )
+    async fn spawn_test_github_compare_failure_server() -> (Url, Arc<AtomicUsize>) {
+        let compare_requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = Arc::clone(&compare_requests);
+        let base_url = spawn_test_ai_server(Router::new().fallback(move |uri: axum::http::Uri| {
+            let request_counter = Arc::clone(&request_counter);
+            async move {
+                if uri.path().starts_with("/repos/") && uri.path().contains("/compare/") {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"message": "compare unavailable"})),
+                    )
+                } else {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"message": "unexpected github path"})),
+                    )
+                }
+            }
         }))
-        .await
+        .await;
+        (base_url, compare_requests)
     }
 
     async fn seed_global_feed_compare_failure_fixture(pool: &SqlitePool) {
@@ -31494,6 +31513,36 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed release translation");
+    }
+
+    async fn seed_release_smart_translation(
+        pool: &SqlitePool,
+        user_id: &str,
+        entity_id: &str,
+        source_hash: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_smart', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(source_hash)
+        .bind(title)
+        .bind(summary)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release smart translation");
     }
 
     async fn seed_access_refresh_task(
@@ -40041,6 +40090,25 @@ line two",
     async fn list_feed_keeps_raw_release_when_compare_evidence_is_unavailable() {
         let pool = setup_pool().await;
         seed_global_feed_compare_failure_fixture(&pool).await;
+        let smart_body =
+            release_feed_body(Some("Release-Identity: current")).expect("smart source body");
+        let smart_source_hash = crate::translations::release_smart_feed_source_hash(
+            "120",
+            "openai/codex",
+            "v1.2.3",
+            Some(smart_body.as_str()),
+            "v1.2.3",
+            Some("v1.2.2"),
+        );
+        seed_release_smart_translation(
+            &pool,
+            test_user_id(1).as_str(),
+            "120",
+            smart_source_hash.as_str(),
+            Some("stale user smart title"),
+            Some("stale user smart summary"),
+        )
+        .await;
         seed_social_event(
             &pool,
             test_user_id(1).as_str(),
@@ -40061,10 +40129,11 @@ line two",
         )
         .await;
 
-        let mut state = setup_state(pool);
+        let mut state = setup_state_with_ai(pool);
+        let (github_base_url, compare_requests) = spawn_test_github_compare_failure_server().await;
         Arc::get_mut(&mut state)
             .expect("unique list feed test state")
-            .github_rest_api_base = spawn_test_github_compare_failure_server().await;
+            .github_rest_api_base = github_base_url;
 
         let Json(feed) = list_feed(
             State(state),
@@ -40089,6 +40158,14 @@ line two",
             .expect("raw release should remain in list feed");
         assert_eq!(release.title.as_deref(), Some("v1.2.3"));
         assert_eq!(release.body.as_deref(), Some("Release-Identity: current"));
+        assert_eq!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.title.as_deref()),
+            None
+        );
+        assert!(compare_requests.load(Ordering::SeqCst) >= 1);
         assert!(
             feed.items
                 .iter()
