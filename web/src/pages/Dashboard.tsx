@@ -2940,17 +2940,6 @@ export function Dashboard(props: {
 				const nextFreshKeys = Array.from(
 					new Set([...feed.freshKeys, ...freshKeys]),
 				);
-				if (readableSections.legacyFallback) {
-					await feed.refresh({
-						freshKeys: nextFreshKeys,
-						throwOnError: true,
-						force: true,
-					});
-					scrollToFreshFeedTop(freshKeys);
-					dismissFeedBoundary(notice.boundaryId);
-					await checkDashboardUpdates({ emit: false, include: ["feed"] });
-					return;
-				}
 				const result = await refreshFeed();
 				if (result === "fallback") {
 					await feed.refresh({
@@ -2999,7 +2988,6 @@ export function Dashboard(props: {
 			feed.refresh,
 			refreshFeed,
 			readableSectionsActive,
-			readableSections.legacyFallback,
 			readableSectionsVisible,
 			scrollToFreshFeedTop,
 		],
@@ -3023,7 +3011,7 @@ export function Dashboard(props: {
 		if (
 			!notice ||
 			initialAccessPending ||
-			(readableSectionsVisible && readableSections.legacyFallback) ||
+			readableSections.legacyFallback ||
 			(readableSectionsActive
 				? readableSectionsLoadingInitial ||
 					readableSections.loadingRefresh ||

@@ -1517,7 +1517,7 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "翻译" })
-				.getByRole("heading", { name: freshTranslation }),
+				.getByText(freshTranslation, { exact: true }),
 		).toBeVisible({
 			timeout: 15_000,
 		});
@@ -1525,7 +1525,7 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "润色" })
-				.getByRole("heading", { name: freshSmart }),
+				.getByText(freshSmart, { exact: true }),
 		).toBeVisible({
 			timeout: 15_000,
 		});
@@ -1536,13 +1536,13 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "翻译" })
-				.getByRole("heading", { name: freshTranslation }),
+				.getByText(freshTranslation, { exact: true }),
 		).toBeVisible();
 		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "润色" })
-				.getByRole("heading", { name: freshSmart }),
+				.getByText(freshSmart, { exact: true }),
 		).toBeVisible();
 		await expect(page.getByText(staleTranslation)).toHaveCount(0);
 		await expect(page.getByText(staleSmart)).toHaveCount(0);
