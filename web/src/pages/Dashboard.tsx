@@ -4852,7 +4852,7 @@ export function Dashboard(props: {
 						dailyBoundaryTimeZone={dailyBoundaryTimeZone}
 						dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
 						error={initialAccessPending || offlineEmpty ? null : feed.error}
-						loadingInitial={feedLoadingInitial}
+						loadingInitial={feedLoadingInitial || feed.refreshing}
 						loadingMore={feed.loadingMore}
 						hasMore={feed.hasMore}
 						translationInFlightKeys={translationInFlightKeys}
