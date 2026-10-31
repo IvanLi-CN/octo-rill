@@ -3,7 +3,7 @@
 ## Current Status
 
 - Lifecycle: active
-- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；正式审查发现的证据完整性、单侧不可读 blob、非语义基线 compare 失败、公开基线候选变更后的旧投影复用、可见性切换、轮询 variant 隔离、提交/轮询不兼容状态、回填旧投影误计成功、回填成功竞态、排队取消、任务收尾后的续排、异常租约恢复、删除目标计数、日报版本归属去重和旧私有搜索投影问题已修复，新的 CI/审查轮次仍待完成。当前 Feed hotfix 对单条 release projection 精确隔离 `release_reading_evidence_unavailable`，保留原始 Release 行并继续处理邻近动态；compare 请求使用可注入 GitHub REST base URL，便于确定性回归验证。
+- Implementation: 主要内容链路、状态合同、公开投影隔离和最近 30 天回填实现已完成；正式审查发现的证据完整性、单侧不可读 blob、非语义基线 compare 失败、公开基线候选变更后的旧投影复用、可见性切换、轮询 variant 隔离、提交/轮询不兼容状态、回填旧投影误计成功、回填成功竞态、排队取消、任务收尾后的续排、异常租约恢复、删除目标计数、日报版本归属去重和旧私有搜索投影问题已修复，新的 CI/审查轮次仍待完成。当前 Feed hotfix 对单条 release projection 精确隔离 `release_reading_evidence_unavailable`，先清空当前行全部用户/模型派生投影，再保留原始 Release 行并继续处理邻近动态；compare 请求使用可注入 GitHub REST base URL，便于确定性回归验证。
 - 本主题不触发生产部署或生产回填启动；旧结果在新结果校验通过前继续可读。
 
 ## Implementation Coverage
@@ -22,7 +22,7 @@
 
 ## Verification
 
-- `cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 和 `cargo test --locked --all-targets`（待本轮修正完成后更新计数）已通过；证据不可用时保留同 audience 的旧有效投影、compare 响应完整性、单侧 blob 不可读、非语义基线 compare 失败、固定端点 tree/blob 差异、429 限流分类、受控 PR/安全引用、分页/分叉比较、非语义标签祖先、公共候选集合指纹、回填当前 ready 复核、回填成功竞态、任务收尾续排、排队取消、worker 异常租约释放、删除目标失败计数、删除 waiting 目标后的计数恢复、日报首次生成并发保护、日报版本去重、日报完整结构化变化、提交/轮询 incompatible 终态、`retry_on_error` 不兼容重试、批量 incompatible 终态、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；本 hotfix 另有精确错误边界、list Feed 和 dashboard Feed compare 503 回归测试；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
+- `cargo fmt --all -- --check`、`cargo check --locked --all-targets --all-features`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 已通过；全量 `cargo test --locked --all-features` 有 1213 项通过、1 项既有 SQLite 并发测试瞬时锁冲突，单独重跑该测试通过。证据不可用时保留同 audience 的旧有效投影、compare 响应完整性、单侧 blob 不可读、非语义基线 compare 失败、固定端点 tree/blob 差异、429 限流分类、受控 PR/安全引用、分页/分叉比较、非语义标签祖先、公共候选集合指纹、回填当前 ready 复核、回填成功竞态、任务收尾续排、排队取消、worker 异常租约释放、删除目标失败计数、删除 waiting 目标后的计数恢复、日报首次生成并发保护、日报版本去重、日报完整结构化变化、提交/轮询 incompatible 终态、`retry_on_error` 不兼容重试、批量 incompatible 终态、内部证据脱敏、旧私有搜索隔离、当前 audience variant 隔离、语义不兼容阅读及轮询状态保持均有确定性测试；本 hotfix 另有精确错误边界、成功投影边界、全部派生字段清空、list Feed 和 dashboard Feed compare 503 回归测试，并验证注入 compare path；`git diff --check` 与规范合同检查也已通过。禁止真实模型、在线模型和生产凭据测试。
 - `bun run build`、`bun run lint` 和 Storybook 测试已通过；桌面/移动 Storybook 元素证据已保存到 `assets/`，提交门禁为 `owner-approved`。
 - 两个授权账号、私有公开发布切换、GitHub 403/429 和完整回填替换仍属于合并前集成验证；当前 head 需等待新的 CI 与 Tier 4 正式审查结果。
 

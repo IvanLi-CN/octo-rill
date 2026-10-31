@@ -18278,6 +18278,7 @@ fn clear_feed_row_processing_projection(row: &mut FeedRow) {
     row.smart_error_text = None;
     row.smart_work_status = None;
     row.smart_reading = None;
+    row.smart_reading_incompatible = false;
 }
 
 async fn fetch_visible_release_reaction_rows(
@@ -28552,7 +28553,8 @@ mod tests {
         seed_global_feed_compare_failure_fixture(&pool).await;
 
         let mut state = setup_state(pool);
-        let (github_base_url, compare_requests) = spawn_test_github_compare_failure_server().await;
+        let (github_base_url, compare_requests, expected_compare_request) =
+            spawn_test_github_compare_failure_server().await;
         Arc::get_mut(&mut state)
             .expect("unique dashboard feed test state")
             .github_rest_api_base = github_base_url;
@@ -28579,7 +28581,24 @@ mod tests {
             .expect("raw release should remain in dashboard feed");
         assert_eq!(release.title.as_deref(), Some("v1.2.3"));
         assert_eq!(release.body.as_deref(), Some("Release-Identity: current"));
+        let previous_release = feed
+            .sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .items
+                    .iter()
+                    .chain(section.supplemental_items.iter())
+            })
+            .find(|item| item.kind == "release" && item.id == "119")
+            .expect("neighboring release should remain in dashboard feed");
+        assert_eq!(previous_release.title.as_deref(), Some("v1.2.2"));
+        assert_eq!(
+            previous_release.body.as_deref(),
+            Some("Release-Identity: previous")
+        );
         assert!(compare_requests.load(Ordering::SeqCst) >= 1);
+        assert!(expected_compare_request.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -29193,14 +29212,21 @@ mod tests {
         Url::parse(&format!("http://{addr}/")).expect("parse test ai base url")
     }
 
-    async fn spawn_test_github_compare_failure_server() -> (Url, Arc<AtomicUsize>) {
+    async fn spawn_test_github_compare_failure_server() -> (Url, Arc<AtomicUsize>, Arc<AtomicBool>)
+    {
         let compare_requests = Arc::new(AtomicUsize::new(0));
         let request_counter = Arc::clone(&compare_requests);
+        let expected_compare_request = Arc::new(AtomicBool::new(false));
+        let expected_request_flag = Arc::clone(&expected_compare_request);
         let base_url = spawn_test_ai_server(Router::new().fallback(move |uri: axum::http::Uri| {
             let request_counter = Arc::clone(&request_counter);
+            let expected_request_flag = Arc::clone(&expected_request_flag);
             async move {
                 if uri.path().starts_with("/repos/") && uri.path().contains("/compare/") {
                     request_counter.fetch_add(1, Ordering::SeqCst);
+                    if uri.path() == "/repos/openai/codex/compare/v1.2.2...v1.2.3" {
+                        expected_request_flag.store(true, Ordering::SeqCst);
+                    }
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"message": "compare unavailable"})),
@@ -29214,7 +29240,7 @@ mod tests {
             }
         }))
         .await;
-        (base_url, compare_requests)
+        (base_url, compare_requests, expected_compare_request)
     }
 
     async fn seed_global_feed_compare_failure_fixture(pool: &SqlitePool) {
@@ -38647,6 +38673,21 @@ mod tests {
 
     #[test]
     fn release_feed_projection_fails_open_only_for_exact_error_code() {
+        let input = crate::translations::TranslationRequestItemInput {
+            producer_ref: "release:120".to_owned(),
+            kind: "release".to_owned(),
+            variant: "release_smart".to_owned(),
+            entity_id: "120".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 5000,
+            source_blocks: Vec::new(),
+            target_slots: Vec::new(),
+        };
+        let projected = release_feed_projection_result(Ok(input))
+            .expect("successful projection should remain successful")
+            .expect("successful projection should remain projectable");
+        assert_eq!(projected.producer_ref, "release:120");
+
         let exact = ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             RELEASE_READING_EVIDENCE_UNAVAILABLE,
@@ -38666,6 +38707,60 @@ mod tests {
         let error = release_feed_projection_result(Err(other))
             .expect_err("other API errors must remain terminal");
         assert_eq!(error.code(), "github_unavailable");
+    }
+
+    #[test]
+    fn clear_feed_row_processing_projection_clears_all_derived_fields() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.trans_source_hash = Some("trans-source".to_owned());
+        row.trans_status = Some("error".to_owned());
+        row.trans_title = Some("translated title".to_owned());
+        row.trans_summary = Some("translated summary".to_owned());
+        row.trans_error_text = Some("translation failed".to_owned());
+        row.trans_work_status = Some("running".to_owned());
+        row.detail_trans_source_hash = Some("detail-source".to_owned());
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("detail title".to_owned());
+        row.detail_trans_summary = Some("detail summary".to_owned());
+        row.detail_trans_error_text = Some("detail failed".to_owned());
+        row.detail_trans_work_status = Some("queued".to_owned());
+        row.smart_source_hash = Some("smart-source".to_owned());
+        row.smart_status = Some("ready".to_owned());
+        row.smart_title = Some("smart title".to_owned());
+        row.smart_summary = Some("smart summary".to_owned());
+        row.smart_error_text = Some("smart failed".to_owned());
+        row.smart_work_status = Some("batched".to_owned());
+        row.smart_reading = Some(super::ReleaseReadingView {
+            version: "1".to_owned(),
+            outcome: "ready".to_owned(),
+            title: Some("reading".to_owned()),
+            changes: Vec::new(),
+            machine_materials: Vec::new(),
+        });
+        row.smart_reading_incompatible = true;
+
+        super::clear_feed_row_processing_projection(&mut row);
+
+        assert!(row.trans_source_hash.is_none());
+        assert!(row.trans_status.is_none());
+        assert!(row.trans_title.is_none());
+        assert!(row.trans_summary.is_none());
+        assert!(row.trans_error_text.is_none());
+        assert!(row.trans_work_status.is_none());
+        assert!(row.detail_trans_source_hash.is_none());
+        assert!(row.detail_trans_status.is_none());
+        assert!(row.detail_trans_title.is_none());
+        assert!(row.detail_trans_summary.is_none());
+        assert!(row.detail_trans_error_text.is_none());
+        assert!(row.detail_trans_work_status.is_none());
+        assert!(row.smart_source_hash.is_none());
+        assert!(row.smart_status.is_none());
+        assert!(row.smart_title.is_none());
+        assert!(row.smart_summary.is_none());
+        assert!(row.smart_error_text.is_none());
+        assert!(row.smart_work_status.is_none());
+        assert!(row.smart_reading.is_none());
+        assert!(!row.smart_reading_incompatible);
     }
 
     #[test]
@@ -40130,7 +40225,8 @@ line two",
         .await;
 
         let mut state = setup_state_with_ai(pool);
-        let (github_base_url, compare_requests) = spawn_test_github_compare_failure_server().await;
+        let (github_base_url, compare_requests, expected_compare_request) =
+            spawn_test_github_compare_failure_server().await;
         Arc::get_mut(&mut state)
             .expect("unique list feed test state")
             .github_rest_api_base = github_base_url;
@@ -40165,7 +40261,36 @@ line two",
                 .and_then(|smart| smart.title.as_deref()),
             None
         );
+        assert_eq!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.summary.as_deref()),
+            None
+        );
+        assert_eq!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.error_code.as_deref()),
+            None
+        );
+        assert_eq!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.request_id.as_deref()),
+            None
+        );
+        assert!(
+            release
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.reading.as_ref())
+                .is_none()
+        );
         assert!(compare_requests.load(Ordering::SeqCst) >= 1);
+        assert!(expected_compare_request.load(Ordering::SeqCst));
         assert!(
             feed.items
                 .iter()
