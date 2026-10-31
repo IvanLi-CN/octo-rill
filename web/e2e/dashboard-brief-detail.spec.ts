@@ -1044,10 +1044,17 @@ test("dashboard clears legacy releases and retries after pagination authorizatio
 
 	await page.goto("/");
 	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	const persistedDashboardCache = () =>
+		page.evaluate(
+			() =>
+				window.localStorage.getItem("octo-rill.dashboard-query-cache.v1") ?? "",
+		);
+	await expect.poll(persistedDashboardCache).toContain(privateTitle);
 	await scrollPaginationSentinelIntoView(page);
 	await expect.poll(tracker.getFeedRequests).toContain("legacy-auth-page-2");
 	await expect.poll(() => deniedLegacyRequestNumber).toBeGreaterThan(0);
 	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect.poll(persistedDashboardCache).not.toContain(privateTitle);
 	const retry = page.getByRole("button", { name: "重试加载" });
 	await expect(retry).toBeVisible();
 	await expect(retry).toBeDisabled();
@@ -1058,6 +1065,209 @@ test("dashboard clears legacy releases and retries after pagination authorizatio
 		tracker.releaseFeedPageRequest(requestNumber);
 	}
 	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
+});
+
+test("dashboard ignores pending translation and smart results after feed authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Release before pending result authorization loss";
+	const recoveredTitle = "Release after pending result authorization retry";
+	const staleTranslation = "Stale translation after authorization loss";
+	const freshTranslation = "Fresh translation after authorization retry";
+	const staleSmart = "Stale smart result after authorization loss";
+	const freshSmart = "Fresh smart result after authorization retry";
+	let authorizationDenied = false;
+	let releaseOldTranslation: (() => void) | null = null;
+	let releaseOldSmart: (() => void) | null = null;
+	let markOldTranslationStarted: (() => void) | null = null;
+	let markOldSmartStarted: (() => void) | null = null;
+	let translationRequests = 0;
+	let smartRequests = 0;
+	const oldTranslationGate = new Promise<void>((resolve) => {
+		releaseOldTranslation = resolve;
+	});
+	const oldSmartGate = new Promise<void>((resolve) => {
+		releaseOldSmart = resolve;
+	});
+	const oldTranslationStarted = new Promise<void>((resolve) => {
+		markOldTranslationStarted = resolve;
+	});
+	const oldSmartStarted = new Promise<void>((resolve) => {
+		markOldSmartStarted = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedFailureForRequest: (_requestNumber, cursor) => {
+			if (cursor !== "pending-result-auth-page-2") return null;
+			authorizationDenied = true;
+			return {
+				status: 403,
+				code: "unauthorized",
+				message: "feed access revoked",
+			};
+		},
+		deferFeedPageForRequest: (_requestNumber, cursor) =>
+			authorizationDenied && cursor === null,
+		feedPage: (cursor) => {
+			if (cursor !== null) return { items: [], nextCursor: null };
+			const release = {
+				...makeReleaseFeedItem({
+					id: "pending-result-auth-release",
+					ts: "2026-05-01T08:00:00Z",
+					tag: "pending-result-auth",
+					title: authorizationDenied ? recoveredTitle : privateTitle,
+				}),
+				body: authorizationDenied
+					? "fresh source after authorization retry"
+					: "old source before authorization loss",
+				smart: {
+					lang: "zh-CN",
+					status: "missing",
+					title: null,
+					summary: null,
+				},
+			};
+			const fillers = Array.from({ length: 14 }, (_, index) => ({
+				...makeReleaseFeedItem({
+					id: `pending-result-auth-filler-${index}`,
+					ts: `2026-05-01T07:${String(index).padStart(2, "0")}:00Z`,
+					tag: `pending-result-auth-filler-${index}`,
+					title: `Authorization fixture release ${index}`,
+				}),
+				translated: {
+					lang: "zh-CN",
+					status: "disabled",
+					title: null,
+					summary: null,
+				},
+			}));
+			return {
+				items: [release, ...fillers],
+				nextCursor: authorizationDenied ? null : "pending-result-auth-page-2",
+			};
+		},
+	});
+
+	await page.route("**/api/translate/results", async (route) => {
+		const body = route.request().postDataJSON() as {
+			items?: Array<{
+				producer_ref?: string;
+				entity_id?: string;
+				kind?: string;
+				variant?: string;
+			}>;
+		};
+		const results = [];
+		for (const item of body.items ?? []) {
+			const isTranslation = item.producer_ref?.startsWith(
+				"feed.auto_translate:",
+			);
+			const requestNumber = isTranslation
+				? ++translationRequests
+				: ++smartRequests;
+			if (requestNumber === 1 && isTranslation) {
+				markOldTranslationStarted?.();
+				await oldTranslationGate;
+			}
+			if (requestNumber === 1 && !isTranslation) {
+				markOldSmartStarted?.();
+				await oldSmartGate;
+			}
+			const resultText = isTranslation
+				? requestNumber === 1
+					? staleTranslation
+					: freshTranslation
+				: requestNumber === 1
+					? staleSmart
+					: freshSmart;
+			results.push({
+				producer_ref: item.producer_ref,
+				entity_id: item.entity_id,
+				kind: item.kind,
+				variant: item.variant,
+				status: "ready",
+				title_zh: resultText,
+				summary_md: resultText,
+				body_md: resultText,
+				error: null,
+				error_code: null,
+				error_summary: null,
+				error_detail: null,
+			});
+		}
+		return json(route, { items: results });
+	});
+
+	try {
+		await page.goto("/");
+		await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+		const release = page.locator(
+			'[data-feed-item-key="release:pending-result-auth-release"]',
+		);
+		await release.getByRole("tab", { name: "翻译" }).click();
+		await oldTranslationStarted;
+		await release.getByRole("tab", { name: "润色" }).click();
+		await oldSmartStarted;
+		await scrollPaginationSentinelIntoView(page);
+		await expect
+			.poll(tracker.getFeedRequests)
+			.toContain("pending-result-auth-page-2");
+		await expect(page.getByText(privateTitle)).toHaveCount(0);
+		await expect
+			.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+			.toHaveLength(1);
+		for (const requestNumber of tracker.getDeferredFeedPageRequestNumbers()) {
+			tracker.releaseFeedPageRequest(requestNumber);
+		}
+		await expect(page.getByText(recoveredTitle)).toBeVisible({
+			timeout: 15_000,
+		});
+		const recoveredRelease = page.locator(
+			'[data-feed-item-key="release:pending-result-auth-release"]',
+		);
+		await recoveredRelease.getByRole("tab", { name: "原文" }).click();
+		await recoveredRelease.getByRole("tab", { name: "翻译" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "翻译" })
+				.getByText(freshTranslation),
+		).toBeVisible({
+			timeout: 15_000,
+		});
+		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "润色" })
+				.getByText(freshSmart),
+		).toBeVisible({
+			timeout: 15_000,
+		});
+
+		releaseOldTranslation?.();
+		releaseOldSmart?.();
+		await recoveredRelease.getByRole("tab", { name: "翻译" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "翻译" })
+				.getByText(freshTranslation),
+		).toBeVisible();
+		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "润色" })
+				.getByText(freshSmart),
+		).toBeVisible();
+		await expect(page.getByText(staleTranslation)).toHaveCount(0);
+		await expect(page.getByText(staleSmart)).toHaveCount(0);
+	} finally {
+		releaseOldTranslation?.();
+		releaseOldSmart?.();
+	}
 });
 
 test("dashboard hides retained readable content when legacy fallback is unauthorized", async ({

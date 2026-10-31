@@ -24549,7 +24549,7 @@ fn release_feed_row_projection_result(
 ) -> Result<Option<translations::TranslationRequestItemInput>, ApiError> {
     if result
         .as_ref()
-        .is_err_and(|error| release_feed_projection_should_fail_open(error))
+        .is_err_and(release_feed_projection_should_fail_open)
     {
         return Ok(None);
     }

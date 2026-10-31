@@ -1831,12 +1831,14 @@ export function Dashboard(props: {
 	const readableAuthorizationDenied = Boolean(
 		readableSections.error?.authorizationDenied,
 	);
+	const invalidateDeniedFeedWorkRef = useRef<(() => void) | null>(null);
 	useEffect(() => {
 		if (!feedAuthorizationDenied && !readableAuthorizationDenied) return;
 		clearDashboardWarmSnapshot();
 		setWarmFeedSnapshotValid(false);
 		feed.invalidateRequests();
 		clearDashboardFeedQueryCache(me.user.id);
+		invalidateDeniedFeedWorkRef.current?.();
 		if (feedAuthorizationDenied) {
 			readableSections.clearContentPreservingMode();
 		}
@@ -1998,16 +2000,11 @@ export function Dashboard(props: {
 	const lastFeedReactionRefreshByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
-	const feedReactionRefreshGenerationRef = useRef(0);
+	const feedReactionGenerationRef = useRef(0);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
 	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
-	const invalidateFeedReactionRefreshes = useCallback(() => {
-		feedReactionRefreshGenerationRef.current += 1;
-		reactionRefreshingKeysRef.current.clear();
-		lastFeedReactionRefreshByKeyRef.current.clear();
-	}, []);
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
 	>(
@@ -2022,6 +2019,26 @@ export function Dashboard(props: {
 		releaseId: string;
 		content: ReactionContent;
 	} | null>(null);
+	const invalidateFeedReactionWork = useCallback(() => {
+		feedReactionGenerationRef.current += 1;
+		reactionRefreshingKeysRef.current.clear();
+		lastFeedReactionRefreshByKeyRef.current.clear();
+		for (const timer of reactionFlushTimerByKeyRef.current.values()) {
+			window.clearTimeout(timer);
+		}
+		reactionFlushTimerByKeyRef.current.clear();
+		reactionBusyKeysRef.current = new Set<string>();
+		reactionDesiredByKeyRef.current.clear();
+		reactionServerByKeyRef.current.clear();
+		pendingReactionRef.current = null;
+		setReactionBusyKeys(new Set<string>());
+		setReactionErrorByKey({});
+	}, []);
+	invalidateDeniedFeedWorkRef.current = () => {
+		invalidateFeedReactionWork();
+		invalidatePendingTranslations();
+		invalidatePendingSmart();
+	};
 	const handleReactionTokenStatusLoaded = useCallback(
 		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
 			queryClient.setQueryData<DashboardReactionTokenQueryData>(
@@ -3311,7 +3328,7 @@ export function Dashboard(props: {
 		if (releaseIdsToRefresh.length === 0) {
 			return;
 		}
-		const requestGeneration = feedReactionRefreshGenerationRef.current;
+		const requestGeneration = feedReactionGenerationRef.current;
 
 		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
 			itemKey({ kind: "release", id: releaseId }),
@@ -3342,8 +3359,7 @@ export function Dashboard(props: {
 			),
 		)
 			.then((results) => {
-				if (requestGeneration !== feedReactionRefreshGenerationRef.current)
-					return;
+				if (requestGeneration !== feedReactionGenerationRef.current) return;
 				for (const result of results) {
 					if (result.status !== "fulfilled") {
 						const reason = result.reason;
@@ -3373,8 +3389,7 @@ export function Dashboard(props: {
 				}
 			})
 			.finally(() => {
-				if (requestGeneration !== feedReactionRefreshGenerationRef.current)
-					return;
+				if (requestGeneration !== feedReactionGenerationRef.current) return;
 				for (const key of refreshingKeys) {
 					reactionRefreshingKeysRef.current.delete(key);
 				}
@@ -3532,7 +3547,7 @@ export function Dashboard(props: {
 			clearReconnectTimer();
 			clearCompletionTimer();
 			readableSections.clearContent();
-			invalidateFeedReactionRefreshes();
+			invalidateFeedReactionWork();
 			invalidatePendingTranslations();
 			invalidatePendingSmart();
 			setInitialAccessPending(false);
@@ -3651,7 +3666,7 @@ export function Dashboard(props: {
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
 				readableSections.clearContent();
-				invalidateFeedReactionRefreshes();
+				invalidateFeedReactionWork();
 				invalidatePendingTranslations();
 				invalidatePendingSmart();
 				clearDashboardWarmSnapshot();
@@ -3778,7 +3793,7 @@ export function Dashboard(props: {
 		accessTaskStream,
 		advanceAccessContext,
 		readableSections.clearContent,
-		invalidateFeedReactionRefreshes,
+		invalidateFeedReactionWork,
 		invalidatePendingSmart,
 		invalidatePendingTranslations,
 		me.user.id,
@@ -4090,6 +4105,7 @@ export function Dashboard(props: {
 			reactionBusyKeysRef.current = nextBusy;
 			setReactionBusyKeys(nextBusy);
 
+			const requestGeneration = feedReactionGenerationRef.current;
 			void apiPostJson<ToggleReleaseReactionResponse>(
 				"/api/release/reactions/toggle",
 				{
@@ -4098,6 +4114,7 @@ export function Dashboard(props: {
 				},
 			)
 				.then((res) => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					reactionServerByKeyRef.current.set(key, res.reactions);
 					setReactionTokenConfigured(true);
 					setReactionErrorByKey((prev) => {
@@ -4117,6 +4134,7 @@ export function Dashboard(props: {
 					}
 				})
 				.catch((err) => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					const stable = reactionServerByKeyRef.current.get(key);
 					if (stable) {
 						reactionDesiredByKeyRef.current.set(key, stable);
@@ -4161,6 +4179,7 @@ export function Dashboard(props: {
 					setReactionErrorByKey((prev) => ({ ...prev, [key]: message }));
 				})
 				.finally(() => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					const nextBusy = new Set(reactionBusyKeysRef.current);
 					nextBusy.delete(key);
 					reactionBusyKeysRef.current = nextBusy;
