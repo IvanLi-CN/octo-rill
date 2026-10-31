@@ -2937,10 +2937,24 @@ export function Dashboard(props: {
 			if (!notice || initialAccessPending) return;
 			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			if (readableSectionsActive) {
+				const nextFreshKeys = Array.from(
+					new Set([...feed.freshKeys, ...freshKeys]),
+				);
+				if (readableSections.legacyFallback) {
+					await feed.refresh({
+						freshKeys: nextFreshKeys,
+						throwOnError: true,
+						force: true,
+					});
+					scrollToFreshFeedTop(freshKeys);
+					dismissFeedBoundary(notice.boundaryId);
+					await checkDashboardUpdates({ emit: false, include: ["feed"] });
+					return;
+				}
 				const result = await refreshFeed();
 				if (result === "fallback") {
 					await feed.refresh({
-						freshKeys: Array.from(new Set([...feed.freshKeys, ...freshKeys])),
+						freshKeys: nextFreshKeys,
 						throwOnError: true,
 						force: true,
 					});
@@ -2985,6 +2999,7 @@ export function Dashboard(props: {
 			feed.refresh,
 			refreshFeed,
 			readableSectionsActive,
+			readableSections.legacyFallback,
 			readableSectionsVisible,
 			scrollToFreshFeedTop,
 		],

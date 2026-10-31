@@ -856,9 +856,17 @@ test("same-key source refresh retries terminal translation and smart failures", 
 		.toContain(`release_smart:${updatedSource}`);
 
 	await release.getByRole("tab", { name: "翻译" }).click();
-	await expect(release.getByText(freshTranslation)).toBeVisible();
+	await expect(
+		release
+			.getByRole("tabpanel", { name: "翻译" })
+			.getByRole("heading", { name: freshTranslation }),
+	).toBeVisible();
 	await release.getByRole("tab", { name: "润色" }).click();
-	await expect(release.getByText(freshSmart)).toBeVisible();
+	await expect(
+		release
+			.getByRole("tabpanel", { name: "润色" })
+			.getByRole("heading", { name: freshSmart }),
+	).toBeVisible();
 });
 
 test("dashboard live updates do not place feed boundaries below processed existing items", async ({
