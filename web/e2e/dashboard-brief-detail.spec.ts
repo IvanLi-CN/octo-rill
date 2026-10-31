@@ -1067,7 +1067,7 @@ test("dashboard clears legacy releases and retries after pagination authorizatio
 	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
 });
 
-test("dashboard refresh drops cursor pages completed from an older feed revision", async ({
+test("dashboard refresh cancels cursor pages still running from an older feed revision", async ({
 	page,
 }) => {
 	await page.addInitScript(() => window.localStorage.clear());
@@ -1229,6 +1229,123 @@ test("dashboard refresh drops cursor pages completed from an older feed revision
 	await expect
 		.poll(() => tracker.getFeedRequests().slice(requestsBeforeFreshPage))
 		.toContain("feed-refresh-cache-page-2");
+	await expect(page.getByText(pageBody(2))).toBeVisible();
+});
+
+test("dashboard refetches completed cursor pages after a feed revision refresh", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	let sourceRevision = 1;
+	let updateRequests = 0;
+	let deferredHeadRequest: number | null = null;
+	let cursorPageRequests = 0;
+	const releaseId = "feed-refresh-completed-cache-release";
+	const primaryBody = (revision: number) =>
+		`Completed cache primary revision ${revision}`;
+	const pageBody = (revision: number) =>
+		`Completed cache cursor revision ${revision}`;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		deferFeedPageForRequest: (requestNumber, cursor) => {
+			if (
+				cursor === null &&
+				sourceRevision > 1 &&
+				deferredHeadRequest === null
+			) {
+				deferredHeadRequest = requestNumber;
+				return true;
+			}
+			return false;
+		},
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				const primary = {
+					...makeReleaseFeedItem({
+						id: releaseId,
+						ts: "2026-04-30T10:00:00Z",
+						tag: releaseId,
+						title: "Completed cursor cache primary release",
+					}),
+					body: primaryBody(sourceRevision),
+				};
+				const fillers = Array.from({ length: 14 }, (_, index) =>
+					makeReleaseFeedItem({
+						id: `feed-refresh-completed-cache-filler-${index}`,
+						ts: `2026-04-30T09:${String(index).padStart(2, "0")}:00Z`,
+						tag: `feed-refresh-completed-cache-filler-${index}`,
+						title: `Completed cursor cache filler ${index}`,
+					}),
+				);
+				return {
+					items: [primary, ...fillers],
+					nextCursor: "feed-refresh-completed-cache-page-2",
+				};
+			}
+
+			cursorPageRequests += 1;
+			return {
+				items: [
+					{
+						...makeReleaseFeedItem({
+							id: "feed-refresh-completed-cache-page-item",
+							ts: "2026-04-29T10:00:00Z",
+							tag: "feed-refresh-completed-cache-page-item",
+							title: `Completed cursor cache page ${sourceRevision}`,
+						}),
+						body: pageBody(sourceRevision),
+					},
+				],
+				nextCursor: null,
+			};
+		},
+		dashboardUpdatesResponse: (requestNumber) => {
+			updateRequests += 1;
+			const changed = sourceRevision > 1;
+			return {
+				token: `feed-refresh-completed-cache-${sourceRevision}-${requestNumber}`,
+				generated_at: "2026-04-30T10:00:00Z",
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? [`release:${releaseId}`] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	const release = page.locator(`[data-feed-item-key="release:${releaseId}"]`);
+	await expect(release).toBeVisible({ timeout: 15_000 });
+	await expect(release.getByText(primaryBody(1))).toBeVisible();
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.getByText(pageBody(1))).toBeVisible();
+	await expect.poll(() => cursorPageRequests).toBe(1);
+
+	sourceRevision = 2;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	const newContentButton = page.getByRole("button", {
+		name: "上方有 1 条新动态",
+	});
+	await expect(newContentButton).toBeVisible();
+	await newContentButton.click();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+	tracker.releaseFeedPageRequest(deferredHeadRequest as number);
+	await expect(release.getByText(primaryBody(2))).toBeVisible();
+
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(() => cursorPageRequests).toBe(2);
 	await expect(page.getByText(pageBody(2))).toBeVisible();
 });
 
@@ -1400,7 +1517,7 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "翻译" })
-				.getByText(freshTranslation),
+				.getByRole("heading", { name: freshTranslation }),
 		).toBeVisible({
 			timeout: 15_000,
 		});
@@ -1408,7 +1525,7 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "润色" })
-				.getByText(freshSmart),
+				.getByRole("heading", { name: freshSmart }),
 		).toBeVisible({
 			timeout: 15_000,
 		});
@@ -1419,13 +1536,13 @@ test("dashboard ignores pending translation and smart results after feed authori
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "翻译" })
-				.getByText(freshTranslation),
+				.getByRole("heading", { name: freshTranslation }),
 		).toBeVisible();
 		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
 		await expect(
 			recoveredRelease
 				.getByRole("tabpanel", { name: "润色" })
-				.getByText(freshSmart),
+				.getByRole("heading", { name: freshSmart }),
 		).toBeVisible();
 		await expect(page.getByText(staleTranslation)).toHaveCount(0);
 		await expect(page.getByText(staleSmart)).toHaveCount(0);
