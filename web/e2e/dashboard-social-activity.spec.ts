@@ -1,20 +1,10 @@
+import { type Locator, type Page, expect, test } from "@playwright/test";
+
 import {
-	type Locator,
-	type Page,
-	type Route,
-	expect,
-	test,
-} from "@playwright/test";
-
-import { buildMockMeResponse } from "./mockApi";
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 function socialPrimaryDesktop(page: Locator | Page, text: string) {
 	return page
@@ -154,6 +144,10 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -365,6 +359,10 @@ test("dashboard keeps social cards inline on mobile widths without horizontal ov
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -585,6 +583,10 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -1142,6 +1144,10 @@ test("switching social tabs clears stale feed items before the next dataset reso
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

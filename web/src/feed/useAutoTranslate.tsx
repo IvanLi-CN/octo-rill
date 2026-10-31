@@ -6,9 +6,13 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
+import {
+	buildRequestSourceKey,
+	buildSummaryRequestItem,
+	buildTranslationSourceKey,
+} from "@/feed/autoLaneRequests";
 import { translationErrorIsRetryable } from "@/feed/retryableErrors";
 import {
-	isAnnouncementFeedItem,
 	isLaneCapableFeedItem,
 	type FeedItem,
 	type TranslatedItem,
@@ -20,7 +24,6 @@ const SECONDARY_PREFETCH_COUNT = 10;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
 const BLOCKED_CONFIG_POLL_INTERVAL_MS = 30_000;
-const AUTO_TRANSLATE_MAX_WAIT_MS = 500;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 const REQUEST_PENDING_MAX_AGE_MS =
@@ -32,68 +35,6 @@ function feedTranslationIsRetryable(item: FeedItem) {
 			item.translated?.error_summary ??
 			item.translated?.error_code,
 	);
-}
-
-function buildReleaseSummaryRequestItem(
-	item: FeedItem,
-): TranslationRequestItemInput {
-	const title = item.title?.trim() || `release:${item.id}`;
-	const body = item.body?.trim();
-	const metadata = [item.repo_full_name, item.reason, item.subject_type]
-		.filter((value): value is string => Boolean(value?.trim()))
-		.join("\n");
-	return {
-		producer_ref: `feed.auto_translate:release:${item.id}`,
-		kind: "release_summary",
-		variant: "feed_body",
-		entity_id: item.id,
-		target_lang: "zh-CN",
-		max_wait_ms: AUTO_TRANSLATE_MAX_WAIT_MS,
-		source_blocks: [
-			{ slot: "title", text: title },
-			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
-			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
-		],
-		target_slots: ["title_zh", "body_md"],
-	};
-}
-
-function buildAnnouncementSummaryRequestItem(
-	item: FeedItem,
-): TranslationRequestItemInput {
-	const title = item.title?.trim() || `announcement:${item.id}`;
-	const body = item.body?.trim();
-	const discussionNumber =
-		isAnnouncementFeedItem(item) && item.discussion_number
-			? `discussion_number=${item.discussion_number}`
-			: null;
-	const metadata = [item.repo_full_name, discussionNumber]
-		.filter((value): value is string => Boolean(value?.trim()))
-		.join("\n");
-	const entityId =
-		isAnnouncementFeedItem(item) && item.discussion_key
-			? item.discussion_key
-			: item.id;
-	return {
-		producer_ref: `feed.auto_translate:announcement:${entityId}`,
-		kind: "announcement_summary",
-		variant: "feed_body",
-		entity_id: entityId,
-		target_lang: "zh-CN",
-		max_wait_ms: AUTO_TRANSLATE_MAX_WAIT_MS,
-		source_blocks: [
-			{ slot: "title", text: title },
-			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
-			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
-		],
-		target_slots: ["title_zh", "body_md"],
-	};
-}
-
-function buildSummaryRequestItem(item: FeedItem): TranslationRequestItemInput {
-	return isAnnouncementFeedItem(item)
-		? buildAnnouncementSummaryRequestItem(item)
-		: buildReleaseSummaryRequestItem(item);
 }
 
 function mapTranslationItemToFeedTranslated(item: {
@@ -267,18 +208,6 @@ function createDeferred<T>(): Deferred<T> {
 	return { promise, resolve, reject };
 }
 
-function buildRequestSourceKey(item: TranslationRequestItemInput) {
-	return JSON.stringify({
-		producer_ref: item.producer_ref,
-		kind: item.kind,
-		variant: item.variant,
-		entity_id: item.entity_id,
-		target_lang: item.target_lang,
-		source_blocks: item.source_blocks,
-		target_slots: item.target_slots,
-	});
-}
-
 function intersectsViewportRange(
 	top: number,
 	bottom: number,
@@ -364,6 +293,7 @@ export function useAutoTranslate(params: {
 	onTranslated: (
 		item: Pick<FeedItem, "kind" | "id">,
 		translated: TranslatedItem,
+		sourceKey: string,
 	) => void;
 }) {
 	const { enabled, onTranslated } = params;
@@ -378,11 +308,12 @@ export function useAutoTranslate(params: {
 
 	const keyToElementRef = useRef(new Map<string, HTMLElement>());
 	const itemByKeyRef = useRef(new Map<string, FeedItem>());
+	const sourceKeyByItemRef = useRef(new Map<string, string>());
 	const requestTasksRef = useRef(new Map<string, TranslationTask>());
-	const failedRef = useRef(new Set<string>());
+	const failedRef = useRef(new Map<string, string>());
 	const retryCountRef = useRef(new Map<string, number>());
 	const pollErrorCountRef = useRef(new Map<string, number>());
-	const autoRetriedKeysRef = useRef(new Set<string>());
+	const autoRetriedKeysRef = useRef(new Map<string, string>());
 
 	const [, forceRender] = useState(0);
 
@@ -399,7 +330,7 @@ export function useAutoTranslate(params: {
 				item.translated.auto_translate !== false) ||
 				(item.translated?.status === "ready" &&
 					item.translated.auto_translate === true)) &&
-			!failedRef.current.has(keyOf(item)),
+			failedRef.current.get(keyOf(item)) !== buildTranslationSourceKey(item),
 		[enabled],
 	);
 
@@ -409,7 +340,8 @@ export function useAutoTranslate(params: {
 			isLaneCapableFeedItem(item) &&
 			item.translated?.status === "error" &&
 			feedTranslationIsRetryable(item) &&
-			!autoRetriedKeysRef.current.has(keyOf(item)),
+			autoRetriedKeysRef.current.get(keyOf(item)) !==
+				buildTranslationSourceKey(item),
 		[enabled],
 	);
 
@@ -431,6 +363,39 @@ export function useAutoTranslate(params: {
 		}
 		task.deferred.resolve(null);
 	}, []);
+
+	const rememberItemSource = useCallback(
+		(item: FeedItem, sourceKey: string) => {
+			const key = keyOf(item);
+			const previousSourceKey = sourceKeyByItemRef.current.get(key);
+			if (previousSourceKey !== undefined && previousSourceKey !== sourceKey) {
+				const existing = requestTasksRef.current.get(key);
+				if (existing && existing.sourceKey !== sourceKey) {
+					retireTask(key, existing);
+				}
+				failedRef.current.delete(key);
+				retryCountRef.current.delete(key);
+				pollErrorCountRef.current.delete(key);
+				autoRetriedKeysRef.current.delete(key);
+			}
+			sourceKeyByItemRef.current.set(key, sourceKey);
+		},
+		[retireTask],
+	);
+
+	const invalidatePendingResults = useCallback(() => {
+		for (const [key, task] of requestTasksRef.current) {
+			retireTask(key, task);
+		}
+		failedRef.current.clear();
+		sourceKeyByItemRef.current.clear();
+		retryCountRef.current.clear();
+		pollErrorCountRef.current.clear();
+		autoRetriedKeysRef.current.clear();
+		keyToElementRef.current.clear();
+		itemByKeyRef.current.clear();
+		bumpRender();
+	}, [bumpRender, retireTask]);
 
 	const scheduleViewportPlanRef = useRef<() => void>(() => {});
 	const schedulePendingPollRef = useRef<() => void>(() => {});
@@ -460,16 +425,18 @@ export function useAutoTranslate(params: {
 			task: TranslationTask,
 			translated: TranslatedItem,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			const mapped = mapTranslatedToTranslateResponse(translated);
 			if (!mapped) {
-				failedRef.current.add(candidate.key);
+				failedRef.current.set(candidate.key, candidate.sourceKey);
 			} else {
 				failedRef.current.delete(candidate.key);
 				retryCountRef.current.delete(candidate.key);
 				onTranslated(
 					{ kind: candidate.item.kind, id: candidate.item.id },
 					translated,
+					candidate.sourceKey,
 				);
 			}
 			settleTaskPromise(task, mapped);
@@ -484,6 +451,7 @@ export function useAutoTranslate(params: {
 			task: TranslationTask,
 			error?: unknown,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			const retries = retryCountRef.current.get(candidate.key) ?? 0;
 			const keepsVisibleReady =
@@ -494,7 +462,7 @@ export function useAutoTranslate(params: {
 				if (keepsVisibleReady) {
 					retryCountRef.current.delete(candidate.key);
 				} else {
-					failedRef.current.add(candidate.key);
+					failedRef.current.set(candidate.key, candidate.sourceKey);
 					retryCountRef.current.delete(candidate.key);
 				}
 			} else {
@@ -513,14 +481,16 @@ export function useAutoTranslate(params: {
 			translated: TranslatedItem | null,
 			error?: unknown,
 		) => {
+			if (requestTasksRef.current.get(candidate.key) !== task) return;
 			clearTask(candidate.key, task);
 			if (translated) {
 				onTranslated(
 					{ kind: candidate.item.kind, id: candidate.item.id },
 					translated,
+					candidate.sourceKey,
 				);
 			}
-			failedRef.current.add(candidate.key);
+			failedRef.current.set(candidate.key, candidate.sourceKey);
 			retryCountRef.current.delete(candidate.key);
 			settleTaskPromise(task, null, error);
 			scheduleViewportPlanRef.current();
@@ -572,6 +542,7 @@ export function useAutoTranslate(params: {
 							onTranslated(
 								{ kind: candidate.item.kind, id: candidate.item.id },
 								pending,
+								candidate.sourceKey,
 							);
 						}
 						task.lastStatus = resolved.status;
@@ -786,6 +757,7 @@ export function useAutoTranslate(params: {
 					itemByKeyRef.current.get(candidate.key) ?? candidate.item;
 				const requestItem = buildSummaryRequestItem(latestItem);
 				const sourceKey = buildRequestSourceKey(requestItem);
+				rememberItemSource(latestItem, sourceKey);
 				const existing = requestTasksRef.current.get(candidate.key);
 				if (existing && existing.sourceKey === sourceKey) {
 					byKey.set(candidate.key, existing.promise);
@@ -844,6 +816,7 @@ export function useAutoTranslate(params: {
 			resolveCandidateTasks,
 			schedulePendingPoll,
 			retireTask,
+			rememberItemSource,
 		],
 	);
 
@@ -858,12 +831,13 @@ export function useAutoTranslate(params: {
 					continue;
 				}
 				const key = keyOf(item);
-				autoRetriedKeysRef.current.add(key);
+				const requestItem = buildSummaryRequestItem(item);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				rememberItemSource(item, sourceKey);
+				autoRetriedKeysRef.current.set(key, sourceKey);
 				failedRef.current.delete(key);
 				retryCountRef.current.delete(key);
 				itemByKeyRef.current.set(key, item);
-				const requestItem = buildSummaryRequestItem(item);
-				const sourceKey = buildRequestSourceKey(requestItem);
 				candidates.push({
 					key,
 					item,
@@ -878,7 +852,7 @@ export function useAutoTranslate(params: {
 			}
 			await submitCandidates(candidates, { retryOnError: true });
 		},
-		[enabled, shouldAutoRetryLoadedError, submitCandidates],
+		[enabled, rememberItemSource, shouldAutoRetryLoadedError, submitCandidates],
 	);
 
 	const prepareCandidates = useCallback(() => {
@@ -893,11 +867,7 @@ export function useAutoTranslate(params: {
 			if (shouldAutoTranslate(item)) {
 				const requestItem = buildSummaryRequestItem(item);
 				const sourceKey = buildRequestSourceKey(requestItem);
-				if (existing) {
-					if (existing.sourceKey !== sourceKey) {
-						retireTask(key, existing);
-					}
-				}
+				rememberItemSource(item, sourceKey);
 				if (!existing || existing.sourceKey !== sourceKey) {
 					candidate = {
 						key,
@@ -923,7 +893,7 @@ export function useAutoTranslate(params: {
 			}
 			return left.bottom - right.bottom;
 		});
-	}, [retireTask, shouldAutoTranslate]);
+	}, [rememberItemSource, retireTask, shouldAutoTranslate]);
 
 	const runViewportPlan = useCallback(async () => {
 		if (!enabled || !mountedRef.current) return;
@@ -975,6 +945,13 @@ export function useAutoTranslate(params: {
 	const register = useCallback(
 		(item: FeedItem) => (element: HTMLElement | null) => {
 			const key = keyOf(item);
+			const requestItem = buildSummaryRequestItem(item);
+			const sourceKey = buildRequestSourceKey(requestItem);
+			rememberItemSource(item, sourceKey);
+			const existing = requestTasksRef.current.get(key);
+			if (existing && existing.sourceKey !== sourceKey) {
+				retireTask(key, existing);
+			}
 			itemByKeyRef.current.set(key, item);
 
 			const previous = keyToElementRef.current.get(key);
@@ -995,7 +972,7 @@ export function useAutoTranslate(params: {
 			resizeObserverRef.current?.observe(element);
 			scheduleViewportPlanRef.current();
 		},
-		[enabled],
+		[enabled, rememberItemSource, retireTask],
 	);
 
 	const translateNow = useCallback(
@@ -1006,6 +983,7 @@ export function useAutoTranslate(params: {
 			const key = keyOf(item);
 			const requestItem = buildSummaryRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
+			rememberItemSource(item, sourceKey);
 			failedRef.current.delete(key);
 			retryCountRef.current.delete(key);
 
@@ -1058,7 +1036,13 @@ export function useAutoTranslate(params: {
 				throw error;
 			}
 		},
-		[bumpRender, finalizeFailure, resolveCandidateTasks, retireTask],
+		[
+			bumpRender,
+			finalizeFailure,
+			rememberItemSource,
+			resolveCandidateTasks,
+			retireTask,
+		],
 	);
 
 	useEffect(() => {
@@ -1127,6 +1111,7 @@ export function useAutoTranslate(params: {
 		register,
 		retryLoadedErrors,
 		translateNow,
+		invalidatePendingResults,
 		inFlightKeys,
 		autoRetryingKeys,
 	};

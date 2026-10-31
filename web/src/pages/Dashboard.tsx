@@ -29,6 +29,7 @@ import {
 import { openAppEventSource } from "@/demo/eventSource";
 import {
 	buildDashboardWarmViewerStateKey,
+	clearDashboardWarmSnapshot,
 	persistDashboardWarmSnapshot,
 	type DashboardWarmSnapshot,
 } from "@/auth/startupCache";
@@ -142,6 +143,7 @@ import {
 	type DashboardNotificationsQueryData,
 	type DashboardReactionTokenQueryData,
 } from "@/query/dashboardQueryKeys";
+import { clearDashboardFeedQueryCache } from "@/query/queryClient";
 
 type TaskAcceptedResponse = {
 	mode: "task_id";
@@ -1664,6 +1666,22 @@ export function Dashboard(props: {
 	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
+	const [initialAccessPending, setInitialAccessPending] = useState(
+		initialAccessTask !== null,
+	);
+	const [warmFeedSnapshotValid, setWarmFeedSnapshotValid] = useState(true);
+	const [accessContextKey, setAccessContextKey] = useState(
+		initialAccessTask ? `access:${initialAccessTask.taskId}` : "stable",
+	);
+	const advanceAccessContext = useCallback(
+		(taskId: string) => {
+			clearDashboardWarmSnapshot();
+			setWarmFeedSnapshotValid(false);
+			clearDashboardFeedQueryCache(me.user.id);
+			setAccessContextKey(`${taskId}:${Date.now()}`);
+		},
+		[me.user.id],
+	);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
 		TaskStreamState[]
 	>([]);
@@ -1776,56 +1794,98 @@ export function Dashboard(props: {
 				}
 			: null;
 	const viewerStateKey = buildDashboardWarmViewerStateKey(me);
+	const readableViewerStateKey = `${viewerStateKey}|access:${accessContextKey}`;
 	const readableMode = !scopedMode && tab === "all";
 	const readableSections = useDashboardReadableSections({
 		userId: me.user.id,
-		viewerStateKey,
+		viewerStateKey: readableViewerStateKey,
 		enabled: readableMode,
 	});
 	const readableSectionsActive =
 		readableMode && !readableSections.legacyFallback;
 	const feed = useFeed(feedRequestType, {
 		userId: me.user.id,
-		viewerStateKey,
-		initialData: readableSectionsActive ? null : warmFeedData,
+		viewerStateKey: readableViewerStateKey,
+		initialData:
+			readableSectionsActive ||
+			accessContextKey !== "stable" ||
+			!warmFeedSnapshotValid
+				? null
+				: warmFeedData,
 		scope,
 		enabled: !readableSectionsActive,
 	});
+	const readableSectionsVisible =
+		readableSectionsActive ||
+		(!initialAccessPending &&
+			readableMode &&
+			readableSections.legacyFallback &&
+			readableSections.sections.length > 0 &&
+			!feed.hasSuccessfulRead);
+	const feedLoadingInitial = initialAccessPending || feed.loadingInitial;
+	const readableSectionsLoadingInitial =
+		initialAccessPending || readableSections.loadingInitial;
+	const readableSectionsVisibleRef = useRef(readableSectionsVisible);
+	readableSectionsVisibleRef.current = readableSectionsVisible;
+	const feedAuthorizationDenied = Boolean(feed.error?.authorizationDenied);
+	const readableAuthorizationDenied = Boolean(
+		readableSections.error?.authorizationDenied,
+	);
+	const invalidateDeniedFeedWorkRef = useRef<(() => void) | null>(null);
+	useEffect(() => {
+		if (!feedAuthorizationDenied && !readableAuthorizationDenied) return;
+		clearDashboardWarmSnapshot();
+		setWarmFeedSnapshotValid(false);
+		feed.invalidateRequests();
+		clearDashboardFeedQueryCache(me.user.id);
+		invalidateDeniedFeedWorkRef.current?.();
+		if (feedAuthorizationDenied) {
+			readableSections.clearContentPreservingMode();
+		}
+	}, [
+		feedAuthorizationDenied,
+		feed.invalidateRequests,
+		me.user.id,
+		readableAuthorizationDenied,
+		readableSections.clearContentPreservingMode,
+	]);
 	const applyTranslationToActive = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
-			if (readableSectionsActive) {
-				readableSections.applyTranslation(item, translated);
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			translated: TranslatedItem,
+			sourceKey: string,
+		) => {
+			if (readableSectionsVisibleRef.current) {
+				readableSections.applyTranslation(item, sourceKey, translated);
 			} else {
-				feed.applyTranslation(item, translated);
+				feed.applyTranslation(item, sourceKey, translated);
 			}
 		},
-		[
-			feed.applyTranslation,
-			readableSectionsActive,
-			readableSections.applyTranslation,
-		],
+		[feed.applyTranslation, readableSections.applyTranslation],
 	);
 	const applySmartToActive = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
-			if (readableSectionsActive) readableSections.applySmart(item, smart);
-			else feed.applySmart(item, smart);
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			smart: SmartItem,
+			sourceKey: string,
+		) => {
+			if (readableSectionsVisibleRef.current)
+				readableSections.applySmart(item, sourceKey, smart);
+			else feed.applySmart(item, sourceKey, smart);
 		},
-		[feed.applySmart, readableSectionsActive, readableSections.applySmart],
+		[feed.applySmart, readableSections.applySmart],
 	);
 	const applyReactionsToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
-			if (readableSectionsActive)
+			if (readableSectionsVisibleRef.current)
 				readableSections.applyReactions(item, reactions);
 			else feed.applyReactions(item, reactions);
 		},
-		[
-			feed.applyReactions,
-			readableSectionsActive,
-			readableSections.applyReactions,
-		],
+		[feed.applyReactions, readableSections.applyReactions],
 	);
 	const activeFeedItems = useMemo(() => {
-		if (!readableSectionsActive) return feed.items;
+		if (initialAccessPending) return [];
+		if (!readableSectionsVisible) return feed.items;
 		return readableSections.sections.flatMap((section) => [
 			...(section.items ?? []),
 			...(section.supplemental_items ?? []),
@@ -1833,7 +1893,8 @@ export function Dashboard(props: {
 		]);
 	}, [
 		feed.items,
-		readableSectionsActive,
+		initialAccessPending,
+		readableSectionsVisible,
 		readableSections.details,
 		readableSections.sections,
 	]);
@@ -1914,8 +1975,12 @@ export function Dashboard(props: {
 		readStoredPageDefaultLane,
 	);
 	const effectivePageDefaultLane = useMemo(
-		() => resolveDisplayLaneForFeed(feed.items, pageDefaultLane),
-		[feed.items, pageDefaultLane],
+		() =>
+			resolveDisplayLaneForFeed(
+				initialAccessPending ? [] : feed.items,
+				pageDefaultLane,
+			),
+		[feed.items, initialAccessPending, pageDefaultLane],
 	);
 	const [fallbackSelectedBriefId, setFallbackSelectedBriefId] = useState<
 		string | null
@@ -1943,6 +2008,7 @@ export function Dashboard(props: {
 	const lastFeedReactionRefreshByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
+	const feedReactionGenerationRef = useRef(0);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
@@ -1961,6 +2027,26 @@ export function Dashboard(props: {
 		releaseId: string;
 		content: ReactionContent;
 	} | null>(null);
+	const invalidateFeedReactionWork = useCallback(() => {
+		feedReactionGenerationRef.current += 1;
+		reactionRefreshingKeysRef.current.clear();
+		lastFeedReactionRefreshByKeyRef.current.clear();
+		for (const timer of reactionFlushTimerByKeyRef.current.values()) {
+			window.clearTimeout(timer);
+		}
+		reactionFlushTimerByKeyRef.current.clear();
+		reactionBusyKeysRef.current = new Set<string>();
+		reactionDesiredByKeyRef.current.clear();
+		reactionServerByKeyRef.current.clear();
+		pendingReactionRef.current = null;
+		setReactionBusyKeys(new Set<string>());
+		setReactionErrorByKey({});
+	}, []);
+	invalidateDeniedFeedWorkRef.current = () => {
+		invalidateFeedReactionWork();
+		invalidatePendingTranslations();
+		invalidatePendingSmart();
+	};
 	const handleReactionTokenStatusLoaded = useCallback(
 		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
 			queryClient.setQueryData<DashboardReactionTokenQueryData>(
@@ -2656,10 +2742,21 @@ export function Dashboard(props: {
 	const refreshAll = useCallback(
 		async (options?: {
 			throwOnError?: boolean;
+			forceReadableFeed?: boolean;
 			onStart?: (cancel: () => void) => void;
 			onQueue?: (cancel: () => void) => void;
 		}) => {
-			const tasks: Array<Promise<unknown>> = [refreshFeed(options)];
+			const refreshFeedContent = async () => {
+				if (!options?.forceReadableFeed || !readableMode) {
+					await refreshFeed(options);
+					return;
+				}
+				const result = await readableSections.refresh(options);
+				if (result === "fallback") {
+					await feed.refresh({ ...options, force: true });
+				}
+			};
+			const tasks: Array<Promise<unknown>> = [refreshFeedContent()];
 			if (!scopedMode) {
 				tasks.push(
 					refreshSidebar({
@@ -2675,7 +2772,16 @@ export function Dashboard(props: {
 			}
 			await Promise.all(tasks);
 		},
-		[hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab],
+		[
+			feed.refresh,
+			hasDesktopSidebarInbox,
+			readableMode,
+			readableSections.refresh,
+			refreshFeed,
+			refreshSidebar,
+			scopedMode,
+			tab,
+		],
 	);
 
 	const onDashboardLiveUpdate = useCallback(
@@ -2712,9 +2818,10 @@ export function Dashboard(props: {
 	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
 		enabled:
 			shellHydrated &&
+			!initialAccessPending &&
 			(readableSectionsActive
 				? !readableSections.loadingInitial && !readableSections.loadingRefresh
-				: !feed.loadingInitial),
+				: !feedLoadingInitial),
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
 		includeNotifications:
@@ -2827,19 +2934,39 @@ export function Dashboard(props: {
 
 	const revealFeedUpdates = useCallback(
 		async (notice = activeFeedNotice) => {
-			if (!notice) return;
+			if (!notice || initialAccessPending) return;
+			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			if (readableSectionsActive) {
+				const nextFreshKeys = Array.from(
+					new Set([...feed.freshKeys, ...freshKeys]),
+				);
+				if (readableSections.legacyFallback) {
+					await feed.refresh({
+						freshKeys: nextFreshKeys,
+						throwOnError: true,
+						force: true,
+					});
+					scrollToFreshFeedTop(freshKeys);
+					dismissFeedBoundary(notice.boundaryId);
+					await checkDashboardUpdates({ emit: false, include: ["feed"] });
+					return;
+				}
 				const result = await refreshFeed();
-				if (result !== "applied") return;
+				if (result === "fallback") {
+					await feed.refresh({
+						freshKeys: nextFreshKeys,
+						throwOnError: true,
+						force: true,
+					});
+					scrollToFreshFeedTop(freshKeys);
+				} else if (result !== "applied") {
+					return;
+				}
 				dismissFeedBoundary(notice.boundaryId);
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
 			}
-			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
-			const hasHydratedFreshItems = feed.items.some((item) =>
-				freshKeys.includes(feedItemKey(item)),
-			);
-			if (!hasHydratedFreshItems) {
+			if (readableSectionsVisible) {
 				const nextFreshKeys = Array.from(
 					new Set([...feed.freshKeys, ...freshKeys]),
 				);
@@ -2847,7 +2974,18 @@ export function Dashboard(props: {
 					freshKeys: nextFreshKeys,
 					throwOnError: true,
 				});
+				scrollToFreshFeedTop(freshKeys);
+				dismissFeedBoundary(notice.boundaryId);
+				await checkDashboardUpdates({ emit: false, include: ["feed"] });
+				return;
 			}
+			const nextFreshKeys = Array.from(
+				new Set([...feed.freshKeys, ...freshKeys]),
+			);
+			await refreshFeed({
+				freshKeys: nextFreshKeys,
+				throwOnError: true,
+			});
 			scrollToFreshFeedTop(freshKeys);
 			dismissFeedBoundary(notice.boundaryId);
 			await checkDashboardUpdates({ emit: false, include: ["feed"] });
@@ -2856,10 +2994,13 @@ export function Dashboard(props: {
 			activeFeedNotice,
 			checkDashboardUpdates,
 			dismissFeedBoundary,
+			initialAccessPending,
 			feed.freshKeys,
-			feed.items,
+			feed.refresh,
 			refreshFeed,
 			readableSectionsActive,
+			readableSections.legacyFallback,
+			readableSectionsVisible,
 			scrollToFreshFeedTop,
 		],
 	);
@@ -2881,11 +3022,13 @@ export function Dashboard(props: {
 		const notice = activeFeedNotice;
 		if (
 			!notice ||
+			initialAccessPending ||
+			(readableSectionsVisible && readableSections.legacyFallback) ||
 			(readableSectionsActive
-				? readableSections.loadingInitial ||
+				? readableSectionsLoadingInitial ||
 					readableSections.loadingRefresh ||
 					readableSections.error?.phase === "refresh"
-				: feed.loadingInitial)
+				: feedLoadingInitial)
 		)
 			return;
 		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
@@ -2902,7 +3045,7 @@ export function Dashboard(props: {
 		if (readableSectionsActive) {
 			void refreshFeed()
 				.then((result) => {
-					if (result === "superseded") {
+					if (result === "superseded" || result === "fallback") {
 						if (
 							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
 							hydratedKey
@@ -2974,13 +3117,16 @@ export function Dashboard(props: {
 		checkDashboardUpdates,
 		dismissFeedBoundary,
 		feed.freshKeys,
-		feed.loadingInitial,
+		feedLoadingInitial,
 		feedRequestType,
+		initialAccessPending,
 		notifyGlobalError,
-		readableSections.loadingInitial,
+		readableSectionsLoadingInitial,
 		readableSections.loadingRefresh,
 		readableSections.error?.phase,
+		readableSections.legacyFallback,
 		readableSectionsActive,
+		readableSectionsVisible,
 		refreshFeed,
 	]);
 
@@ -3123,6 +3269,7 @@ export function Dashboard(props: {
 		register: registerTranslate,
 		retryLoadedErrors: retryLoadedTranslations,
 		translateNow,
+		invalidatePendingResults: invalidatePendingTranslations,
 		inFlightKeys: translationInFlightKeys,
 		autoRetryingKeys: translationAutoRetryingKeys,
 	} = useAutoTranslate({
@@ -3134,6 +3281,7 @@ export function Dashboard(props: {
 		register: registerSmart,
 		retryLoadedErrors: retryLoadedSmart,
 		smartNow,
+		invalidatePendingResults: invalidatePendingSmart,
 		inFlightKeys: smartInFlightKeys,
 		autoRetryingKeys: smartAutoRetryingKeys,
 	} = useAutoSmart({
@@ -3207,6 +3355,7 @@ export function Dashboard(props: {
 		if (releaseIdsToRefresh.length === 0) {
 			return;
 		}
+		const requestGeneration = feedReactionGenerationRef.current;
 
 		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
 			itemKey({ kind: "release", id: releaseId }),
@@ -3237,6 +3386,7 @@ export function Dashboard(props: {
 			),
 		)
 			.then((results) => {
+				if (requestGeneration !== feedReactionGenerationRef.current) return;
 				for (const result of results) {
 					if (result.status !== "fulfilled") {
 						const reason = result.reason;
@@ -3266,6 +3416,7 @@ export function Dashboard(props: {
 				}
 			})
 			.finally(() => {
+				if (requestGeneration !== feedReactionGenerationRef.current) return;
 				for (const key of refreshingKeys) {
 					reactionRefreshingKeysRef.current.delete(key);
 				}
@@ -3296,32 +3447,59 @@ export function Dashboard(props: {
 	}, [pageDefaultLane]);
 
 	useEffect(() => {
-		if (!feed.error) {
+		if (initialAccessPending || !feed.error) {
 			return;
 		}
 		if (feed.error.phase !== "initial" || feed.items.length === 0) {
 			return;
 		}
 		pushErrorToast("动态刷新失败", feed.error.message);
-	}, [feed.error?.at, feed.error, feed.items.length, pushErrorToast]);
+	}, [
+		feed.error?.at,
+		feed.error,
+		feed.items.length,
+		initialAccessPending,
+		pushErrorToast,
+	]);
 
 	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
 			return;
 		}
-		if (feed.loadingInitial || feed.items.length === 0) {
+		if (
+			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
+			feed.loadingInitial ||
+			feed.items.length === 0
+		) {
 			return;
 		}
 		void primeSmart(feed.items).catch((error) => {
 			notifyGlobalError("润色预取失败", error, "润色预取失败，请稍后重试。");
 		});
-	}, [feed.items, feed.loadingInitial, notifyGlobalError, primeSmart, tab]);
+	}, [
+		feed.items,
+		feed.loadingInitial,
+		feedAuthorizationDenied,
+		initialAccessPending,
+		notifyGlobalError,
+		primeSmart,
+		readableAuthorizationDenied,
+		tab,
+	]);
 
 	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
 			return;
 		}
-		if (feed.loadingInitial || feed.items.length === 0) {
+		if (
+			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
+			feed.loadingInitial ||
+			feed.items.length === 0
+		) {
 			return;
 		}
 		void retryLoadedTranslations(feed.items).catch((error) => {
@@ -3341,7 +3519,10 @@ export function Dashboard(props: {
 	}, [
 		feed.items,
 		feed.loadingInitial,
+		feedAuthorizationDenied,
+		initialAccessPending,
 		notifyGlobalError,
+		readableAuthorizationDenied,
 		retryLoadedSmart,
 		retryLoadedTranslations,
 		tab,
@@ -3400,6 +3581,12 @@ export function Dashboard(props: {
 			streamSettled = true;
 			clearReconnectTimer();
 			clearCompletionTimer();
+			readableSections.clearContent();
+			invalidateFeedReactionWork();
+			invalidatePendingTranslations();
+			invalidatePendingSmart();
+			setInitialAccessPending(false);
+			advanceAccessContext(accessTaskStream.taskId);
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
 			);
@@ -3513,6 +3700,14 @@ export function Dashboard(props: {
 					payload.status !== "succeeded"
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
+				readableSections.clearContent();
+				invalidateFeedReactionWork();
+				invalidatePendingTranslations();
+				invalidatePendingSmart();
+				clearDashboardWarmSnapshot();
+				setWarmFeedSnapshotValid(false);
+				clearDashboardFeedQueryCache(me.user.id);
+				setInitialAccessPending(payload.status === "succeeded");
 				if (payload.status === "succeeded") {
 					setAccessSyncLifecycle("refreshing");
 					startQueuedCompletionTimer();
@@ -3525,6 +3720,7 @@ export function Dashboard(props: {
 					try {
 						await refreshAllRef.current({
 							throwOnError: true,
+							forceReadableFeed: true,
 							onStart: startCompletionTimer,
 							onQueue: (cancel) => queuedRefreshCancels.add(cancel),
 						});
@@ -3552,6 +3748,8 @@ export function Dashboard(props: {
 							resolvedError,
 							"同步已完成，但页面刷新失败，请稍后重试。",
 						);
+						setInitialAccessPending(false);
+						advanceAccessContext(completedTaskId);
 						source.close();
 						settleTaskWaiterRef.current(completedTaskId, resolvedError);
 						setAccessTaskStream((current) =>
@@ -3559,6 +3757,7 @@ export function Dashboard(props: {
 						);
 						return;
 					}
+					setInitialAccessPending(false);
 					setAccessSyncStage("completed");
 					setAccessSyncLifecycle("succeeded");
 					setAccessSyncProgress(() => ({
@@ -3581,6 +3780,9 @@ export function Dashboard(props: {
 					}
 				}
 				if (streamSettled) return;
+				if (payload.status !== "succeeded") {
+					advanceAccessContext(completedTaskId);
+				}
 				streamSettled = true;
 				clearReconnectTimer();
 				clearCompletionTimer();
@@ -3622,7 +3824,15 @@ export function Dashboard(props: {
 			source.removeEventListener("task.recovered_failed", onCompleted);
 			source.close();
 		};
-	}, [accessTaskStream]);
+	}, [
+		accessTaskStream,
+		advanceAccessContext,
+		readableSections.clearContent,
+		invalidateFeedReactionWork,
+		invalidatePendingSmart,
+		invalidatePendingTranslations,
+		me.user.id,
+	]);
 
 	useEffect(() => {
 		if (refreshTaskStreams.length === 0) return;
@@ -3930,6 +4140,7 @@ export function Dashboard(props: {
 			reactionBusyKeysRef.current = nextBusy;
 			setReactionBusyKeys(nextBusy);
 
+			const requestGeneration = feedReactionGenerationRef.current;
 			void apiPostJson<ToggleReleaseReactionResponse>(
 				"/api/release/reactions/toggle",
 				{
@@ -3938,6 +4149,7 @@ export function Dashboard(props: {
 				},
 			)
 				.then((res) => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					reactionServerByKeyRef.current.set(key, res.reactions);
 					setReactionTokenConfigured(true);
 					setReactionErrorByKey((prev) => {
@@ -3957,6 +4169,7 @@ export function Dashboard(props: {
 					}
 				})
 				.catch((err) => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					const stable = reactionServerByKeyRef.current.get(key);
 					if (stable) {
 						reactionDesiredByKeyRef.current.set(key, stable);
@@ -4001,6 +4214,7 @@ export function Dashboard(props: {
 					setReactionErrorByKey((prev) => ({ ...prev, [key]: message }));
 				})
 				.finally(() => {
+					if (requestGeneration !== feedReactionGenerationRef.current) return;
 					const nextBusy = new Set(reactionBusyKeysRef.current);
 					nextBusy.delete(key);
 					reactionBusyKeysRef.current = nextBusy;
@@ -4249,6 +4463,20 @@ export function Dashboard(props: {
 		);
 	}, [releaseReturnTab, routeSelectedBriefId, scope, setRouteState]);
 
+	useEffect(() => {
+		if (
+			(feedAuthorizationDenied || readableAuthorizationDenied) &&
+			activeReleaseTarget
+		) {
+			onCloseReleaseDetail();
+		}
+	}, [
+		activeReleaseTarget,
+		feedAuthorizationDenied,
+		onCloseReleaseDetail,
+		readableAuthorizationDenied,
+	]);
+
 	const onCloseAnnouncementDetail = useCallback(() => {
 		setRouteState(
 			{
@@ -4336,10 +4564,10 @@ export function Dashboard(props: {
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
 		const rootReadable =
-			mode === "all" && !scopedMode && readableSectionsActive;
-		const filteredItems = filterFeedItemsForTab(feed.items, mode, {
-			scoped: scopedMode,
-		});
+			mode === "all" && !scopedMode && readableSectionsVisible;
+		const filteredItems = initialAccessPending
+			? []
+			: filterFeedItemsForTab(feed.items, mode, { scoped: scopedMode });
 		const feedNetworkUnavailable =
 			feed.error?.phase === "initial" &&
 			(feed.error.kind === "offline" || feed.error.kind === "network");
@@ -4352,18 +4580,19 @@ export function Dashboard(props: {
 		const networkUnavailableDetail =
 			(feedNetworkUnavailable ? feed.error?.detail : null) ?? bootErrorDetail;
 		const blockingFeedError =
+			!initialAccessPending &&
 			feed.error?.phase === "initial" &&
 			filteredItems.length === 0 &&
 			!networkUnavailable;
 		const offlineEmpty =
-			networkUnavailable && !feed.loadingInitial && filteredItems.length === 0;
+			networkUnavailable && !feedLoadingInitial && filteredItems.length === 0;
 		const offlineWithCachedContent =
 			networkUnavailable && filteredItems.length > 0;
 		const scopedEmpty =
-			scopedMode && !feed.loadingInitial && filteredItems.length === 0;
+			scopedMode && !feedLoadingInitial && filteredItems.length === 0;
 		const readableEmpty =
 			rootReadable &&
-			!readableSections.loadingInitial &&
+			!readableSectionsLoadingInitial &&
 			!readableSections.loadingRefresh &&
 			!readableSections.error &&
 			readableSections.sections.length === 0;
@@ -4461,11 +4690,39 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
+				{mode === "all" &&
+				!scopedMode &&
+				readableMode &&
+				!initialAccessPending &&
+				(readableSections.legacyFallback || feed.error?.authorizationDenied) &&
+				feed.error?.phase === "initial" ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-readable-fallback-error="true"
+						role="alert"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<p className="min-w-0">{feed.error.message}</p>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								disabled={feedLoadingInitial}
+								onClick={() => void feed.loadInitial()}
+							>
+								<RefreshCcw className="size-4" />
+								重试加载
+							</Button>
+						</div>
+					</div>
+				) : null}
+
 				{readableEmpty ||
 				(!rootReadable &&
 					!blockingFeedError &&
 					!offlineEmpty &&
-					!feed.loadingInitial &&
+					!feedLoadingInitial &&
 					filteredItems.length === 0) ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 						{scopedEmpty && scope ? (
@@ -4522,56 +4779,78 @@ export function Dashboard(props: {
 				) : null}
 
 				{rootReadable ? (
-					<FeedReadableSectionList
-						sections={readableSections.sections}
-						details={readableSections.details}
-						error={readableSections.error}
-						loadingInitial={readableSections.loadingInitial}
-						loadingRefresh={readableSections.loadingRefresh}
-						loadingMore={readableSections.loadingMore}
-						hasMore={readableSections.hasMore}
-						onLoadMore={() => void readableSections.loadMore()}
-						onRetry={() => void readableSections.retry()}
-						onLoadSectionItems={(sectionId, cursor) => {
-							void readableSections.loadSectionItems(sectionId, cursor);
-						}}
-						feedCardProps={{
-							currentViewer: {
-								login: me.user.login,
-								avatar_url: me.user.avatar_url,
-								html_url: `https://github.com/${me.user.login}`,
-							},
-							sourceTab: mode,
-							currentScope: null,
-							translationInFlightKeys,
-							translationAutoRetryingKeys,
-							smartInFlightKeys,
-							smartAutoRetryingKeys,
-							registerItemRef: registerFeedItem,
-							selectedLaneByKey: Object.fromEntries(
-								activeFeedItems.map((item) => [
-									feedItemKey(item),
-									resolveLaneForItem(
-										item,
-										selectedLaneByKey,
-										pageDefaultLane,
-										allowReleaseItemLaneOverride,
-									),
-								]),
-							),
-							onSelectLane,
-							onTranslateNow,
-							onSmartNow,
-							reactionBusyKeys,
-							reactionErrorByKey,
-							onToggleReaction,
-							freshKeys: new Set(),
-						}}
-						onOpenReleaseFromBrief={onOpenReleaseDetail}
-						onOpenBrief={openBrief}
-						onCopyBrief={copyBrief}
-						onGenerateBriefForDate={onGenerateBriefForDate}
-					/>
+					<>
+						{readableSectionsVisible &&
+						readableSections.legacyFallback &&
+						activeFeedNotice ? (
+							<NewContentNotice
+								count={
+									activeFeedNotice.boundaryKeys.length ||
+									activeFeedNotice.newCount
+								}
+								label="动态"
+								onReveal={() => {
+									void revealFeedUpdates(activeFeedNotice).catch((error) => {
+										notifyGlobalError(
+											"新动态显示失败",
+											error,
+											"新动态显示失败，请稍后重试。",
+										);
+									});
+								}}
+							/>
+						) : null}
+						<FeedReadableSectionList
+							sections={initialAccessPending ? [] : readableSections.sections}
+							details={initialAccessPending ? {} : readableSections.details}
+							error={initialAccessPending ? null : readableSections.error}
+							loadingInitial={readableSectionsLoadingInitial}
+							loadingRefresh={readableSections.loadingRefresh}
+							loadingMore={readableSections.loadingMore}
+							hasMore={readableSections.hasMore}
+							onLoadMore={() => void readableSections.loadMore()}
+							onRetry={() => void readableSections.retry()}
+							onLoadSectionItems={(sectionId, cursor) => {
+								void readableSections.loadSectionItems(sectionId, cursor);
+							}}
+							feedCardProps={{
+								currentViewer: {
+									login: me.user.login,
+									avatar_url: me.user.avatar_url,
+									html_url: `https://github.com/${me.user.login}`,
+								},
+								sourceTab: mode,
+								currentScope: null,
+								translationInFlightKeys,
+								translationAutoRetryingKeys,
+								smartInFlightKeys,
+								smartAutoRetryingKeys,
+								registerItemRef: registerFeedItem,
+								selectedLaneByKey: Object.fromEntries(
+									activeFeedItems.map((item) => [
+										feedItemKey(item),
+										resolveLaneForItem(
+											item,
+											selectedLaneByKey,
+											pageDefaultLane,
+											allowReleaseItemLaneOverride,
+										),
+									]),
+								),
+								onSelectLane,
+								onTranslateNow,
+								onSmartNow,
+								reactionBusyKeys,
+								reactionErrorByKey,
+								onToggleReaction,
+								freshKeys: new Set(),
+							}}
+							onOpenReleaseFromBrief={onOpenReleaseDetail}
+							onOpenBrief={openBrief}
+							onCopyBrief={copyBrief}
+							onGenerateBriefForDate={onGenerateBriefForDate}
+						/>
+					</>
 				) : (
 					<FeedGroupedList
 						mode={mode}
@@ -4587,8 +4866,8 @@ export function Dashboard(props: {
 						dailyBoundaryLocal={dailyBoundaryLocal}
 						dailyBoundaryTimeZone={dailyBoundaryTimeZone}
 						dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-						error={offlineEmpty ? null : feed.error}
-						loadingInitial={feed.loadingInitial}
+						error={initialAccessPending || offlineEmpty ? null : feed.error}
+						loadingInitial={feedLoadingInitial || feed.refreshing}
 						loadingMore={feed.loadingMore}
 						hasMore={feed.hasMore}
 						translationInFlightKeys={translationInFlightKeys}
@@ -4677,7 +4956,13 @@ export function Dashboard(props: {
 		if (tab !== "all" && tab !== "releases") {
 			return;
 		}
-		if (feed.loadingInitial || feed.items.length === 0) {
+		if (
+			initialAccessPending ||
+			feedAuthorizationDenied ||
+			readableAuthorizationDenied ||
+			feed.loadingInitial ||
+			feed.items.length === 0
+		) {
 			return;
 		}
 		for (const item of feed.items) {
@@ -4701,8 +4986,11 @@ export function Dashboard(props: {
 		allowReleaseItemLaneOverride,
 		feed.items,
 		feed.loadingInitial,
+		feedAuthorizationDenied,
+		initialAccessPending,
 		pageDefaultLane,
 		requestLaneIfNeeded,
+		readableAuthorizationDenied,
 		selectedLaneByKey,
 		tab,
 	]);
@@ -4739,7 +5027,12 @@ export function Dashboard(props: {
 	]);
 
 	useEffect(() => {
-		if (readableSectionsActive || feed.loadingInitial || sidebarLoading) {
+		if (
+			initialAccessPending ||
+			readableSectionsVisible ||
+			feed.loadingInitial ||
+			sidebarLoading
+		) {
 			return;
 		}
 		persistDashboardWarmSnapshot({
@@ -4758,13 +5051,14 @@ export function Dashboard(props: {
 		effectiveSelectedBriefId,
 		feed.items,
 		feed.loadingInitial,
+		initialAccessPending,
 		feed.nextCursor,
 		me.user.id,
 		notifications,
 		routeState,
 		sidebarLoading,
 		feedRequestType,
-		readableSectionsActive,
+		readableSectionsVisible,
 	]);
 
 	const showStartupSkeleton =
@@ -4982,7 +5276,7 @@ export function Dashboard(props: {
 							<aside className="hidden space-y-4 lg:block">
 								<ScopedSummaryCard
 									scope={scope}
-									feedItems={feed.items}
+									feedItems={initialAccessPending ? [] : feed.items}
 									personalRepos={scope.kind === "mine" ? personalRepos : null}
 									personalReposLoading={
 										scope.kind === "mine" && personalReposLoading
@@ -5049,7 +5343,11 @@ export function Dashboard(props: {
 				</Tabs>
 
 				<ReleaseDetailCard
-					target={activeReleaseTarget}
+					target={
+						feedAuthorizationDenied || readableAuthorizationDenied
+							? null
+							: activeReleaseTarget
+					}
 					onClose={onCloseReleaseDetail}
 					onResolvedDetail={onReleaseDetailResolved}
 				/>

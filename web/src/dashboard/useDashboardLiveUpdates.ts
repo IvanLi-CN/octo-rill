@@ -221,6 +221,10 @@ export function useDashboardLiveUpdates(options: {
 			inFlightRef.current = true;
 			const requestBaselineKey = baselineKey;
 			const requestGeneration = generationRef.current;
+			const isCurrentRequest = () =>
+				activeRef.current &&
+				generationRef.current === requestGeneration &&
+				currentBaselineKey() === requestBaselineKey;
 			try {
 				const bootstrapInclude = pendingIncludeBootstrapRef.current;
 				if (bootstrapInclude.length > 0 && tokenRef.current) {
@@ -235,7 +239,7 @@ export function useDashboardLiveUpdates(options: {
 					const bootstrapResponse = await apiGet<DashboardUpdatesResponse>(
 						`/api/dashboard/updates?${bootstrapParams.toString()}`,
 					);
-					if (currentBaselineKey() !== requestBaselineKey) return;
+					if (!isCurrentRequest()) return;
 					const bootstrapIncludeSet = new Set<DashboardLiveUpdateList>(
 						bootstrapInclude,
 					);
@@ -266,7 +270,7 @@ export function useDashboardLiveUpdates(options: {
 				const response = await apiGet<DashboardUpdatesResponse>(
 					`/api/dashboard/updates?${params.toString()}`,
 				);
-				if (currentBaselineKey() !== requestBaselineKey) return;
+				if (!isCurrentRequest()) return;
 				errorCountRef.current = 0;
 				const notices: DashboardLiveUpdateNotice[] = [];
 				for (const list of ["feed", "briefs", "notifications"] as const) {
@@ -307,7 +311,7 @@ export function useDashboardLiveUpdates(options: {
 					tokenRef.current = response.token;
 				}
 			} catch {
-				errorCountRef.current += 1;
+				if (isCurrentRequest()) errorCountRef.current += 1;
 			} finally {
 				inFlightRef.current = false;
 				const queuedCheck = queuedCheckRef.current;

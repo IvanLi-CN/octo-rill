@@ -1,17 +1,13 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 function sleep(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
 }
 
 async function seedWarmDashboardCache(page: Page) {
@@ -620,6 +616,10 @@ test("warm cache holds the dashboard until the network refresh completes", async
 					is_admin: true,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

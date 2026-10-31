@@ -324,11 +324,11 @@ function normalizeReleaseTarget(
 
 function releaseTargetKey(target: DashboardReleaseTarget | null) {
 	if (!target) return null;
-	if (target.releaseId) {
-		return `release:${target.releaseId}`;
-	}
 	if (target.locator) {
 		return `locator:${target.locator.owner}/${target.locator.repo}#${target.locator.tag}`;
+	}
+	if (target.releaseId) {
+		return `release:${target.releaseId}`;
 	}
 	return null;
 }
@@ -382,6 +382,8 @@ export function ReleaseDetailCard(props: {
 	const initialLane = normalizedTarget?.lane ?? null;
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const [detailTargetKey, setDetailTargetKey] = useState<string | null>(null);
+	const activeTargetKeyRef = useRef(activeTargetKey);
+	activeTargetKeyRef.current = activeTargetKey;
 	const translateRequestSeqRef = useRef(0);
 	const smartRequestSeqRef = useRef(0);
 	const loadRequestSeqRef = useRef(0);
@@ -389,6 +391,7 @@ export function ReleaseDetailCard(props: {
 	const pendingTranslationRequestRef = useRef<{
 		releaseId: string;
 		requestId: string;
+		targetKey: string;
 	} | null>(null);
 
 	const loadDetail = useCallback(
@@ -396,6 +399,8 @@ export function ReleaseDetailCard(props: {
 			targetRelease: DashboardReleaseTarget,
 			options?: { resetDisplay?: boolean },
 		) => {
+			const targetKey = releaseTargetKey(targetRelease);
+			if (!targetKey) return;
 			const requestSeq = loadRequestSeqRef.current + 1;
 			loadRequestSeqRef.current = requestSeq;
 			pendingTranslationRequestRef.current = null;
@@ -410,12 +415,17 @@ export function ReleaseDetailCard(props: {
 			}
 			void fetchReleaseDetail(targetRelease)
 				.then((response) => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					const requestId = response.translated?.request_id;
 					if (requestId) {
 						pendingTranslationRequestRef.current = {
 							releaseId: response.release_id,
 							requestId,
+							targetKey,
 						};
 					}
 					setDetail(response);
@@ -423,7 +433,11 @@ export function ReleaseDetailCard(props: {
 					onResolvedDetail?.(response);
 				})
 				.catch((error) => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					setDetail(null);
 					setDetailTargetKey(null);
 					setLoadError(
@@ -431,12 +445,24 @@ export function ReleaseDetailCard(props: {
 					);
 				})
 				.finally(() => {
-					if (loadRequestSeqRef.current !== requestSeq) return;
+					if (
+						loadRequestSeqRef.current !== requestSeq ||
+						activeTargetKeyRef.current !== targetKey
+					)
+						return;
 					setLoading(false);
 				});
 		},
 		[onResolvedDetail],
 	);
+
+	const handleClose = useCallback(() => {
+		loadRequestSeqRef.current += 1;
+		translateRequestSeqRef.current += 1;
+		smartRequestSeqRef.current += 1;
+		pendingTranslationRequestRef.current = null;
+		onClose();
+	}, [onClose]);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
@@ -445,6 +471,8 @@ export function ReleaseDetailCard(props: {
 		setTranslating(false);
 		setSmartResolving(false);
 		if (!normalizedTarget || !activeTargetKey) {
+			loadRequestSeqRef.current += 1;
+			setLoading(false);
 			pendingTranslationRequestRef.current = null;
 			setDetail(null);
 			setDetailTargetKey(null);
@@ -496,9 +524,13 @@ export function ReleaseDetailCard(props: {
 
 	const onTranslate = useCallback(
 		(options?: { retry?: boolean }) => {
-			if (!activeDetail || translating) return;
+			const requestTargetKey = activeTargetKey;
+			if (!activeDetail || !requestTargetKey || translating) return;
 			const requestSeq = translateRequestSeqRef.current + 1;
 			translateRequestSeqRef.current = requestSeq;
+			const isCurrentRequest = () =>
+				translateRequestSeqRef.current === requestSeq &&
+				activeTargetKeyRef.current === requestTargetKey;
 			const requestReleaseId = activeDetail.release_id;
 			const preserveReadyTranslation = hasReadyTranslatedContent(
 				activeDetail.translated,
@@ -507,7 +539,9 @@ export function ReleaseDetailCard(props: {
 			setTranslateError(null);
 			void (async () => {
 				let requestId =
-					pendingTranslationRequestRef.current?.releaseId === requestReleaseId
+					pendingTranslationRequestRef.current?.releaseId ===
+						requestReleaseId &&
+					pendingTranslationRequestRef.current.targetKey === requestTargetKey
 						? pendingTranslationRequestRef.current.requestId
 						: null;
 				let response: TranslationRequestResponse | null = null;
@@ -519,21 +553,29 @@ export function ReleaseDetailCard(props: {
 								: requestId
 									? await apiGetTranslationRequest(requestId)
 									: await apiTranslateReleaseDetail(activeDetail);
+						if (!isCurrentRequest()) return;
 						pendingTranslationRequestRef.current = {
 							releaseId: requestReleaseId,
 							requestId: response.request_id,
+							targetKey: requestTargetKey,
 						};
 						const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
 						while (isPendingTranslationResultStatus(response.result.status)) {
+							if (!isCurrentRequest()) return;
 							pendingTranslationRequestRef.current = {
 								releaseId: requestReleaseId,
 								requestId: response.request_id,
+								targetKey: requestTargetKey,
 							};
 							const pendingTranslated =
 								mapTranslationResultToReleaseDetailTranslated(response.result);
 							if (pendingTranslated) {
 								setDetail((prev) => {
-									if (!prev || prev.release_id !== requestReleaseId)
+									if (
+										!isCurrentRequest() ||
+										!prev ||
+										prev.release_id !== requestReleaseId
+									)
 										return prev;
 									const translated =
 										preserveReadyTranslation &&
@@ -548,18 +590,21 @@ export function ReleaseDetailCard(props: {
 											: pendingTranslated;
 									return { ...prev, translated };
 								});
+								if (!isCurrentRequest()) return;
 								setTranslateError(null);
 							}
 							if (Date.now() >= deadline) {
 								return;
 							}
-							if (translateRequestSeqRef.current !== requestSeq) return;
+							if (!isCurrentRequest()) return;
 							await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-							if (translateRequestSeqRef.current !== requestSeq) return;
+							if (!isCurrentRequest()) return;
 							response = await apiGetTranslationRequest(response.request_id);
+							if (!isCurrentRequest()) return;
 						}
 						break;
 					} catch (error) {
+						if (!isCurrentRequest()) return;
 						if (!isMissingTranslationRequestError(error) || attempt === 1) {
 							throw error;
 						}
@@ -570,7 +615,7 @@ export function ReleaseDetailCard(props: {
 				if (!response) {
 					throw new Error("translation request could not be recovered");
 				}
-				if (translateRequestSeqRef.current !== requestSeq) return;
+				if (!isCurrentRequest()) return;
 				const translated = mapTranslationResultToReleaseDetailTranslated(
 					response.result,
 				);
@@ -590,7 +635,7 @@ export function ReleaseDetailCard(props: {
 					return;
 				}
 				setDetail((prev) => {
-					if (!prev) return prev;
+					if (!isCurrentRequest() || !prev) return prev;
 					if (prev.release_id !== requestReleaseId) return prev;
 					return { ...prev, translated };
 				});
@@ -604,7 +649,7 @@ export function ReleaseDetailCard(props: {
 				}
 			})()
 				.catch((error) => {
-					if (translateRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					if (preserveReadyTranslation) {
 						const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
 						pushErrorToast("翻译失败", failure.summary, {
@@ -615,21 +660,25 @@ export function ReleaseDetailCard(props: {
 					setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
 				})
 				.finally(() => {
-					if (translateRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					setTranslating(false);
 				});
 		},
-		[activeDetail, pushErrorToast, translating],
+		[activeDetail, activeTargetKey, pushErrorToast, translating],
 	);
 
 	const onResolveSmart = useCallback(
 		(options?: { selectLane?: boolean; retryOnError?: boolean }) => {
-			if (!activeDetail || smartResolving) return;
+			const requestTargetKey = activeTargetKey;
+			if (!activeDetail || !requestTargetKey || smartResolving) return;
 			if (options?.selectLane !== false) {
 				setSelectedLane("smart");
 			}
 			const requestSeq = smartRequestSeqRef.current + 1;
 			smartRequestSeqRef.current = requestSeq;
+			const isCurrentRequest = () =>
+				smartRequestSeqRef.current === requestSeq &&
+				activeTargetKeyRef.current === requestTargetKey;
 			const requestReleaseId = activeDetail.release_id;
 			setSmartResolving(true);
 			setSmartError(null);
@@ -642,23 +691,31 @@ export function ReleaseDetailCard(props: {
 						retry_on_error: options?.retryOnError ?? true,
 					})
 				).items.find((item) => item.producer_ref === requestItem.producer_ref);
+				if (!isCurrentRequest()) return;
 
 				while (result && isPendingTranslationResultStatus(result.status)) {
+					if (!isCurrentRequest()) return;
 					if (Date.now() >= deadline) {
 						const pendingSmart =
 							mapTranslationResultToReleaseDetailSmart(result);
 						if (pendingSmart) {
 							setDetail((prev) => {
-								if (!prev || prev.release_id !== requestReleaseId) return prev;
+								if (
+									!isCurrentRequest() ||
+									!prev ||
+									prev.release_id !== requestReleaseId
+								)
+									return prev;
 								return { ...prev, smart: pendingSmart };
 							});
+							if (!isCurrentRequest()) return;
 							setSmartError(null);
 						}
 						return;
 					}
-					if (smartRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-					if (smartRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					result = (
 						await apiResolveTranslationResults({
 							items: [requestItem],
@@ -667,18 +724,19 @@ export function ReleaseDetailCard(props: {
 					).items.find(
 						(item) => item.producer_ref === requestItem.producer_ref,
 					);
+					if (!isCurrentRequest()) return;
 				}
 
 				if (!result) {
 					throw new Error("release polish result missing");
 				}
-				if (smartRequestSeqRef.current !== requestSeq) return;
+				if (!isCurrentRequest()) return;
 				const smart = mapTranslationResultToReleaseDetailSmart(result);
 				if (!smart) {
 					throw new Error(resolveErrorSummary(result, "润色失败"));
 				}
 				setDetail((prev) => {
-					if (!prev) return prev;
+					if (!isCurrentRequest() || !prev) return prev;
 					if (prev.release_id !== requestReleaseId) return prev;
 					return { ...prev, smart };
 				});
@@ -689,15 +747,15 @@ export function ReleaseDetailCard(props: {
 				);
 			})()
 				.catch((error) => {
-					if (smartRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					setSmartError(toUnknownUiError(error, "润色失败，请稍后重试。"));
 				})
 				.finally(() => {
-					if (smartRequestSeqRef.current !== requestSeq) return;
+					if (!isCurrentRequest()) return;
 					setSmartResolving(false);
 				});
 		},
-		[activeDetail, smartResolving],
+		[activeDetail, activeTargetKey, smartResolving],
 	);
 
 	useEffect(() => {
@@ -777,7 +835,7 @@ export function ReleaseDetailCard(props: {
 		<Dialog
 			open
 			onOpenChange={(open) => {
-				if (!open) onClose();
+				if (!open) handleClose();
 			}}
 		>
 			<DialogContent
@@ -885,7 +943,7 @@ export function ReleaseDetailCard(props: {
 								variant="ghost"
 								size="sm"
 								className="shrink-0 font-mono text-xs"
-								onClick={onClose}
+								onClick={handleClose}
 							>
 								<X className="size-4" />
 								关闭

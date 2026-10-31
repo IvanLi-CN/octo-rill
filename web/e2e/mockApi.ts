@@ -1,8 +1,31 @@
+import type { Route } from "@playwright/test";
+
 export const mockDashboardBootstrap = {
 	daily_boundary_local: "00:00",
 	daily_boundary_time_zone: "Asia/Shanghai",
 	daily_boundary_utc_offset_minutes: 480,
 };
+
+export function json(route: Route, payload: unknown, status = 200) {
+	return route.fulfill({
+		status,
+		contentType: "application/json",
+		body: JSON.stringify(payload),
+	});
+}
+
+export function mockUnavailableDashboardReadableFeed(route: Route) {
+	return json(
+		route,
+		{
+			error: {
+				code: "release_reading_evidence_unavailable",
+				message: "Release compare evidence is not ready",
+			},
+		},
+		503,
+	);
+}
 
 type MockUser = {
 	id: string;

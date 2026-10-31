@@ -1,15 +1,11 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 import { installPasskeyBrowserMock } from "./passkeyHelpers";
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
 
 function buildAnnouncementFeedItem() {
 	return {
@@ -103,6 +99,10 @@ async function installAuthenticatedAnnouncementMocks(page: Page) {
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

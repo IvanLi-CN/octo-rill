@@ -1,20 +1,17 @@
+import { expect, test, type Locator, type Page } from "@playwright/test";
+
 import {
-	expect,
-	test,
-	type Locator,
-	type Page,
-	type Route,
-} from "@playwright/test";
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
-import { buildMockMeResponse } from "./mockApi";
+const unexpectedReadableFeedRequests = new WeakMap<Page, number>();
 
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
+test.afterEach(async ({ page }) => {
+	expect(unexpectedReadableFeedRequests.get(page) ?? 0).toBe(0);
+	unexpectedReadableFeedRequests.delete(page);
+});
 
 async function expectRepositoryListGeometry(
 	panel: Locator,
@@ -153,6 +150,7 @@ async function installScopedFocusMocks(
 	options?: {
 		includeOwnReleases?: boolean;
 		holdBriefGeneration?: boolean;
+		readableFallback?: boolean;
 		personalRepositoryCount?: number;
 		holdPersonalRepos?: boolean;
 		personalReposError?: boolean;
@@ -161,6 +159,7 @@ async function installScopedFocusMocks(
 ) {
 	const includeOwnReleases = options?.includeOwnReleases ?? false;
 	const holdBriefGeneration = options?.holdBriefGeneration ?? false;
+	const readableFallback = options?.readableFallback ?? false;
 	const personalRepositoryCount = options?.personalRepositoryCount ?? 3;
 	const holdPersonalRepos = options?.holdPersonalRepos ?? false;
 	const personalReposError = options?.personalReposError ?? false;
@@ -345,6 +344,27 @@ async function installScopedFocusMocks(
 			return json(
 				route,
 				nextAssociatedItems.find((item) => item.full_name === fullName),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			if (readableFallback) {
+				return mockUnavailableDashboardReadableFeed(route);
+			}
+			unexpectedReadableFeedRequests.set(
+				page,
+				(unexpectedReadableFeedRequests.get(page) ?? 0) + 1,
+			);
+			return json(
+				route,
+				{
+					error: {
+						code: "unexpected_readable_feed_request",
+						message:
+							"This scoped Dashboard fixture does not expect readable feed requests.",
+					},
+				},
+				500,
 			);
 		}
 
@@ -610,7 +630,7 @@ async function installScopedFocusMocks(
 test("root all desktop renders the Inbox quick list instead of a repository sidebar", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page);
+	await installScopedFocusMocks(page, { readableFallback: true });
 	let followingRequestCount = 0;
 	page.on("request", (request) => {
 		if (new URL(request.url()).pathname === "/api/repos/following") {
@@ -637,7 +657,7 @@ test("root all desktop renders the Inbox quick list instead of a repository side
 test("root all at 1024px keeps the Inbox quick list visible", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page);
+	await installScopedFocusMocks(page, { readableFallback: true });
 	await page.setViewportSize({ width: 1024, height: 768 });
 	await page.goto("/");
 
@@ -871,7 +891,7 @@ test("personal repository errors stay inside the bounded list viewport", async (
 test("narrow root dashboard does not request or render the following sidebar", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page);
+	await installScopedFocusMocks(page, { readableFallback: true });
 	let followingRequestCount = 0;
 	page.on("request", (request) => {
 		if (new URL(request.url()).pathname === "/api/repos/following") {
@@ -962,7 +982,7 @@ test("scoped repo and org feeds hide per-day daily brief generation", async ({
 test("dashboard brand link opens the home feed from scoped routes", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page);
+	await installScopedFocusMocks(page, { readableFallback: true });
 
 	await page.goto("/focus/repo/lobehub/lobe-chat");
 	await expect(
@@ -983,7 +1003,10 @@ test("dashboard brand link opens the home feed from scoped routes", async ({
 test("scoped feeds ignore cached briefs and pending generation state from the global feed", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page, { holdBriefGeneration: true });
+	await installScopedFocusMocks(page, {
+		holdBriefGeneration: true,
+		readableFallback: true,
+	});
 
 	await page.goto("/");
 	const generateButton = page.getByRole("button", { name: "生成日报" });
@@ -1016,7 +1039,10 @@ test("scoped feeds ignore cached briefs and pending generation state from the gl
 test("account menu keeps mine entry available regardless of include_own_releases", async ({
 	page,
 }) => {
-	await installScopedFocusMocks(page, { includeOwnReleases: true });
+	await installScopedFocusMocks(page, {
+		includeOwnReleases: true,
+		readableFallback: true,
+	});
 
 	await page.goto("/");
 	await page.getByRole("button", { name: "查看账号信息" }).click();
@@ -1036,7 +1062,10 @@ test("account menu keeps mine entry available regardless of include_own_releases
 		enabledSummary.getByText("story-viewer/no-release-repo"),
 	).toBeVisible();
 
-	await installScopedFocusMocks(page, { includeOwnReleases: false });
+	await installScopedFocusMocks(page, {
+		includeOwnReleases: false,
+		readableFallback: true,
+	});
 	await page.goto("/");
 	await page.getByRole("button", { name: "查看账号信息" }).click();
 	await expect(page.getByRole("link", { name: "个人仓库" })).toBeVisible();

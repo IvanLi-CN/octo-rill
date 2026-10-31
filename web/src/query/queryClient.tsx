@@ -1,4 +1,8 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	dehydrate,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { createSyncStoragePersister } from "@tanstack/query-sync-storage-persister";
 import type { ReactNode } from "react";
@@ -10,6 +14,7 @@ import {
 } from "@/query/dashboardQueryKeys";
 
 const DASHBOARD_QUERY_PERSIST_KEY = "octo-rill.dashboard-query-cache.v1";
+const DASHBOARD_QUERY_BUSTER = "dashboard-query-cache-v1";
 
 function createDashboardStoragePersister() {
 	if (typeof window === "undefined") {
@@ -44,6 +49,24 @@ export function clearDashboardQueryCache() {
 	}
 }
 
+export function clearDashboardFeedQueryCache(userId: string) {
+	queryClient.removeQueries({
+		queryKey: ["dashboard", "feed", { userId }],
+	});
+	if (!dashboardPersister) return;
+
+	dashboardPersister.removeClient();
+	dashboardPersister.persistClient({
+		timestamp: Date.now(),
+		buster: DASHBOARD_QUERY_BUSTER,
+		clientState: dehydrate(queryClient, {
+			shouldDehydrateQuery: (query) =>
+				query.state.status === "success" &&
+				shouldPersistDashboardQuery(query.queryKey),
+		}),
+	});
+}
+
 export function AppQueryProvider(props: { children: ReactNode }) {
 	const { children } = props;
 
@@ -59,7 +82,7 @@ export function AppQueryProvider(props: { children: ReactNode }) {
 			persistOptions={{
 				persister: dashboardPersister,
 				maxAge: DASHBOARD_QUERY_MAX_AGE_MS,
-				buster: "dashboard-query-cache-v1",
+				buster: DASHBOARD_QUERY_BUSTER,
 				dehydrateOptions: {
 					shouldDehydrateQuery: (query) =>
 						query.state.status === "success" &&

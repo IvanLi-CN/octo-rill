@@ -189,23 +189,51 @@ async function installDashboardBriefMocks(
 			nextCursor: string | null;
 		};
 		readableSectionPage?: (cursor: string | null) => unknown;
+		readableSectionPageFailure?: {
+			status?: number;
+			code: string;
+			message: string;
+		};
+		readableSectionPageFailureForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
 		readableSectionPageFailures?: Array<string | null>;
 		deferReadableSectionPageCursors?: Array<string | null>;
 		readableSectionItemsPage?: (
 			sectionId: string,
 			cursor: string | null,
 		) => unknown;
+		readableSectionItemsFailureForRequest?: (
+			requestNumber: number,
+			sectionId: string,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
 		deferReadableSectionItems?: string[];
 		readableSectionItemsFailures?: string[];
 		deferFeedPageCursors?: Array<string | null>;
+		deferFeedPageForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => boolean;
 		feedPageFailureCursors?: Array<string | null>;
+		feedFailure?: { status: number; code: string; message: string };
+		feedFailureForRequest?: (
+			requestNumber: number,
+			cursor: string | null,
+		) => { status: number; code: string; message: string } | null;
+		dashboardUpdatesResponse?: (
+			requestNumber: number,
+		) => unknown | Promise<unknown>;
 		briefDetailFailureIds?: Set<string>;
 	},
 ) {
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
 	const feedRequests: Array<string | null> = [];
+	const feedRequestUrls: string[] = [];
 	const readableSectionRequests: Array<string | null> = [];
+	let dashboardUpdateRequests = 0;
 	const readableSectionItemRequests: Array<{
 		sectionId: string;
 		cursor: string | null;
@@ -213,6 +241,7 @@ async function installDashboardBriefMocks(
 	const feedPageFailures = new Map<string | null, number>();
 	const deferredFeedPageCursors = new Set(options?.deferFeedPageCursors ?? []);
 	const deferredFeedPageResolvers = new Map<string | null, () => void>();
+	const deferredFeedPageRequestResolvers = new Map<number, () => void>();
 	const deferredReadableItemResolvers = new Map<string, () => void>();
 	const deferredReadablePageResolvers = new Map<string | null, () => void>();
 	const deferredReadableItems = new Set(
@@ -259,6 +288,40 @@ async function installDashboardBriefMocks(
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			const cursor = url.searchParams.get("cursor");
 			feedRequests.push(cursor);
+			feedRequestUrls.push(`${pathname}${url.search}`);
+			const requestFailure = options?.feedFailureForRequest?.(
+				feedRequests.length,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
+			if (options?.deferFeedPageForRequest?.(feedRequests.length, cursor)) {
+				await new Promise<void>((resolve) => {
+					deferredFeedPageRequestResolvers.set(feedRequests.length, resolve);
+				});
+			}
+			if (options?.feedFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: options.feedFailure.code,
+							message: options.feedFailure.message,
+						},
+					},
+					options.feedFailure.status,
+				);
+			}
 			if (deferredFeedPageCursors.has(cursor)) {
 				await new Promise<void>((resolve) => {
 					deferredFeedPageResolvers.set(cursor, resolve);
@@ -290,6 +353,30 @@ async function installDashboardBriefMocks(
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			const cursor = url.searchParams.get("cursor");
 			readableSectionRequests.push(cursor);
+			const requestFailure = options?.readableSectionPageFailureForRequest?.(
+				readableSectionRequests.length,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
+			if (options?.readableSectionPageFailure && cursor === null) {
+				const failure = options.readableSectionPageFailure;
+				return json(
+					route,
+					{ error: { code: failure.code, message: failure.message } },
+					failure.status ?? 500,
+				);
+			}
 			if (deferredReadablePages.has(cursor)) {
 				await new Promise<void>((resolve) => {
 					deferredReadablePageResolvers.set(cursor, resolve);
@@ -337,6 +424,23 @@ async function installDashboardBriefMocks(
 			const sectionId = decodeURIComponent(pathname.split("/").at(-2) ?? "");
 			const cursor = url.searchParams.get("cursor");
 			readableSectionItemRequests.push({ sectionId, cursor });
+			const requestFailure = options?.readableSectionItemsFailureForRequest?.(
+				readableSectionItemRequests.length,
+				sectionId,
+				cursor,
+			);
+			if (requestFailure) {
+				return json(
+					route,
+					{
+						error: {
+							code: requestFailure.code,
+							message: requestFailure.message,
+						},
+					},
+					requestFailure.status,
+				);
+			}
 			if (deferredReadableItems.has(sectionId)) {
 				await new Promise<void>((resolve) => {
 					deferredReadableItemResolvers.set(sectionId, resolve);
@@ -363,6 +467,11 @@ async function installDashboardBriefMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			dashboardUpdateRequests += 1;
+			const response = await options?.dashboardUpdatesResponse?.(
+				dashboardUpdateRequests,
+			);
+			if (response) return json(route, response);
 			return json(route, {
 				token: "brief-token",
 				generated_at: "2026-04-30T10:00:00Z",
@@ -462,6 +571,9 @@ async function installDashboardBriefMocks(
 
 	return {
 		getFeedRequests: () => feedRequests.slice(),
+		getFeedRequestUrls: () => feedRequestUrls.slice(),
+		getDeferredFeedPageRequestNumbers: () =>
+			Array.from(deferredFeedPageRequestResolvers.keys()),
 		getReadableSectionRequests: () => readableSectionRequests.slice(),
 		getReadableSectionItemRequests: () => readableSectionItemRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
@@ -472,6 +584,14 @@ async function installDashboardBriefMocks(
 				throw new Error(`No deferred feed request for cursor ${cursor}`);
 			}
 			deferredFeedPageResolvers.delete(cursor);
+			resolve();
+		},
+		releaseFeedPageRequest: (requestNumber: number) => {
+			const resolve = deferredFeedPageRequestResolvers.get(requestNumber);
+			if (!resolve) {
+				throw new Error(`No deferred feed request number ${requestNumber}`);
+			}
+			deferredFeedPageRequestResolvers.delete(requestNumber);
 			resolve();
 		},
 		releaseReadableSectionItems: (sectionId: string) => {
@@ -578,6 +698,955 @@ test("dashboard advances to the next readable section without a continuation sto
 	await expect(
 		page.getByRole("button", { name: "继续加载历史动态" }),
 	).toHaveCount(0);
+});
+
+test("dashboard falls back to the legacy feed for unavailable readable evidence", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const legacyItem = makeReleaseFeedItem({
+		id: "legacy-fallback",
+		ts: "2026-04-30T08:00:00Z",
+		tag: "legacy-fallback",
+		title: "Legacy fallback release appears",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedItems: [legacyItem],
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Legacy fallback release appears")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(tracker.getFeedRequestUrls).toEqual(["/api/feed?limit=30"]);
+});
+
+test("dashboard keeps generic readable failures visible without a legacy fallback", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 502,
+			code: "readable_page_failed",
+			message: "readable page failed",
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("readable page failed")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+	await expect(tracker.getFeedRequestUrls()).toEqual([]);
+});
+
+test("dashboard hides readable release content when refresh authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+		Object.defineProperty(window.navigator, "onLine", {
+			configurable: true,
+			value: true,
+		});
+	});
+	const title = "Private release after readable authorization loss";
+	let updateRequests = 0;
+	let revokeReadableAccess = false;
+	let reportFeedChange = false;
+	let failReadableRequestsAfter = Number.POSITIVE_INFINITY;
+	let markDashboardUpdateStarted: (() => void) | null = null;
+	let releaseDashboardUpdate: (() => void) | null = null;
+	const dashboardUpdateStarted = new Promise<void>((resolve) => {
+		markDashboardUpdateStarted = resolve;
+	});
+	const dashboardUpdateGate = new Promise<void>((resolve) => {
+		releaseDashboardUpdate = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableRawSection({
+					id: "auth-revoked",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "auth-revoked-release",
+							ts: "2026-04-30T08:00:00Z",
+							tag: "auth-revoked",
+							title,
+						}),
+					],
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionPageFailureForRequest: (requestNumber) =>
+			revokeReadableAccess && requestNumber > failReadableRequestsAfter
+				? {
+						status: 404,
+						code: "not_found",
+						message: "read access revoked",
+					}
+				: null,
+		dashboardUpdatesResponse: async (requestNumber) => {
+			updateRequests += 1;
+			if (requestNumber === 1) {
+				markDashboardUpdateStarted?.();
+				await dashboardUpdateGate;
+			}
+			const changed = reportFeedChange;
+			reportFeedChange = false;
+			return {
+				token: `auth-refresh-${updateRequests}`,
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? ["release:auth-revoked-release"] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(title)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await dashboardUpdateStarted;
+	failReadableRequestsAfter = tracker.getReadableSectionRequests().length;
+	const readableRequestCountBeforeRefresh = failReadableRequestsAfter;
+	revokeReadableAccess = true;
+	reportFeedChange = true;
+	releaseDashboardUpdate?.();
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toHaveLength(readableRequestCountBeforeRefresh + 1);
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+	await expect(page.getByText(title)).toHaveCount(0);
+});
+
+test("dashboard clears readable releases and retries after pagination authorization is revoked", async ({
+	page,
+}) => {
+	const warmSnapshot = {
+		savedAt: Date.now(),
+		userId: "2f4k7m9p3x6c8v2a",
+		viewerStateKey: "00:00|Asia/Shanghai|480|0",
+		routeState: {
+			tab: "all",
+			scopeSignature: null,
+			selectedBriefId: null,
+			activeReleaseId: null,
+			activeReleaseLocatorKey: null,
+			activeAnnouncementLocatorKey: null,
+			lane: null,
+			releaseReturnTab: "briefs",
+		},
+		feedRequestType: "all",
+		feedItems: [
+			makeReleaseFeedItem({
+				id: "warm-readable-auth-release",
+				tag: "warm-readable-auth-release",
+				title: "Warm private readable feed snapshot",
+			}),
+		],
+		nextCursor: null,
+		notifications: [],
+		briefs: [],
+		selectedBriefId: null,
+	};
+	await page.addInitScript((snapshot) => {
+		window.localStorage.clear();
+		window.localStorage.setItem(
+			"octo-rill.dashboard-warm.v1",
+			JSON.stringify(snapshot),
+		);
+	}, warmSnapshot);
+	const privateTitle =
+		"Private release before readable page authorization loss";
+	const recoveredTitle = "Readable feed recovered after authorization retry";
+	let authorizationDenied = false;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: (cursor) => ({
+			sections: [
+				makeReadableRawSection({
+					id: "readable-auth-pagination",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "readable-auth-pagination-release",
+							tag: "readable-auth-pagination",
+							title: authorizationDenied ? recoveredTitle : privateTitle,
+						}),
+						...Array.from({ length: 12 }, (_, index) =>
+							makeReleaseFeedItem({
+								id: `readable-auth-pagination-filler-${index}`,
+								tag: `readable-auth-pagination-filler-${index}`,
+								title: `Readable pagination filler ${index}`,
+							}),
+						),
+					],
+				}),
+			],
+			next_cursor:
+				cursor === null && !authorizationDenied ? "readable-auth-page-2" : null,
+		}),
+		readableSectionPageFailureForRequest: (_requestNumber, cursor) => {
+			if (cursor !== "readable-auth-page-2" || authorizationDenied) return null;
+			authorizationDenied = true;
+			return {
+				status: 403,
+				code: "unauthorized",
+				message: "read access revoked",
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				window.localStorage.getItem("octo-rill.dashboard-warm.v1"),
+			),
+		)
+		.toContain("Warm private readable feed snapshot");
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toContain("readable-auth-page-2");
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				window.localStorage.getItem("octo-rill.dashboard-warm.v1"),
+			),
+		)
+		.toBeNull();
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+
+	await page.getByRole("button", { name: "重试" }).click();
+	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
+});
+
+test("dashboard clears visible section details after detail pagination authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Private section detail before authorization loss";
+	const privateBrief = "Private brief before detail authorization loss";
+	const privateItem = makeReleaseFeedItem({
+		id: "detail-auth-pagination-release",
+		tag: "detail-auth-pagination",
+		title: privateTitle,
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableBriefSection({
+					id: "detail-auth-pagination",
+					date: "2026-04-30",
+					content: `## ${privateBrief}`,
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionItemsPage: (_sectionId, cursor) =>
+			cursor === null
+				? { items: [privateItem], next_cursor: "detail-auth-page-2" }
+				: { items: [privateItem], next_cursor: null },
+		readableSectionItemsFailureForRequest: (
+			_requestNumber,
+			_sectionId,
+			cursor,
+		) =>
+			cursor === "detail-auth-page-2"
+				? {
+						status: 403,
+						code: "unauthorized",
+						message: "read access revoked",
+					}
+				: null,
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateBrief)).toBeVisible({ timeout: 15_000 });
+	const section = page.locator(
+		'[data-readable-section-id="section-detail-auth-pagination"]',
+	);
+	await section
+		.locator("[data-readable-section-header='true']")
+		.getByRole("button", { name: "列表" })
+		.click();
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionItemRequests).toContainEqual({
+		sectionId: "section-detail-auth-pagination",
+		cursor: "detail-auth-page-2",
+	});
+
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect(page.getByText(privateBrief)).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
+});
+
+test("dashboard clears legacy releases and retries after pagination authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Private release before legacy page authorization loss";
+	const recoveredTitle = "Legacy feed recovered after authorization retry";
+	let authorizationDenied = false;
+	let deniedLegacyRequestNumber = 0;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedFailureForRequest: (requestNumber, cursor) => {
+			if (cursor !== "legacy-auth-page-2") return null;
+			authorizationDenied = true;
+			deniedLegacyRequestNumber ||= requestNumber;
+			return {
+				status: 404,
+				code: "not_found",
+				message: "feed access revoked",
+			};
+		},
+		deferFeedPageForRequest: (_requestNumber, cursor) =>
+			authorizationDenied && cursor === null,
+		feedPage: (cursor) => ({
+			items:
+				cursor === null
+					? [
+							makeReleaseFeedItem({
+								id: "legacy-auth-pagination-release",
+								tag: "legacy-auth-pagination",
+								title: authorizationDenied ? recoveredTitle : privateTitle,
+							}),
+						]
+					: [],
+			nextCursor:
+				cursor === null && !authorizationDenied ? "legacy-auth-page-2" : null,
+		}),
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+	const persistedDashboardCache = () =>
+		page.evaluate(
+			() =>
+				window.localStorage.getItem("octo-rill.dashboard-query-cache.v1") ?? "",
+		);
+	await expect.poll(persistedDashboardCache).toContain(privateTitle);
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(tracker.getFeedRequests).toContain("legacy-auth-page-2");
+	await expect.poll(() => deniedLegacyRequestNumber).toBeGreaterThan(0);
+	await expect(page.getByText(privateTitle)).toHaveCount(0);
+	await expect.poll(persistedDashboardCache).not.toContain(privateTitle);
+	const retry = page.getByRole("button", { name: "重试加载" });
+	await expect(retry).toBeVisible();
+	await expect(retry).toBeDisabled();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+	for (const requestNumber of tracker.getDeferredFeedPageRequestNumbers()) {
+		tracker.releaseFeedPageRequest(requestNumber);
+	}
+	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
+});
+
+test("dashboard refresh cancels cursor pages still running from an older feed revision", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	let sourceRevision = 1;
+	let updateRequests = 0;
+	let deferredPageRequest: number | null = null;
+	let deferredHeadRequest: number | null = null;
+	let deferredPageRevision = 1;
+	let pageResponses = 0;
+	const releaseId = "feed-refresh-cache-release";
+	const primaryBody = (revision: number) =>
+		`Primary source revision ${revision}`;
+	const pageBody = (revision: number) =>
+		`Cursor page source revision ${revision}`;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		deferFeedPageForRequest: (requestNumber, cursor) => {
+			if (
+				cursor === null &&
+				sourceRevision > 1 &&
+				deferredHeadRequest === null
+			) {
+				deferredHeadRequest = requestNumber;
+				return true;
+			}
+			if (cursor !== "feed-refresh-cache-page-2" || deferredPageRequest) {
+				return false;
+			}
+			deferredPageRequest = requestNumber;
+			deferredPageRevision = sourceRevision;
+			return true;
+		},
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				const primary = {
+					...makeReleaseFeedItem({
+						id: releaseId,
+						ts: "2026-04-30T10:00:00Z",
+						tag: releaseId,
+						title: "Primary release while cursor page loads",
+					}),
+					body: primaryBody(sourceRevision),
+				};
+				const fillers = Array.from({ length: 14 }, (_, index) =>
+					makeReleaseFeedItem({
+						id: `feed-refresh-cache-filler-${index}`,
+						ts: `2026-04-30T09:${String(index).padStart(2, "0")}:00Z`,
+						tag: `feed-refresh-cache-filler-${index}`,
+						title: `Feed refresh cache filler ${index}`,
+					}),
+				);
+				return {
+					items: [primary, ...fillers],
+					nextCursor: "feed-refresh-cache-page-2",
+				};
+			}
+
+			const responseRevision =
+				pageResponses++ === 0 ? deferredPageRevision : sourceRevision;
+			return {
+				items: [
+					{
+						...makeReleaseFeedItem({
+							id: "feed-refresh-cache-page-item",
+							ts: "2026-04-29T10:00:00Z",
+							tag: "feed-refresh-cache-page-item",
+							title: `Cursor page revision ${responseRevision}`,
+						}),
+						body: pageBody(responseRevision),
+					},
+				],
+				nextCursor: null,
+			};
+		},
+		dashboardUpdatesResponse: (requestNumber) => {
+			updateRequests += 1;
+			const changed = sourceRevision > 1;
+			return {
+				token: `feed-refresh-cache-${sourceRevision}-${requestNumber}`,
+				generated_at: "2026-04-30T10:00:00Z",
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? [`release:${releaseId}`] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	const release = page.locator(`[data-feed-item-key="release:${releaseId}"]`);
+	await expect(release).toBeVisible({ timeout: 15_000 });
+	await expect(release.getByText(primaryBody(1))).toBeVisible();
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+
+	sourceRevision = 2;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	const newContentButton = page.getByRole("button", {
+		name: "上方有 1 条新动态",
+	});
+	await expect(newContentButton).toBeVisible();
+	await newContentButton.click();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(2);
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	const pageCursorRequestCount = () =>
+		tracker
+			.getFeedRequests()
+			.filter((cursor) => cursor === "feed-refresh-cache-page-2").length;
+	const latePageRequest = await page
+		.waitForRequest(
+			(request) => {
+				const url = new URL(request.url());
+				return (
+					request.method() === "GET" &&
+					url.pathname === "/api/feed" &&
+					url.searchParams.get("cursor") === "feed-refresh-cache-page-2"
+				);
+			},
+			{ timeout: 500 },
+		)
+		.catch((error: unknown) => {
+			if (error instanceof Error && error.name === "TimeoutError") return null;
+			throw error;
+		});
+	expect(latePageRequest).toBeNull();
+	expect(pageCursorRequestCount()).toBe(1);
+
+	tracker.releaseFeedPageRequest(deferredHeadRequest as number);
+	await expect(release.getByText(primaryBody(2))).toBeVisible();
+	await expect
+		.poll(
+			() =>
+				tracker.getFeedRequests().filter((cursor) => cursor === null).length,
+		)
+		.toBeGreaterThan(1);
+
+	await page.evaluate(() => window.scrollTo(0, 0));
+	tracker.releaseFeedPageRequest(deferredPageRequest as number);
+	await expect(page.getByText(pageBody(1))).toHaveCount(0);
+	const requestsBeforeFreshPage = tracker.getFeedRequests().length;
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(() => tracker.getFeedRequests().length)
+		.toBeGreaterThan(requestsBeforeFreshPage);
+	await expect
+		.poll(() => tracker.getFeedRequests().slice(requestsBeforeFreshPage))
+		.toContain("feed-refresh-cache-page-2");
+	await expect(page.getByText(pageBody(2))).toBeVisible();
+});
+
+test("dashboard refetches completed cursor pages after a feed revision refresh", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	let sourceRevision = 1;
+	let updateRequests = 0;
+	let deferredHeadRequest: number | null = null;
+	let cursorPageRequests = 0;
+	const releaseId = "feed-refresh-completed-cache-release";
+	const primaryBody = (revision: number) =>
+		`Completed cache primary revision ${revision}`;
+	const pageBody = (revision: number) =>
+		`Completed cache cursor revision ${revision}`;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		deferFeedPageForRequest: (requestNumber, cursor) => {
+			if (
+				cursor === null &&
+				sourceRevision > 1 &&
+				deferredHeadRequest === null
+			) {
+				deferredHeadRequest = requestNumber;
+				return true;
+			}
+			return false;
+		},
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				const primary = {
+					...makeReleaseFeedItem({
+						id: releaseId,
+						ts: "2026-04-30T10:00:00Z",
+						tag: releaseId,
+						title: "Completed cursor cache primary release",
+					}),
+					body: primaryBody(sourceRevision),
+				};
+				const fillers = Array.from({ length: 14 }, (_, index) =>
+					makeReleaseFeedItem({
+						id: `feed-refresh-completed-cache-filler-${index}`,
+						ts: `2026-04-30T09:${String(index).padStart(2, "0")}:00Z`,
+						tag: `feed-refresh-completed-cache-filler-${index}`,
+						title: `Completed cursor cache filler ${index}`,
+					}),
+				);
+				return {
+					items: [primary, ...fillers],
+					nextCursor: "feed-refresh-completed-cache-page-2",
+				};
+			}
+
+			cursorPageRequests += 1;
+			return {
+				items: [
+					{
+						...makeReleaseFeedItem({
+							id: "feed-refresh-completed-cache-page-item",
+							ts: "2026-04-29T10:00:00Z",
+							tag: "feed-refresh-completed-cache-page-item",
+							title: `Completed cursor cache page ${sourceRevision}`,
+						}),
+						body: pageBody(sourceRevision),
+					},
+				],
+				nextCursor: null,
+			};
+		},
+		dashboardUpdatesResponse: (requestNumber) => {
+			updateRequests += 1;
+			const changed = sourceRevision > 1;
+			return {
+				token: `feed-refresh-completed-cache-${sourceRevision}-${requestNumber}`,
+				generated_at: "2026-04-30T10:00:00Z",
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? [`release:${releaseId}`] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	const release = page.locator(`[data-feed-item-key="release:${releaseId}"]`);
+	await expect(release).toBeVisible({ timeout: 15_000 });
+	await expect(release.getByText(primaryBody(1))).toBeVisible();
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.getByText(pageBody(1))).toBeVisible();
+	await expect.poll(() => cursorPageRequests).toBe(1);
+
+	sourceRevision = 2;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	const newContentButton = page.getByRole("button", {
+		name: "上方有 1 条新动态",
+	});
+	await expect(newContentButton).toBeVisible();
+	await newContentButton.click();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+	tracker.releaseFeedPageRequest(deferredHeadRequest as number);
+	await expect(release.getByText(primaryBody(2))).toBeVisible();
+
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(() => cursorPageRequests).toBe(2);
+	await expect(page.getByText(pageBody(2))).toBeVisible();
+});
+
+test("dashboard ignores pending translation and smart results after feed authorization is revoked", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const privateTitle = "Release before pending result authorization loss";
+	const recoveredTitle = "Release after pending result authorization retry";
+	const staleTranslation = "Stale translation after authorization loss";
+	const freshTranslation = "Fresh translation after authorization retry";
+	const staleSmart = "Stale smart result after authorization loss";
+	const freshSmart = "Fresh smart result after authorization retry";
+	let authorizationDenied = false;
+	let releaseOldTranslation: (() => void) | null = null;
+	let releaseOldSmart: (() => void) | null = null;
+	let markOldTranslationStarted: (() => void) | null = null;
+	let markOldSmartStarted: (() => void) | null = null;
+	let translationRequests = 0;
+	let smartRequests = 0;
+	const oldTranslationGate = new Promise<void>((resolve) => {
+		releaseOldTranslation = resolve;
+	});
+	const oldSmartGate = new Promise<void>((resolve) => {
+		releaseOldSmart = resolve;
+	});
+	const oldTranslationStarted = new Promise<void>((resolve) => {
+		markOldTranslationStarted = resolve;
+	});
+	const oldSmartStarted = new Promise<void>((resolve) => {
+		markOldSmartStarted = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		feedFailureForRequest: (_requestNumber, cursor) => {
+			if (cursor !== "pending-result-auth-page-2") return null;
+			authorizationDenied = true;
+			return {
+				status: 403,
+				code: "unauthorized",
+				message: "feed access revoked",
+			};
+		},
+		deferFeedPageForRequest: (_requestNumber, cursor) =>
+			authorizationDenied && cursor === null,
+		feedPage: (cursor) => {
+			if (cursor !== null) return { items: [], nextCursor: null };
+			const release = {
+				...makeReleaseFeedItem({
+					id: "pending-result-auth-release",
+					ts: "2026-05-01T08:00:00Z",
+					tag: "pending-result-auth",
+					title: authorizationDenied ? recoveredTitle : privateTitle,
+				}),
+				body: authorizationDenied
+					? "fresh source after authorization retry"
+					: "old source before authorization loss",
+				smart: {
+					lang: "zh-CN",
+					status: "missing",
+					title: null,
+					summary: null,
+				},
+			};
+			const fillers = Array.from({ length: 14 }, (_, index) => ({
+				...makeReleaseFeedItem({
+					id: `pending-result-auth-filler-${index}`,
+					ts: `2026-05-01T07:${String(index).padStart(2, "0")}:00Z`,
+					tag: `pending-result-auth-filler-${index}`,
+					title: `Authorization fixture release ${index}`,
+				}),
+				translated: {
+					lang: "zh-CN",
+					status: "disabled",
+					title: null,
+					summary: null,
+				},
+			}));
+			return {
+				items: [release, ...fillers],
+				nextCursor: authorizationDenied ? null : "pending-result-auth-page-2",
+			};
+		},
+	});
+
+	await page.route("**/api/translate/results", async (route) => {
+		const body = route.request().postDataJSON() as {
+			items?: Array<{
+				producer_ref?: string;
+				entity_id?: string;
+				kind?: string;
+				variant?: string;
+			}>;
+		};
+		const results = [];
+		for (const item of body.items ?? []) {
+			const isTranslation = item.producer_ref?.startsWith(
+				"feed.auto_translate:",
+			);
+			const requestNumber = isTranslation
+				? ++translationRequests
+				: ++smartRequests;
+			if (requestNumber === 1 && isTranslation) {
+				markOldTranslationStarted?.();
+				await oldTranslationGate;
+			}
+			if (requestNumber === 1 && !isTranslation) {
+				markOldSmartStarted?.();
+				await oldSmartGate;
+			}
+			const resultText = isTranslation
+				? requestNumber === 1
+					? staleTranslation
+					: freshTranslation
+				: requestNumber === 1
+					? staleSmart
+					: freshSmart;
+			results.push({
+				producer_ref: item.producer_ref,
+				entity_id: item.entity_id,
+				kind: item.kind,
+				variant: item.variant,
+				status: "ready",
+				title_zh: resultText,
+				summary_md: resultText,
+				body_md: resultText,
+				error: null,
+				error_code: null,
+				error_summary: null,
+				error_detail: null,
+			});
+		}
+		return json(route, { items: results });
+	});
+
+	try {
+		await page.goto("/");
+		await expect(page.getByText(privateTitle)).toBeVisible({ timeout: 15_000 });
+		const release = page.locator(
+			'[data-feed-item-key="release:pending-result-auth-release"]',
+		);
+		await release.getByRole("tab", { name: "翻译" }).click();
+		await oldTranslationStarted;
+		await release.getByRole("tab", { name: "润色" }).click();
+		await oldSmartStarted;
+		await scrollPaginationSentinelIntoView(page);
+		await expect
+			.poll(tracker.getFeedRequests)
+			.toContain("pending-result-auth-page-2");
+		await expect(page.getByText(privateTitle)).toHaveCount(0);
+		await expect
+			.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+			.toHaveLength(1);
+		for (const requestNumber of tracker.getDeferredFeedPageRequestNumbers()) {
+			tracker.releaseFeedPageRequest(requestNumber);
+		}
+		await expect(page.getByText(recoveredTitle)).toBeVisible({
+			timeout: 15_000,
+		});
+		const recoveredRelease = page.locator(
+			'[data-feed-item-key="release:pending-result-auth-release"]',
+		);
+		await recoveredRelease.getByRole("tab", { name: "原文" }).click();
+		await recoveredRelease.getByRole("tab", { name: "翻译" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "翻译" })
+				.getByRole("heading", { name: freshTranslation }),
+		).toBeVisible({
+			timeout: 15_000,
+		});
+		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "润色" })
+				.getByRole("heading", { name: freshSmart }),
+		).toBeVisible({
+			timeout: 15_000,
+		});
+
+		releaseOldTranslation?.();
+		releaseOldSmart?.();
+		await recoveredRelease.getByRole("tab", { name: "翻译" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "翻译" })
+				.getByRole("heading", { name: freshTranslation }),
+		).toBeVisible();
+		await recoveredRelease.getByRole("tab", { name: "润色" }).click();
+		await expect(
+			recoveredRelease
+				.getByRole("tabpanel", { name: "润色" })
+				.getByRole("heading", { name: freshSmart }),
+		).toBeVisible();
+		await expect(page.getByText(staleTranslation)).toHaveCount(0);
+		await expect(page.getByText(staleSmart)).toHaveCount(0);
+	} finally {
+		releaseOldTranslation?.();
+		releaseOldSmart?.();
+	}
+});
+
+test("dashboard hides retained readable content when legacy fallback is unauthorized", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+		Object.defineProperty(window.navigator, "onLine", {
+			configurable: true,
+			value: true,
+		});
+	});
+	const title = "Private release before legacy authorization loss";
+	let updateRequests = 0;
+	let compareEvidenceUnavailable = false;
+	let reportFeedChange = false;
+	let failReadableRequestsAfter = Number.POSITIVE_INFINITY;
+	let markDashboardUpdateStarted: (() => void) | null = null;
+	let releaseDashboardUpdate: (() => void) | null = null;
+	const dashboardUpdateStarted = new Promise<void>((resolve) => {
+		markDashboardUpdateStarted = resolve;
+	});
+	const dashboardUpdateGate = new Promise<void>((resolve) => {
+		releaseDashboardUpdate = resolve;
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableRawSection({
+					id: "legacy-auth-revoked",
+					date: "2026-04-30",
+					items: [
+						makeReleaseFeedItem({
+							id: "legacy-auth-revoked-release",
+							ts: "2026-04-30T08:00:00Z",
+							tag: "legacy-auth-revoked",
+							title,
+						}),
+					],
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionPageFailureForRequest: (requestNumber) =>
+			compareEvidenceUnavailable && requestNumber > failReadableRequestsAfter
+				? {
+						status: 503,
+						code: "release_reading_evidence_unavailable",
+						message: "compare evidence unavailable",
+					}
+				: null,
+		feedFailure: {
+			status: 403,
+			code: "unauthorized",
+			message: "feed access revoked",
+		},
+		dashboardUpdatesResponse: async (requestNumber) => {
+			updateRequests += 1;
+			if (requestNumber === 1) {
+				markDashboardUpdateStarted?.();
+				await dashboardUpdateGate;
+			}
+			const changed = reportFeedChange;
+			reportFeedChange = false;
+			return {
+				token: `legacy-auth-refresh-${updateRequests}`,
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? ["release:legacy-auth-revoked-release"] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText(title)).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await dashboardUpdateStarted;
+	failReadableRequestsAfter = tracker.getReadableSectionRequests().length;
+	const readableRequestCountBeforeRefresh = failReadableRequestsAfter;
+	compareEvidenceUnavailable = true;
+	reportFeedChange = true;
+	releaseDashboardUpdate?.();
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toHaveLength(readableRequestCountBeforeRefresh + 1);
+	await expect.poll(tracker.getFeedRequestUrls).toContain("/api/feed?limit=30");
+	await expect(
+		page.locator('[data-dashboard-readable-fallback-error="true"]'),
+	).toBeVisible();
+	await expect(page.getByText(title)).toHaveCount(0);
 });
 
 test("dashboard fetches covered raw releases only after switching a brief to list", async ({

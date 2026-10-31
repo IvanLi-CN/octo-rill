@@ -1,18 +1,14 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-import { buildMockMeResponse } from "./mockApi";
+import {
+	buildMockMeResponse,
+	json,
+	mockUnavailableDashboardReadableFeed,
+} from "./mockApi";
 
 const TWO_LINE_REPO = "acme/release-notes-for-mobile";
 const EXTREME_REPO =
 	"owner-with-a-very-long-github-handle/repository-name-that-keeps-terminal-tail-2026";
-
-function json(route: Route, payload: unknown, status = 200) {
-	return route.fulfill({
-		status,
-		contentType: "application/json",
-		body: JSON.stringify(payload),
-	});
-}
 
 function releaseItem(id: string, repoFullName: string) {
 	return {
@@ -60,6 +56,10 @@ async function installMocks(page: Page) {
 					is_admin: false,
 				}),
 			);
+		}
+
+		if (request.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
 		}
 
 		if (request.method() === "GET" && pathname === "/api/feed") {

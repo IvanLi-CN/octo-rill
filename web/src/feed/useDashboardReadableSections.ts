@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiGet } from "@/api";
+import {
+	applySmartIfSourceMatches,
+	applyTranslationIfSourceMatches,
+} from "@/feed/autoLaneRequests";
 import type {
 	DashboardReadableFeedResponse,
 	DashboardReadableSection,
@@ -22,6 +26,7 @@ export type ReadableSectionsError = {
 	kind: NetworkErrorKind;
 	detail: string | null;
 	at: number;
+	authorizationDenied?: boolean;
 };
 
 export type ReadableSectionDetails = {
@@ -32,7 +37,20 @@ export type ReadableSectionDetails = {
 	refreshPending?: boolean;
 };
 
-export type ReadableRefreshResult = "applied" | "superseded" | "failed";
+export type ReadableRefreshResult =
+	| "applied"
+	| "fallback"
+	| "superseded"
+	| "failed";
+
+function isProtectedFeedUnavailable(error: unknown) {
+	return (
+		error instanceof ApiError &&
+		(error.status === 401 ||
+			error.status === 403 ||
+			(error.status === 404 && error.code === "not_found"))
+	);
+}
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -146,6 +164,7 @@ export function useDashboardReadableSections(options?: {
 		() => `${userId}:${viewerStateKey ?? ""}`,
 		[userId, viewerStateKey],
 	);
+	const [stateSignature, setStateSignature] = useState(signature);
 	const [sections, setSections] = useState<DashboardReadableSection[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(true);
@@ -153,6 +172,7 @@ export function useDashboardReadableSections(options?: {
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<ReadableSectionsError | null>(null);
 	const [legacyFallback, setLegacyFallback] = useState(false);
+	const legacyFallbackRef = useRef(false);
 	const [details, setDetails] = useState<
 		Record<string, ReadableSectionDetails>
 	>({});
@@ -162,6 +182,13 @@ export function useDashboardReadableSections(options?: {
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
 	const lifecycleGenerationRef = useRef(0);
+	const lastSignatureRef = useRef(signature);
+	const contentWriteGenerationRef = useRef(0);
+	if (lastSignatureRef.current !== signature) {
+		lastSignatureRef.current = signature;
+		contentWriteGenerationRef.current += 1;
+	}
+	const contentWriteGeneration = contentWriteGenerationRef.current;
 	const refreshQueueRef = useRef<Promise<ReadableRefreshResult | undefined>>(
 		Promise.resolve(undefined),
 	);
@@ -172,6 +199,39 @@ export function useDashboardReadableSections(options?: {
 	const cursorCompletedRef = useRef(new Set<string>());
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
+	const clearSectionData = useCallback((loadingInitial: boolean) => {
+		contentWriteGenerationRef.current += 1;
+		lifecycleGenerationRef.current += 1;
+		requestIdRef.current += 1;
+		refreshPriorityRef.current += 1;
+		refreshInFlightRef.current = false;
+		cursorInFlightRef.current.clear();
+		cursorCompletedRef.current.clear();
+		detailCursorInFlightRef.current.clear();
+		detailCursorCompletedRef.current.clear();
+		sectionsRef.current = [];
+		detailsRef.current = {};
+		setSections([]);
+		setNextCursor(null);
+		setLoadingInitial(loadingInitial);
+		setLoadingRefresh(false);
+		setLoadingMore(false);
+		setError(null);
+		setDetails({});
+	}, []);
+	const clearContent = useCallback(
+		(options?: { preserveLegacyFallback?: boolean }) => {
+			const preserveLegacyFallback = options?.preserveLegacyFallback ?? false;
+			clearSectionData(!preserveLegacyFallback);
+			legacyFallbackRef.current = preserveLegacyFallback;
+			setLegacyFallback(preserveLegacyFallback);
+		},
+		[clearSectionData],
+	);
+	const clearContentPreservingMode = useCallback(
+		() => clearSectionData(false),
+		[clearSectionData],
+	);
 
 	const loadSections = useCallback(
 		async (
@@ -182,6 +242,8 @@ export function useDashboardReadableSections(options?: {
 				onQueue?: (cancel: () => void) => void;
 			},
 		) => {
+			if (preserveContent && legacyFallbackRef.current) return "fallback";
+
 			const requestId = ++requestIdRef.current;
 			let cancelled = false;
 			const cancelRefresh = () => {
@@ -199,6 +261,26 @@ export function useDashboardReadableSections(options?: {
 				if (options?.throwOnError) throw new Error("刷新已取消");
 				return "superseded";
 			};
+			const enterLegacyFallback = () => {
+				if (legacyFallbackRef.current) return;
+				legacyFallbackRef.current = true;
+				requestIdRef.current += 1;
+				refreshInFlightRef.current = false;
+				cursorInFlightRef.current.clear();
+				detailCursorInFlightRef.current.clear();
+				setLegacyFallback(true);
+				setLoadingInitial(false);
+				setLoadingRefresh(false);
+				setLoadingMore(false);
+				setDetails((current) =>
+					Object.fromEntries(
+						Object.entries(current).map(([sectionId, detail]) => [
+							sectionId,
+							{ ...detail, loading: false },
+						]),
+					),
+				);
+			};
 			refreshInFlightRef.current = preserveContent;
 			cursorInFlightRef.current.clear();
 			cursorCompletedRef.current.clear();
@@ -211,6 +293,7 @@ export function useDashboardReadableSections(options?: {
 			setLoadingMore(false);
 			setError(null);
 			if (!preserveContent) {
+				legacyFallbackRef.current = false;
 				setLegacyFallback(false);
 				setSections([]);
 				sectionsRef.current = [];
@@ -226,7 +309,6 @@ export function useDashboardReadableSections(options?: {
 					),
 				);
 			}
-			let usedLegacyFallback = false;
 			try {
 				let response: DashboardReadableFeedResponse;
 				try {
@@ -234,42 +316,21 @@ export function useDashboardReadableSections(options?: {
 						"/api/dashboard/feed",
 					);
 				} catch (cause) {
-					// Keep rolling deployments and older test fixtures usable while the
-					// readable endpoint is introduced. A successful readable response
-					// always remains the only normal root-feed path.
+					// Older deployments can explicitly signal that readable evidence is
+					// unavailable. Other API failures must remain visible to the user.
 					const endpointUnavailable =
-						(cause instanceof ApiError && cause.status === 404) ||
-						cause instanceof TypeError;
+						cause instanceof ApiError &&
+						cause.code === "release_reading_evidence_unavailable";
 					if (!endpointUnavailable) throw cause;
-					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
 					const superseded = rejectIfSuperseded();
 					if (superseded) return superseded;
-					usedLegacyFallback = true;
-					const legacyItems = legacy.items ?? [];
-					const firstTimestamp =
-						legacyItems[0]?.ts ?? new Date(0).toISOString();
-					response = {
-						sections:
-							legacyItems.length > 0
-								? [
-										{
-											id: "legacy-feed",
-											date: firstTimestamp.slice(0, 10),
-											kind: "raw",
-											item_count: legacyItems.length,
-											brief: null,
-											items: legacyItems,
-											items_next_cursor: null,
-											supplemental_items: [],
-										},
-									]
-								: [],
-						next_cursor: legacy.next_cursor ?? null,
-					};
+					enterLegacyFallback();
+					return "fallback";
 				}
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
-				setLegacyFallback(usedLegacyFallback);
+				legacyFallbackRef.current = false;
+				setLegacyFallback(false);
 				const nextSections = response.sections ?? [];
 				const previousSections = new Map(
 					sectionsRef.current.map((section) => [section.id, section]),
@@ -309,14 +370,21 @@ export function useDashboardReadableSections(options?: {
 			} catch (cause) {
 				const superseded = rejectIfSuperseded();
 				if (superseded) return superseded;
+				const authorizationDenied = isProtectedFeedUnavailable(cause);
+				if (authorizationDenied) {
+					clearContent();
+					setLoadingInitial(false);
+				}
 				const description = describeNetworkAwareError(
 					cause,
 					"可读动态加载失败，请稍后重试。",
 				);
 				setError({
-					phase: preserveContent ? "refresh" : "initial",
+					phase:
+						authorizationDenied || !preserveContent ? "initial" : "refresh",
 					...description,
 					at: Date.now(),
+					authorizationDenied,
 				});
 				if (options?.throwOnError) throw cause;
 				return "failed";
@@ -328,7 +396,7 @@ export function useDashboardReadableSections(options?: {
 				}
 			}
 		},
-		[],
+		[clearContent],
 	);
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
@@ -338,6 +406,9 @@ export function useDashboardReadableSections(options?: {
 			onStart?: (cancel: () => void) => void;
 			onQueue?: (cancel: () => void) => void;
 		}) => {
+			if (legacyFallbackRef.current) {
+				return Promise.resolve<ReadableRefreshResult>("fallback");
+			}
 			const generation = lifecycleGenerationRef.current;
 			const priority = options?.throwOnError
 				? ++refreshPriorityRef.current
@@ -364,6 +435,7 @@ export function useDashboardReadableSections(options?: {
 					) {
 						return Promise.reject(new Error("刷新已取消"));
 					}
+					if (legacyFallbackRef.current) return "fallback";
 					return loadSections(true, {
 						...options,
 						onStart: (cancel) =>
@@ -388,6 +460,7 @@ export function useDashboardReadableSections(options?: {
 						if (options?.throwOnError) throw new Error("刷新已取消");
 						return "superseded";
 					}
+					if (legacyFallbackRef.current) return "fallback";
 					const result = await loadSections(true, options);
 					return result;
 				},
@@ -401,6 +474,7 @@ export function useDashboardReadableSections(options?: {
 	useEffect(() => {
 		if (!enabled) {
 			lifecycleGenerationRef.current += 1;
+			legacyFallbackRef.current = false;
 			refreshInFlightRef.current = false;
 			setLoadingRefresh(false);
 			setLoadingInitial(false);
@@ -411,8 +485,10 @@ export function useDashboardReadableSections(options?: {
 			sectionsRef.current = [];
 			setNextCursor(null);
 			setDetails({});
+			setStateSignature(signature);
 			return;
 		}
+		setStateSignature(signature);
 		void loadInitial();
 		return () => {
 			lifecycleGenerationRef.current += 1;
@@ -425,6 +501,7 @@ export function useDashboardReadableSections(options?: {
 		const requestId = requestIdRef.current;
 		const requestKey = `${requestId}:${cursor ?? ""}`;
 		if (
+			legacyFallbackRef.current ||
 			!cursor ||
 			refreshInFlightRef.current ||
 			loadingMore ||
@@ -442,7 +519,8 @@ export function useDashboardReadableSections(options?: {
 			const response = await apiGet<DashboardReadableFeedResponse>(
 				`/api/dashboard/feed?${params.toString()}`,
 			);
-			if (requestId !== requestIdRef.current) return;
+			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+				return;
 			cursorCompletedRef.current.add(requestKey);
 			setSections((current) => {
 				const byId = new Map(current.map((section) => [section.id, section]));
@@ -470,17 +548,28 @@ export function useDashboardReadableSections(options?: {
 					: null,
 			);
 		} catch (cause) {
-			if (requestId !== requestIdRef.current) return;
+			if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+				return;
+			const authorizationDenied = isProtectedFeedUnavailable(cause);
+			if (authorizationDenied) {
+				clearContent();
+				setLoadingInitial(false);
+			}
 			const description = describeNetworkAwareError(
 				cause,
 				"更多可读动态加载失败，请稍后重试。",
 			);
-			setError({ phase: "append", ...description, at: Date.now() });
+			setError({
+				phase: authorizationDenied ? "initial" : "append",
+				...description,
+				at: Date.now(),
+				authorizationDenied,
+			});
 		} finally {
 			cursorInFlightRef.current.delete(requestKey);
 			if (requestId === requestIdRef.current) setLoadingMore(false);
 		}
-	}, [loadingInitial, loadingMore, nextCursor]);
+	}, [clearContent, loadingInitial, loadingMore, nextCursor]);
 
 	const retry = useCallback(async () => {
 		if (error?.phase === "append") {
@@ -494,7 +583,7 @@ export function useDashboardReadableSections(options?: {
 
 	const loadSectionItems = useCallback(
 		async (sectionId: string, cursor?: string | null) => {
-			if (!enabled) return;
+			if (!enabled || legacyFallbackRef.current) return;
 			const requestId = requestIdRef.current;
 			const normalizedCursor = cursor ?? "__initial__";
 			const requestKey = `${requestId}:${sectionId}:${normalizedCursor}`;
@@ -524,7 +613,8 @@ export function useDashboardReadableSections(options?: {
 				const response = await apiGet<FeedResponse>(
 					`/api/dashboard/feed/sections/${encodeURIComponent(sectionId)}/items${suffix}`,
 				);
-				if (requestId !== requestIdRef.current) return;
+				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+					return;
 				detailCursorCompletedRef.current.add(requestKey);
 				setDetails((previous) => {
 					const before = previous[sectionId] ?? {
@@ -550,7 +640,22 @@ export function useDashboardReadableSections(options?: {
 					};
 				});
 			} catch (cause) {
-				if (requestId !== requestIdRef.current) return;
+				if (requestId !== requestIdRef.current || legacyFallbackRef.current)
+					return;
+				if (isProtectedFeedUnavailable(cause)) {
+					clearContent();
+					setLoadingInitial(false);
+					setError({
+						phase: "initial",
+						...describeNetworkAwareError(
+							cause,
+							"可读动态加载失败，请稍后重试。",
+						),
+						at: Date.now(),
+						authorizationDenied: true,
+					});
+					return;
+				}
 				setDetails((previous) => ({
 					...previous,
 					[sectionId]: {
@@ -565,40 +670,72 @@ export function useDashboardReadableSections(options?: {
 				}));
 			} finally {
 				detailCursorInFlightRef.current.delete(requestKey);
+				if (requestId === requestIdRef.current && legacyFallbackRef.current) {
+					setDetails((previous) => {
+						const detail = previous[sectionId];
+						if (!detail?.loading) return previous;
+						return {
+							...previous,
+							[sectionId]: {
+								...detail,
+								loading: false,
+								refreshPending: false,
+							},
+						};
+					});
+				}
 			}
 		},
-		[enabled],
+		[clearContent, enabled],
 	);
 
-	const applyToItems = useCallback((updater: (item: FeedItem) => FeedItem) => {
-		setSections((current) => updateItems(current, updater));
-		setDetails((current) =>
-			Object.fromEntries(
-				Object.entries(current).map(([id, detail]) => [
-					id,
-					{ ...detail, items: detail.items.map(updater) },
-				]),
-			),
-		);
-	}, []);
+	const applyToItems = useCallback(
+		(updater: (item: FeedItem) => FeedItem) => {
+			if (contentWriteGeneration !== contentWriteGenerationRef.current) return;
+			setSections((current) =>
+				contentWriteGeneration === contentWriteGenerationRef.current
+					? updateItems(current, updater)
+					: current,
+			);
+			setDetails((current) =>
+				contentWriteGeneration === contentWriteGenerationRef.current
+					? Object.fromEntries(
+							Object.entries(current).map(([id, detail]) => [
+								id,
+								{ ...detail, items: detail.items.map(updater) },
+							]),
+						)
+					: current,
+			);
+		},
+		[contentWriteGeneration],
+	);
 
 	const applyTranslation = useCallback(
-		(target: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+		(
+			target: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			translated: TranslatedItem,
+		) => {
 			const key = itemKey(target);
 			applyToItems((item) =>
-				itemKey(item) === key && isLaneCapableFeedItem(item)
-					? { ...item, translated }
+				itemKey(item) === key
+					? applyTranslationIfSourceMatches(item, sourceKey, translated)
 					: item,
 			);
 		},
 		[applyToItems],
 	);
 	const applySmart = useCallback(
-		(target: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+		(
+			target: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			smart: SmartItem,
+		) => {
 			const key = itemKey(target);
 			applyToItems((item) =>
-				itemKey(item) === key && isLaneCapableFeedItem(item)
-					? { ...item, smart }
+				itemKey(item) === key
+					? applySmartIfSourceMatches(item, sourceKey, smart)
 					: item,
 			);
 		},
@@ -616,10 +753,14 @@ export function useDashboardReadableSections(options?: {
 		[applyToItems],
 	);
 
+	const stateCurrent = stateSignature === signature;
+	const visibleSections = stateCurrent ? sections : [];
+	const visibleDetails = stateCurrent ? details : {};
 	const stats = useMemo(() => {
-		const items = sections.flatMap((section) => [
+		const items = visibleSections.flatMap((section) => [
 			...(section.items ?? []),
 			...(section.supplemental_items ?? []),
+			...(visibleDetails[section.id]?.items ?? []),
 		]);
 		return {
 			total: items.length,
@@ -628,19 +769,21 @@ export function useDashboardReadableSections(options?: {
 			followers: items.filter((item) => item.kind === "follower_received")
 				.length,
 		};
-	}, [sections]);
+	}, [visibleDetails, visibleSections]);
 
 	return {
-		sections,
-		nextCursor,
-		hasMore: Boolean(nextCursor),
-		loadingInitial,
-		loadingRefresh,
-		loadingMore,
-		error,
-		legacyFallback,
-		details,
+		sections: visibleSections,
+		nextCursor: stateCurrent ? nextCursor : null,
+		hasMore: stateCurrent && Boolean(nextCursor),
+		loadingInitial: !stateCurrent || loadingInitial,
+		loadingRefresh: stateCurrent && loadingRefresh,
+		loadingMore: stateCurrent && loadingMore,
+		error: stateCurrent ? error : null,
+		legacyFallback: stateCurrent && legacyFallback,
+		details: visibleDetails,
 		stats,
+		clearContent,
+		clearContentPreservingMode,
 		loadInitial,
 		refresh,
 		loadMore,

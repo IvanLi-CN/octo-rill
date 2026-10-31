@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { apiGet } from "@/api";
+import { ApiError, apiGet } from "@/api";
+import {
+	applySmartIfSourceMatches,
+	applyTranslationIfSourceMatches,
+} from "@/feed/autoLaneRequests";
 import {
 	buildDashboardScopeSignature,
 	type DashboardScope,
@@ -13,11 +17,7 @@ import type {
 	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
-import {
-	isLaneCapableFeedItem,
-	isReleaseFeedItem,
-	isSocialFeedItem,
-} from "@/feed/types";
+import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -37,7 +37,17 @@ export type FeedLoadError = {
 	kind: NetworkErrorKind;
 	detail: string | null;
 	at: number;
+	authorizationDenied: boolean;
 };
+
+function isProtectedFeedUnavailable(error: unknown) {
+	return (
+		error instanceof ApiError &&
+		(error.status === 401 ||
+			error.status === 403 ||
+			(error.status === 404 && error.code === "not_found"))
+	);
+}
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -176,18 +186,73 @@ export function useFeed(
 	const initialStateMatches = initialData?.type === type;
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [appendError, setAppendError] = useState<FeedLoadError | null>(null);
+	const [authorizationDenied, setAuthorizationDenied] = useState<{
+		queryKey: string;
+		error: ApiError;
+	} | null>(null);
+	const queryKeySignature = JSON.stringify(queryKey);
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
+	const [refreshing, setRefreshing] = useState(false);
 
 	const reqIdRef = useRef(0);
+	const refreshingReqIdRef = useRef<number | null>(null);
+	const queryRequestSeqRef = useRef(0);
+	const invalidateRequests = useCallback(() => {
+		reqIdRef.current += 1;
+		refreshingReqIdRef.current = null;
+		queryRequestSeqRef.current += 1;
+		void queryClient.cancelQueries({
+			queryKey: ["dashboard", "feed", { userId }],
+		});
+		setRefreshing(false);
+		setLoadingMore(false);
+		setAppendError(null);
+	}, [queryClient, userId]);
+	const clearCachedFeedContent = useCallback(() => {
+		invalidateRequests();
+		queryClient.setQueryData<DashboardFeedQueryData>(queryKey, {
+			type,
+			scopeSignature,
+			items: [],
+			nextCursor: null,
+		});
+		queryClient.setQueriesData<DashboardFeedQueryData>(
+			{ queryKey: ["dashboard", "feed", { userId }] },
+			(current) =>
+				current ? { ...current, items: [], nextCursor: null } : current,
+		);
+	}, [invalidateRequests, queryClient, queryKey, scopeSignature, type, userId]);
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
 		enabled,
+		retry: (failureCount, error) =>
+			!isProtectedFeedUnavailable(error) && failureCount < 1,
 		queryFn: async ({ signal }) => {
+			const requestSeq = ++queryRequestSeqRef.current;
+			const requestIsCurrent = () =>
+				requestSeq === queryRequestSeqRef.current && !signal.aborted;
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
-			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
-				signal,
-			});
+			let res: FeedResponse;
+			try {
+				res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
+					signal,
+				});
+				if (requestIsCurrent()) {
+					setAuthorizationDenied((current) =>
+						current?.queryKey === queryKeySignature ? null : current,
+					);
+				}
+			} catch (error) {
+				if (
+					requestIsCurrent() &&
+					error instanceof ApiError &&
+					isProtectedFeedUnavailable(error)
+				) {
+					setAuthorizationDenied({ queryKey: queryKeySignature, error });
+				}
+				throw error;
+			}
 			return {
 				type,
 				scopeSignature,
@@ -210,25 +275,54 @@ export function useFeed(
 		staleTime: DASHBOARD_QUERY_STALE_MS,
 		gcTime: DASHBOARD_QUERY_MAX_AGE_MS,
 	});
+	const authorizationDeniedError =
+		authorizationDenied?.queryKey === queryKeySignature
+			? authorizationDenied.error
+			: null;
+	const feedAuthorizationDenied =
+		Boolean(authorizationDeniedError) ||
+		isProtectedFeedUnavailable(query.error);
+	useEffect(() => {
+		if (!feedAuthorizationDenied || query.isFetching) return;
+		clearCachedFeedContent();
+	}, [clearCachedFeedContent, feedAuthorizationDenied, query.isFetching]);
 
 	const currentData = query.data ?? null;
-	const currentItems = currentData?.items ?? [];
-	const currentNextCursor = currentData?.nextCursor ?? null;
+	const hasSuccessfulRead =
+		feedAuthorizationDenied ||
+		(queryClient.getQueryState<DashboardFeedQueryData>(queryKey)
+			?.dataUpdateCount ?? 0) > 0;
+	const currentItems = feedAuthorizationDenied
+		? []
+		: (currentData?.items ?? []);
+	const currentNextCursor = feedAuthorizationDenied
+		? null
+		: (currentData?.nextCursor ?? null);
 	const currentLoadingInitial = enabled && !currentData && query.isPending;
 	const hasMore = Boolean(currentNextCursor);
-	const currentInitialError = query.error
-		? {
-				phase: "initial" as const,
-				...describeNetworkAwareError(query.error, "动态加载失败，请稍后重试。"),
-				at: query.errorUpdatedAt || Date.now(),
-			}
-		: null;
-	const currentError = appendError ?? currentInitialError;
+	const currentInitialError =
+		(authorizationDeniedError ?? query.error)
+			? {
+					phase: "initial" as const,
+					...describeNetworkAwareError(
+						authorizationDeniedError ?? query.error,
+						"动态加载失败，请稍后重试。",
+					),
+					at: query.errorUpdatedAt || Date.now(),
+					authorizationDenied: feedAuthorizationDenied,
+				}
+			: null;
+	const currentError = feedAuthorizationDenied
+		? currentInitialError
+		: (appendError ?? currentInitialError);
 
 	useEffect(() => {
 		reqIdRef.current += 1;
+		refreshingReqIdRef.current = null;
+		setRefreshing(false);
 		setLoadingMore(false);
 		setAppendError(null);
+		setAuthorizationDenied(null);
 		setFreshKeys(new Set());
 	}, [queryKey]);
 
@@ -236,43 +330,87 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
+			force?: boolean;
 			onStart?: (cancel: () => void) => void;
 		}) => {
-			if (!enabled) return;
+			if (!enabled && !options?.force) return;
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
-			const cancelled = Symbol("feed-refresh-cancelled");
-			let cancelRefresh = () => undefined;
-			const cancellation = new Promise<typeof cancelled>((resolve) => {
-				cancelRefresh = () => {
-					if (reqId !== reqIdRef.current) return;
-					reqIdRef.current += 1;
-					void queryClient.cancelQueries({ queryKey, exact: true });
-					resolve(cancelled);
-				};
-			});
-			options?.onStart?.(cancelRefresh);
+			refreshingReqIdRef.current = reqId;
+			setRefreshing(true);
+			try {
+				const cancelled = Symbol("feed-refresh-cancelled");
+				let cancelRefresh = () => undefined;
+				const cancellation = new Promise<typeof cancelled>((resolve) => {
+					cancelRefresh = () => {
+						if (reqId !== reqIdRef.current) return;
+						reqIdRef.current += 1;
+						void queryClient.cancelQueries({ queryKey, exact: true });
+						resolve(cancelled);
+					};
+				});
+				options?.onStart?.(cancelRefresh);
 
-			// Cancel any in-flight "load more" state; we are replacing the list.
-			setLoadingMore(false);
-			setAppendError(null);
-			const result = await Promise.race([query.refetch(), cancellation]);
-			if (result === cancelled) return;
-			if (reqId !== reqIdRef.current) return;
-			if (result.error) {
-				if (options?.throwOnError) {
-					throw result.error;
+				// Cancel any in-flight "load more" state; we are replacing the list.
+				setLoadingMore(false);
+				setAppendError(null);
+				const currentPageQueries = {
+					predicate: (query: { queryKey: readonly unknown[] }) => {
+						const [root, name, dimensions] = query.queryKey;
+						if (
+							root !== "dashboard" ||
+							name !== "feed" ||
+							!dimensions ||
+							typeof dimensions !== "object"
+						) {
+							return false;
+						}
+						const pageKey = dimensions as Record<string, unknown>;
+						return (
+							pageKey.userId === userId &&
+							pageKey.type === type &&
+							pageKey.scope === scopeSignature &&
+							pageKey.viewerStateKey === viewerStateKey &&
+							typeof pageKey.cursor === "string"
+						);
+					},
+				};
+				await queryClient.cancelQueries(currentPageQueries);
+				queryClient.removeQueries(currentPageQueries);
+				if (reqId !== reqIdRef.current) return;
+				const result = await Promise.race([query.refetch(), cancellation]);
+				if (result === cancelled) return;
+				if (reqId !== reqIdRef.current) return;
+				if (result.error) {
+					if (options?.throwOnError) {
+						throw result.error;
+					}
+					return;
 				}
-				return;
-			}
-			if (result.data) {
-				setFreshKeys(new Set(options?.freshKeys ?? []));
+				if (result.data) {
+					setFreshKeys(new Set(options?.freshKeys ?? []));
+				}
+			} finally {
+				if (refreshingReqIdRef.current === reqId) {
+					refreshingReqIdRef.current = null;
+					setRefreshing(false);
+				}
 			}
 		},
-		[enabled, query.refetch, queryClient, queryKey],
+		[
+			enabled,
+			query.refetch,
+			queryClient,
+			queryKey,
+			scopeSignature,
+			type,
+			userId,
+			viewerStateKey,
+		],
 	);
 
 	const loadMore = useCallback(async () => {
+		if (refreshingReqIdRef.current !== null) return;
 		if (!currentNextCursor || loadingMore || currentLoadingInitial) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
@@ -311,6 +449,10 @@ export function useFeed(
 			}));
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
+			const authorizationDenied = isProtectedFeedUnavailable(err);
+			if (err instanceof ApiError && authorizationDenied) {
+				setAuthorizationDenied({ queryKey: queryKeySignature, error: err });
+			}
 			const description = describeNetworkAwareError(
 				err,
 				"更多动态加载失败，请稍后重试。",
@@ -321,6 +463,7 @@ export function useFeed(
 				kind: description.kind,
 				detail: description.detail,
 				at: Date.now(),
+				authorizationDenied,
 			});
 		} finally {
 			if (reqId === reqIdRef.current) {
@@ -333,6 +476,8 @@ export function useFeed(
 		loadingMore,
 		queryClient,
 		queryKey,
+		clearCachedFeedContent,
+		queryKeySignature,
 		scope,
 		scopeSignature,
 		type,
@@ -344,6 +489,7 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
+			force?: boolean;
 			onStart?: (cancel: () => void) => void;
 		}) => {
 			await loadInitial(options);
@@ -352,7 +498,11 @@ export function useFeed(
 	);
 
 	const applyTranslation = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			translated: TranslatedItem,
+		) => {
 			const key = itemKey(item);
 			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
 				current
@@ -360,11 +510,11 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isLaneCapableFeedItem(it)) return it;
-								return {
-									...it,
-									translated: { ...translated },
-								};
+								return applyTranslationIfSourceMatches(
+									it,
+									sourceKey,
+									translated,
+								);
 							}),
 						}
 					: current,
@@ -374,7 +524,11 @@ export function useFeed(
 	);
 
 	const applySmart = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			smart: SmartItem,
+		) => {
 			const key = itemKey(item);
 			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
 				current
@@ -382,11 +536,7 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isLaneCapableFeedItem(it)) return it;
-								return {
-									...it,
-									smart: { ...smart },
-								};
+								return applySmartIfSourceMatches(it, sourceKey, smart);
 							}),
 						}
 					: current,
@@ -432,13 +582,16 @@ export function useFeed(
 
 	return {
 		items: currentItems,
+		hasSuccessfulRead,
 		freshKeys,
 		nextCursor: currentNextCursor,
 		hasMore,
 		loadingInitial: currentLoadingInitial,
+		refreshing,
 		loadingMore,
 		error: currentError,
 		stats,
+		invalidateRequests,
 		loadInitial,
 		loadMore,
 		refresh,
