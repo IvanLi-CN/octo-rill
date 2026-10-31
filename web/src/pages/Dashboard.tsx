@@ -2938,7 +2938,16 @@ export function Dashboard(props: {
 			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			if (readableSectionsActive) {
 				const result = await refreshFeed();
-				if (result !== "applied") return;
+				if (result === "fallback") {
+					await feed.refresh({
+						freshKeys: Array.from(new Set([...feed.freshKeys, ...freshKeys])),
+						throwOnError: true,
+						force: true,
+					});
+					scrollToFreshFeedTop(freshKeys);
+				} else if (result !== "applied") {
+					return;
+				}
 				dismissFeedBoundary(notice.boundaryId);
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
@@ -2973,6 +2982,7 @@ export function Dashboard(props: {
 			dismissFeedBoundary,
 			initialAccessPending,
 			feed.freshKeys,
+			feed.refresh,
 			refreshFeed,
 			readableSectionsActive,
 			readableSectionsVisible,

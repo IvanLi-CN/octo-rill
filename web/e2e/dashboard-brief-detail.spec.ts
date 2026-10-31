@@ -1067,6 +1067,137 @@ test("dashboard clears legacy releases and retries after pagination authorizatio
 	await expect(page.getByText(recoveredTitle)).toBeVisible({ timeout: 15_000 });
 });
 
+test("dashboard refresh drops cursor pages completed from an older feed revision", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	let sourceRevision = 1;
+	let reportFeedChange = false;
+	let updateRequests = 0;
+	let deferredPageRequest: number | null = null;
+	let deferredPageRevision = 1;
+	let pageResponses = 0;
+	const releaseId = "feed-refresh-cache-release";
+	const primaryBody = (revision: number) =>
+		`Primary source revision ${revision}`;
+	const pageBody = (revision: number) =>
+		`Cursor page source revision ${revision}`;
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailure: {
+			status: 503,
+			code: "release_reading_evidence_unavailable",
+			message: "readable evidence unavailable",
+		},
+		deferFeedPageForRequest: (requestNumber, cursor) => {
+			if (cursor !== "feed-refresh-cache-page-2" || deferredPageRequest) {
+				return false;
+			}
+			deferredPageRequest = requestNumber;
+			deferredPageRevision = sourceRevision;
+			return true;
+		},
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				const primary = {
+					...makeReleaseFeedItem({
+						id: releaseId,
+						ts: "2026-04-30T10:00:00Z",
+						tag: releaseId,
+						title: "Primary release while cursor page loads",
+					}),
+					body: primaryBody(sourceRevision),
+				};
+				const fillers = Array.from({ length: 14 }, (_, index) =>
+					makeReleaseFeedItem({
+						id: `feed-refresh-cache-filler-${index}`,
+						ts: `2026-04-30T09:${String(index).padStart(2, "0")}:00Z`,
+						tag: `feed-refresh-cache-filler-${index}`,
+						title: `Feed refresh cache filler ${index}`,
+					}),
+				);
+				return {
+					items: [primary, ...fillers],
+					nextCursor: "feed-refresh-cache-page-2",
+				};
+			}
+
+			const responseRevision =
+				pageResponses++ === 0 ? deferredPageRevision : sourceRevision;
+			return {
+				items: [
+					{
+						...makeReleaseFeedItem({
+							id: "feed-refresh-cache-page-item",
+							ts: "2026-04-29T10:00:00Z",
+							tag: "feed-refresh-cache-page-item",
+							title: `Cursor page revision ${responseRevision}`,
+						}),
+						body: pageBody(responseRevision),
+					},
+				],
+				nextCursor: null,
+			};
+		},
+		dashboardUpdatesResponse: (requestNumber) => {
+			updateRequests += 1;
+			const changed = reportFeedChange;
+			reportFeedChange = false;
+			return {
+				token: `feed-refresh-cache-${requestNumber}`,
+				generated_at: "2026-04-30T10:00:00Z",
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? [`release:${releaseId}`] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			};
+		},
+	});
+
+	await page.goto("/");
+	const release = page.locator(`[data-feed-item-key="release:${releaseId}"]`);
+	await expect(release).toBeVisible({ timeout: 15_000 });
+	await expect(release.getByText(primaryBody(1))).toBeVisible();
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(1);
+
+	sourceRevision = 2;
+	reportFeedChange = true;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	const newContentButton = page.getByRole("button", {
+		name: "上方有 1 条新动态",
+	});
+	await expect(newContentButton).toBeVisible();
+	await newContentButton.click();
+	await expect(release.getByText(primaryBody(2))).toBeVisible();
+	await expect
+		.poll(
+			() =>
+				tracker.getFeedRequests().filter((cursor) => cursor === null).length,
+		)
+		.toBeGreaterThan(1);
+
+	await page.evaluate(() => window.scrollTo(0, 0));
+	tracker.releaseFeedPageRequest(deferredPageRequest as number);
+	await expect(page.getByText(pageBody(1))).toHaveCount(0);
+	const requestsBeforeFreshPage = tracker.getFeedRequests().length;
+	await scrollPaginationSentinelIntoView(page);
+	await expect
+		.poll(() => tracker.getFeedRequests().length)
+		.toBeGreaterThan(requestsBeforeFreshPage);
+	await expect
+		.poll(() => tracker.getFeedRequests().slice(requestsBeforeFreshPage))
+		.toContain("feed-refresh-cache-page-2");
+	await expect(page.getByText(pageBody(2))).toBeVisible();
+});
+
 test("dashboard ignores pending translation and smart results after feed authorization is revoked", async ({
 	page,
 }) => {
