@@ -1106,13 +1106,227 @@ test("late release detail response does not reopen a closed target", async ({
 		await detailDialog.getByRole("button", { name: "关闭" }).click();
 		await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-02-23$/);
 
+		const lateDetailResponse = page.waitForResponse((response) => {
+			return (
+				new URL(response.url()).pathname === "/api/releases/289513858/detail"
+			);
+		});
 		detailFetchGate.release();
+		const response = await lateDetailResponse;
+		await response.finished();
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) => {
+					window.setTimeout(() => {
+						requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+					}, 0);
+				}),
+		);
 		await expect(page).not.toHaveURL(
 			/\/owner\/repo\/releases\/tag\/v1\.2\.3\?from=briefs$/,
 		);
 		await expect(detailDialog).toHaveCount(0);
 	} finally {
 		detailFetchGate.release();
+	}
+});
+
+test("late detail translation cannot overwrite the reopened current response", async ({
+	page,
+}) => {
+	const translationGate = createPendingGate();
+	let markTranslationStarted = () => {};
+	const translationStarted = new Promise<void>((resolve) => {
+		markTranslationStarted = resolve;
+	});
+	let reopenedDetail = false;
+
+	await installApiMocks(page, {
+		releaseId: "123",
+		briefId: "brief-2026-02-23",
+		releaseDetailSmartInitialStatus: "ready",
+	});
+	await page.route(
+		"**/api/repos/owner/repo/releases/tag/v1.2.3/detail",
+		async (route) => {
+			return json(route, {
+				release_id: "123",
+				repo_full_name: "owner/repo",
+				repo_visual: {
+					owner_avatar_url: null,
+					open_graph_image_url: null,
+					uses_custom_open_graph_image: false,
+				},
+				tag_name: "v1.2.3",
+				previous_tag_name: "v1.2.2",
+				name: reopenedDetail
+					? "Current release detail"
+					: "Initial release detail",
+				body: reopenedDetail ? "updated source" : "initial source",
+				body_truncated: false,
+				html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
+				published_at: "2026-02-22T11:22:33Z",
+				is_prerelease: 0,
+				is_draft: 0,
+				translated: reopenedDetail
+					? {
+							lang: "zh-CN",
+							status: "ready",
+							title: "Current translation",
+							summary: "Current translated body",
+							error_code: null,
+							error_summary: null,
+							error_detail: null,
+						}
+					: {
+							lang: "zh-CN",
+							status: "missing",
+							title: null,
+							summary: null,
+							error_code: null,
+							error_summary: null,
+							error_detail: null,
+						},
+				smart: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "Polished release",
+					summary: "Current polished body",
+					error_code: null,
+					error_summary: null,
+					error_detail: null,
+				},
+			});
+		},
+	);
+	let staleTranslationRequestReads = 0;
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (
+			request.method() === "GET" &&
+			url.pathname === "/api/translate/requests/late-release-detail-request"
+		) {
+			staleTranslationRequestReads += 1;
+		}
+	});
+	let translationSubmissionCount = 0;
+	await page.route("**/api/translate/requests", async (route) => {
+		const body = route.request().postDataJSON() as {
+			mode?: string;
+			item?: { kind?: string; entity_id?: string };
+		};
+		if (body.mode !== "wait" || body.item?.kind !== "release_detail") {
+			await route.fallback();
+			return;
+		}
+		translationSubmissionCount += 1;
+		if (translationSubmissionCount > 1) {
+			return json(route, {
+				request_id: "current-release-detail-request",
+				status: "completed",
+				result: {
+					producer_ref: "release_detail:123",
+					entity_id: "123",
+					kind: "release_detail",
+					variant: "detail_card",
+					status: "ready",
+					title_zh: "Current translation",
+					summary_md: null,
+					body_md: "Current translated body",
+					error: null,
+					error_code: null,
+					error_summary: null,
+					error_detail: null,
+					work_item_id: "current-work",
+					batch_id: "current-batch",
+				},
+			});
+		}
+		markTranslationStarted();
+		await translationGate.wait;
+		return json(route, {
+			request_id: "late-release-detail-request",
+			status: "running",
+			result: {
+				producer_ref: "release_detail:123",
+				entity_id: "123",
+				kind: "release_detail",
+				variant: "detail_card",
+				status: "running",
+				title_zh: "Stale translation",
+				summary_md: null,
+				body_md: "Stale translated body",
+				error: null,
+				error_code: null,
+				error_summary: null,
+				error_detail: null,
+				work_item_id: "late-work",
+				batch_id: "late-batch",
+			},
+		});
+	});
+
+	try {
+		await page.goto("/briefs?brief=brief-2026-02-23");
+		await page.getByText("repo/v1.2.3", { exact: true }).click();
+		const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+		await detailDialog.getByRole("tab", { name: "原文" }).click();
+		await expect(
+			detailDialog.getByRole("heading", { name: "Initial release detail" }),
+		).toBeVisible();
+		await detailDialog.getByRole("tab", { name: "翻译" }).click();
+		await translationStarted;
+		await detailDialog.getByRole("button", { name: "关闭" }).click();
+		await expect(detailDialog).toHaveCount(0);
+
+		reopenedDetail = true;
+		await page.getByText("repo/v1.2.3", { exact: true }).click();
+		await detailDialog.getByRole("tab", { name: "原文" }).click();
+		await expect(
+			detailDialog.getByRole("heading", { name: "Current release detail" }),
+		).toBeVisible();
+
+		const lateTranslationResponse = page.waitForResponse((response) => {
+			const url = new URL(response.url());
+			return (
+				url.pathname === "/api/translate/requests" &&
+				response.request().method() === "POST"
+			);
+		});
+		translationGate.release();
+		const response = await lateTranslationResponse;
+		await response.finished();
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) => {
+					window.setTimeout(() => {
+						requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+					}, 0);
+				}),
+		);
+		await detailDialog.getByRole("tab", { name: "翻译" }).click();
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+		);
+		await expect(
+			detailDialog.getByText("Current translated body"),
+		).toBeVisible();
+		expect(staleTranslationRequestReads).toBe(0);
+		await expect(detailDialog.getByText("翻译正在后台处理中。")).toHaveCount(0);
+		const currentTranslationResponse = page.waitForResponse((candidate) => {
+			const url = new URL(candidate.url());
+			return (
+				candidate.request().method() === "POST" &&
+				url.pathname === "/api/translate/requests"
+			);
+		});
+		await detailDialog.getByRole("tab", { name: "翻译" }).click();
+		const nextTranslationResponse = await currentTranslationResponse;
+		await nextTranslationResponse.finished();
+		expect(staleTranslationRequestReads).toBe(0);
+	} finally {
+		translationGate.release();
 	}
 });
 
