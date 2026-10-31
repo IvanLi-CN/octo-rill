@@ -345,6 +345,30 @@ export function useFeed(
 			// Cancel any in-flight "load more" state; we are replacing the list.
 			setLoadingMore(false);
 			setAppendError(null);
+			const currentPageQueries = {
+				predicate: (query: { queryKey: readonly unknown[] }) => {
+					const [root, name, dimensions] = query.queryKey;
+					if (
+						root !== "dashboard" ||
+						name !== "feed" ||
+						!dimensions ||
+						typeof dimensions !== "object"
+					) {
+						return false;
+					}
+					const pageKey = dimensions as Record<string, unknown>;
+					return (
+						pageKey.userId === userId &&
+						pageKey.type === type &&
+						pageKey.scope === scopeSignature &&
+						pageKey.viewerStateKey === viewerStateKey &&
+						typeof pageKey.cursor === "string"
+					);
+				},
+			};
+			await queryClient.cancelQueries(currentPageQueries);
+			queryClient.removeQueries(currentPageQueries);
+			if (reqId !== reqIdRef.current) return;
 			const result = await Promise.race([query.refetch(), cancellation]);
 			if (result === cancelled) return;
 			if (reqId !== reqIdRef.current) return;
@@ -358,7 +382,16 @@ export function useFeed(
 				setFreshKeys(new Set(options?.freshKeys ?? []));
 			}
 		},
-		[enabled, query.refetch, queryClient, queryKey],
+		[
+			enabled,
+			query.refetch,
+			queryClient,
+			queryKey,
+			scopeSignature,
+			type,
+			userId,
+			viewerStateKey,
+		],
 	);
 
 	const loadMore = useCallback(async () => {
