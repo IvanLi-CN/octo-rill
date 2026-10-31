@@ -1923,7 +1923,7 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 				JSON.stringify({
 					savedAt: Date.now(),
 					userId: "2f4k7m9p3x6c8v2a",
-					viewerStateKey: "stable",
+					viewerStateKey: "00:00|Asia/Shanghai|480|0",
 					routeState: { tab: "all", activeReleaseId: null },
 					feedRequestType: "all",
 					feedItems: [
@@ -2771,6 +2771,9 @@ test("dashboard discards warm feed and reaction responses after successful acces
 	let markInitialReactionStarted: (() => void) | null = null;
 	let releaseInitialReaction: (() => void) | null = null;
 	let markInitialReactionResponseCompleted: (() => void) | null = null;
+	let markManualReactionStarted: (() => void) | null = null;
+	let releaseManualReaction: (() => void) | null = null;
+	let markManualReactionResponseCompleted: (() => void) | null = null;
 	const readableRefreshStarted = new Promise<void>((resolve) => {
 		markReadableRefreshStarted = resolve;
 	});
@@ -2785,6 +2788,15 @@ test("dashboard discards warm feed and reaction responses after successful acces
 	});
 	const initialReactionResponseCompleted = new Promise<void>((resolve) => {
 		markInitialReactionResponseCompleted = resolve;
+	});
+	const manualReactionStarted = new Promise<void>((resolve) => {
+		markManualReactionStarted = resolve;
+	});
+	const manualReactionGate = new Promise<void>((resolve) => {
+		releaseManualReaction = resolve;
+	});
+	const manualReactionResponseCompleted = new Promise<void>((resolve) => {
+		markManualReactionResponseCompleted = resolve;
 	});
 
 	await page.addInitScript(
@@ -2982,6 +2994,23 @@ test("dashboard discards warm feed and reaction responses after successful acces
 			}
 			return;
 		}
+		if (
+			req.method() === "POST" &&
+			pathname === "/api/release/reactions/toggle"
+		) {
+			markManualReactionStarted?.();
+			await manualReactionGate;
+			try {
+				await json(route, {
+					reactions: buildReactionFooterReady(1),
+				});
+			} catch {
+				// Access refresh may abort the old request before the response is sent.
+			} finally {
+				markManualReactionResponseCompleted?.();
+			}
+			return;
+		}
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
 			return json(route, {
 				configured: true,
@@ -3027,6 +3056,10 @@ test("dashboard discards warm feed and reaction responses after successful acces
 		});
 		await initialReactionStarted;
 		await expect.poll(() => reactionRefreshCalls).toBe(1);
+		const plusOneReaction = page.locator('[data-reaction-trigger="plus1"]');
+		await plusOneReaction.first().click();
+		await manualReactionStarted;
+		await expect(plusOneReaction.first()).toHaveClass(/opacity-80/);
 		await page
 			.getByRole("banner")
 			.getByRole("button", { name: "同步" })
@@ -3073,9 +3106,22 @@ test("dashboard discards warm feed and reaction responses after successful acces
 		await expect
 			.poll(() => reactionRefreshCalls, { timeout: 5000 })
 			.toBeGreaterThan(1);
-		await expect(
-			page.locator('[data-reaction-trigger="plus1"]'),
-		).toHaveAttribute("data-reaction-count", "12");
+		await expect(plusOneReaction).toHaveAttribute("data-reaction-count", "12");
+		await expect(plusOneReaction.first()).not.toHaveClass(/opacity-80/);
+
+		releaseManualReaction?.();
+		await manualReactionResponseCompleted;
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+				),
+		);
+		await expect(plusOneReaction.first()).toHaveAttribute(
+			"data-reaction-count",
+			"12",
+		);
+		await expect(plusOneReaction.first()).not.toHaveClass(/opacity-80/);
 
 		releaseInitialReaction?.();
 		await initialReactionResponseCompleted;
@@ -3091,6 +3137,7 @@ test("dashboard discards warm feed and reaction responses after successful acces
 	} finally {
 		releaseReadableRefresh?.();
 		releaseInitialReaction?.();
+		releaseManualReaction?.();
 	}
 });
 
