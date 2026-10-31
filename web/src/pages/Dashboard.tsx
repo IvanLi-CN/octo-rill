@@ -2956,18 +2956,13 @@ export function Dashboard(props: {
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
 			}
-			const hasHydratedFreshItems = feed.items.some((item) =>
-				freshKeys.includes(feedItemKey(item)),
+			const nextFreshKeys = Array.from(
+				new Set([...feed.freshKeys, ...freshKeys]),
 			);
-			if (!hasHydratedFreshItems) {
-				const nextFreshKeys = Array.from(
-					new Set([...feed.freshKeys, ...freshKeys]),
-				);
-				await refreshFeed({
-					freshKeys: nextFreshKeys,
-					throwOnError: true,
-				});
-			}
+			await refreshFeed({
+				freshKeys: nextFreshKeys,
+				throwOnError: true,
+			});
 			scrollToFreshFeedTop(freshKeys);
 			dismissFeedBoundary(notice.boundaryId);
 			await checkDashboardUpdates({ emit: false, include: ["feed"] });
@@ -2978,7 +2973,6 @@ export function Dashboard(props: {
 			dismissFeedBoundary,
 			initialAccessPending,
 			feed.freshKeys,
-			feed.items,
 			refreshFeed,
 			readableSectionsActive,
 			readableSectionsVisible,

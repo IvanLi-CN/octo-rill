@@ -791,8 +791,8 @@ test("dashboard hides readable release content when refresh authorization is rev
 		readableSectionPageFailureForRequest: (requestNumber) =>
 			revokeReadableAccess && requestNumber > failReadableRequestsAfter
 				? {
-						status: 403,
-						code: "unauthorized",
+						status: 404,
+						code: "not_found",
 						message: "read access revoked",
 					}
 				: null,
@@ -1019,8 +1019,8 @@ test("dashboard clears legacy releases and retries after pagination authorizatio
 			authorizationDenied = true;
 			deniedLegacyRequestNumber ||= requestNumber;
 			return {
-				status: 403,
-				code: "unauthorized",
+				status: 404,
+				code: "not_found",
 				message: "feed access revoked",
 			};
 		},

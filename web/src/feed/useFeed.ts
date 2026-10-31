@@ -40,9 +40,12 @@ export type FeedLoadError = {
 	authorizationDenied: boolean;
 };
 
-function isAuthorizationDenied(error: unknown) {
+function isProtectedFeedUnavailable(error: unknown) {
 	return (
-		error instanceof ApiError && (error.status === 401 || error.status === 403)
+		error instanceof ApiError &&
+		(error.status === 401 ||
+			error.status === 403 ||
+			(error.status === 404 && error.code === "not_found"))
 	);
 }
 
@@ -219,7 +222,7 @@ export function useFeed(
 		queryKey,
 		enabled,
 		retry: (failureCount, error) =>
-			!isAuthorizationDenied(error) && failureCount < 1,
+			!isProtectedFeedUnavailable(error) && failureCount < 1,
 		queryFn: async ({ signal }) => {
 			const requestSeq = ++queryRequestSeqRef.current;
 			const requestIsCurrent = () =>
@@ -240,7 +243,7 @@ export function useFeed(
 				if (
 					requestIsCurrent() &&
 					error instanceof ApiError &&
-					isAuthorizationDenied(error)
+					isProtectedFeedUnavailable(error)
 				) {
 					setAuthorizationDenied({ queryKey: queryKeySignature, error });
 				}
@@ -273,7 +276,8 @@ export function useFeed(
 			? authorizationDenied.error
 			: null;
 	const feedAuthorizationDenied =
-		Boolean(authorizationDeniedError) || isAuthorizationDenied(query.error);
+		Boolean(authorizationDeniedError) ||
+		isProtectedFeedUnavailable(query.error);
 	useEffect(() => {
 		if (!feedAuthorizationDenied || query.isFetching) return;
 		clearCachedFeedContent();
@@ -396,7 +400,7 @@ export function useFeed(
 			}));
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
-			const authorizationDenied = isAuthorizationDenied(err);
+			const authorizationDenied = isProtectedFeedUnavailable(err);
 			if (err instanceof ApiError && authorizationDenied) {
 				setAuthorizationDenied({ queryKey: queryKeySignature, error: err });
 			}
