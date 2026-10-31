@@ -18008,18 +18008,23 @@ async fn overlay_global_feed_processing(
             )
         };
         let global_smart_input = if row.kind == "release" {
-            Some(
+            let release_id = row
+                .entity_id
+                .parse::<i64>()
+                .map_err(|error| ApiError::bad_request(format!("invalid release id: {error}")))?;
+            match release_feed_projection_result(
                 global_release_request_item(
                     state,
                     user_id,
-                    row.entity_id.parse::<i64>().map_err(|error| {
-                        ApiError::bad_request(format!("invalid release id: {error}"))
-                    })?,
+                    release_id,
                     "release_smart",
                     "api.feed.smart",
                 )
-                .await?,
-            )
+                .await,
+            )? {
+                Some(input) => Some(input),
+                None => continue,
+            }
         } else {
             None
         };
@@ -24408,7 +24413,10 @@ async fn fetch_release_compare_payload_request(
         urlencoding::encode(base_tag),
         urlencoding::encode(head_tag)
     );
-    let url = format!("https://api.github.com/repos/{repo_full_name}/compare/{compare_ref}");
+    let url = state
+        .github_rest_api_base
+        .join(&format!("repos/{repo_full_name}/compare/{compare_ref}"))
+        .map_err(ApiError::internal)?;
     let mut request = state
         .http
         .get(url)
@@ -24495,6 +24503,20 @@ struct ReleaseReadingEvidenceRequest<'a> {
 }
 
 const RELEASE_READING_EVIDENCE_UNAVAILABLE: &str = "release_reading_evidence_unavailable";
+
+fn release_feed_projection_should_fail_open(error: &ApiError) -> bool {
+    error.code() == RELEASE_READING_EVIDENCE_UNAVAILABLE
+}
+
+fn release_feed_projection_result(
+    result: Result<translations::TranslationRequestItemInput, ApiError>,
+) -> Result<Option<translations::TranslationRequestItemInput>, ApiError> {
+    match result {
+        Ok(input) => Ok(Some(input)),
+        Err(error) if release_feed_projection_should_fail_open(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 fn release_reading_evidence_is_unavailable(
     evidence: &[translations::ReleaseReadingEvidence],
@@ -28522,6 +28544,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_readable_feed_keeps_raw_release_when_compare_evidence_is_unavailable() {
+        let pool = setup_pool().await;
+        seed_global_feed_compare_failure_fixture(&pool).await;
+
+        let mut state = setup_state(pool);
+        Arc::get_mut(&mut state)
+            .expect("unique dashboard feed test state")
+            .github_rest_api_base = spawn_test_github_compare_failure_server().await;
+
+        let Json(feed) = dashboard_readable_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardReadableFeedQuery { cursor: None }),
+        )
+        .await
+        .expect("compare evidence failure should not fail dashboard feed");
+
+        let release = feed
+            .sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .items
+                    .iter()
+                    .chain(section.supplemental_items.iter())
+            })
+            .find(|item| item.kind == "release" && item.id == "120")
+            .expect("raw release should remain in dashboard feed");
+        assert_eq!(release.title.as_deref(), Some("v1.2.3"));
+        assert_eq!(release.body.as_deref(), Some("Release-Identity: current"));
+    }
+
+    #[tokio::test]
     async fn dashboard_readable_feed_reads_three_date_sections_and_uses_section_cursor() {
         let pool = setup_pool().await;
         seed_star(&pool, 42).await;
@@ -28659,7 +28715,8 @@ mod tests {
         GitHubCompareFile, GitHubCompareResponse, GitHubTreeEntry, GitHubTreeResponse,
         ReleaseCompareBaselineRow,
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
-        PublicReleaseReadingRevision, RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts,
+        PublicReleaseReadingRevision, RELEASE_FEED_BODY_MAX_CHARS,
+        RELEASE_READING_EVIDENCE_UNAVAILABLE, ReleaseReactionCounts,
         ReleaseReactionRow,
         ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslateReleaseRequest,
@@ -28671,7 +28728,7 @@ mod tests {
         admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_compare_digest_with_coverage, build_endpoint_tree_compare,
-        release_reading_view_from_payload,
+        release_feed_projection_result, release_reading_view_from_payload,
         build_feed_reaction_refresh_item, build_task_diagnostics, compare_requires_endpoint_diff,
         compact_dashboard_signatures,
         dashboard_readable_brief_public, dashboard_readable_feed, dashboard_readable_local_date,
@@ -29129,6 +29186,47 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test ai app");
         });
         Url::parse(&format!("http://{addr}/")).expect("parse test ai base url")
+    }
+
+    async fn spawn_test_github_compare_failure_server() -> Url {
+        spawn_test_ai_server(Router::new().fallback(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "compare unavailable"})),
+            )
+        }))
+        .await
+    }
+
+    async fn seed_global_feed_compare_failure_fixture(pool: &SqlitePool) {
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(pool)
+            .await
+            .expect("enable global content processing mode");
+        seed_star(pool, 42).await;
+        seed_repo_release(pool, 42, 119).await;
+        seed_repo_release(pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET tag_name = CASE release_id
+                  WHEN 119 THEN 'v1.2.2'
+                  WHEN 120 THEN 'v1.2.3'
+                END,
+                name = CASE release_id
+                  WHEN 119 THEN 'v1.2.2'
+                  WHEN 120 THEN 'v1.2.3'
+                END,
+                body = CASE release_id
+                  WHEN 119 THEN 'Release-Identity: previous'
+                  WHEN 120 THEN 'Release-Identity: current'
+                END
+            WHERE release_id IN (119, 120)
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("seed compare-only release bodies");
     }
 
     async fn setup_session(user_id: i64) -> Session {
@@ -38499,6 +38597,102 @@ mod tests {
     }
 
     #[test]
+    fn release_feed_projection_fails_open_only_for_exact_error_code() {
+        let exact = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            "compare evidence unavailable",
+        );
+        assert!(
+            release_feed_projection_result(Err(exact))
+                .expect("exact evidence error should be fail-open")
+                .is_none()
+        );
+
+        let other = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github_unavailable",
+            "GitHub unavailable",
+        );
+        let error = release_feed_projection_result(Err(other))
+            .expect_err("other API errors must remain terminal");
+        assert_eq!(error.code(), "github_unavailable");
+    }
+
+    #[test]
+    fn release_feed_projection_fail_open_preserves_original_release_fields() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.release_tag_name = Some("v1.2.3".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- original release body".to_owned());
+        row.html_url = Some("https://github.com/openai/codex/releases/tag/v1.2.3".to_owned());
+        row.unread = Some(1);
+        row.react_plus1 = Some(4);
+
+        let exact = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            "compare evidence unavailable",
+        );
+        assert!(
+            release_feed_projection_result(Err(exact))
+                .expect("exact evidence error should be fail-open")
+                .is_none()
+        );
+
+        let item = feed_item_from_row(row, false, None);
+        assert_eq!(item.kind, "release");
+        assert_eq!(item.id, "1");
+        assert_eq!(item.repo_full_name.as_deref(), Some("openai/codex"));
+        assert_eq!(item.title.as_deref(), Some("Release v1.2.3"));
+        assert_eq!(item.body.as_deref(), Some("- original release body"));
+        assert_eq!(
+            item.html_url.as_deref(),
+            Some("https://github.com/openai/codex/releases/tag/v1.2.3")
+        );
+        assert_eq!(item.unread, Some(1));
+        assert_eq!(item.reactions.expect("release reactions").counts.plus1, 4);
+    }
+
+    #[test]
+    fn release_feed_projection_fail_open_keeps_neighboring_rows_projectable() {
+        let mut failed_row = test_feed_row(Some("R_node"));
+        failed_row.title = Some("Release v1.2.3".to_owned());
+        failed_row.release_body = Some("- original release body".to_owned());
+
+        let mut neighboring_row = test_feed_row(None);
+        neighboring_row.kind = "repo_star_received".to_owned();
+        neighboring_row.release_id = None;
+        neighboring_row.entity_id = "neighbor-event".to_owned();
+        neighboring_row.id_key = "neighbor-event".to_owned();
+        neighboring_row.title = Some("Neighboring event".to_owned());
+        neighboring_row.html_url = Some("https://github.com/openai/codex".to_owned());
+
+        let exact = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            "compare evidence unavailable",
+        );
+        let mut rows = vec![failed_row, neighboring_row];
+        if release_feed_projection_result(Err(exact))
+            .expect("exact evidence error should be fail-open")
+            .is_none()
+        {
+            rows.remove(0);
+        }
+
+        let items = rows
+            .into_iter()
+            .map(|row| feed_item_from_row(row, false, None))
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "repo_star_received");
+        assert_eq!(items[0].id, "neighbor-event");
+        assert_eq!(items[0].title.as_deref(), Some("Neighboring event"));
+    }
+
+    #[test]
     fn feed_item_from_row_keeps_terminal_missing_non_retryable() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
@@ -39840,6 +40034,65 @@ line two",
                 .repos
                 .iter()
                 .any(|repo| repo.full_name == other_owner_repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_feed_keeps_raw_release_when_compare_evidence_is_unavailable() {
+        let pool = setup_pool().await;
+        seed_global_feed_compare_failure_fixture(&pool).await;
+        seed_social_event(
+            &pool,
+            test_user_id(1).as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "compare-failure-neighbor",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: Some("Neighboring event"),
+                body: Some("The neighboring event remains visible."),
+                html_url: Some("https://github.com/openai/codex"),
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T08:00:00Z",
+            },
+        )
+        .await;
+
+        let mut state = setup_state(pool);
+        Arc::get_mut(&mut state)
+            .expect("unique list feed test state")
+            .github_rest_api_base = spawn_test_github_compare_failure_server().await;
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("compare evidence failure should not fail the list feed");
+
+        let release = feed
+            .items
+            .iter()
+            .find(|item| item.kind == "release" && item.id == "120")
+            .expect("raw release should remain in list feed");
+        assert_eq!(release.title.as_deref(), Some("v1.2.3"));
+        assert_eq!(release.body.as_deref(), Some("Release-Identity: current"));
+        assert!(
+            feed.items
+                .iter()
+                .any(|item| item.id == "compare-failure-neighbor")
         );
     }
 
