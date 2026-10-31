@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiGet } from "@/api";
+import {
+	applySmartIfSourceMatches,
+	applyTranslationIfSourceMatches,
+} from "@/feed/autoLaneRequests";
 import type {
 	DashboardReadableFeedResponse,
 	DashboardReadableSection,
@@ -705,22 +709,30 @@ export function useDashboardReadableSections(options?: {
 	);
 
 	const applyTranslation = useCallback(
-		(target: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+		(
+			target: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			translated: TranslatedItem,
+		) => {
 			const key = itemKey(target);
 			applyToItems((item) =>
-				itemKey(item) === key && isLaneCapableFeedItem(item)
-					? { ...item, translated }
+				itemKey(item) === key
+					? applyTranslationIfSourceMatches(item, sourceKey, translated)
 					: item,
 			);
 		},
 		[applyToItems],
 	);
 	const applySmart = useCallback(
-		(target: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+		(
+			target: Pick<FeedItem, "kind" | "id">,
+			sourceKey: string,
+			smart: SmartItem,
+		) => {
 			const key = itemKey(target);
 			applyToItems((item) =>
-				itemKey(item) === key && isLaneCapableFeedItem(item)
-					? { ...item, smart }
+				itemKey(item) === key
+					? applySmartIfSourceMatches(item, sourceKey, smart)
 					: item,
 			);
 		},

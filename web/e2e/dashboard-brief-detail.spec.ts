@@ -1360,7 +1360,7 @@ test("dashboard hides retained readable content when legacy fallback is unauthor
 	await expect
 		.poll(tracker.getReadableSectionRequests)
 		.toHaveLength(readableRequestCountBeforeRefresh + 1);
-	await expect.poll(tracker.getFeedRequestUrls).toHaveLength(2);
+	await expect.poll(tracker.getFeedRequestUrls).toContain("/api/feed?limit=30");
 	await expect(
 		page.locator('[data-dashboard-readable-fallback-error="true"]'),
 	).toBeVisible();

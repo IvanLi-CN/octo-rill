@@ -1850,20 +1850,28 @@ export function Dashboard(props: {
 		readableSections.clearContentPreservingMode,
 	]);
 	const applyTranslationToActive = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			translated: TranslatedItem,
+			sourceKey: string,
+		) => {
 			if (readableSectionsVisibleRef.current) {
-				readableSections.applyTranslation(item, translated);
+				readableSections.applyTranslation(item, sourceKey, translated);
 			} else {
-				feed.applyTranslation(item, translated);
+				feed.applyTranslation(item, sourceKey, translated);
 			}
 		},
 		[feed.applyTranslation, readableSections.applyTranslation],
 	);
 	const applySmartToActive = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+		(
+			item: Pick<FeedItem, "kind" | "id">,
+			smart: SmartItem,
+			sourceKey: string,
+		) => {
 			if (readableSectionsVisibleRef.current)
-				readableSections.applySmart(item, smart);
-			else feed.applySmart(item, smart);
+				readableSections.applySmart(item, sourceKey, smart);
+			else feed.applySmart(item, sourceKey, smart);
 		},
 		[feed.applySmart, readableSections.applySmart],
 	);

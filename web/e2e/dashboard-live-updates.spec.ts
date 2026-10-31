@@ -1,6 +1,13 @@
 import { expect, test } from "@playwright/test";
 
 import {
+	applySmartIfSourceMatches,
+	applyTranslationIfSourceMatches,
+	buildSmartSourceKey,
+	buildTranslationSourceKey,
+} from "../src/feed/autoLaneRequests";
+import type { FeedItem } from "../src/feed/types";
+import {
 	buildMockMeResponse,
 	json,
 	mockUnavailableDashboardReadableFeed,
@@ -28,6 +35,44 @@ function buildReleaseFeedItem(id: string, title: string) {
 		reactions: null,
 	};
 }
+
+test("late feed projections are rejected after same-key source changes", () => {
+	const original = {
+		...buildReleaseFeedItem("source-key", "Same release"),
+		body: "Release body revision one",
+	} as FeedItem;
+	const refreshed = {
+		...original,
+		body: "Release body revision two",
+	} as FeedItem;
+	const staleTranslation = {
+		lang: "zh-CN",
+		status: "ready",
+		title: "Stale translation",
+		summary: "Stale translation body",
+	} as const;
+	const staleSmart = {
+		lang: "zh-CN",
+		status: "ready",
+		title: "Stale polish",
+		summary: "Stale polish body",
+	} as const;
+
+	expect(
+		applyTranslationIfSourceMatches(
+			refreshed,
+			buildTranslationSourceKey(original),
+			staleTranslation,
+		),
+	).toBe(refreshed);
+	expect(
+		applySmartIfSourceMatches(
+			refreshed,
+			buildSmartSourceKey(original),
+			staleSmart,
+		),
+	).toBe(refreshed);
+});
 
 test("dashboard live updates retain feed boundaries until they leave the viewport", async ({
 	page,
@@ -609,6 +654,210 @@ test("dashboard live updates retire pending projections when a feed source chang
 		releaseOldTranslation?.();
 		releaseOldSmart?.();
 	}
+});
+
+test("same-key source refresh retries terminal translation and smart failures", async ({
+	page,
+}) => {
+	const originalSource = "Terminal source revision one";
+	const updatedSource = "Terminal source revision two";
+	const freshTranslation = "Translation recovered for revision two";
+	const freshSmart = "Polish recovered for revision two";
+	let sourceRevision = 1;
+	let updateRequests = 0;
+	const submittedSources: Array<{ kind: string; body: string | null }> = [];
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			return mockUnavailableDashboardReadableFeed(route);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, {
+				items: [
+					{
+						...buildReleaseFeedItem("20001", "Same release source refresh"),
+						body: sourceRevision === 1 ? originalSource : updatedSource,
+						translated: {
+							lang: "zh-CN",
+							status: "missing",
+							title: null,
+							summary: null,
+						},
+						smart: {
+							lang: "zh-CN",
+							status: "missing",
+							title: null,
+							summary: null,
+						},
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			updateRequests += 1;
+			const token = url.searchParams.get("token") ?? "token-stage-0";
+			const changed = sourceRevision > 1 && token === "token-stage-0";
+			return json(route, {
+				token: changed ? "token-stage-1" : token,
+				generated_at: "2026-04-30T10:00:00Z",
+				lists: {
+					feed: {
+						changed,
+						new_count: changed ? 1 : 0,
+						latest_keys: changed ? ["release:20001"] : [],
+					},
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+
+		if (req.method() === "POST" && pathname === "/api/translate/results") {
+			const body = req.postDataJSON() as {
+				items?: Array<{
+					producer_ref?: string;
+					entity_id?: string;
+					kind?: string;
+					variant?: string;
+					source_blocks?: Array<{ slot?: string; text?: string }>;
+				}>;
+			};
+			return json(route, {
+				items: (body.items ?? []).map((item) => {
+					const sourceBody =
+						item.source_blocks?.find((block) => block.slot === "body_markdown")
+							?.text ?? null;
+					const isTranslation = item.kind === "release_summary";
+					submittedSources.push({ kind: item.kind ?? "", body: sourceBody });
+					const terminal = sourceBody === originalSource;
+					const output = terminal
+						? isTranslation
+							? "Terminal translation fixture failure"
+							: "Terminal smart fixture failure"
+						: isTranslation
+							? freshTranslation
+							: freshSmart;
+					return {
+						producer_ref: item.producer_ref,
+						entity_id: item.entity_id,
+						kind: item.kind,
+						variant: item.variant,
+						status: terminal ? "error" : "ready",
+						title_zh: output,
+						summary_md: output,
+						body_md: output,
+						error: terminal ? output : null,
+						error_code: terminal ? "fixture_terminal" : null,
+						error_summary: terminal ? output : null,
+						error_detail: null,
+					};
+				}),
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: { state: "idle", message: null, checked_at: null },
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+	const release = page.locator('[data-feed-item-key="release:20001"]');
+	await expect(release).toBeVisible({ timeout: 15_000 });
+	await expect.poll(() => updateRequests).toBeGreaterThan(0);
+	await expect
+		.poll(() =>
+			submittedSources.map((source) => `${source.kind}:${source.body}`),
+		)
+		.toContain(`release_summary:${originalSource}`);
+	await expect
+		.poll(() =>
+			submittedSources.map((source) => `${source.kind}:${source.body}`),
+		)
+		.toContain(`release_smart:${originalSource}`);
+
+	await release.getByRole("tab", { name: "翻译" }).click();
+	await expect(
+		release.getByText("Terminal translation fixture failure"),
+	).toBeVisible();
+	await release.getByRole("tab", { name: "润色" }).click();
+	await expect(
+		release.getByText("Terminal smart fixture failure"),
+	).toBeVisible();
+
+	sourceRevision = 2;
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	const newContentButton = page.getByRole("button", {
+		name: "上方有 1 条新动态",
+	});
+	await expect(newContentButton).toBeVisible();
+	await newContentButton.click();
+	await expect(
+		release.getByRole("tabpanel", { name: "原文" }).getByText(updatedSource),
+	).toBeVisible();
+	await expect
+		.poll(() =>
+			submittedSources.map((source) => `${source.kind}:${source.body}`),
+		)
+		.toContain(`release_summary:${updatedSource}`);
+	await expect
+		.poll(() =>
+			submittedSources.map((source) => `${source.kind}:${source.body}`),
+		)
+		.toContain(`release_smart:${updatedSource}`);
+
+	await release.getByRole("tab", { name: "翻译" }).click();
+	await expect(release.getByText(freshTranslation)).toBeVisible();
+	await release.getByRole("tab", { name: "润色" }).click();
+	await expect(release.getByText(freshSmart)).toBeVisible();
 });
 
 test("dashboard live updates do not place feed boundaries below processed existing items", async ({
