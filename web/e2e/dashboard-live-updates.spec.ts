@@ -840,6 +840,7 @@ test("same-key source refresh retries terminal translation and smart failures", 
 	});
 	await expect(newContentButton).toBeVisible();
 	await newContentButton.click();
+	await release.getByRole("tab", { name: "原文" }).click();
 	await expect(
 		release.getByRole("tabpanel", { name: "原文" }).getByText(updatedSource),
 	).toBeVisible();

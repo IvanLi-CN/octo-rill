@@ -1072,9 +1072,9 @@ test("dashboard refresh drops cursor pages completed from an older feed revision
 }) => {
 	await page.addInitScript(() => window.localStorage.clear());
 	let sourceRevision = 1;
-	let reportFeedChange = false;
 	let updateRequests = 0;
 	let deferredPageRequest: number | null = null;
+	let deferredHeadRequest: number | null = null;
 	let deferredPageRevision = 1;
 	let pageResponses = 0;
 	const releaseId = "feed-refresh-cache-release";
@@ -1089,6 +1089,14 @@ test("dashboard refresh drops cursor pages completed from an older feed revision
 			message: "readable evidence unavailable",
 		},
 		deferFeedPageForRequest: (requestNumber, cursor) => {
+			if (
+				cursor === null &&
+				sourceRevision > 1 &&
+				deferredHeadRequest === null
+			) {
+				deferredHeadRequest = requestNumber;
+				return true;
+			}
 			if (cursor !== "feed-refresh-cache-page-2" || deferredPageRequest) {
 				return false;
 			}
@@ -1140,10 +1148,9 @@ test("dashboard refresh drops cursor pages completed from an older feed revision
 		},
 		dashboardUpdatesResponse: (requestNumber) => {
 			updateRequests += 1;
-			const changed = reportFeedChange;
-			reportFeedChange = false;
+			const changed = sourceRevision > 1;
 			return {
-				token: `feed-refresh-cache-${requestNumber}`,
+				token: `feed-refresh-cache-${sourceRevision}-${requestNumber}`,
 				generated_at: "2026-04-30T10:00:00Z",
 				lists: {
 					feed: {
@@ -1169,13 +1176,40 @@ test("dashboard refresh drops cursor pages completed from an older feed revision
 		.toHaveLength(1);
 
 	sourceRevision = 2;
-	reportFeedChange = true;
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
 	const newContentButton = page.getByRole("button", {
 		name: "上方有 1 条新动态",
 	});
 	await expect(newContentButton).toBeVisible();
 	await newContentButton.click();
+	await expect
+		.poll(() => tracker.getDeferredFeedPageRequestNumbers())
+		.toHaveLength(2);
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	const pageCursorRequestCount = () =>
+		tracker
+			.getFeedRequests()
+			.filter((cursor) => cursor === "feed-refresh-cache-page-2").length;
+	const latePageRequest = await page
+		.waitForRequest(
+			(request) => {
+				const url = new URL(request.url());
+				return (
+					request.method() === "GET" &&
+					url.pathname === "/api/feed" &&
+					url.searchParams.get("cursor") === "feed-refresh-cache-page-2"
+				);
+			},
+			{ timeout: 500 },
+		)
+		.catch((error: unknown) => {
+			if (error instanceof Error && error.name === "TimeoutError") return null;
+			throw error;
+		});
+	expect(latePageRequest).toBeNull();
+	expect(pageCursorRequestCount()).toBe(1);
+
+	tracker.releaseFeedPageRequest(deferredHeadRequest as number);
 	await expect(release.getByText(primaryBody(2))).toBeVisible();
 	await expect
 		.poll(

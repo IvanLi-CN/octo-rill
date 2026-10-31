@@ -192,15 +192,19 @@ export function useFeed(
 	} | null>(null);
 	const queryKeySignature = JSON.stringify(queryKey);
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
+	const [refreshing, setRefreshing] = useState(false);
 
 	const reqIdRef = useRef(0);
+	const refreshingReqIdRef = useRef<number | null>(null);
 	const queryRequestSeqRef = useRef(0);
 	const invalidateRequests = useCallback(() => {
 		reqIdRef.current += 1;
+		refreshingReqIdRef.current = null;
 		queryRequestSeqRef.current += 1;
 		void queryClient.cancelQueries({
 			queryKey: ["dashboard", "feed", { userId }],
 		});
+		setRefreshing(false);
 		setLoadingMore(false);
 		setAppendError(null);
 	}, [queryClient, userId]);
@@ -314,6 +318,8 @@ export function useFeed(
 
 	useEffect(() => {
 		reqIdRef.current += 1;
+		refreshingReqIdRef.current = null;
+		setRefreshing(false);
 		setLoadingMore(false);
 		setAppendError(null);
 		setAuthorizationDenied(null);
@@ -330,56 +336,65 @@ export function useFeed(
 			if (!enabled && !options?.force) return;
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
-			const cancelled = Symbol("feed-refresh-cancelled");
-			let cancelRefresh = () => undefined;
-			const cancellation = new Promise<typeof cancelled>((resolve) => {
-				cancelRefresh = () => {
-					if (reqId !== reqIdRef.current) return;
-					reqIdRef.current += 1;
-					void queryClient.cancelQueries({ queryKey, exact: true });
-					resolve(cancelled);
-				};
-			});
-			options?.onStart?.(cancelRefresh);
+			refreshingReqIdRef.current = reqId;
+			setRefreshing(true);
+			try {
+				const cancelled = Symbol("feed-refresh-cancelled");
+				let cancelRefresh = () => undefined;
+				const cancellation = new Promise<typeof cancelled>((resolve) => {
+					cancelRefresh = () => {
+						if (reqId !== reqIdRef.current) return;
+						reqIdRef.current += 1;
+						void queryClient.cancelQueries({ queryKey, exact: true });
+						resolve(cancelled);
+					};
+				});
+				options?.onStart?.(cancelRefresh);
 
-			// Cancel any in-flight "load more" state; we are replacing the list.
-			setLoadingMore(false);
-			setAppendError(null);
-			const currentPageQueries = {
-				predicate: (query: { queryKey: readonly unknown[] }) => {
-					const [root, name, dimensions] = query.queryKey;
-					if (
-						root !== "dashboard" ||
-						name !== "feed" ||
-						!dimensions ||
-						typeof dimensions !== "object"
-					) {
-						return false;
+				// Cancel any in-flight "load more" state; we are replacing the list.
+				setLoadingMore(false);
+				setAppendError(null);
+				const currentPageQueries = {
+					predicate: (query: { queryKey: readonly unknown[] }) => {
+						const [root, name, dimensions] = query.queryKey;
+						if (
+							root !== "dashboard" ||
+							name !== "feed" ||
+							!dimensions ||
+							typeof dimensions !== "object"
+						) {
+							return false;
+						}
+						const pageKey = dimensions as Record<string, unknown>;
+						return (
+							pageKey.userId === userId &&
+							pageKey.type === type &&
+							pageKey.scope === scopeSignature &&
+							pageKey.viewerStateKey === viewerStateKey &&
+							typeof pageKey.cursor === "string"
+						);
+					},
+				};
+				await queryClient.cancelQueries(currentPageQueries);
+				queryClient.removeQueries(currentPageQueries);
+				if (reqId !== reqIdRef.current) return;
+				const result = await Promise.race([query.refetch(), cancellation]);
+				if (result === cancelled) return;
+				if (reqId !== reqIdRef.current) return;
+				if (result.error) {
+					if (options?.throwOnError) {
+						throw result.error;
 					}
-					const pageKey = dimensions as Record<string, unknown>;
-					return (
-						pageKey.userId === userId &&
-						pageKey.type === type &&
-						pageKey.scope === scopeSignature &&
-						pageKey.viewerStateKey === viewerStateKey &&
-						typeof pageKey.cursor === "string"
-					);
-				},
-			};
-			await queryClient.cancelQueries(currentPageQueries);
-			queryClient.removeQueries(currentPageQueries);
-			if (reqId !== reqIdRef.current) return;
-			const result = await Promise.race([query.refetch(), cancellation]);
-			if (result === cancelled) return;
-			if (reqId !== reqIdRef.current) return;
-			if (result.error) {
-				if (options?.throwOnError) {
-					throw result.error;
+					return;
 				}
-				return;
-			}
-			if (result.data) {
-				setFreshKeys(new Set(options?.freshKeys ?? []));
+				if (result.data) {
+					setFreshKeys(new Set(options?.freshKeys ?? []));
+				}
+			} finally {
+				if (refreshingReqIdRef.current === reqId) {
+					refreshingReqIdRef.current = null;
+					setRefreshing(false);
+				}
 			}
 		},
 		[
@@ -395,6 +410,7 @@ export function useFeed(
 	);
 
 	const loadMore = useCallback(async () => {
+		if (refreshingReqIdRef.current !== null) return;
 		if (!currentNextCursor || loadingMore || currentLoadingInitial) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
@@ -571,6 +587,7 @@ export function useFeed(
 		nextCursor: currentNextCursor,
 		hasMore,
 		loadingInitial: currentLoadingInitial,
+		refreshing,
 		loadingMore,
 		error: currentError,
 		stats,
