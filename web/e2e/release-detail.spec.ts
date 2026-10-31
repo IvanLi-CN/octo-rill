@@ -68,6 +68,8 @@ type ApiOptions = {
 		| "insufficient";
 	releaseDetailRequestStatus?: "ready" | "error" | "disabled";
 	releaseDetailRequestError?: TranslationErrorPayload;
+	releaseDetailFetchGate?: Promise<void>;
+	onReleaseDetailFetch?: () => void;
 };
 
 type MockApiTracker = {
@@ -704,6 +706,10 @@ async function installApiMocks(
 			req.method() === "GET" &&
 			pathname === `/api/releases/${cfg.releaseId}/detail`
 		) {
+			cfg.onReleaseDetailFetch?.();
+			if (cfg.releaseDetailFetchGate) {
+				await cfg.releaseDetailFetchGate;
+			}
 			return json(route, {
 				release_id: cfg.releaseId,
 				repo_full_name: "owner/repo",
@@ -1074,6 +1080,40 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 		"aria-selected",
 		"true",
 	);
+});
+
+test("late release detail response does not reopen a closed target", async ({
+	page,
+}) => {
+	const detailFetchGate = createPendingGate();
+	let markDetailFetchStarted = () => {};
+	const detailFetchStarted = new Promise<void>((resolve) => {
+		markDetailFetchStarted = resolve;
+	});
+	await installApiMocks(page, {
+		releaseId: "289513858",
+		briefId: "brief-2026-02-23",
+		detailTitle: "Late release detail response",
+		releaseDetailFetchGate: detailFetchGate.wait,
+		onReleaseDetailFetch: markDetailFetchStarted,
+	});
+
+	try {
+		await page.goto("/?release=289513858");
+		const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+		await expect(detailDialog).toBeVisible({ timeout: 15_000 });
+		await detailFetchStarted;
+		await detailDialog.getByRole("button", { name: "关闭" }).click();
+		await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-02-23$/);
+
+		detailFetchGate.release();
+		await expect(page).not.toHaveURL(
+			/\/owner\/repo\/releases\/tag\/v1\.2\.3\?from=briefs$/,
+		);
+		await expect(detailDialog).toHaveCount(0);
+	} finally {
+		detailFetchGate.release();
+	}
 });
 
 test("release detail opened from a brief deep link restores the same brief on close", async ({
