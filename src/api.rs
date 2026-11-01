@@ -17957,7 +17957,20 @@ async fn load_feed_release_evidence_snapshot(
             "release feed row is missing its repository identity",
         ));
     };
-    let base_tag = row.release_previous_tag_name.as_deref();
+    let Some(base_tag) = row
+        .release_previous_tag_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let head_tag = row.release_tag_name.as_deref().unwrap_or_default();
+    if head_tag.trim().is_empty() {
+        return Ok(None);
+    }
+    let release_id = row.entity_id.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
+    })?;
     let public_release = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT EXISTS(
@@ -17986,42 +17999,60 @@ async fn load_feed_release_evidence_snapshot(
         "authorized"
     };
     let audience_user_id = (!public_release).then_some(user_id);
-    let snapshot_id = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT id
-        FROM release_evidence_snapshots
-        WHERE release_id = ?
-          AND repo_id = ?
-          AND head_tag = ?
-          AND (? IS NULL OR base_tag = ?)
-          AND audience = ?
-          AND audience_user_id IS ?
-        ORDER BY datetime(updated_at) DESC, id DESC
-        LIMIT 1
-        "#,
+    let release_source = sqlx::query_as::<_, (
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )>(
+        "SELECT updated_at, detected_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
     )
-    .bind(row.entity_id.parse::<i64>().map_err(|error| {
-        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
-    })?)
-    .bind(repo_id)
-    .bind(row.release_tag_name.as_deref().unwrap_or_default())
-    .bind(base_tag)
-    .bind(base_tag)
-    .bind(audience)
-    .bind(audience_user_id)
+    .bind(release_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(ApiError::internal)?;
-    let Some(snapshot_id) = snapshot_id else {
-        return Ok(None);
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::internal("release feed row has no source release"))?;
+    let title = release_source
+        .4
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(release_source.3.as_str());
+    let body = release_source
+        .5
+        .as_deref()
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let observed_at = content_processing::authoritative_release_revision(
+        release_source.0.as_str(),
+        release_source.1.as_deref(),
+    )
+    .unwrap_or(release_source.0.as_str());
+    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
+        release_source.2.as_str(),
+        release_source.3.as_str(),
+        title,
+        body.as_str(),
+    ]);
+    let request = jobs::ReleaseEvidenceRequest {
+        release_id,
+        repo_id,
+        repo_full_name: row
+            .repo_full_name
+            .clone()
+            .ok_or_else(|| ApiError::internal("release feed row has no repository name"))?,
+        base_tag: base_tag.to_owned(),
+        head_tag: head_tag.to_owned(),
+        audience_user_id: audience_user_id.map(str::to_owned),
+        source_revision: format!("{observed_at}\n{revision_tiebreak}"),
     };
-    let snapshot =
-        jobs::load_release_evidence_snapshot(state, snapshot_id.as_str(), audience_user_id)
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| {
-                ApiError::internal("release evidence snapshot is outside its audience scope")
-            })?;
+    // Admission is deliberately DB-only. The worker performs all GitHub I/O;
+    // a feed request only creates or reuses the durable snapshot/task identity.
+    let snapshot = jobs::ensure_release_evidence(state, request)
+        .await
+        .map_err(ApiError::internal)?;
     if snapshot.reference.status == "ready" {
         if snapshot.snapshot.is_none() {
             return Err(ApiError::internal(
@@ -29538,6 +29569,24 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed compare-only release bodies");
+        let source_revision_tiebreak =
+            crate::content_processing::release_source_revision_content_tiebreak(&[
+                "https://github.com/openai/codex/releases/tag/v1.2.3",
+                "v1.2.3",
+                "v1.2.3",
+                "Release-Identity: current",
+            ]);
+        let source_revision = format!("2026-02-23T00:00:00Z\n{source_revision_tiebreak}");
+        let request_key = jobs::ReleaseEvidenceRequest {
+            release_id: 120,
+            repo_id: 42,
+            repo_full_name: "openai/codex".to_owned(),
+            base_tag: "v1.2.2".to_owned(),
+            head_tag: "v1.2.3".to_owned(),
+            audience_user_id: None,
+            source_revision: source_revision.clone(),
+        }
+        .request_key();
         sqlx::query(
             r#"
             INSERT INTO release_evidence_snapshots (
@@ -29546,12 +29595,14 @@ mod tests {
               attempt_count, last_error_code, last_error_summary, created_at, updated_at
             )
             VALUES (
-              'feed-evidence-120', 'feed-evidence-request-120', 120, 42, 'openai/codex', 'public',
-              NULL, 'feed-evidence-revision-120', 'v1.2.2', 'v1.2.3', ?,
+              'feed-evidence-120', ?, 120, 42, 'openai/codex', 'public',
+              NULL, ?, 'v1.2.2', 'v1.2.3', ?,
               1, ?, ?, '2026-02-24T08:00:00Z', '2026-02-24T08:00:00Z'
             )
             "#,
         )
+        .bind(request_key)
+        .bind(source_revision)
         .bind(evidence_status)
         .bind((evidence_status == "failed").then_some("github_evidence_incomplete"))
         .bind((evidence_status == "failed").then_some("Release evidence is incomplete"))
@@ -40528,6 +40579,82 @@ line two",
             feed.items
                 .iter()
                 .any(|item| item.id == "compare-failure-neighbor")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_feed_admits_missing_evidence_without_external_requests() {
+        let pool = setup_pool().await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("enable global content processing mode");
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 119).await;
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET tag_name = CASE release_id WHEN 119 THEN 'v1.2.2' WHEN 120 THEN 'v1.2.3' END,
+                name = CASE release_id WHEN 119 THEN 'v1.2.2' WHEN 120 THEN 'v1.2.3' END,
+                body = CASE release_id WHEN 119 THEN 'Release-Identity: previous' WHEN 120 THEN 'Release-Identity: current' END
+            WHERE release_id IN (119, 120)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed compare-only release bodies");
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool.clone(), external_base_url.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique missing evidence test state")
+            .github_rest_api_base = external_base_url;
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("missing evidence should be admitted locally");
+
+        let release = feed
+            .items
+            .iter()
+            .find(|item| item.kind == "release" && item.id == "120")
+            .expect("raw release should remain visible");
+        assert_eq!(
+            release.smart.as_ref().map(|smart| smart.status.as_str()),
+            Some("queued")
+        );
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM release_evidence_snapshots WHERE release_id = 120",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count admitted evidence snapshots"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND status IN ('queued', 'running')",
+            )
+            .bind(crate::jobs::TASK_RELEASE_EVIDENCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count admitted evidence tasks"),
+            1
         );
     }
 
