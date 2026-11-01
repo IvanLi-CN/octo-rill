@@ -1987,7 +1987,7 @@ async fn claim_release_evidence_snapshot(
             lease_owner IS NULL
             OR lease_expires_at IS NULL
             OR julianday(lease_expires_at) <= julianday(?)
-            OR lease_owner = ?
+            OR (lease_owner = ? AND task_id = ?)
           )
         "#,
     )
@@ -2001,6 +2001,7 @@ async fn claim_release_evidence_snapshot(
     .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
     .bind(&now_text)
     .bind(state.runtime_owner_id.as_str())
+    .bind(task_id)
     .execute(&mut *tx)
     .await
     .context("claim release evidence snapshot")?;
@@ -15932,6 +15933,55 @@ mod tests {
         .await
         .expect_err("expired worker must not publish evidence");
         assert!(expired_error.to_string().contains("lease was lost"));
+    }
+
+    #[tokio::test]
+    async fn release_evidence_claim_does_not_cross_claim_same_runtime_owner() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let queued = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 51,
+                repo_id: 61,
+                repo_full_name: "acme/claim-ownership".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.1.0".to_owned(),
+                audience_user_id: None,
+                source_revision: "claim-ownership-revision".to_owned(),
+            },
+        )
+        .await
+        .expect("queue claim ownership evidence");
+        let snapshot_id = queued.reference.snapshot_id.as_str();
+
+        super::claim_release_evidence_snapshot(state.as_ref(), "first-task", snapshot_id)
+            .await
+            .expect("first worker claims evidence snapshot");
+        let second_claim =
+            super::claim_release_evidence_snapshot(state.as_ref(), "second-task", snapshot_id)
+                .await
+                .expect_err("second worker must not replace an unexpired lease");
+        assert!(
+            second_claim
+                .to_string()
+                .contains("already owned or not ready to retry")
+        );
+
+        let (status, task_id, lease_owner): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, task_id, lease_owner FROM release_evidence_snapshots WHERE id = ?",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load claim ownership evidence");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(task_id.as_deref(), Some("first-task"));
+        assert_eq!(
+            lease_owner.as_deref(),
+            Some(state.runtime_owner_id.as_str())
+        );
     }
 
     #[test]
