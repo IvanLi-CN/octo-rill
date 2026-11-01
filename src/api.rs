@@ -18087,6 +18087,152 @@ async fn load_feed_release_evidence_snapshot(
     Ok(Some(snapshot))
 }
 
+async fn admit_feed_release_evidence_work(
+    state: &AppState,
+    user_id: &str,
+    row: &FeedRow,
+    evidence: &jobs::ReleaseEvidenceSnapshot,
+) -> Result<(), ApiError> {
+    let release_id = row.entity_id.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
+    })?;
+    let repo_id = row
+        .release_repo_id
+        .ok_or_else(|| ApiError::internal("release feed row is missing its repository identity"))?;
+    let source = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, String, Option<String>)>(
+        "SELECT html_url, tag_name, name, body, updated_at, detected_at FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::internal("release feed row has no source release"))?;
+    let repo_full_name = row
+        .repo_full_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| resolve_release_full_name(&source.0, repo_id));
+    let title = source
+        .2
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(source.1.as_str())
+        .to_owned();
+    let body = source
+        .3
+        .as_deref()
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let snapshot = evidence
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("ready release evidence snapshot has no payload"))?;
+    let evidence_text = serde_json::to_string(snapshot).map_err(ApiError::internal)?;
+    let reading_evidence = vec![translations::ReleaseReadingEvidence {
+        kind: "github_compare".to_owned(),
+        reference: format!(
+            "{}...{}",
+            snapshot
+                .get("base_tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            snapshot
+                .get("head_tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ),
+        scope: Some(format!(
+            "base_sha={};merge_base_sha={};head_sha={}",
+            snapshot
+                .get("base_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            snapshot
+                .get("merge_base_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            snapshot
+                .get("head_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )),
+    }];
+    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
+        source.0.as_str(),
+        source.1.as_str(),
+        title.as_str(),
+        body.as_str(),
+    ]);
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("{repo_full_name}\n{}", source.1),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if !body.trim().is_empty() {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    source_blocks.extend([
+        translations::TranslationSourceBlock {
+            slot: "reading_contract".to_owned(),
+            text: "human_changes_direct; machine_materials_collapsible; no_source_section; no_version_repetition; no_author_attribution".to_owned(),
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_evidence_json".to_owned(),
+            text: serde_json::to_string(&reading_evidence).map_err(ApiError::internal)?,
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_compare".to_owned(),
+            text: evidence_text,
+        },
+        translations::TranslationSourceBlock {
+            slot: "release_evidence_snapshot".to_owned(),
+            text: serde_json::to_string(&json!({
+                "snapshot_id": evidence.reference.snapshot_id,
+                "status": "ready",
+            }))
+            .map_err(ApiError::internal)?,
+        },
+    ]);
+    let observed_at =
+        content_processing::authoritative_release_revision(source.4.as_str(), source.5.as_deref())
+            .unwrap_or(source.4.as_str());
+    let variant = if evidence.reference.audience == "public" {
+        translations::RELEASE_READING_PUBLIC_VARIANT
+    } else {
+        translations::RELEASE_READING_AUTHORIZED_VARIANT
+    };
+    let item = translations::TranslationRequestItemInput {
+        producer_ref: "feed.release.evidence".to_owned(),
+        kind: "release_smart".to_owned(),
+        variant: variant.to_owned(),
+        entity_id: release_id.to_string(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks: with_source_revision(
+            source_blocks,
+            Some(observed_at),
+            Some(revision_tiebreak.as_str()),
+        ),
+        target_slots: vec![
+            "title_zh".to_owned(),
+            "summary_md".to_owned(),
+            "reading".to_owned(),
+        ],
+    };
+    content_processing::submit_item(state, user_id, "async", &item).await?;
+    Ok(())
+}
+
 async fn load_feed_release_smart_work(
     state: &AppState,
     row: &FeedRow,
@@ -18221,6 +18367,7 @@ async fn read_local_release_smart_result(
                 evidence.reference.error_code.clone(),
             )));
         }
+        admit_feed_release_evidence_work(state, user_id, row, evidence).await?;
     }
     let Some(repo_id) = row.release_repo_id else {
         return Err(ApiError::internal(
@@ -24638,6 +24785,32 @@ async fn enrich_endpoint_tree_compare(
 }
 
 async fn fetch_release_compare_snapshot_request(
+    state: &AppState,
+    repo_full_name: &str,
+    base_tag: &str,
+    head_tag: &str,
+    access_token: Option<&str>,
+) -> Result<Option<ReleaseCompareSnapshot>, ApiError> {
+    let mut budget = crate::github::CompareBudget::default_for_feed();
+    budget
+        .run(fetch_release_compare_snapshot_request_inner(
+            state,
+            repo_full_name,
+            base_tag,
+            head_tag,
+            access_token,
+        ))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                RELEASE_READING_EVIDENCE_UNAVAILABLE,
+                error.to_string(),
+            )
+        })?
+}
+
+async fn fetch_release_compare_snapshot_request_inner(
     state: &AppState,
     repo_full_name: &str,
     base_tag: &str,
@@ -40580,6 +40753,82 @@ line two",
                 .iter()
                 .any(|item| item.id == "compare-failure-neighbor")
         );
+    }
+
+    #[tokio::test]
+    async fn list_feed_admits_ready_evidence_work_without_external_requests() {
+        let pool = setup_pool().await;
+        seed_global_feed_evidence_fixture(&pool, "ready").await;
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET snapshot_json = ?, content_hash = ? WHERE id = 'feed-evidence-120'",
+        )
+        .bind(
+            json!({
+                "base_tag": "v1.2.2",
+                "head_tag": "v1.2.3",
+                "base_sha": "base",
+                "merge_base_sha": "merge",
+                "head_sha": "head",
+                "coverage_complete": true,
+            })
+            .to_string(),
+        )
+        .bind("feed-evidence-hash")
+        .execute(&pool)
+        .await
+        .expect("seed ready evidence payload");
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_index (
+              id, repo_id, repo_full_name, audience, audience_user_id,
+              resource_kind, resource_key, side, status, payload_json,
+              content_hash, created_at, updated_at
+            ) VALUES ('feed-resource-120', 42, 'openai/codex', 'public', NULL,
+                       'compare', 'feed-compare', '', 'ready', '{}',
+                       'feed-resource-hash', '2026-02-24T08:00:00Z', '2026-02-24T08:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed ready evidence resource");
+        sqlx::query(
+            "INSERT INTO release_evidence_snapshot_items (snapshot_id, index_id, ordinal, created_at) VALUES ('feed-evidence-120', 'feed-resource-120', 0, '2026-02-24T08:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("link ready evidence resource");
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool.clone(), external_base_url.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique ready evidence test state")
+            .github_rest_api_base = external_base_url;
+
+        let _ = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("ready evidence should admit content work locally");
+
+        let (work_count, source_snapshot): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(source_snapshot_json) FROM content_work_items WHERE evidence_snapshot_id = 'feed-evidence-120'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load admitted ready evidence work");
+        assert_eq!(work_count, 1);
+        assert!(source_snapshot.contains("feed-evidence-120"));
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
