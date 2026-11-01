@@ -13,8 +13,8 @@
     "description": "SQLx migration history, global content-processing tables, legacy observation rows, and runtime-owner leases.",
     "storage_implementation": "SQLite via SQLx",
     "source_compatibility_range": {
-      "from_program_versions": "current SQLx history through migration 0092; target applies migrations 0093 through 0104 before listener bind",
-      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox, admin realtime task query indexes, recent subscription sync task index, and Release reading backfill state",
+      "from_program_versions": "current SQLx history through migration 0104; target applies migration 0105 before listener bind",
+      "to_program_version": "content-processing-online-v2 plus realtime-search-projection-outbox, admin realtime task query indexes, recent subscription sync task index, Release reading backfill state, and durable Release evidence collection state",
       "direct_major_skips_supported": false,
       "existing_history_behavior": "validate applied history first, then apply pending SQLx migrations transactionally before the listener binds"
     }
@@ -149,6 +149,16 @@
         "applies_before_listener_bind": true,
         "pauseable": false,
         "startup_order": 104,
+        "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
+      },
+      {
+        "version": 105,
+        "file": "migrations/0105_release_evidence_collection.sql",
+        "definition_checksum": "117176c157d90578d09fb543da70d8ecb0802223421e29147cdc745a144dcecf",
+        "description": "Create durable Release evidence snapshots, bounded resource indexes, snapshot-item links, and retry/lease state for DB-only feed admission and background GitHub collection.",
+        "applies_before_listener_bind": true,
+        "pauseable": false,
+        "startup_order": 105,
         "rollback_behavior": "retain migration and repair forward with a new program version; do not down-migrate"
       }
     ],

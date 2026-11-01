@@ -228,6 +228,35 @@ pub fn is_slow_or_error(status: StatusCode, latency: Duration, threshold_ms: usi
         || is_slow_http_latency(latency, threshold_ms)
 }
 
+pub fn compare_attempt_should_log(outcome: &str, latency: Duration, threshold_ms: usize) -> bool {
+    outcome != "success" || is_slow_http_latency(latency, threshold_ms)
+}
+
+#[allow(dead_code)]
+pub fn log_github_compare_completion(outcome: &str, latency: Duration, threshold_ms: usize) {
+    let latency_ms = latency.as_millis();
+    let slow = compare_attempt_should_log(outcome, latency, threshold_ms);
+    if slow {
+        tracing::warn!(
+            event = "github.compare",
+            outcome,
+            latency_ms,
+            slow,
+            threshold_ms,
+            "github compare attempt finished"
+        );
+    } else {
+        tracing::info!(
+            event = "github.compare",
+            outcome,
+            latency_ms,
+            slow,
+            threshold_ms,
+            "github compare attempt finished"
+        );
+    }
+}
+
 impl fmt::Display for LoggingThresholds {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -275,5 +304,24 @@ mod tests {
         let summary = error_chain_summary(err.as_ref());
         assert!(summary.contains("middle"));
         assert!(summary.contains("outer"));
+    }
+
+    #[test]
+    fn compare_attempt_logging_covers_failures_and_slow_successes() {
+        assert!(compare_attempt_should_log(
+            "service_unavailable",
+            Duration::from_millis(1),
+            1_000,
+        ));
+        assert!(compare_attempt_should_log(
+            "success",
+            Duration::from_millis(1_001),
+            1_000,
+        ));
+        assert!(!compare_attempt_should_log(
+            "success",
+            Duration::from_millis(999),
+            1_000,
+        ));
     }
 }
