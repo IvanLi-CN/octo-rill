@@ -916,6 +916,19 @@ mod tests {
             .expect("read migration 103"),
             1
         );
+        for version in [104_i64, 105_i64] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ? AND success = 1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("read release evidence migration history"),
+                1,
+                "migration {version} must be applied"
+            );
+        }
         for table in [
             "release_reading_backfill_runs",
             "release_reading_backfill_items",
@@ -949,6 +962,75 @@ mod tests {
                 "migration 102 must create {index}"
             );
         }
+        for table in [
+            "release_evidence_snapshots",
+            "release_evidence_index",
+            "release_evidence_snapshot_items",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("check release evidence table"),
+                1,
+                "migration 105 must create {table}"
+            );
+        }
+        for index in [
+            "idx_release_evidence_snapshots_release_audience",
+            "idx_release_evidence_snapshots_retry",
+            "idx_release_evidence_index_scope_key",
+            "idx_release_evidence_index_lookup",
+            "idx_release_evidence_snapshot_items_order",
+            "idx_release_evidence_task_active_snapshot",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                )
+                .bind(index)
+                .fetch_one(&pool)
+                .await
+                .expect("check release evidence index"),
+                1,
+                "migration 105 must create {index}"
+            );
+        }
+        let evidence_snapshot_columns =
+            sqlx::query("PRAGMA table_info('release_evidence_snapshots')")
+                .fetch_all(&pool)
+                .await
+                .expect("read release evidence snapshot columns");
+        let evidence_snapshot_column_names = evidence_snapshot_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<HashSet<_>>();
+        for required in [
+            "source_revision",
+            "status",
+            "attempt_count",
+            "retry_expires_at",
+            "lease_owner",
+            "lease_expires_at",
+        ] {
+            assert!(
+                evidence_snapshot_column_names.contains(required),
+                "missing release evidence snapshot column {required}"
+            );
+        }
+        let work_columns = sqlx::query("PRAGMA table_info('content_work_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("read content work columns");
+        let work_column_names = work_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<HashSet<_>>();
+        assert!(work_column_names.contains("evidence_snapshot_id"));
+        assert!(work_column_names.contains("evidence_status"));
         let foreign_keys = sqlx::query("PRAGMA foreign_key_list('release_reading_backfill_items')")
             .fetch_all(&pool)
             .await
