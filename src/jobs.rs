@@ -1,11 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::Infallible,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -15,9 +18,10 @@ use axum::response::{
     IntoResponse, Response,
     sse::{Event, KeepAlive, Sse},
 };
+use base64::Engine;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{Sqlite, Transaction};
 use tokio::io::AsyncWriteExt;
@@ -52,6 +56,7 @@ pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_BRIEF_HISTORY_RECOMPUTE: &str = "brief.history_recompute";
 pub const TASK_BRIEF_REFRESH_CONTENT: &str = "brief.refresh_content";
 pub const TASK_RELEASE_READING_BACKFILL: &str = "release.reading_backfill";
+pub const TASK_RELEASE_EVIDENCE: &str = "release.evidence";
 pub const TASK_RETRY_RECENT_FAILURES: &str = "retry.recent_failures";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
@@ -63,6 +68,17 @@ pub const TASK_WEBHOOK_PUSH_AUDIT: &str = "webhook.push.audit";
 
 const RELEASE_READING_BACKFILL_BATCH_SIZE: i64 = 100;
 const RELEASE_READING_BACKFILL_WINDOW_DAYS: i64 = 30;
+const RELEASE_EVIDENCE_LEASE_SECS: i64 = 5 * 60;
+const RELEASE_EVIDENCE_LEASE_HEARTBEAT_SECS: u64 = 60;
+const RELEASE_EVIDENCE_COLLECTION_TIMEOUT_SECS: u64 = 4 * 60;
+const RELEASE_EVIDENCE_MAX_ATTEMPTS: i64 = 5;
+const RELEASE_EVIDENCE_MAX_FILES: usize = 8;
+const RELEASE_EVIDENCE_MAX_COMMITS: usize = 32;
+const RELEASE_EVIDENCE_MAX_BLOB_BYTES: usize = 32 * 1024;
+// compare + commit + two trees + up to two blobs per changed file. This is a
+// batch-wide cap, including retries across multiple authorized connections.
+const RELEASE_EVIDENCE_MAX_REQUESTS: usize = 4 + RELEASE_EVIDENCE_MAX_FILES * 2;
+const RELEASE_EVIDENCE_RETRY_DELAYS_SECS: [i64; 5] = [30, 120, 600, 1_800, 7_200];
 
 fn is_webhook_push_task_type(task_type: &str) -> bool {
     matches!(
@@ -98,6 +114,89 @@ pub struct EnqueuedTask {
     pub reused: bool,
 }
 
+/// The immutable input used to identify one evidence snapshot.  `None` is
+/// deliberately the only public audience value; authorized snapshots are
+/// always tied to the requesting user and are never eligible for public reuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseEvidenceRequest {
+    pub release_id: i64,
+    pub repo_id: i64,
+    pub repo_full_name: String,
+    pub base_tag: String,
+    pub head_tag: String,
+    #[serde(default)]
+    pub audience_user_id: Option<String>,
+    #[serde(default)]
+    pub source_revision: String,
+}
+
+impl ReleaseEvidenceRequest {
+    fn validate(&self) -> Result<()> {
+        if self.release_id <= 0 || self.repo_id <= 0 {
+            return Err(anyhow!("release evidence identifiers must be positive"));
+        }
+        for (name, value) in [
+            ("repo_full_name", self.repo_full_name.as_str()),
+            ("base_tag", self.base_tag.as_str()),
+            ("head_tag", self.head_tag.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(anyhow!("release evidence {name} is required"));
+            }
+        }
+        if self
+            .audience_user_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(anyhow!("release evidence audience user is empty"));
+        }
+        Ok(())
+    }
+
+    fn audience(&self) -> &'static str {
+        if self.audience_user_id.is_some() {
+            "authorized"
+        } else {
+            "public"
+        }
+    }
+
+    pub(crate) fn request_key(&self) -> String {
+        ai::sha256_hex(&format!(
+            "release-evidence.v1\nrepo_id={}\nrepo={}\naudience={}\naudience_user_id={}\nrelease_id={}\nbase={}\nhead={}\nrevision={}",
+            self.repo_id,
+            self.repo_full_name,
+            self.audience(),
+            self.audience_user_id.as_deref().unwrap_or(""),
+            self.release_id,
+            self.base_tag,
+            self.head_tag,
+            self.source_revision,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseEvidenceSnapshotRef {
+    pub snapshot_id: String,
+    pub request_key: String,
+    pub status: String,
+    pub audience: String,
+    pub audience_user_id: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt_count: i64,
+    pub next_retry_at: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseEvidenceSnapshot {
+    #[serde(flatten)]
+    pub reference: ReleaseEvidenceSnapshotRef,
+    pub snapshot: Option<Value>,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct TaskRow {
     id: String,
@@ -118,6 +217,129 @@ struct SlotRow {
 struct DispatchStateRow {
     last_dispatch_key: Option<String>,
 }
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ReleaseEvidenceSnapshotRow {
+    id: String,
+    request_key: String,
+    release_id: i64,
+    repo_id: i64,
+    repo_full_name: String,
+    audience: String,
+    audience_user_id: Option<String>,
+    source_revision: String,
+    base_tag: String,
+    head_tag: String,
+    status: String,
+    snapshot_json: Option<String>,
+    attempt_count: i64,
+    next_retry_at: Option<String>,
+    retry_expires_at: Option<String>,
+    task_id: Option<String>,
+    lease_expires_at: Option<String>,
+    last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseEvidenceResource {
+    kind: &'static str,
+    key: String,
+    side: &'static str,
+    payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseEvidenceCollection {
+    snapshot: Value,
+    resources: Vec<ReleaseEvidenceResource>,
+    content_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceCompareResponse {
+    status: Option<String>,
+    ahead_by: Option<i64>,
+    behind_by: Option<i64>,
+    total_commits: Option<i64>,
+    base_commit: Option<GitHubEvidenceCommitRef>,
+    merge_base_commit: Option<GitHubEvidenceCommitRef>,
+    head_commit: Option<GitHubEvidenceCommitRef>,
+    #[serde(default)]
+    commits: Vec<GitHubEvidenceCommit>,
+    #[serde(default)]
+    files: Vec<GitHubEvidenceFile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceCommitRef {
+    sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceCommit {
+    sha: String,
+    commit: GitHubEvidenceCommitDetail,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceCommitDetail {
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceFile {
+    filename: String,
+    status: Option<String>,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    changes: Option<i64>,
+    patch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceTreeResponse {
+    #[serde(default)]
+    tree: Vec<GitHubEvidenceTreeEntry>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceTreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    sha: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubEvidenceCommitResponse {
+    sha: String,
+    #[serde(default)]
+    commit: Option<GitHubEvidenceCommitDetail>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubEvidenceBlobResponse {
+    encoding: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct ReleaseEvidenceFailure {
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+impl std::fmt::Display for ReleaseEvidenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReleaseEvidenceFailure {}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct StarSyncConnectionRow {
@@ -854,6 +1076,1425 @@ pub async fn enqueue_brief_refresh_content_if_needed(state: &AppState) -> Result
     .await?;
 
     Ok(Some(task.task_id))
+}
+
+const RELEASE_EVIDENCE_SNAPSHOT_SELECT: &str = r#"
+    SELECT id, request_key, release_id, repo_id, repo_full_name, audience,
+           audience_user_id, source_revision, base_tag, head_tag, status,
+           snapshot_json, attempt_count, next_retry_at, retry_expires_at,
+           task_id, lease_expires_at, last_error_code
+    FROM release_evidence_snapshots
+"#;
+
+fn release_evidence_snapshot_reference(
+    row: &ReleaseEvidenceSnapshotRow,
+) -> ReleaseEvidenceSnapshotRef {
+    ReleaseEvidenceSnapshotRef {
+        snapshot_id: row.id.clone(),
+        request_key: row.request_key.clone(),
+        status: row.status.clone(),
+        audience: row.audience.clone(),
+        audience_user_id: row.audience_user_id.clone(),
+        task_id: row.task_id.clone(),
+        attempt_count: row.attempt_count,
+        next_retry_at: row.next_retry_at.clone(),
+        error_code: row.last_error_code.clone(),
+    }
+}
+
+fn release_evidence_snapshot_view(
+    row: &ReleaseEvidenceSnapshotRow,
+) -> Result<ReleaseEvidenceSnapshot> {
+    let snapshot = row
+        .snapshot_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("invalid persisted release evidence snapshot")?;
+    Ok(ReleaseEvidenceSnapshot {
+        reference: release_evidence_snapshot_reference(row),
+        snapshot,
+    })
+}
+
+async fn find_release_evidence_snapshot(
+    state: &AppState,
+    request_key: &str,
+) -> Result<Option<ReleaseEvidenceSnapshotRow>> {
+    sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
+        "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE request_key = ? LIMIT 1"
+    ))
+    .bind(request_key)
+    .fetch_optional(&state.pool)
+    .await
+    .context("load release evidence snapshot")
+}
+
+async fn find_active_release_evidence_task(
+    state: &AppState,
+    snapshot_id: &str,
+) -> Result<Option<EnqueuedTask>> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        r#"
+        SELECT id, task_type, status
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status IN (?, ?)
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.snapshot_id') = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(TASK_RELEASE_EVIDENCE)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .bind(snapshot_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("find active release evidence task")?;
+    Ok(row.map(|(task_id, task_type, status)| EnqueuedTask {
+        task_id,
+        task_type,
+        status,
+        reused: true,
+    }))
+}
+
+async fn update_release_evidence_snapshot_task(
+    state: &AppState,
+    snapshot_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    state
+        .sqlite_writer
+        .write_foreground("release_evidence_task_link", |_| async {
+            sqlx::query(
+                "UPDATE release_evidence_snapshots SET task_id = ?, updated_at = ? WHERE id = ? AND status IN ('queued', 'failed')",
+            )
+            .bind(task_id)
+            .bind(Utc::now().to_rfc3339())
+            .bind(snapshot_id)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("link release evidence task")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
+async fn enqueue_release_evidence_task(
+    state: &AppState,
+    request: &ReleaseEvidenceRequest,
+    snapshot_id: &str,
+) -> Result<EnqueuedTask> {
+    let _guard = task_singleton_enqueue_lock().lock().await;
+    if let Some(existing) = find_active_release_evidence_task(state, snapshot_id).await? {
+        return Ok(existing);
+    }
+    let mut payload =
+        serde_json::to_value(request).context("serialize release evidence request")?;
+    payload["snapshot_id"] = Value::String(snapshot_id.to_owned());
+    let task = match enqueue_task(
+        state,
+        NewTask {
+            task_type: TASK_RELEASE_EVIDENCE.to_owned(),
+            payload,
+            source: "release_reading.evidence".to_owned(),
+            requested_by: request.audience_user_id.clone(),
+            parent_task_id: None,
+        },
+    )
+    .await
+    {
+        Ok(task) => task,
+        Err(error) if is_unique_violation(&error) => {
+            find_active_release_evidence_task(state, snapshot_id)
+                .await?
+                .context("release evidence task disappeared after unique conflict")?
+        }
+        Err(error) => return Err(error),
+    };
+    update_release_evidence_snapshot_task(state, snapshot_id, task.task_id.as_str()).await?;
+    Ok(task)
+}
+
+/// Ensure that a durable evidence snapshot exists and that its collection is
+/// represented by at most one queued/running task. This function performs
+/// only SQLite work and is safe to call from an HTTP request path.
+pub async fn ensure_release_evidence(
+    state: &AppState,
+    request: ReleaseEvidenceRequest,
+) -> Result<ReleaseEvidenceSnapshot> {
+    request.validate()?;
+    let request_key = request.request_key();
+    let now = Utc::now();
+    let mut row = find_release_evidence_snapshot(state, request_key.as_str()).await?;
+    if row.is_none() {
+        let snapshot_id = local_id::generate_local_id().to_string();
+        let retry_expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
+        state
+            .sqlite_writer
+            .write_foreground("release_evidence_snapshot_insert", |_| async {
+                sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO release_evidence_snapshots (
+                      id, request_key, release_id, repo_id, repo_full_name, audience,
+                      audience_user_id, source_revision, base_tag, head_tag, status,
+                      retry_expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                    "#,
+                )
+                .bind(&snapshot_id)
+                .bind(&request_key)
+                .bind(request.release_id)
+                .bind(request.repo_id)
+                .bind(&request.repo_full_name)
+                .bind(request.audience())
+                .bind(request.audience_user_id.as_deref())
+                .bind(&request.source_revision)
+                .bind(&request.base_tag)
+                .bind(&request.head_tag)
+                .bind(&retry_expires_at)
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
+                .await
+                .context("insert release evidence snapshot")
+            })
+            .await?;
+        row = find_release_evidence_snapshot(state, request_key.as_str()).await?;
+    }
+
+    let mut row = row.context("release evidence snapshot disappeared after insert")?;
+    let retry_due = row.status == "failed"
+        && row.attempt_count < RELEASE_EVIDENCE_MAX_ATTEMPTS
+        && row
+            .retry_expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) > now)
+        && row
+            .next_retry_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) <= now);
+    if retry_due {
+        state
+            .sqlite_writer
+            .write_foreground("release_evidence_snapshot_retry", |_| async {
+                sqlx::query(
+                    "UPDATE release_evidence_snapshots SET status = 'queued', next_retry_at = NULL, last_error_code = NULL, last_error_summary = NULL, task_id = NULL, updated_at = ? WHERE id = ? AND status = 'failed'",
+                )
+                .bind(now.to_rfc3339())
+                .bind(&row.id)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
+                .await
+                .context("queue release evidence retry")?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        row = find_release_evidence_snapshot(state, request_key.as_str())
+            .await?
+            .context("reload release evidence retry")?;
+    }
+
+    if row.status == "ready" {
+        return release_evidence_snapshot_view(&row);
+    }
+    if row.status == "running"
+        && row
+            .lease_expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) > now)
+    {
+        return release_evidence_snapshot_view(&row);
+    }
+    if row.status == "failed" && !retry_due {
+        return release_evidence_snapshot_view(&row);
+    }
+    if row.status == "queued"
+        && find_active_release_evidence_task(state, row.id.as_str())
+            .await?
+            .is_some()
+    {
+        return release_evidence_snapshot_view(&row);
+    }
+
+    let task = enqueue_release_evidence_task(state, &request, row.id.as_str()).await?;
+    if row.status != "queued" {
+        state
+            .sqlite_writer
+            .write_foreground("release_evidence_snapshot_requeue", |_| async {
+                let now_text = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE release_evidence_snapshots SET status = 'queued', task_id = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status <> 'ready' AND (status <> 'running' OR lease_expires_at IS NULL OR julianday(lease_expires_at) <= julianday(?))",
+                )
+                .bind(&task.task_id)
+                .bind(&now_text)
+                .bind(&row.id)
+                .bind(&now_text)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
+                .await
+                .context("requeue release evidence snapshot")?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+    }
+    row = find_release_evidence_snapshot(state, request_key.as_str())
+        .await?
+        .context("reload release evidence snapshot after enqueue")?;
+    let mut view = release_evidence_snapshot_view(&row)?;
+    if view.reference.task_id.is_none() {
+        view.reference.task_id = Some(task.task_id);
+    }
+    Ok(view)
+}
+
+/// Read a snapshot only when the requested audience matches its durable scope.
+/// A public read cannot observe an authorized snapshot even if it knows the
+/// release id or request key.
+#[allow(dead_code)]
+pub async fn load_release_evidence_snapshot(
+    state: &AppState,
+    snapshot_id: &str,
+    audience_user_id: Option<&str>,
+) -> Result<Option<ReleaseEvidenceSnapshot>> {
+    let row = sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
+        "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE id = ? AND ((audience = 'public' AND audience_user_id IS NULL AND ? IS NULL) OR (audience = 'authorized' AND audience_user_id = ?)) LIMIT 1"
+    ))
+    .bind(snapshot_id)
+    .bind(audience_user_id)
+    .bind(audience_user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("load scoped release evidence snapshot")?;
+    row.map(|row| release_evidence_snapshot_view(&row))
+        .transpose()
+}
+
+fn release_evidence_http_failure(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    audience: &str,
+) -> ReleaseEvidenceFailure {
+    let (code, retryable) =
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            ("github_unavailable", true)
+        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+            ("reauth_required", false)
+        } else if status == reqwest::StatusCode::FORBIDDEN {
+            let remaining = headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim);
+            if remaining == Some("0")
+                || headers.get(reqwest::header::RETRY_AFTER).is_some()
+                || body.to_ascii_lowercase().contains("rate limit")
+            {
+                ("github_unavailable", true)
+            } else {
+                (
+                    if audience == "authorized" {
+                        "github_private_access_denied"
+                    } else {
+                        "github_public_access_denied"
+                    },
+                    false,
+                )
+            }
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            ("github_not_found", false)
+        } else {
+            ("github_evidence_request_failed", false)
+        };
+    ReleaseEvidenceFailure {
+        code: code.to_owned(),
+        message: format!("GitHub evidence request returned {status}"),
+        retryable,
+    }
+}
+
+fn release_evidence_transport_failure(error: impl std::fmt::Display) -> ReleaseEvidenceFailure {
+    ReleaseEvidenceFailure {
+        code: "github_unavailable".to_owned(),
+        message: format!("GitHub evidence request failed: {error}"),
+        retryable: true,
+    }
+}
+
+fn release_evidence_budget_failure(
+    error: crate::github::CompareGuardError,
+) -> ReleaseEvidenceFailure {
+    ReleaseEvidenceFailure {
+        code: "github_unavailable".to_owned(),
+        message: format!("GitHub evidence request budget exhausted: {error}"),
+        retryable: true,
+    }
+}
+
+fn release_evidence_budget() -> crate::github::CompareBudget {
+    crate::github::CompareBudget::new(
+        Duration::from_secs(RELEASE_EVIDENCE_COLLECTION_TIMEOUT_SECS),
+        RELEASE_EVIDENCE_MAX_REQUESTS,
+    )
+}
+
+async fn fetch_release_evidence_json<T: DeserializeOwned>(
+    state: &AppState,
+    path: &str,
+    token: Option<&str>,
+    audience: &str,
+    budget: &mut crate::github::CompareBudget,
+) -> std::result::Result<(T, bool), ReleaseEvidenceFailure> {
+    let url = state
+        .github_rest_api_base
+        .join(path)
+        .map_err(release_evidence_transport_failure)?;
+    let mut request = state
+        .github_rest_http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    budget
+        .run(async move {
+            let response = request
+                .send()
+                .await
+                .map_err(release_evidence_transport_failure)?;
+            let status = response.status();
+            if !status.is_success() {
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_default();
+                return Err(release_evidence_http_failure(
+                    status, &headers, &body, audience,
+                ));
+            }
+            let pagination_truncated = response
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("rel=\"next\""));
+            response
+                .json::<T>()
+                .await
+                .map(|payload| (payload, pagination_truncated))
+                .map_err(|error| ReleaseEvidenceFailure {
+                    code: "github_evidence_incomplete".to_owned(),
+                    message: format!("GitHub evidence response was invalid: {error}"),
+                    retryable: true,
+                })
+        })
+        .await
+        .map_err(release_evidence_budget_failure)?
+}
+
+async fn fetch_release_evidence_blob(
+    state: &AppState,
+    repo_full_name: &str,
+    blob_sha: &str,
+    token: Option<&str>,
+    audience: &str,
+    budget: &mut crate::github::CompareBudget,
+) -> std::result::Result<Option<String>, ReleaseEvidenceFailure> {
+    let path = format!(
+        "repos/{repo_full_name}/git/blobs/{}",
+        urlencoding::encode(blob_sha)
+    );
+    let (payload, _) = fetch_release_evidence_json::<GitHubEvidenceBlobResponse>(
+        state, &path, token, audience, budget,
+    )
+    .await?;
+    if payload.encoding != "base64" {
+        return Ok(None);
+    }
+    let encoded = payload.content.replace(['\n', '\r'], "");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: format!("GitHub blob content was invalid: {error}"),
+            retryable: true,
+        })?;
+    if bytes.len() > RELEASE_EVIDENCE_MAX_BLOB_BYTES {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub blob content was not UTF-8".to_owned(),
+            retryable: true,
+        })
+}
+
+fn release_evidence_file_is_noise(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "yarn.lock",
+        "cargo.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "poetry.lock",
+        "pipfile.lock",
+        "bun.lock",
+        "bun.lockb",
+        "uv.lock",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        || path.ends_with(".min.js")
+        || path.ends_with(".min.css")
+        || path.ends_with(".map")
+        || path.contains("/dist/")
+        || path.contains("/build/")
+        || path.contains("/generated/")
+        || path.contains(".generated.")
+        || [
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar",
+            ".jar", ".wasm", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mov",
+        ]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
+fn release_evidence_excerpt(content: &str) -> String {
+    content.lines().take(24).collect::<Vec<_>>().join("\n")
+}
+
+fn release_evidence_tree_files(
+    tree: &GitHubEvidenceTreeResponse,
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
+    tree.tree
+        .iter()
+        .filter(|entry| entry.entry_type != "tree")
+        .map(|entry| (entry.path.clone(), (entry.sha.clone(), entry.mode.clone())))
+        .collect()
+}
+
+fn release_evidence_file_status(
+    base: Option<&(Option<String>, Option<String>)>,
+    head: Option<&(Option<String>, Option<String>)>,
+) -> &'static str {
+    match (base, head) {
+        (None, Some(_)) => "added",
+        (Some(_), None) => "removed",
+        _ => "modified",
+    }
+}
+
+async fn collect_release_evidence_with_token(
+    state: &AppState,
+    request: &ReleaseEvidenceRequest,
+    token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
+) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
+    let audience = request.audience();
+    let compare_path = format!(
+        "repos/{}/compare/{}...{}",
+        request.repo_full_name,
+        urlencoding::encode(&request.base_tag),
+        urlencoding::encode(&request.head_tag)
+    );
+    let (compare, compare_paginated) =
+        fetch_release_evidence_json::<GitHubEvidenceCompareResponse>(
+            state,
+            &compare_path,
+            token,
+            audience,
+            budget,
+        )
+        .await?;
+    let Some(status) = compare.status.as_deref() else {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub compare response has no relationship status".to_owned(),
+            retryable: true,
+        });
+    };
+    if !status.eq_ignore_ascii_case("ahead") {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_insufficient".to_owned(),
+            message: format!("GitHub compare relationship status was {status}, not ahead"),
+            retryable: false,
+        });
+    }
+    if compare.base_commit.is_none()
+        || compare.merge_base_commit.is_none()
+        || compare.total_commits.is_none()
+        || compare.total_commits.is_some_and(|value| value < 0)
+    {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub compare response is incomplete".to_owned(),
+            retryable: true,
+        });
+    }
+    if compare
+        .total_commits
+        .is_some_and(|total| total as usize > RELEASE_EVIDENCE_MAX_COMMITS)
+        || compare.commits.len() > RELEASE_EVIDENCE_MAX_COMMITS
+        || compare_paginated
+    {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub compare response is paginated or exceeds the evidence bound"
+                .to_owned(),
+            retryable: true,
+        });
+    }
+
+    let base_sha = compare
+        .base_commit
+        .as_ref()
+        .map(|commit| commit.sha.clone())
+        .filter(|sha| !sha.trim().is_empty())
+        .ok_or_else(|| ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub compare response has no base SHA".to_owned(),
+            retryable: true,
+        })?;
+    let head_commit_path = format!(
+        "repos/{}/commits/{}",
+        request.repo_full_name,
+        urlencoding::encode(&request.head_tag)
+    );
+    let (head_commit, head_commit_paginated) = fetch_release_evidence_json::<
+        GitHubEvidenceCommitResponse,
+    >(
+        state, &head_commit_path, token, audience, budget
+    )
+    .await?;
+    let head_sha = head_commit.sha.trim().to_owned();
+    if head_sha.is_empty() || head_commit_paginated {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub head commit response is incomplete".to_owned(),
+            retryable: true,
+        });
+    }
+
+    let base_tree_path = format!(
+        "repos/{}/git/trees/{}?recursive=1",
+        request.repo_full_name,
+        urlencoding::encode(&base_sha)
+    );
+    let head_tree_path = format!(
+        "repos/{}/git/trees/{}?recursive=1",
+        request.repo_full_name,
+        urlencoding::encode(&head_sha)
+    );
+    let (base_tree, base_tree_paginated) =
+        fetch_release_evidence_json::<GitHubEvidenceTreeResponse>(
+            state,
+            &base_tree_path,
+            token,
+            audience,
+            budget,
+        )
+        .await?;
+    let (head_tree, head_tree_paginated) =
+        fetch_release_evidence_json::<GitHubEvidenceTreeResponse>(
+            state,
+            &head_tree_path,
+            token,
+            audience,
+            budget,
+        )
+        .await?;
+    if base_tree.truncated || head_tree.truncated || base_tree_paginated || head_tree_paginated {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub tree response is truncated".to_owned(),
+            retryable: true,
+        });
+    }
+
+    let base_files = release_evidence_tree_files(&base_tree);
+    let head_files = release_evidence_tree_files(&head_tree);
+    let mut paths = base_files.keys().cloned().collect::<BTreeSet<_>>();
+    paths.extend(head_files.keys().cloned());
+    let compare_files = compare
+        .files
+        .iter()
+        .map(|file| (file.filename.as_str(), file))
+        .collect::<HashMap<_, _>>();
+    let changed_paths = paths
+        .into_iter()
+        .filter(|path| !release_evidence_file_is_noise(path))
+        .filter(|path| base_files.get(path) != head_files.get(path))
+        .collect::<Vec<_>>();
+    if compare_files.len() > RELEASE_EVIDENCE_MAX_FILES
+        || changed_paths.len() > RELEASE_EVIDENCE_MAX_FILES
+    {
+        return Err(ReleaseEvidenceFailure {
+            code: "github_evidence_incomplete".to_owned(),
+            message: "GitHub file evidence exceeds the bounded collection size".to_owned(),
+            retryable: true,
+        });
+    }
+
+    let mut resources = vec![
+        ReleaseEvidenceResource {
+            kind: "compare",
+            key: format!("{}...{}", request.base_tag, request.head_tag),
+            side: "",
+            payload: serde_json::to_value(&compare).map_err(|error| ReleaseEvidenceFailure {
+                code: "evidence_serialization_failed".to_owned(),
+                message: format!("serialize GitHub compare evidence failed: {error}"),
+                retryable: false,
+            })?,
+        },
+        ReleaseEvidenceResource {
+            kind: "commit",
+            key: head_sha.clone(),
+            side: "head",
+            payload: serde_json::to_value(&head_commit).map_err(|error| {
+                ReleaseEvidenceFailure {
+                    code: "evidence_serialization_failed".to_owned(),
+                    message: format!("serialize GitHub commit evidence failed: {error}"),
+                    retryable: false,
+                }
+            })?,
+        },
+        ReleaseEvidenceResource {
+            kind: "tree",
+            key: base_sha.clone(),
+            side: "base",
+            payload: serde_json::to_value(&base_tree).map_err(|error| ReleaseEvidenceFailure {
+                code: "evidence_serialization_failed".to_owned(),
+                message: format!("serialize GitHub base tree evidence failed: {error}"),
+                retryable: false,
+            })?,
+        },
+        ReleaseEvidenceResource {
+            kind: "tree",
+            key: head_sha.clone(),
+            side: "head",
+            payload: serde_json::to_value(&head_tree).map_err(|error| ReleaseEvidenceFailure {
+                code: "evidence_serialization_failed".to_owned(),
+                message: format!("serialize GitHub head tree evidence failed: {error}"),
+                retryable: false,
+            })?,
+        },
+    ];
+
+    let mut files = Vec::new();
+    for path in changed_paths {
+        let base = base_files.get(&path);
+        let head = head_files.get(&path);
+        let base_sha = base.and_then(|entry| entry.0.as_deref());
+        let head_sha = head.and_then(|entry| entry.0.as_deref());
+        let base_text = match base_sha {
+            Some(sha) => {
+                fetch_release_evidence_blob(
+                    state,
+                    &request.repo_full_name,
+                    sha,
+                    token,
+                    audience,
+                    budget,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let head_text = match head_sha {
+            Some(sha) => {
+                fetch_release_evidence_blob(
+                    state,
+                    &request.repo_full_name,
+                    sha,
+                    token,
+                    audience,
+                    budget,
+                )
+                .await?
+            }
+            None => None,
+        };
+        if (base.is_some() && base_text.is_none()) || (head.is_some() && head_text.is_none()) {
+            return Err(ReleaseEvidenceFailure {
+                code: "github_evidence_incomplete".to_owned(),
+                message: format!("GitHub blob evidence is unavailable for {path}"),
+                retryable: true,
+            });
+        }
+        let compare_file = compare_files.get(path.as_str()).copied();
+        let file_payload = json!({
+            "path": path,
+            "status": compare_file
+                .and_then(|file| file.status.as_deref())
+                .unwrap_or_else(|| release_evidence_file_status(base, head)),
+            "additions": compare_file.and_then(|file| file.additions),
+            "deletions": compare_file.and_then(|file| file.deletions),
+            "changes": compare_file.and_then(|file| file.changes),
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "base_text": base_text.as_deref(),
+            "head_text": head_text.as_deref(),
+            "patch_excerpt": match (base_text.as_deref(), head_text.as_deref()) {
+                (Some(base), Some(head)) => Some(format!("-{}\n+{}", release_evidence_excerpt(base), release_evidence_excerpt(head))),
+                (None, Some(head)) => Some(format!("+{}", release_evidence_excerpt(head))),
+                (Some(base), None) => Some(format!("-{}", release_evidence_excerpt(base))),
+                (None, None) => None,
+            },
+        });
+        if let Some(sha) = base_sha {
+            resources.push(ReleaseEvidenceResource {
+                kind: "blob",
+                key: sha.to_owned(),
+                side: "base",
+                payload: json!({"sha": sha, "text": base_text}),
+            });
+        }
+        if let Some(sha) = head_sha {
+            resources.push(ReleaseEvidenceResource {
+                kind: "blob",
+                key: sha.to_owned(),
+                side: "head",
+                payload: json!({"sha": sha, "text": head_text}),
+            });
+        }
+        resources.push(ReleaseEvidenceResource {
+            kind: "file",
+            key: path.clone(),
+            side: "",
+            payload: file_payload.clone(),
+        });
+        files.push(file_payload);
+    }
+
+    let snapshot = json!({
+        "version": 1,
+        "audience": audience,
+        "repo_full_name": request.repo_full_name,
+        "release_id": request.release_id,
+        "base_tag": request.base_tag,
+        "head_tag": request.head_tag,
+        "relationship_status": status,
+        "base_sha": base_sha,
+        "merge_base_sha": compare.merge_base_commit.map(|commit| commit.sha),
+        "head_sha": head_sha,
+        "ahead_by": compare.ahead_by,
+        "behind_by": compare.behind_by,
+        "total_commits": compare.total_commits,
+        "commits": compare.commits,
+        "files": files,
+        "coverage_complete": true,
+    });
+    let serialized = serde_json::to_string(&snapshot).map_err(|error| ReleaseEvidenceFailure {
+        code: "evidence_serialization_failed".to_owned(),
+        message: format!("serialize release evidence snapshot failed: {error}"),
+        retryable: false,
+    })?;
+    Ok(ReleaseEvidenceCollection {
+        snapshot,
+        resources,
+        content_hash: ai::sha256_hex(&serialized),
+    })
+}
+
+async fn collect_release_evidence(
+    state: &AppState,
+    request: &ReleaseEvidenceRequest,
+) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
+    let mut budget = release_evidence_budget();
+    collect_release_evidence_with_budget(state, request, &mut budget).await
+}
+
+async fn collect_release_evidence_with_budget(
+    state: &AppState,
+    request: &ReleaseEvidenceRequest,
+    budget: &mut crate::github::CompareBudget,
+) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
+    let tokens = if let Some(user_id) = request.audience_user_id.as_deref() {
+        let connections = state
+            .load_github_connections(user_id)
+            .await
+            .map_err(release_evidence_transport_failure)?;
+        if connections.is_empty() {
+            return Err(ReleaseEvidenceFailure {
+                code: "reauth_required".to_owned(),
+                message: "no authorized GitHub connection is available".to_owned(),
+                retryable: false,
+            });
+        }
+        connections
+            .into_iter()
+            .map(|connection| Some(connection.access_token))
+            .collect::<Vec<_>>()
+    } else {
+        vec![None]
+    };
+    let mut last_error = None;
+    for token in tokens {
+        match collect_release_evidence_with_token(state, request, token.as_deref(), budget).await {
+            Ok(collection) => return Ok(collection),
+            Err(error)
+                if error.code == "reauth_required" || error.code.contains("access_denied") =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ReleaseEvidenceFailure {
+        code: "github_evidence_request_failed".to_owned(),
+        message: "GitHub evidence collection failed".to_owned(),
+        retryable: false,
+    }))
+}
+
+async fn claim_release_evidence_snapshot(
+    state: &AppState,
+    task_id: &str,
+    snapshot_id: &str,
+) -> Result<ReleaseEvidenceSnapshotRow> {
+    let now = Utc::now();
+    let lease_expires_at =
+        (now + chrono::Duration::seconds(RELEASE_EVIDENCE_LEASE_SECS)).to_rfc3339();
+    let now_text = now.to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_evidence_claim",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin release evidence claim")?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE release_evidence_snapshots
+        SET status = 'running', attempt_count = attempt_count + 1,
+            task_id = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?
+        WHERE id = ?
+          AND status IN ('queued', 'failed', 'running')
+          AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime(?))
+          AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))
+          AND attempt_count < ?
+          AND (
+            lease_owner IS NULL
+            OR lease_expires_at IS NULL
+            OR julianday(lease_expires_at) <= julianday(?)
+            OR (lease_owner = ? AND task_id = ?)
+          )
+        "#,
+    )
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(&lease_expires_at)
+    .bind(&now_text)
+    .bind(snapshot_id)
+    .bind(&now_text)
+    .bind(&now_text)
+    .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+    .bind(&now_text)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await
+    .context("claim release evidence snapshot")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err(anyhow!(
+            "release evidence snapshot is already owned or not ready to retry"
+        ));
+    }
+    let row = sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
+        "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE id = ? LIMIT 1"
+    ))
+    .bind(snapshot_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("reload claimed release evidence snapshot")?;
+    tx.commit().await.context("commit release evidence claim")?;
+    Ok(row)
+}
+
+async fn renew_release_evidence_lease(
+    state: &AppState,
+    task_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let lease_expires_at =
+        (now + chrono::Duration::seconds(RELEASE_EVIDENCE_LEASE_SECS)).to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_evidence_lease_heartbeat",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin release evidence lease heartbeat")?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE release_evidence_snapshots
+        SET lease_expires_at = ?, updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND task_id = ?
+          AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL
+          AND julianday(lease_expires_at) > julianday(?)
+        "#,
+    )
+    .bind(&lease_expires_at)
+    .bind(&now_text)
+    .bind(snapshot_id)
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(&now_text)
+    .execute(&mut *tx)
+    .await
+    .context("renew release evidence lease")?;
+    tx.commit()
+        .await
+        .context("commit release evidence lease heartbeat")?;
+    Ok(updated.rows_affected() > 0)
+}
+
+fn release_evidence_retry_delay(attempt_count: i64) -> chrono::Duration {
+    let index = attempt_count.saturating_sub(1).clamp(0, 4) as usize;
+    chrono::Duration::seconds(RELEASE_EVIDENCE_RETRY_DELAYS_SECS[index])
+}
+
+fn scoped_release_evidence_resource_key(source_revision: &str, resource_key: &str) -> String {
+    format!("release-evidence-resource.v1\n{source_revision}\n{resource_key}")
+}
+
+async fn persist_release_evidence_failure(
+    state: &AppState,
+    task_id: &str,
+    snapshot_id: &str,
+    failure: &ReleaseEvidenceFailure,
+) -> Result<()> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_evidence_failure",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin release evidence failure")?;
+    let (attempt_count, retry_expires_at) = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT attempt_count, retry_expires_at FROM release_evidence_snapshots WHERE id = ? AND task_id = ? AND lease_owner = ?",
+    )
+    .bind(snapshot_id)
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load release evidence failure attempt")?
+    .unwrap_or((0, None));
+    let retry_window_open = retry_expires_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|value| value.with_timezone(&Utc) > now);
+    let retryable =
+        failure.retryable && attempt_count < RELEASE_EVIDENCE_MAX_ATTEMPTS && retry_window_open;
+    let next_retry_at =
+        retryable.then(|| (now + release_evidence_retry_delay(attempt_count)).to_rfc3339());
+    let updated = sqlx::query(
+        r#"
+        UPDATE release_evidence_snapshots
+        SET status = 'failed', next_retry_at = ?,
+            last_error_code = ?, last_error_summary = ?,
+            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND task_id = ? AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL
+          AND julianday(lease_expires_at) > julianday(?)
+        "#,
+    )
+    .bind(next_retry_at.as_deref())
+    .bind(&failure.code)
+    .bind(&failure.message)
+    .bind(&now_text)
+    .bind(snapshot_id)
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(&now_text)
+    .execute(&mut *tx)
+    .await
+    .context("persist release evidence failure")?;
+    if updated.rows_affected() > 0 {
+        sqlx::query(
+        "UPDATE content_work_items SET evidence_status = 'failed', updated_at = ? WHERE evidence_snapshot_id = ? AND evidence_status = 'pending'",
+        )
+        .bind(&now_text)
+        .bind(snapshot_id)
+        .execute(&mut *tx)
+        .await
+        .context("mark content work evidence failed")?;
+    } else {
+        tx.rollback().await.ok();
+        return Err(anyhow!("release evidence failure lease was lost"));
+    }
+    tx.commit()
+        .await
+        .context("commit release evidence failure")?;
+    Ok(())
+}
+
+async fn persist_release_evidence_collection(
+    state: &AppState,
+    task_id: &str,
+    snapshot_id: &str,
+    collection: ReleaseEvidenceCollection,
+) -> Result<()> {
+    let snapshot_json = serde_json::to_string(&collection.snapshot)
+        .context("serialize collected release evidence")?;
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "release_evidence_publish",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin release evidence publish")?;
+    let transaction_now = Utc::now().to_rfc3339();
+    let now = transaction_now.clone();
+    let snapshot = sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
+        "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE id = ? AND status = 'running' AND task_id = ? AND lease_owner = ? AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?) LIMIT 1"
+    ))
+    .bind(snapshot_id)
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(&transaction_now)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("check release evidence publish lease")?;
+    let Some(snapshot) = snapshot else {
+        tx.rollback().await.ok();
+        return Err(anyhow!("release evidence publish lease was lost"));
+    };
+    for resource in &collection.resources {
+        let payload_json = serde_json::to_string(&resource.payload)
+            .context("serialize release evidence index payload")?;
+        let content_hash = ai::sha256_hex(&payload_json);
+        let index_id = local_id::generate_local_id().to_string();
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO release_evidence_index (
+              id, repo_id, repo_full_name, audience, audience_user_id,
+              resource_kind, resource_key, side, status, payload_json,
+              content_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&index_id)
+        .bind(snapshot.repo_id)
+        .bind(&snapshot.repo_full_name)
+        .bind(&snapshot.audience)
+        .bind(snapshot.audience_user_id.as_deref())
+        .bind(resource.kind)
+        .bind(scoped_release_evidence_resource_key(
+            snapshot.source_revision.as_str(),
+            resource.key.as_str(),
+        ))
+        .bind(resource.side)
+        .bind(&payload_json)
+        .bind(&content_hash)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .context("upsert release evidence index resource")?;
+        let persisted_index_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM release_evidence_index WHERE repo_id = ? AND audience = ? AND audience_user_id IS ? AND resource_kind = ? AND resource_key = ? AND side = ? LIMIT 1",
+        )
+        .bind(snapshot.repo_id)
+        .bind(&snapshot.audience)
+        .bind(snapshot.audience_user_id.as_deref())
+        .bind(resource.kind)
+        .bind(scoped_release_evidence_resource_key(
+            snapshot.source_revision.as_str(),
+            resource.key.as_str(),
+        ))
+        .bind(resource.side)
+        .fetch_one(&mut *tx)
+        .await
+        .context("load release evidence index resource")?;
+        sqlx::query(
+            "UPDATE release_evidence_index SET status = 'ready', payload_json = ?, content_hash = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&payload_json)
+        .bind(&content_hash)
+        .bind(&now)
+        .bind(&persisted_index_id)
+        .execute(&mut *tx)
+        .await
+        .context("refresh release evidence index resource")?;
+        let ordinal = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM release_evidence_snapshot_items WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("allocate release evidence item ordinal")?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO release_evidence_snapshot_items (snapshot_id, index_id, ordinal, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(snapshot_id)
+        .bind(&persisted_index_id)
+        .bind(ordinal)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .context("link release evidence index resource")?;
+    }
+    let publish_now = Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        r#"
+        UPDATE release_evidence_snapshots
+        SET status = 'ready', snapshot_json = ?, content_hash = ?,
+            next_retry_at = NULL, last_error_code = NULL,
+            last_error_summary = NULL, lease_owner = NULL,
+            lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'running' AND task_id = ? AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL
+          AND julianday(lease_expires_at) > julianday(?)
+        "#,
+    )
+    .bind(&snapshot_json)
+    .bind(&collection.content_hash)
+    .bind(&publish_now)
+    .bind(snapshot_id)
+    .bind(task_id)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(&publish_now)
+    .execute(&mut *tx)
+    .await
+    .context("publish release evidence snapshot")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err(anyhow!("release evidence publish lease was lost"));
+    }
+    sqlx::query(
+        "UPDATE content_work_items SET evidence_status = 'ready', updated_at = ? WHERE evidence_snapshot_id = ? AND evidence_status IN ('pending', 'failed')",
+    )
+    .bind(&publish_now)
+    .bind(snapshot_id)
+    .execute(&mut *tx)
+    .await
+    .context("release content work after evidence publish")?;
+    tx.commit()
+        .await
+        .context("commit release evidence publish")?;
+    crate::content_processing::wake_global_scheduler();
+    Ok(())
+}
+
+async fn execute_release_evidence_task(
+    state: &AppState,
+    task_id: &str,
+    payload: &Value,
+) -> Result<Value> {
+    let snapshot_id = payload
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("release evidence task missing snapshot_id")?;
+    let request: ReleaseEvidenceRequest =
+        serde_json::from_value(payload.clone()).context("invalid release evidence task payload")?;
+    request.validate()?;
+    let existing = find_release_evidence_snapshot(state, request.request_key().as_str())
+        .await?
+        .context("release evidence snapshot not found")?;
+    if existing.id != snapshot_id {
+        return Err(anyhow!("release evidence task snapshot identity mismatch"));
+    }
+    if existing.status == "ready" {
+        return Ok(json!({"snapshot_id": snapshot_id, "status": "ready", "reused": true}));
+    }
+    let claimed = claim_release_evidence_snapshot(state, task_id, snapshot_id).await?;
+    let heartbeat_state = state.clone();
+    let heartbeat_task_id = task_id.to_owned();
+    let heartbeat_snapshot_id = snapshot_id.to_owned();
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_healthy = Arc::new(AtomicBool::new(true));
+    let heartbeat_stop_task = Arc::clone(&heartbeat_stop);
+    let heartbeat_healthy_task = Arc::clone(&heartbeat_healthy);
+    let heartbeat = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(RELEASE_EVIDENCE_LEASE_HEARTBEAT_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if heartbeat_stop_task.load(Ordering::Acquire) {
+                break;
+            }
+            match renew_release_evidence_lease(
+                &heartbeat_state,
+                heartbeat_task_id.as_str(),
+                heartbeat_snapshot_id.as_str(),
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    heartbeat_healthy_task.store(false, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    });
+    let collection_result = match tokio::time::timeout(
+        Duration::from_secs(RELEASE_EVIDENCE_COLLECTION_TIMEOUT_SECS),
+        collect_release_evidence(state, &request),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ReleaseEvidenceFailure {
+            code: "github_unavailable".to_owned(),
+            message: "GitHub evidence collection exceeded its deadline".to_owned(),
+            retryable: true,
+        }),
+    };
+    heartbeat_stop.store(true, Ordering::Release);
+    heartbeat.abort();
+    let _ = heartbeat.await;
+    if !heartbeat_healthy.load(Ordering::Acquire) {
+        return Err(anyhow!("release evidence lease was lost during collection"));
+    }
+    match collection_result {
+        Ok(collection) => {
+            persist_release_evidence_collection(state, task_id, snapshot_id, collection).await?;
+            Ok(json!({"snapshot_id": snapshot_id, "status": "ready"}))
+        }
+        Err(failure) => {
+            persist_release_evidence_failure(state, task_id, snapshot_id, &failure).await?;
+            Err(anyhow::Error::new(failure).context(format!(
+                "release evidence collection failed after attempt {}",
+                claimed.attempt_count
+            )))
+        }
+    }
+}
+
+async fn recover_release_evidence_snapshots(state: &AppState) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write_foreground("release_evidence_recover", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE release_evidence_snapshots
+                SET status = 'queued', task_id = NULL, lease_owner = NULL,
+                    lease_expires_at = NULL, next_retry_at = NULL, updated_at = ?
+                WHERE status = 'failed'
+                  AND next_retry_at IS NOT NULL
+                  AND datetime(next_retry_at) <= datetime(?)
+                  AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))
+                  AND attempt_count < ?
+                "#,
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("recover retryable release evidence snapshots")?;
+            sqlx::query(
+                r#"
+                UPDATE release_evidence_snapshots
+                SET status = CASE
+                        WHEN attempt_count >= ? THEN 'failed'
+                        WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'failed'
+                        ELSE 'queued'
+                    END,
+                    task_id = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                    next_retry_at = NULL,
+                    last_error_code = CASE
+                        WHEN attempt_count >= ? THEN 'release_evidence_attempt_limit'
+                        WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'release_evidence_retry_window_expired'
+                        ELSE 'runtime_lease_expired'
+                    END,
+                    last_error_summary = CASE
+                        WHEN attempt_count >= ? THEN 'evidence worker lease expired after the retry limit'
+                        WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'evidence worker lease expired after the retry window'
+                        ELSE 'evidence worker lease expired'
+                    END,
+                    updated_at = ?
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND julianday(lease_expires_at) <= julianday(?)
+                "#,
+            )
+            .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+            .bind(&now)
+            .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+            .bind(&now)
+            .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("recover stale release evidence snapshots")?;
+            sqlx::query(
+                r#"
+                UPDATE content_work_items
+                SET evidence_status = 'failed', updated_at = ?
+                WHERE evidence_status = 'pending'
+                  AND evidence_snapshot_id IN (
+                    SELECT id
+                    FROM release_evidence_snapshots
+                    WHERE status = 'failed'
+                      AND last_error_code IN (
+                        'release_evidence_attempt_limit',
+                        'release_evidence_retry_window_expired'
+                      )
+                  )
+                "#,
+            )
+            .bind(&now)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("mark terminal release evidence work items failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+    let rows = sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
+        "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime(?)) ORDER BY updated_at ASC, id ASC LIMIT 100"
+    ))
+    .bind(&now)
+    .fetch_all(&state.pool)
+    .await
+    .context("load recoverable release evidence snapshots")?;
+    for row in rows {
+        let request = ReleaseEvidenceRequest {
+            release_id: row.release_id,
+            repo_id: row.repo_id,
+            repo_full_name: row.repo_full_name,
+            base_tag: row.base_tag,
+            head_tag: row.head_tag,
+            audience_user_id: row.audience_user_id,
+            source_revision: row.source_revision,
+        };
+        let _ = ensure_release_evidence(state, request).await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -4267,6 +5908,34 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 return Ok(());
             }
 
+            if task.task_type == TASK_RELEASE_EVIDENCE
+                && let Some(failure) = err.downcast_ref::<ReleaseEvidenceFailure>()
+                && failure.retryable
+            {
+                let retry_count = payload
+                    .get("retry_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(0);
+                if i64::from(retry_count) + 1 < RELEASE_EVIDENCE_MAX_ATTEMPTS {
+                    let available_at =
+                        Utc::now() + release_evidence_retry_delay(i64::from(retry_count) + 1);
+                    heartbeat.stop().await;
+                    let _ = reschedule_task_with_retry_count_if_owned(
+                        state.as_ref(),
+                        &task.id,
+                        available_at,
+                        retry_count.saturating_add(1),
+                        json!({
+                            "reason": "release_evidence_retry",
+                            "error_code": failure.code.clone(),
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+
             let message = err.to_string();
             if task.task_type == TASK_RELEASE_READING_BACKFILL
                 && let Some(run_id) = payload.get("run_id").and_then(Value::as_str)
@@ -4558,7 +6227,8 @@ async fn execute_task(
     task_type: &str,
     payload: &Value,
 ) -> Result<Value> {
-    if let Some(user_id) = payload.get("user_id").and_then(Value::as_str)
+    if task_type != TASK_RELEASE_EVIDENCE
+        && let Some(user_id) = payload.get("user_id").and_then(Value::as_str)
         && !user_is_background_eligible(state, user_id).await?
     {
         return Ok(json!({
@@ -4664,6 +6334,7 @@ async fn execute_task(
         TASK_RELEASE_READING_BACKFILL => {
             execute_release_reading_backfill_task(state, task_id, payload).await
         }
+        TASK_RELEASE_EVIDENCE => execute_release_evidence_task(state, task_id, payload).await,
         TASK_RETRY_RECENT_FAILURES => {
             execute_recent_failures_retry_task(state, task_id, payload).await
         }
@@ -7023,6 +8694,8 @@ async fn recover_runtime_state_with_mode(
         }
     }
 
+    recover_release_evidence_snapshots(state).await?;
+
     Ok(())
 }
 
@@ -7158,6 +8831,42 @@ async fn recover_task_if_stale(
                         .await
                         .context("requeue stale release reading backfill run")?;
                     }
+                } else if task_type.as_deref() == Some(TASK_RELEASE_EVIDENCE) {
+                    sqlx::query(
+                        "UPDATE release_evidence_snapshots SET status = CASE WHEN attempt_count >= ? THEN 'failed' WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'failed' ELSE 'queued' END, task_id = NULL, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, last_error_code = CASE WHEN attempt_count >= ? THEN 'release_evidence_attempt_limit' WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'release_evidence_retry_window_expired' ELSE 'runtime_lease_expired' END, last_error_summary = CASE WHEN attempt_count >= ? THEN 'evidence task lease expired after the retry limit' WHEN retry_expires_at IS NOT NULL AND datetime(retry_expires_at) <= datetime(?) THEN 'evidence task lease expired after the retry window' ELSE 'evidence task lease expired' END, updated_at = ? WHERE task_id = ? AND status = 'running' AND lease_owner IS ?",
+                    )
+                    .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+                    .bind(&now)
+                    .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+                    .bind(&now)
+                    .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(task_id)
+                    .bind(previous_runtime_owner_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("requeue stale release evidence snapshot")?;
+                    sqlx::query(
+                        r#"
+                        UPDATE content_work_items
+                        SET evidence_status = 'failed', updated_at = ?
+                        WHERE evidence_status = 'pending'
+                          AND evidence_snapshot_id IN (
+                            SELECT id
+                            FROM release_evidence_snapshots
+                            WHERE status = 'failed'
+                              AND last_error_code IN (
+                                'release_evidence_attempt_limit',
+                                'release_evidence_retry_window_expired'
+                              )
+                          )
+                        "#,
+                    )
+                    .bind(now.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .context("mark stale terminal evidence work items failed")?;
                 }
                 sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
                     .bind(task_id)
@@ -7376,23 +9085,26 @@ fn is_terminal_status(status: &str) -> bool {
 mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
+    use base64::Engine;
+
     use super::{
-        NewTask, RELEASE_READING_BACKFILL_BATCH_SIZE, ReleaseReadingBackfillItemRow,
-        RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE, SMART_NO_VALUABLE_VERSION_INFO,
-        STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX, STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX,
-        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
-        SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RELEASE_READING_BACKFILL,
-        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
-        TASK_SYNC_RELEASES, TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE,
-        TASK_SYNC_SUBSCRIPTIONS, TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT,
-        TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor, cancel_task,
-        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
-        current_star_sync_delta_schedule_key, current_subscription_schedule_key,
-        defer_task_after_sqlite_write_backpressure, dispatch_scheduled_task_atomic,
-        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
-        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
-        enqueue_release_reading_backfill_follow_up_if_queued,
+        NewTask, RELEASE_EVIDENCE_MAX_ATTEMPTS, RELEASE_READING_BACKFILL_BATCH_SIZE,
+        ReleaseEvidenceCollection, ReleaseEvidenceRequest, ReleaseEvidenceResource,
+        ReleaseReadingBackfillItemRow, RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE,
+        SMART_NO_VALUABLE_VERSION_INFO, STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX,
+        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
+        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy,
+        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
+        TASK_RELEASE_EVIDENCE, TASK_RELEASE_READING_BACKFILL, TASK_RETRY_RECENT_FAILURES,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
+        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
+        TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
+        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
+        current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
+        current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
+        dispatch_scheduled_task_atomic, enqueue_brief_history_recompute_if_needed,
+        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
+        enqueue_recent_failures_retry_if_due, enqueue_release_reading_backfill_follow_up_if_queued,
         enqueue_release_reading_backfill_if_needed, enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
@@ -7402,14 +9114,20 @@ mod tests {
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
-        recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
+        recover_release_evidence_snapshots, recover_runtime_state,
+        recover_runtime_state_on_startup, recover_task_if_stale, renew_release_evidence_lease,
         reschedule_task_if_owned, reset_release_reading_backfill_run_after_backpressure,
         retry_candidate_is_retryable, rollback_scheduler_dispatch,
         run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, update_release_reading_backfill_item,
         update_release_reading_backfill_item_checked, upsert_dispatch_state,
     };
-    use axum::body::to_bytes;
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::any,
+    };
     use chrono::{Duration, NaiveTime, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
@@ -9825,6 +11543,99 @@ mod tests {
                 .await
                 .expect("load revived task status");
         assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn stale_release_evidence_recovery_fails_linked_work_item_at_terminal_limit() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "stale-evidence-task";
+        let snapshot_id = "stale-evidence-snapshot";
+        seed_task(&pool, task_id, TASK_RELEASE_EVIDENCE, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET payload_json = ?, runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(json!({"snapshot_id": snapshot_id}).to_string())
+        .bind("old-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence task lease");
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, retry_expires_at, task_id, lease_owner,
+              lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, 90, 91, 'acme/stale-evidence', 'public', NULL,
+                      'stale-revision', 'v1.0.0', 'v1.1.0', 'running', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind("stale-evidence-request")
+        .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+        .bind((Utc::now() + Duration::hours(1)).to_rfc3339())
+        .bind(task_id)
+        .bind("old-owner")
+        .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence snapshot");
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline,
+              variant, target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              evidence_snapshot_id, evidence_status, created_at, updated_at
+            ) VALUES ('stale-evidence-work', 'release', '90', 'polishing',
+                      'public', 'zh-CN', 'stale-source', ?, 'test-model', '{}',
+                      'test-config', 'queued', ?, 'pending', ?, ?)
+            "#,
+        )
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(snapshot_id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence work item");
+
+        assert!(
+            recover_task_if_stale(
+                state.as_ref(),
+                task_id,
+                Some("old-owner"),
+                Some("2026-03-06T00:00:00Z"),
+                "2026-03-06T00:01:00Z",
+                super::runtime::RuntimeRecoveryMode::Sweep,
+            )
+            .await
+            .expect("recover stale evidence task")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM release_evidence_snapshots WHERE id = ?",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load stale evidence status"),
+            STATUS_FAILED
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT evidence_status FROM content_work_items WHERE id = 'stale-evidence-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load stale evidence work status"),
+            "failed"
+        );
     }
 
     #[tokio::test]
@@ -13552,5 +15363,896 @@ mod tests {
         assert!(rows[0].1.is_some());
         assert_eq!(rows[1].1, None);
         assert_eq!(rows[2].1, None);
+    }
+
+    #[tokio::test]
+    async fn release_evidence_is_idempotent_and_keeps_public_and_authorized_scopes_separate() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "alice").await;
+        let public_request = ReleaseEvidenceRequest {
+            release_id: 10,
+            repo_id: 20,
+            repo_full_name: "acme/octo-rill".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: None,
+            source_revision: "release-10-revision".to_owned(),
+        };
+        let first = super::ensure_release_evidence(state.as_ref(), public_request.clone())
+            .await
+            .expect("queue public release evidence");
+        let second = super::ensure_release_evidence(state.as_ref(), public_request)
+            .await
+            .expect("reuse public release evidence");
+        assert_eq!(first.reference.snapshot_id, second.reference.snapshot_id);
+        assert_eq!(first.reference.task_id, second.reference.task_id);
+        assert_eq!(first.reference.status, STATUS_QUEUED);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND status IN ('queued', 'running')",
+            )
+            .bind(TASK_RELEASE_EVIDENCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count public evidence tasks"),
+            1
+        );
+        assert!(
+            super::load_release_evidence_snapshot(
+                state.as_ref(),
+                first.reference.snapshot_id.as_str(),
+                None,
+            )
+            .await
+            .expect("load public evidence")
+            .is_some()
+        );
+        assert!(
+            super::load_release_evidence_snapshot(
+                state.as_ref(),
+                first.reference.snapshot_id.as_str(),
+                Some("1"),
+            )
+            .await
+            .expect("probe public evidence from authorized scope")
+            .is_none()
+        );
+
+        let private = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                audience_user_id: Some("1".to_owned()),
+                ..ReleaseEvidenceRequest {
+                    release_id: 10,
+                    repo_id: 20,
+                    repo_full_name: "acme/octo-rill".to_owned(),
+                    base_tag: "v1.0.0".to_owned(),
+                    head_tag: "v1.1.0".to_owned(),
+                    audience_user_id: None,
+                    source_revision: "release-10-revision".to_owned(),
+                }
+            },
+        )
+        .await
+        .expect("queue authorized release evidence");
+        assert_ne!(first.reference.snapshot_id, private.reference.snapshot_id);
+        assert!(
+            super::load_release_evidence_snapshot(
+                state.as_ref(),
+                private.reference.snapshot_id.as_str(),
+                Some("1"),
+            )
+            .await
+            .expect("load authorized evidence")
+            .is_some()
+        );
+        assert!(
+            super::load_release_evidence_snapshot(
+                state.as_ref(),
+                private.reference.snapshot_id.as_str(),
+                Some("2"),
+            )
+            .await
+            .expect("probe authorized evidence from another user")
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_evidence_source_revision_is_part_of_snapshot_identity() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let first = ReleaseEvidenceRequest {
+            release_id: 10,
+            repo_id: 20,
+            repo_full_name: "acme/octo-rill".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: None,
+            source_revision: "revision-a".to_owned(),
+        };
+        let second = ReleaseEvidenceRequest {
+            source_revision: "revision-b".to_owned(),
+            ..first.clone()
+        };
+
+        let first_snapshot = super::ensure_release_evidence(state.as_ref(), first)
+            .await
+            .expect("queue first revision evidence");
+        let second_snapshot = super::ensure_release_evidence(state.as_ref(), second)
+            .await
+            .expect("queue second revision evidence");
+
+        assert_ne!(
+            first_snapshot.reference.snapshot_id,
+            second_snapshot.reference.snapshot_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM release_evidence_snapshots WHERE release_id = 10",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count revision-specific snapshots"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn release_evidence_index_isolated_by_source_revision() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let first = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 11,
+                repo_id: 21,
+                repo_full_name: "acme/evidence".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.1.0".to_owned(),
+                audience_user_id: None,
+                source_revision: "revision-a".to_owned(),
+            },
+        )
+        .await
+        .expect("queue first indexed evidence");
+        let second = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 11,
+                repo_id: 21,
+                repo_full_name: "acme/evidence".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.1.0".to_owned(),
+                audience_user_id: None,
+                source_revision: "revision-b".to_owned(),
+            },
+        )
+        .await
+        .expect("queue second indexed evidence");
+        let expiry = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+        for (snapshot_id, task_id) in [
+            (
+                first.reference.snapshot_id.as_str(),
+                first
+                    .reference
+                    .task_id
+                    .as_deref()
+                    .expect("first evidence task"),
+            ),
+            (
+                second.reference.snapshot_id.as_str(),
+                second
+                    .reference
+                    .task_id
+                    .as_deref()
+                    .expect("second evidence task"),
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE release_evidence_snapshots SET status = 'running', task_id = ?, lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+            )
+            .bind(task_id)
+            .bind(state.runtime_owner_id.as_str())
+            .bind(&expiry)
+            .bind(snapshot_id)
+            .execute(&pool)
+            .await
+            .expect("seed running indexed evidence");
+        }
+
+        for (snapshot_id, task_id, marker) in [
+            (
+                first.reference.snapshot_id.as_str(),
+                first
+                    .reference
+                    .task_id
+                    .as_deref()
+                    .expect("first evidence task"),
+                "first",
+            ),
+            (
+                second.reference.snapshot_id.as_str(),
+                second
+                    .reference
+                    .task_id
+                    .as_deref()
+                    .expect("second evidence task"),
+                "second",
+            ),
+        ] {
+            super::persist_release_evidence_collection(
+                state.as_ref(),
+                task_id,
+                snapshot_id,
+                ReleaseEvidenceCollection {
+                    snapshot: json!({"source_revision": marker}),
+                    resources: vec![ReleaseEvidenceResource {
+                        kind: "blob",
+                        key: "README.md".to_owned(),
+                        side: "head",
+                        payload: json!({"marker": marker}),
+                    }],
+                    content_hash: format!("hash-{marker}"),
+                },
+            )
+            .await
+            .expect("publish revision-scoped evidence");
+        }
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT resource_key, payload_json FROM release_evidence_index WHERE repo_id = 21 ORDER BY resource_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load revision-scoped evidence resources");
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].0, rows[1].0);
+        assert!(rows.iter().any(|row| row.1.contains("first")));
+        assert!(rows.iter().any(|row| row.1.contains("second")));
+    }
+
+    #[tokio::test]
+    async fn recover_release_evidence_requeues_retryable_failures_once() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = Utc::now();
+        let request = ReleaseEvidenceRequest {
+            release_id: 30,
+            repo_id: 40,
+            repo_full_name: "acme/recovery".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: None,
+            source_revision: "recovery-revision".to_owned(),
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, next_retry_at, retry_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'public', NULL, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("recovery-snapshot")
+        .bind(request.request_key())
+        .bind(request.release_id)
+        .bind(request.repo_id)
+        .bind(&request.repo_full_name)
+        .bind(&request.source_revision)
+        .bind(&request.base_tag)
+        .bind(&request.head_tag)
+        .bind(1_i64)
+        .bind((now - Duration::seconds(1)).to_rfc3339())
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed retryable failed evidence");
+
+        recover_release_evidence_snapshots(state.as_ref())
+            .await
+            .expect("recover retryable evidence");
+        recover_release_evidence_snapshots(state.as_ref())
+            .await
+            .expect("repeat evidence recovery");
+
+        let (status, task_id, next_retry_at): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, task_id, next_retry_at FROM release_evidence_snapshots WHERE id = 'recovery-snapshot'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered evidence");
+        assert_eq!(status, STATUS_QUEUED);
+        assert!(task_id.is_some());
+        assert_eq!(next_retry_at, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND status IN ('queued', 'running')",
+            )
+            .bind(TASK_RELEASE_EVIDENCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count recovered evidence tasks"),
+            1
+        );
+
+        let exhausted = ReleaseEvidenceRequest {
+            release_id: 31,
+            ..request.clone()
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, next_retry_at, retry_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'public', NULL, ?, ?, ?, 'failed', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("exhausted-snapshot")
+        .bind(exhausted.request_key())
+        .bind(exhausted.release_id)
+        .bind(exhausted.repo_id)
+        .bind(&exhausted.repo_full_name)
+        .bind(&exhausted.source_revision)
+        .bind(&exhausted.base_tag)
+        .bind(&exhausted.head_tag)
+        .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+        .bind((now - Duration::seconds(1)).to_rfc3339())
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed exhausted evidence");
+        recover_release_evidence_snapshots(state.as_ref())
+            .await
+            .expect("recover exhausted evidence");
+        let exhausted_status: String = sqlx::query_scalar(
+            "SELECT status FROM release_evidence_snapshots WHERE id = 'exhausted-snapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load exhausted evidence");
+        assert_eq!(exhausted_status, STATUS_FAILED);
+
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, task_id, lease_owner, lease_expires_at, created_at, updated_at
+            ) VALUES ('expired-running-snapshot', ?, ?, ?, ?, 'public', NULL, ?, ?, ?, 'running', ?, 'expired-task', 'old-owner', ?, ?, ?)
+            "#,
+        )
+        .bind("expired-running-request")
+        .bind(request.release_id)
+        .bind(request.repo_id)
+        .bind(&request.repo_full_name)
+        .bind(&request.source_revision)
+        .bind(&request.base_tag)
+        .bind(&request.head_tag)
+        .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+        .bind((now - Duration::minutes(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed exhausted running evidence");
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline,
+              variant, target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              evidence_snapshot_id, evidence_status, created_at, updated_at
+            ) VALUES (
+              'expired-running-work', 'release', '30', 'polishing',
+              'public', 'zh-CN', 'recovery-source', ?, 'test-model',
+              '{}', 'test-config', 'queued', 'expired-running-snapshot', 'pending', ?, ?
+            )
+            "#,
+        )
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed pending evidence work item");
+        recover_release_evidence_snapshots(state.as_ref())
+            .await
+            .expect("recover exhausted running evidence");
+        let exhausted_running: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error_code FROM release_evidence_snapshots WHERE id = 'expired-running-snapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load exhausted running evidence");
+        assert_eq!(exhausted_running.0, STATUS_FAILED);
+        assert_eq!(
+            exhausted_running.1.as_deref(),
+            Some("release_evidence_attempt_limit")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT evidence_status FROM content_work_items WHERE id = 'expired-running-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load terminal evidence work status"),
+            "failed"
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, retry_expires_at, task_id, lease_owner, lease_expires_at, created_at, updated_at
+            ) VALUES ('expired-window-running-snapshot', ?, ?, ?, ?, 'public', NULL, ?, ?, ?, 'running', 1, ?, 'expired-window-task', 'old-owner', ?, ?, ?)
+            "#,
+        )
+        .bind("expired-window-running-request")
+        .bind(request.release_id)
+        .bind(request.repo_id)
+        .bind(&request.repo_full_name)
+        .bind(&request.source_revision)
+        .bind(&request.base_tag)
+        .bind(&request.head_tag)
+        .bind((now - Duration::minutes(1)).to_rfc3339())
+        .bind((now - Duration::minutes(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed expired-window running evidence");
+        recover_release_evidence_snapshots(state.as_ref())
+            .await
+            .expect("recover expired-window running evidence");
+        let expired_window_code: Option<String> = sqlx::query_scalar(
+            "SELECT last_error_code FROM release_evidence_snapshots WHERE id = 'expired-window-running-snapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load expired-window error");
+        assert_eq!(
+            expired_window_code.as_deref(),
+            Some("release_evidence_retry_window_expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn release_evidence_lease_heartbeat_and_publish_fence_reject_stale_owner() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let request = ReleaseEvidenceRequest {
+            release_id: 50,
+            repo_id: 60,
+            repo_full_name: "acme/lease".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: None,
+            source_revision: "lease-revision".to_owned(),
+        };
+        let queued = super::ensure_release_evidence(state.as_ref(), request)
+            .await
+            .expect("queue lease evidence");
+        let old_expiry = (Utc::now() + Duration::seconds(30)).to_rfc3339();
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET status = 'running', task_id = ?, lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+        )
+        .bind("lease-task")
+        .bind(state.runtime_owner_id.as_str())
+        .bind(&old_expiry)
+        .bind(&queued.reference.snapshot_id)
+        .execute(&pool)
+        .await
+        .expect("seed running lease");
+
+        assert!(
+            renew_release_evidence_lease(
+                state.as_ref(),
+                "lease-task",
+                queued.reference.snapshot_id.as_str()
+            )
+            .await
+            .expect("renew evidence lease")
+        );
+        let renewed_expiry: String = sqlx::query_scalar(
+            "SELECT lease_expires_at FROM release_evidence_snapshots WHERE id = ?",
+        )
+        .bind(&queued.reference.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load renewed lease");
+        assert!(renewed_expiry > old_expiry);
+
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET lease_owner = 'other-runtime-owner' WHERE id = ?",
+        )
+        .bind(&queued.reference.snapshot_id)
+        .execute(&pool)
+        .await
+        .expect("replace evidence lease owner");
+        let publish_error = super::persist_release_evidence_collection(
+            state.as_ref(),
+            "lease-task",
+            queued.reference.snapshot_id.as_str(),
+            super::ReleaseEvidenceCollection {
+                snapshot: json!({}),
+                resources: Vec::new(),
+                content_hash: "stale-worker".to_owned(),
+            },
+        )
+        .await
+        .expect_err("stale worker must not publish evidence");
+        assert!(publish_error.to_string().contains("lease was lost"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM release_evidence_index WHERE repo_id = 60",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count stale evidence resources"),
+            0
+        );
+        assert!(
+            !renew_release_evidence_lease(
+                state.as_ref(),
+                "lease-task",
+                queued.reference.snapshot_id.as_str()
+            )
+            .await
+            .expect("check lost evidence lease")
+        );
+
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind((Utc::now() - Duration::seconds(1)).to_rfc3339())
+        .bind(&queued.reference.snapshot_id)
+        .execute(&pool)
+        .await
+        .expect("expire current evidence lease");
+        let expired_error = super::persist_release_evidence_collection(
+            state.as_ref(),
+            "lease-task",
+            queued.reference.snapshot_id.as_str(),
+            super::ReleaseEvidenceCollection {
+                snapshot: json!({}),
+                resources: Vec::new(),
+                content_hash: "expired-worker".to_owned(),
+            },
+        )
+        .await
+        .expect_err("expired worker must not publish evidence");
+        assert!(expired_error.to_string().contains("lease was lost"));
+    }
+
+    #[tokio::test]
+    async fn release_evidence_claim_does_not_cross_claim_same_runtime_owner() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let queued = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 51,
+                repo_id: 61,
+                repo_full_name: "acme/claim-ownership".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.1.0".to_owned(),
+                audience_user_id: None,
+                source_revision: "claim-ownership-revision".to_owned(),
+            },
+        )
+        .await
+        .expect("queue claim ownership evidence");
+        let snapshot_id = queued.reference.snapshot_id.as_str();
+
+        super::claim_release_evidence_snapshot(state.as_ref(), "first-task", snapshot_id)
+            .await
+            .expect("first worker claims evidence snapshot");
+        let second_claim =
+            super::claim_release_evidence_snapshot(state.as_ref(), "second-task", snapshot_id)
+                .await
+                .expect_err("second worker must not replace an unexpired lease");
+        assert!(
+            second_claim
+                .to_string()
+                .contains("already owned or not ready to retry")
+        );
+
+        let (status, task_id, lease_owner): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, task_id, lease_owner FROM release_evidence_snapshots WHERE id = ?",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load claim ownership evidence");
+        assert_eq!(status, STATUS_RUNNING);
+        assert_eq!(task_id.as_deref(), Some("first-task"));
+        assert_eq!(
+            lease_owner.as_deref(),
+            Some(state.runtime_owner_id.as_str())
+        );
+    }
+
+    #[test]
+    fn release_evidence_rate_limited_forbidden_is_retryable() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining",
+            reqwest::header::HeaderValue::from_static("0"),
+        );
+        let failure = super::release_evidence_http_failure(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            "API rate limit exceeded",
+            "public",
+        );
+        assert_eq!(failure.code, "github_unavailable");
+        assert!(failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn authorized_release_evidence_shares_request_budget_across_connections() {
+        let pool = setup_pool().await;
+        let mut state = setup_state(pool.clone());
+        seed_user(&pool, 701, "evidence-budget").await;
+        for (index, token) in [(1_i64, "first-token"), (2_i64, "second-token")] {
+            let encrypted = state
+                .encryption_key
+                .encrypt_str(token)
+                .expect("encrypt evidence budget token");
+            sqlx::query(
+                r#"
+                INSERT INTO github_connections (
+                  id, user_id, github_user_id, login, access_token_ciphertext,
+                  access_token_nonce, scopes, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("evidence-budget-connection-{index}"))
+            .bind("701")
+            .bind(40_701_i64 + index)
+            .bind(format!("evidence-budget-{index}"))
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind("repo")
+            .bind(format!("2026-03-07T00:0{index}:00Z"))
+            .bind(format!("2026-03-07T00:0{index}:00Z"))
+            .execute(&pool)
+            .await
+            .expect("seed evidence budget connection");
+        }
+
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_for_server = std::sync::Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move |_request: Request<Body>| {
+            let request_count = std::sync::Arc::clone(&request_count_for_server);
+            async move {
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"message": "bad credentials"})),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind evidence budget GitHub mock");
+        let address = listener
+            .local_addr()
+            .expect("read evidence budget mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve evidence budget GitHub mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("own evidence budget state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse evidence budget mock URL");
+
+        let request = ReleaseEvidenceRequest {
+            release_id: 701,
+            repo_id: 702,
+            repo_full_name: "acme/evidence-budget".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: Some("701".to_owned()),
+            source_revision: "evidence-budget-revision".to_owned(),
+        };
+        let mut budget = crate::github::CompareBudget::new(std::time::Duration::from_secs(1), 1);
+        let failure =
+            super::collect_release_evidence_with_budget(state.as_ref(), &request, &mut budget)
+                .await
+                .expect_err("second authorized connection must not reset the budget");
+        assert_eq!(failure.code, "github_unavailable");
+        assert_eq!(budget.attempts(), 1);
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shared budget must stop before the second connection makes a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_evidence_rejects_non_ahead_compare_status() {
+        let pool = setup_pool().await;
+        let mut state = setup_state(pool.clone());
+        let app = Router::new().fallback(any(|_request: Request<Body>| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "identical",
+                    "ahead_by": 0,
+                    "behind_by": 0,
+                    "total_commits": 0,
+                    "base_commit": {"sha": "base"},
+                    "merge_base_commit": {"sha": "merge"},
+                    "head_commit": {"sha": "head"},
+                    "commits": [],
+                    "files": []
+                })),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind non-ahead GitHub mock");
+        let address = listener.local_addr().expect("read non-ahead mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve non-ahead GitHub mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("own non-ahead evidence state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse non-ahead mock URL");
+
+        let queued = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 12,
+                repo_id: 22,
+                repo_full_name: "acme/non-ahead".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.0.1".to_owned(),
+                audience_user_id: None,
+                source_revision: "non-ahead-revision".to_owned(),
+            },
+        )
+        .await
+        .expect("queue non-ahead evidence");
+        let task_id = queued.reference.task_id.clone().expect("non-ahead task id");
+        let payload =
+            sqlx::query_scalar::<_, String>("SELECT payload_json FROM job_tasks WHERE id = ?")
+                .bind(&task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load non-ahead task payload")
+                .parse::<Value>()
+                .expect("parse non-ahead task payload");
+
+        super::execute_release_evidence_task(state.as_ref(), &task_id, &payload)
+            .await
+            .expect_err("non-ahead evidence must not become ready");
+        let (status, error_code): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error_code FROM release_evidence_snapshots WHERE id = ?",
+        )
+        .bind(&queued.reference.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load non-ahead evidence status");
+        assert_eq!(status, STATUS_FAILED);
+        assert_eq!(error_code.as_deref(), Some("github_evidence_insufficient"));
+    }
+
+    #[tokio::test]
+    async fn release_evidence_worker_collects_bounded_snapshot_from_deterministic_github_mock() {
+        let pool = setup_pool().await;
+        let mut state = setup_state(pool.clone());
+        let app = Router::new().fallback(any(|request: Request<Body>| async move {
+            let path = request.uri().path();
+            let payload = if path.contains("/compare/v1.0.0...v1.1.0") {
+                json!({
+                    "status": "ahead",
+                    "ahead_by": 1,
+                    "behind_by": 0,
+                    "total_commits": 1,
+                    "base_commit": {"sha": "base"},
+                    "merge_base_commit": {"sha": "merge"},
+                    "head_commit": {"sha": "head"},
+                    "commits": [{"sha": "commit-1", "commit": {"message": "Improve reading"}}],
+                    "files": [{"filename": "src/lib.rs", "status": "modified", "additions": 1, "deletions": 1, "changes": 2, "patch": "@@"}]
+                })
+            } else if path.contains("/commits/v1.1.0") {
+                json!({"sha": "head", "commit": {"message": "Improve reading"}})
+            } else if path.contains("/git/trees/base") {
+                json!({"tree": [{"path": "src/lib.rs", "type": "blob", "sha": "base-blob", "mode": "100644"}], "truncated": false})
+            } else if path.contains("/git/trees/head") {
+                json!({"tree": [{"path": "src/lib.rs", "type": "blob", "sha": "head-blob", "mode": "100644"}], "truncated": false})
+            } else if path.contains("/git/blobs/base-blob") {
+                json!({"encoding": "base64", "content": base64::engine::general_purpose::STANDARD.encode("old title\n")})
+            } else if path.contains("/git/blobs/head-blob") {
+                json!({"encoding": "base64", "content": base64::engine::general_purpose::STANDARD.encode("new title\n")})
+            } else {
+                return (StatusCode::NOT_FOUND, Json(json!({"message": "not found"})));
+            };
+            (StatusCode::OK, Json(payload))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind deterministic GitHub mock");
+        let address = listener.local_addr().expect("read GitHub mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve deterministic GitHub mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("own test state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse GitHub mock URL");
+
+        let queued = super::ensure_release_evidence(
+            state.as_ref(),
+            ReleaseEvidenceRequest {
+                release_id: 11,
+                repo_id: 21,
+                repo_full_name: "acme/octo-rill".to_owned(),
+                base_tag: "v1.0.0".to_owned(),
+                head_tag: "v1.1.0".to_owned(),
+                audience_user_id: None,
+                source_revision: "revision-11".to_owned(),
+            },
+        )
+        .await
+        .expect("queue mocked evidence");
+        let task_id = queued.reference.task_id.clone().expect("evidence task id");
+        let result = super::execute_release_evidence_task(
+            state.as_ref(),
+            task_id.as_str(),
+            &sqlx::query_scalar::<_, String>("SELECT payload_json FROM job_tasks WHERE id = ?")
+                .bind(&task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load evidence task payload")
+                .parse::<Value>()
+                .expect("parse evidence task payload"),
+        )
+        .await
+        .expect("collect mocked evidence");
+        assert_eq!(result["status"], json!("ready"));
+        let snapshot = super::load_release_evidence_snapshot(
+            state.as_ref(),
+            queued.reference.snapshot_id.as_str(),
+            None,
+        )
+        .await
+        .expect("load collected evidence")
+        .expect("collected evidence snapshot");
+        assert_eq!(snapshot.reference.status, "ready");
+        assert_eq!(
+            snapshot.snapshot.as_ref().expect("snapshot payload")["coverage_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM release_evidence_index WHERE repo_id = 21 AND audience = 'public'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count collected evidence resources"),
+            7
+        );
     }
 }

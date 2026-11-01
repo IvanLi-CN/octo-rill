@@ -22,6 +22,7 @@ use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 
+use crate::github::RELEASE_READING_EVIDENCE_UNAVAILABLE;
 use crate::release_links::{
     InternalReleaseRef, ReleaseLocator, build_github_release_url_prefixes,
     parse_internal_release_ref, parse_release_locator_from_github_release_url,
@@ -16557,6 +16558,7 @@ struct FeedRow {
     translation_entity_id: Option<String>,
     #[allow(dead_code)]
     release_id: Option<i64>,
+    release_repo_id: Option<i64>,
     release_node_id: Option<String>,
     repo_full_name: Option<String>,
     discussion_number: Option<i64>,
@@ -17556,6 +17558,7 @@ async fn fetch_feed_items(
             entity_id AS translation_entity_id,
             NULL AS discussion_number,
             release_id,
+            release_repo_id,
             release_node_id,
             repo_full_name,
             owner_avatar_url,
@@ -17586,6 +17589,7 @@ async fn fetch_feed_items(
               printf('%020d', r.release_id) AS id_key,
               CAST(r.release_id AS TEXT) AS entity_id,
               r.release_id AS release_id,
+              r.repo_id AS release_repo_id,
               r.node_id AS release_node_id,
               sr.full_name AS repo_full_name,
               sr.owner_avatar_url AS owner_avatar_url,
@@ -17640,6 +17644,7 @@ async fn fetch_feed_items(
             END AS translation_entity_id,
             e.discussion_number AS discussion_number,
             NULL AS release_id,
+            NULL AS release_repo_id,
             NULL AS release_node_id,
             e.repo_full_name AS repo_full_name,
             COALESCE(e.repo_owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
@@ -17685,7 +17690,7 @@ async fn fetch_feed_items(
             AND (? = 0 OR (e.repo_full_name IS NOT NULL AND vr.repo_id IS NOT NULL))
         )
         SELECT
-          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.translation_entity_id, i.release_id, i.release_node_id,
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.translation_entity_id, i.release_id, i.release_repo_id, i.release_node_id,
           i.repo_full_name, i.owner_avatar_url, i.open_graph_image_url, i.uses_custom_open_graph_image,
           i.discussion_number,
           i.release_tag_name, i.release_previous_tag_name,
@@ -17935,6 +17940,490 @@ async fn read_global_release_smart_with_legacy_fallback(
     Ok(legacy.or(current))
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct FeedReleaseSmartWorkRow {
+    source_hash: String,
+    status: String,
+    failure_class: Option<String>,
+}
+
+async fn load_feed_release_evidence_snapshot(
+    state: &AppState,
+    user_id: &str,
+    row: &FeedRow,
+) -> Result<Option<jobs::ReleaseEvidenceSnapshot>, ApiError> {
+    let Some(repo_id) = row.release_repo_id else {
+        return Err(ApiError::internal(
+            "release feed row is missing its repository identity",
+        ));
+    };
+    let Some(base_tag) = row
+        .release_previous_tag_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let head_tag = row.release_tag_name.as_deref().unwrap_or_default();
+    if head_tag.trim().is_empty() {
+        return Ok(None);
+    }
+    let release_id = row.entity_id.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
+    })?;
+    let public_release = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+          SELECT 1
+          FROM user_release_visible_repos
+          WHERE user_id = ? AND repo_id = ? AND is_private = 0
+        ) OR EXISTS(
+          SELECT 1
+          FROM public_repo_release_usage
+          WHERE repo_id = ?
+            AND access_kind IN ('github_public', 'private_owner_published')
+            AND last_sync_status <> 'inaccessible'
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        != 0;
+    let audience = if public_release {
+        "public"
+    } else {
+        "authorized"
+    };
+    let audience_user_id = (!public_release).then_some(user_id);
+    let release_source = sqlx::query_as::<_, (
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )>(
+        "SELECT updated_at, detected_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::internal("release feed row has no source release"))?;
+    let title = release_source
+        .4
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(release_source.3.as_str());
+    let body = release_source
+        .5
+        .as_deref()
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let observed_at = content_processing::authoritative_release_revision(
+        release_source.0.as_str(),
+        release_source.1.as_deref(),
+    )
+    .unwrap_or(release_source.0.as_str());
+    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
+        release_source.2.as_str(),
+        release_source.3.as_str(),
+        title,
+        body.as_str(),
+    ]);
+    let request = jobs::ReleaseEvidenceRequest {
+        release_id,
+        repo_id,
+        repo_full_name: row
+            .repo_full_name
+            .clone()
+            .ok_or_else(|| ApiError::internal("release feed row has no repository name"))?,
+        base_tag: base_tag.to_owned(),
+        head_tag: head_tag.to_owned(),
+        audience_user_id: audience_user_id.map(str::to_owned),
+        source_revision: format!("{observed_at}\n{revision_tiebreak}"),
+    };
+    // Admission is deliberately DB-only. The worker performs all GitHub I/O;
+    // a feed request only creates or reuses the durable snapshot/task identity.
+    let snapshot = jobs::ensure_release_evidence(state, request)
+        .await
+        .map_err(ApiError::internal)?;
+    if snapshot.reference.status == "ready" {
+        if snapshot.snapshot.is_none() {
+            return Err(ApiError::internal(
+                "ready release evidence snapshot has no payload",
+            ));
+        }
+        let indexed_resources = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM release_evidence_snapshot_items item
+            JOIN release_evidence_index resource ON resource.id = item.index_id
+            WHERE item.snapshot_id = ?
+              AND resource.repo_id = ?
+              AND resource.audience = ?
+              AND resource.audience_user_id IS ?
+              AND resource.status = 'ready'
+            "#,
+        )
+        .bind(snapshot.reference.snapshot_id.as_str())
+        .bind(repo_id)
+        .bind(audience)
+        .bind(audience_user_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        if indexed_resources == 0 {
+            return Err(ApiError::internal(
+                "ready release evidence snapshot has no ready indexed resources",
+            ));
+        }
+    }
+    Ok(Some(snapshot))
+}
+
+async fn admit_feed_release_evidence_work(
+    state: &AppState,
+    user_id: &str,
+    row: &FeedRow,
+    evidence: &jobs::ReleaseEvidenceSnapshot,
+) -> Result<(), ApiError> {
+    let release_id = row.entity_id.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
+    })?;
+    let repo_id = row
+        .release_repo_id
+        .ok_or_else(|| ApiError::internal("release feed row is missing its repository identity"))?;
+    let source = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, String, Option<String>)>(
+        "SELECT html_url, tag_name, name, body, updated_at, detected_at FROM repo_releases WHERE release_id = ? LIMIT 1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::internal("release feed row has no source release"))?;
+    let repo_full_name = row
+        .repo_full_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| resolve_release_full_name(&source.0, repo_id));
+    let title = source
+        .2
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(source.1.as_str())
+        .to_owned();
+    let body = source
+        .3
+        .as_deref()
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let snapshot = evidence
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("ready release evidence snapshot has no payload"))?;
+    let evidence_text = serde_json::to_string(snapshot).map_err(ApiError::internal)?;
+    let reading_evidence = vec![translations::ReleaseReadingEvidence {
+        kind: "github_compare".to_owned(),
+        reference: format!(
+            "{}...{}",
+            snapshot
+                .get("base_tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            snapshot
+                .get("head_tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ),
+        scope: Some(format!(
+            "base_sha={};merge_base_sha={};head_sha={}",
+            snapshot
+                .get("base_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            snapshot
+                .get("merge_base_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            snapshot
+                .get("head_sha")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )),
+    }];
+    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
+        source.0.as_str(),
+        source.1.as_str(),
+        title.as_str(),
+        body.as_str(),
+    ]);
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("{repo_full_name}\n{}", source.1),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if !body.trim().is_empty() {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    source_blocks.extend([
+        translations::TranslationSourceBlock {
+            slot: "reading_contract".to_owned(),
+            text: "human_changes_direct; machine_materials_collapsible; no_source_section; no_version_repetition; no_author_attribution".to_owned(),
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_evidence_json".to_owned(),
+            text: serde_json::to_string(&reading_evidence).map_err(ApiError::internal)?,
+        },
+        translations::TranslationSourceBlock {
+            slot: "reading_compare".to_owned(),
+            text: evidence_text,
+        },
+        translations::TranslationSourceBlock {
+            slot: "release_evidence_snapshot".to_owned(),
+            text: serde_json::to_string(&json!({
+                "snapshot_id": evidence.reference.snapshot_id,
+                "status": "ready",
+            }))
+            .map_err(ApiError::internal)?,
+        },
+    ]);
+    let observed_at =
+        content_processing::authoritative_release_revision(source.4.as_str(), source.5.as_deref())
+            .unwrap_or(source.4.as_str());
+    let variant = if evidence.reference.audience == "public" {
+        translations::RELEASE_READING_PUBLIC_VARIANT
+    } else {
+        translations::RELEASE_READING_AUTHORIZED_VARIANT
+    };
+    let item = translations::TranslationRequestItemInput {
+        producer_ref: "feed.release.evidence".to_owned(),
+        kind: "release_smart".to_owned(),
+        variant: variant.to_owned(),
+        entity_id: release_id.to_string(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks: with_source_revision(
+            source_blocks,
+            Some(observed_at),
+            Some(revision_tiebreak.as_str()),
+        ),
+        target_slots: vec![
+            "title_zh".to_owned(),
+            "summary_md".to_owned(),
+            "reading".to_owned(),
+        ],
+    };
+    content_processing::submit_item(state, user_id, "async", &item).await?;
+    Ok(())
+}
+
+async fn load_feed_release_smart_work(
+    state: &AppState,
+    row: &FeedRow,
+    variant: &str,
+    evidence_snapshot_id: Option<&str>,
+) -> Result<Option<FeedReleaseSmartWorkRow>, ApiError> {
+    let release_id = row.entity_id.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!("invalid release id in feed row: {error}"))
+    })?;
+    let Some(snapshot_id) = evidence_snapshot_id else {
+        let work = sqlx::query_as::<_, FeedReleaseSmartWorkRow>(
+            r#"
+            SELECT w.source_hash, w.status, w.failure_class
+            FROM content_work_items w
+            WHERE w.canonical_resource_type = 'release'
+              AND w.canonical_resource_id = ?
+              AND w.pipeline = 'polishing'
+              AND w.variant = ?
+              AND w.target_lang = 'zh-CN'
+              AND w.protocol_version = ?
+              AND w.evidence_snapshot_id IS NULL
+            ORDER BY CASE w.status
+              WHEN 'ready' THEN 0
+              WHEN 'queued' THEN 1
+              WHEN 'running' THEN 2
+              WHEN 'deferred_provider' THEN 3
+              WHEN 'blocked_config' THEN 4
+              ELSE 5
+            END, datetime(w.updated_at) DESC, w.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        return Ok(work);
+    };
+
+    let work = if content_identity_upgrade::is_complete(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        sqlx::query_as::<_, FeedReleaseSmartWorkRow>(
+            r#"
+            SELECT i.source_hash, w.status, w.failure_class
+            FROM content_work_identities i
+            JOIN content_work_identity_members member ON member.identity_id = i.id
+            JOIN content_work_items w ON w.id = member.work_item_id
+            WHERE i.canonical_resource_type = 'release'
+              AND i.canonical_resource_id = ?
+              AND i.pipeline = 'polishing'
+              AND i.variant = ?
+              AND i.target_lang = 'zh-CN'
+              AND i.protocol_version = ?
+              AND w.evidence_snapshot_id = ?
+            ORDER BY CASE w.status
+              WHEN 'ready' THEN 0
+              WHEN 'queued' THEN 1
+              WHEN 'running' THEN 2
+              WHEN 'deferred_provider' THEN 3
+              WHEN 'blocked_config' THEN 4
+              ELSE 5
+            END, datetime(w.updated_at) DESC, w.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(snapshot_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        sqlx::query_as::<_, FeedReleaseSmartWorkRow>(
+            r#"
+            SELECT w.source_hash, w.status, w.failure_class
+            FROM content_work_items w
+            WHERE w.canonical_resource_type = 'release'
+              AND w.canonical_resource_id = ?
+              AND w.pipeline = 'polishing'
+              AND w.variant = ?
+              AND w.target_lang = 'zh-CN'
+              AND w.protocol_version = ?
+              AND w.evidence_snapshot_id = ?
+            ORDER BY CASE w.status
+              WHEN 'ready' THEN 0
+              WHEN 'queued' THEN 1
+              WHEN 'running' THEN 2
+              WHEN 'deferred_provider' THEN 3
+              WHEN 'blocked_config' THEN 4
+              ELSE 5
+            END, datetime(w.updated_at) DESC, w.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(snapshot_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    };
+    Ok(work)
+}
+
+async fn read_local_release_smart_result(
+    state: &AppState,
+    user_id: &str,
+    row: &FeedRow,
+) -> Result<Option<(String, Value, Option<String>)>, ApiError> {
+    let title = row.title.as_deref().unwrap_or("");
+    let body = row.release_body.as_deref().unwrap_or("");
+    let requires_evidence = !release_body_has_actionable_content(title, body);
+    let evidence = if requires_evidence {
+        load_feed_release_evidence_snapshot(state, user_id, row).await?
+    } else {
+        None
+    };
+    if requires_evidence {
+        let Some(evidence) = evidence.as_ref() else {
+            return Ok(None);
+        };
+        if evidence.reference.status != "ready" {
+            return Ok(Some((
+                evidence.reference.status.clone(),
+                json!({}),
+                evidence.reference.error_code.clone(),
+            )));
+        }
+        admit_feed_release_evidence_work(state, user_id, row, evidence).await?;
+    }
+    let Some(repo_id) = row.release_repo_id else {
+        return Err(ApiError::internal(
+            "release feed row is missing its repository identity",
+        ));
+    };
+    let public_release = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+          SELECT 1 FROM user_release_visible_repos
+          WHERE user_id = ? AND repo_id = ? AND is_private = 0
+        ) OR EXISTS(
+          SELECT 1 FROM public_repo_release_usage
+          WHERE repo_id = ?
+            AND access_kind IN ('github_public', 'private_owner_published')
+            AND last_sync_status <> 'inaccessible'
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        != 0;
+    let variant = if public_release {
+        translations::RELEASE_READING_PUBLIC_VARIANT
+    } else {
+        translations::RELEASE_READING_AUTHORIZED_VARIANT
+    };
+    let work = load_feed_release_smart_work(
+        state,
+        row,
+        variant,
+        evidence
+            .as_ref()
+            .map(|value| value.reference.snapshot_id.as_str()),
+    )
+    .await?;
+    let Some(work) = work else {
+        return Ok(None);
+    };
+    let result = content_processing::read_global_resource(
+        state,
+        "release",
+        row.entity_id.as_str(),
+        "polishing",
+        variant,
+        work.source_hash.as_str(),
+    )
+    .await?
+    .unwrap_or_else(|| (work.status.clone(), json!({})));
+    Ok(Some((result.0, result.1, work.failure_class)))
+}
+
 async fn overlay_global_feed_processing(
     state: &AppState,
     user_id: &str,
@@ -18008,28 +18497,6 @@ async fn overlay_global_feed_processing(
                 row.release_previous_tag_name.as_deref(),
             )
         };
-        let global_smart_input = if row.kind == "release" {
-            let release_id = row
-                .entity_id
-                .parse::<i64>()
-                .map_err(|error| ApiError::bad_request(format!("invalid release id: {error}")))?;
-            match release_feed_projection_result(
-                global_release_request_item(
-                    state,
-                    user_id,
-                    release_id,
-                    "release_smart",
-                    "api.feed.smart",
-                )
-                .await,
-            )? {
-                Some(input) => Some(input),
-                None => continue,
-            }
-        } else {
-            None
-        };
-
         let global_hash_for_variant = |kind: &str, variant: &str| {
             if resource_type == "announcement" {
                 global_announcement_source_hash(
@@ -18168,29 +18635,8 @@ async fn overlay_global_feed_processing(
                 .map(str::to_owned);
             row.detail_trans_work_status = Some(status);
         }
-        let global_smart_result = if let Some(input) = global_smart_input.as_ref() {
-            let smart_source_hash = content_processing::source_hash_for_item(input);
-            if row.kind == "release" {
-                let legacy_smart_hash = global_hash_for_variant("release_smart", "smart");
-                read_global_release_smart_with_legacy_fallback(
-                    state,
-                    resource_id.as_str(),
-                    input,
-                    smart_source_hash.as_str(),
-                    legacy_smart_hash.as_str(),
-                )
-                .await?
-            } else {
-                content_processing::read_global_resource(
-                    state,
-                    resource_type,
-                    resource_id.as_str(),
-                    "polishing",
-                    input.variant.as_str(),
-                    smart_source_hash.as_str(),
-                )
-                .await?
-            }
+        let global_smart_result = if row.kind == "release" {
+            read_local_release_smart_result(state, user_id, row).await?
         } else {
             read_first_global_resource_variant(
                 state,
@@ -18204,8 +18650,9 @@ async fn overlay_global_feed_processing(
                 ],
             )
             .await?
+            .map(|(status, payload)| (status, payload, None))
         };
-        if let Some((status, payload)) = global_smart_result {
+        if let Some((status, payload, work_error_text)) = global_smart_result {
             let has_text = payload
                 .get("title_zh")
                 .or_else(|| payload.get("summary_md"))
@@ -18222,6 +18669,13 @@ async fn overlay_global_feed_processing(
                 "insufficient".to_owned()
             } else if reading_incompatible && status == "ready" {
                 "incompatible".to_owned()
+            } else if row.kind == "release"
+                && matches!(
+                    status.as_str(),
+                    "queued" | "running" | "deferred_provider" | "blocked_config"
+                )
+            {
+                status.clone()
             } else if matches!(
                 status.as_str(),
                 "queued" | "running" | "deferred_provider" | "blocked_config"
@@ -18251,7 +18705,8 @@ async fn overlay_global_feed_processing(
                 .get("error_detail")
                 .or_else(|| payload.get("error_summary"))
                 .and_then(Value::as_str)
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or(work_error_text);
             row.smart_work_status = Some(status);
         }
     }
@@ -24033,11 +24488,28 @@ async fn select_release_compare_baseline_for_release(
     .await
 }
 
+async fn run_compare_request<F, T>(
+    budget: &mut crate::github::CompareBudget,
+    future: F,
+) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>>,
+{
+    budget.run(future).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            error.to_string(),
+        )
+    })?
+}
+
 async fn fetch_github_tree_request(
     state: &AppState,
     repo_full_name: &str,
     sha: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubTreeResponse, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/git/trees/{}?recursive=1",
@@ -24052,17 +24524,20 @@ async fn fetch_github_tree_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    response
-        .json::<GitHubTreeResponse>()
-        .await
-        .map_err(ApiError::internal)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        response
+            .json::<GitHubTreeResponse>()
+            .await
+            .map_err(ApiError::internal)
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -24076,6 +24551,7 @@ async fn fetch_github_blob_text_request(
     repo_full_name: &str,
     blob_sha: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<Option<String>, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/git/blobs/{}",
@@ -24090,28 +24566,31 @@ async fn fetch_github_blob_text_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let payload = response
-        .json::<GitHubBlobResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    if payload.encoding != "base64" {
-        return Ok(None);
-    }
-    let encoded = payload.content.replace(['\n', '\r'], "");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(ApiError::internal)?;
-    if bytes.len() > 32 * 1024 {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok())
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let payload = response
+            .json::<GitHubBlobResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        if payload.encoding != "base64" {
+            return Ok(None);
+        }
+        let encoded = payload.content.replace(['\n', '\r'], "");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(ApiError::internal)?;
+        if bytes.len() > 32 * 1024 {
+            return Ok(None);
+        }
+        Ok(String::from_utf8(bytes).ok())
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -24124,6 +24603,7 @@ async fn fetch_github_commit_sha_request(
     repo_full_name: &str,
     reference: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<String, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/commits/{}",
@@ -24138,21 +24618,24 @@ async fn fetch_github_commit_sha_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let payload = response
-        .json::<GitHubCommitResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    if payload.sha.trim().is_empty() {
-        return Err(ApiError::internal("github commit response is missing sha"));
-    }
-    Ok(payload.sha)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let payload = response
+            .json::<GitHubCommitResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        if payload.sha.trim().is_empty() {
+            return Err(ApiError::internal("github commit response is missing sha"));
+        }
+        Ok(payload.sha)
+    })
+    .await
 }
 
 fn build_endpoint_tree_compare(
@@ -24242,6 +24725,7 @@ async fn enrich_endpoint_tree_compare(
     base_tree: GitHubTreeResponse,
     head_tree: GitHubTreeResponse,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubCompareResponse, ApiError> {
     let mut enriched = build_endpoint_tree_compare(compare, base_tree.clone(), head_tree.clone());
     let base = base_tree
@@ -24286,13 +24770,15 @@ async fn enrich_endpoint_tree_compare(
         }
         let before_text = match before_sha {
             Some(sha) => {
-                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token, budget)
+                    .await?
             }
             None => None,
         };
         let after_text = match after_sha {
             Some(sha) => {
-                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token, budget)
+                    .await?
             }
             None => None,
         };
@@ -24336,6 +24822,26 @@ async fn fetch_release_compare_snapshot_request(
     head_tag: &str,
     access_token: Option<&str>,
 ) -> Result<Option<ReleaseCompareSnapshot>, ApiError> {
+    let mut budget = crate::github::CompareBudget::default_for_feed();
+    fetch_release_compare_snapshot_request_inner(
+        state,
+        repo_full_name,
+        base_tag,
+        head_tag,
+        access_token,
+        &mut budget,
+    )
+    .await
+}
+
+async fn fetch_release_compare_snapshot_request_inner(
+    state: &AppState,
+    repo_full_name: &str,
+    base_tag: &str,
+    head_tag: &str,
+    access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
+) -> Result<Option<ReleaseCompareSnapshot>, ApiError> {
     let payload = fetch_release_compare_payload_request(
         state,
         repo_full_name,
@@ -24343,10 +24849,12 @@ async fn fetch_release_compare_snapshot_request(
         head_tag,
         "...",
         access_token,
+        budget,
     )
     .await?;
     let head_sha =
-        fetch_github_commit_sha_request(state, repo_full_name, head_tag, access_token).await?;
+        fetch_github_commit_sha_request(state, repo_full_name, head_tag, access_token, budget)
+            .await?;
     let relationship_status = payload.status.clone().unwrap_or_default();
     let payload = if compare_requires_endpoint_diff(payload.status.as_deref()) {
         let base_sha = payload
@@ -24356,10 +24864,16 @@ async fn fetch_release_compare_snapshot_request(
             .context("github compare response missing base SHA")
             .map_err(ApiError::internal)?;
         let base_tree =
-            fetch_github_tree_request(state, repo_full_name, base_sha, access_token).await?;
-        let head_tree =
-            fetch_github_tree_request(state, repo_full_name, head_sha.as_str(), access_token)
+            fetch_github_tree_request(state, repo_full_name, base_sha, access_token, budget)
                 .await?;
+        let head_tree = fetch_github_tree_request(
+            state,
+            repo_full_name,
+            head_sha.as_str(),
+            access_token,
+            budget,
+        )
+        .await?;
         enrich_endpoint_tree_compare(
             state,
             repo_full_name,
@@ -24367,6 +24881,7 @@ async fn fetch_release_compare_snapshot_request(
             base_tree,
             head_tree,
             access_token,
+            budget,
         )
         .await?
     } else {
@@ -24411,6 +24926,7 @@ async fn fetch_release_compare_payload_request(
     head_tag: &str,
     separator: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubCompareResponse, ApiError> {
     let compare_ref = format!(
         "{}{separator}{}",
@@ -24430,25 +24946,28 @@ async fn fetch_release_compare_payload_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let pagination_truncated = response
-        .headers()
-        .get(reqwest::header::LINK)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("rel=\"next\""));
-    let mut payload = response
-        .json::<GitHubCompareResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    validate_github_compare_response(&payload)?;
-    payload.pagination_truncated = pagination_truncated;
-    Ok(payload)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let pagination_truncated = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("rel=\"next\""));
+        let mut payload = response
+            .json::<GitHubCompareResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        validate_github_compare_response(&payload)?;
+        payload.pagination_truncated = pagination_truncated;
+        Ok(payload)
+    })
+    .await
 }
 
 async fn fetch_release_compare_snapshot(
@@ -24506,12 +25025,12 @@ struct ReleaseReadingEvidenceRequest<'a> {
     public_only: bool,
 }
 
-const RELEASE_READING_EVIDENCE_UNAVAILABLE: &str = "release_reading_evidence_unavailable";
-
+#[allow(dead_code)]
 fn release_feed_projection_should_fail_open(error: &ApiError) -> bool {
-    error.code() == RELEASE_READING_EVIDENCE_UNAVAILABLE
+    crate::github::is_exact_release_reading_evidence_unavailable(error.code())
 }
 
+#[allow(dead_code)]
 fn release_feed_projection_result(
     result: Result<translations::TranslationRequestItemInput, ApiError>,
 ) -> Result<Option<translations::TranslationRequestItemInput>, ApiError> {
@@ -24528,7 +25047,7 @@ fn release_reading_evidence_is_unavailable(
     evidence.iter().any(|item| {
         matches!(
             item.kind.as_str(),
-            "compare_unavailable" | "github_compare_incomplete"
+            "compare_unavailable" | "github_compare_incomplete" | "github_evidence_insufficient"
         )
     })
 }
@@ -24596,9 +25115,7 @@ async fn prepare_release_reading_evidence(
                 )
                 .await
             } {
-                Ok(Some(snapshot))
-                    if snapshot.relationship_status.eq_ignore_ascii_case("ahead") =>
-                {
+                Ok(Some(snapshot)) if compare_status_is_ahead(&snapshot.relationship_status) => {
                     baseline = Some(candidate);
                     verified_snapshot = Some(snapshot);
                     break;
@@ -24693,6 +25210,22 @@ async fn prepare_release_reading_evidence(
             }
         }
     };
+    if !compare_status_is_ahead(&snapshot.relationship_status) {
+        return Ok((
+            format!(
+                "Compare evidence for {}...{} was not an ahead relationship ({}); do not infer a code change.",
+                snapshot.base_tag, snapshot.head_tag, snapshot.relationship_status
+            ),
+            vec![translations::ReleaseReadingEvidence {
+                kind: "github_evidence_insufficient".to_owned(),
+                reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
+                scope: Some(format!(
+                    "compare relationship status: {}",
+                    snapshot.relationship_status
+                )),
+            }],
+        ));
+    }
     if !snapshot.coverage_complete {
         return Ok((
             format!(
@@ -24721,6 +25254,10 @@ async fn prepare_release_reading_evidence(
         )),
     }];
     Ok((evidence_text, evidence))
+}
+
+fn compare_status_is_ahead(status: &str) -> bool {
+    status.eq_ignore_ascii_case("ahead")
 }
 
 #[allow(dead_code)]
@@ -28548,16 +29085,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_readable_feed_keeps_raw_release_when_compare_evidence_is_unavailable() {
+    async fn dashboard_readable_feed_uses_local_failed_evidence_without_external_requests() {
         let pool = setup_pool().await;
-        seed_global_feed_compare_failure_fixture(&pool).await;
+        seed_global_feed_evidence_fixture(&pool, "failed").await;
 
-        let mut state = setup_state(pool);
-        let (github_base_url, compare_requests, expected_compare_request) =
-            spawn_test_github_compare_failure_server().await;
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool, external_base_url.clone());
         Arc::get_mut(&mut state)
             .expect("unique dashboard feed test state")
-            .github_rest_api_base = github_base_url;
+            .github_rest_api_base = external_base_url;
 
         let Json(feed) = dashboard_readable_feed(
             State(state),
@@ -28597,8 +29134,11 @@ mod tests {
             previous_release.body.as_deref(),
             Some("Release-Identity: previous")
         );
-        assert!(compare_requests.load(Ordering::SeqCst) >= 1);
-        assert!(expected_compare_request.load(Ordering::SeqCst));
+        assert_eq!(
+            release.smart.as_ref().map(|smart| smart.status.as_str()),
+            Some("error")
+        );
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -28858,6 +29398,7 @@ mod tests {
             entity_id: "1".to_owned(),
             translation_entity_id: None,
             release_id: Some(1),
+            release_repo_id: Some(1),
             release_node_id: node_id.map(str::to_owned),
             repo_full_name: None,
             discussion_number: None,
@@ -29212,38 +29753,23 @@ mod tests {
         Url::parse(&format!("http://{addr}/")).expect("parse test ai base url")
     }
 
-    async fn spawn_test_github_compare_failure_server() -> (Url, Arc<AtomicUsize>, Arc<AtomicBool>)
-    {
-        let compare_requests = Arc::new(AtomicUsize::new(0));
-        let request_counter = Arc::clone(&compare_requests);
-        let expected_compare_request = Arc::new(AtomicBool::new(false));
-        let expected_request_flag = Arc::clone(&expected_compare_request);
-        let base_url = spawn_test_ai_server(Router::new().fallback(move |uri: axum::http::Uri| {
-            let request_counter = Arc::clone(&request_counter);
-            let expected_request_flag = Arc::clone(&expected_request_flag);
-            async move {
-                if uri.path().starts_with("/repos/") && uri.path().contains("/compare/") {
-                    request_counter.fetch_add(1, Ordering::SeqCst);
-                    if uri.path() == "/repos/openai/codex/compare/v1.2.2...v1.2.3" {
-                        expected_request_flag.store(true, Ordering::SeqCst);
-                    }
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"message": "compare unavailable"})),
-                    )
-                } else {
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({"message": "unexpected github path"})),
-                    )
-                }
+    async fn spawn_test_external_request_guard_server() -> (Url, Arc<AtomicUsize>) {
+        let external_requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = Arc::clone(&external_requests);
+        let base_url = spawn_test_ai_server(Router::new().fallback(move || {
+            request_counter.fetch_add(1, Ordering::SeqCst);
+            async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "unexpected external request"})),
+                )
             }
         }))
         .await;
-        (base_url, compare_requests, expected_compare_request)
+        (base_url, external_requests)
     }
 
-    async fn seed_global_feed_compare_failure_fixture(pool: &SqlitePool) {
+    async fn seed_global_feed_evidence_fixture(pool: &SqlitePool, evidence_status: &str) {
         sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
             .execute(pool)
             .await
@@ -29272,6 +29798,46 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed compare-only release bodies");
+        let source_revision_tiebreak =
+            crate::content_processing::release_source_revision_content_tiebreak(&[
+                "https://github.com/openai/codex/releases/tag/v1.2.3",
+                "v1.2.3",
+                "v1.2.3",
+                "Release-Identity: current",
+            ]);
+        let source_revision = format!("2026-02-23T00:00:00Z\n{source_revision_tiebreak}");
+        let request_key = jobs::ReleaseEvidenceRequest {
+            release_id: 120,
+            repo_id: 42,
+            repo_full_name: "openai/codex".to_owned(),
+            base_tag: "v1.2.2".to_owned(),
+            head_tag: "v1.2.3".to_owned(),
+            audience_user_id: None,
+            source_revision: source_revision.clone(),
+        }
+        .request_key();
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, last_error_code, last_error_summary, created_at, updated_at
+            )
+            VALUES (
+              'feed-evidence-120', ?, 120, 42, 'openai/codex', 'public',
+              NULL, ?, 'v1.2.2', 'v1.2.3', ?,
+              1, ?, ?, '2026-02-24T08:00:00Z', '2026-02-24T08:00:00Z'
+            )
+            "#,
+        )
+        .bind(request_key)
+        .bind(source_revision)
+        .bind(evidence_status)
+        .bind((evidence_status == "failed").then_some("github_evidence_incomplete"))
+        .bind((evidence_status == "failed").then_some("Release evidence is incomplete"))
+        .execute(pool)
+        .await
+        .expect("seed local release evidence snapshot");
     }
 
     async fn setup_session(user_id: i64) -> Session {
@@ -31539,36 +32105,6 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed release translation");
-    }
-
-    async fn seed_release_smart_translation(
-        pool: &SqlitePool,
-        user_id: &str,
-        entity_id: &str,
-        source_hash: &str,
-        title: Option<&str>,
-        summary: Option<&str>,
-    ) {
-        let now = "2026-02-23T00:00:00Z";
-        sqlx::query(
-            r#"
-            INSERT INTO ai_translations (
-              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
-            )
-            VALUES (?, ?, 'release_smart', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
-            "#,
-        )
-        .bind(crate::local_id::generate_local_id())
-        .bind(user_id)
-        .bind(entity_id)
-        .bind(source_hash)
-        .bind(title)
-        .bind(summary)
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("seed release smart translation");
     }
 
     async fn seed_access_refresh_task(
@@ -39633,6 +40169,31 @@ body={}
     }
 
     #[test]
+    fn release_compare_reading_requires_ahead_relationship() {
+        assert!(super::compare_status_is_ahead("ahead"));
+        assert!(super::compare_status_is_ahead("AHEAD"));
+        for status in ["identical", "behind", "diverged", ""] {
+            assert!(!super::compare_status_is_ahead(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compare_request_budget_counts_each_nested_request() {
+        let mut budget = crate::github::CompareBudget::new(std::time::Duration::from_secs(1), 2);
+        super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect("first nested request should fit the budget");
+        super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect("second nested request should fit the budget");
+        let error = super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect_err("third nested request must exhaust the budget");
+        assert_eq!(error.code(), RELEASE_READING_EVIDENCE_UNAVAILABLE);
+        assert_eq!(budget.attempts(), 2);
+    }
+
+    #[test]
     fn endpoint_tree_compare_uses_fixed_base_and_head_paths() {
         let compare = GitHubCompareResponse {
             status: Some("diverged".to_owned()),
@@ -40182,28 +40743,9 @@ line two",
     }
 
     #[tokio::test]
-    async fn list_feed_keeps_raw_release_when_compare_evidence_is_unavailable() {
+    async fn list_feed_uses_local_queued_evidence_without_external_requests() {
         let pool = setup_pool().await;
-        seed_global_feed_compare_failure_fixture(&pool).await;
-        let smart_body =
-            release_feed_body(Some("Release-Identity: current")).expect("smart source body");
-        let smart_source_hash = crate::translations::release_smart_feed_source_hash(
-            "120",
-            "openai/codex",
-            "v1.2.3",
-            Some(smart_body.as_str()),
-            "v1.2.3",
-            Some("v1.2.2"),
-        );
-        seed_release_smart_translation(
-            &pool,
-            test_user_id(1).as_str(),
-            "120",
-            smart_source_hash.as_str(),
-            Some("stale user smart title"),
-            Some("stale user smart summary"),
-        )
-        .await;
+        seed_global_feed_evidence_fixture(&pool, "queued").await;
         seed_social_event(
             &pool,
             test_user_id(1).as_str(),
@@ -40224,12 +40766,12 @@ line two",
         )
         .await;
 
-        let mut state = setup_state_with_ai(pool);
-        let (github_base_url, compare_requests, expected_compare_request) =
-            spawn_test_github_compare_failure_server().await;
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool, external_base_url.clone());
         Arc::get_mut(&mut state)
             .expect("unique list feed test state")
-            .github_rest_api_base = github_base_url;
+            .github_rest_api_base = external_base_url;
 
         let Json(feed) = list_feed(
             State(state),
@@ -40269,11 +40811,8 @@ line two",
             None
         );
         assert_eq!(
-            release
-                .smart
-                .as_ref()
-                .and_then(|smart| smart.error_code.as_deref()),
-            None
+            release.smart.as_ref().map(|smart| smart.status.as_str()),
+            Some("queued")
         );
         assert_eq!(
             release
@@ -40289,13 +40828,194 @@ line two",
                 .and_then(|smart| smart.reading.as_ref())
                 .is_none()
         );
-        assert!(compare_requests.load(Ordering::SeqCst) >= 1);
-        assert!(expected_compare_request.load(Ordering::SeqCst));
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
         assert!(
             feed.items
                 .iter()
                 .any(|item| item.id == "compare-failure-neighbor")
         );
+    }
+
+    #[tokio::test]
+    async fn list_feed_admits_ready_evidence_work_without_external_requests() {
+        let pool = setup_pool().await;
+        seed_global_feed_evidence_fixture(&pool, "ready").await;
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET snapshot_json = ?, content_hash = ? WHERE id = 'feed-evidence-120'",
+        )
+        .bind(
+            json!({
+                "base_tag": "v1.2.2",
+                "head_tag": "v1.2.3",
+                "base_sha": "base",
+                "merge_base_sha": "merge",
+                "head_sha": "head",
+                "coverage_complete": true,
+            })
+            .to_string(),
+        )
+        .bind("feed-evidence-hash")
+        .execute(&pool)
+        .await
+        .expect("seed ready evidence payload");
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_index (
+              id, repo_id, repo_full_name, audience, audience_user_id,
+              resource_kind, resource_key, side, status, payload_json,
+              content_hash, created_at, updated_at
+            ) VALUES ('feed-resource-120', 42, 'openai/codex', 'public', NULL,
+                       'compare', 'feed-compare', '', 'ready', '{}',
+                       'feed-resource-hash', '2026-02-24T08:00:00Z', '2026-02-24T08:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed ready evidence resource");
+        sqlx::query(
+            "INSERT INTO release_evidence_snapshot_items (snapshot_id, index_id, ordinal, created_at) VALUES ('feed-evidence-120', 'feed-resource-120', 0, '2026-02-24T08:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("link ready evidence resource");
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool.clone(), external_base_url.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique ready evidence test state")
+            .github_rest_api_base = external_base_url;
+
+        let _ = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("ready evidence should admit content work locally");
+
+        let (work_count, source_snapshot): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(source_snapshot_json) FROM content_work_items WHERE evidence_snapshot_id = 'feed-evidence-120'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load admitted ready evidence work");
+        assert_eq!(work_count, 1);
+        assert!(source_snapshot.contains("feed-evidence-120"));
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn list_feed_admits_missing_evidence_without_external_requests() {
+        let pool = setup_pool().await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("enable global content processing mode");
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 119).await;
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET tag_name = CASE release_id WHEN 119 THEN 'v1.2.2' WHEN 120 THEN 'v1.2.3' END,
+                name = CASE release_id WHEN 119 THEN 'v1.2.2' WHEN 120 THEN 'v1.2.3' END,
+                body = CASE release_id WHEN 119 THEN 'Release-Identity: previous' WHEN 120 THEN 'Release-Identity: current' END
+            WHERE release_id IN (119, 120)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed compare-only release bodies");
+        let (external_base_url, external_requests) =
+            spawn_test_external_request_guard_server().await;
+        let mut state = setup_state_with_ai_base_url(pool.clone(), external_base_url.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique missing evidence test state")
+            .github_rest_api_base = external_base_url;
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("missing evidence should be admitted locally");
+
+        let release = feed
+            .items
+            .iter()
+            .find(|item| item.kind == "release" && item.id == "120")
+            .expect("raw release should remain visible");
+        assert_eq!(
+            release.smart.as_ref().map(|smart| smart.status.as_str()),
+            Some("queued")
+        );
+        assert_eq!(external_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM release_evidence_snapshots WHERE release_id = 120",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count admitted evidence snapshots"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND status IN ('queued', 'running')",
+            )
+            .bind(crate::jobs::TASK_RELEASE_EVIDENCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count admitted evidence tasks"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_feed_terminates_on_invalid_local_evidence_snapshot() {
+        let pool = setup_pool().await;
+        seed_global_feed_evidence_fixture(&pool, "ready").await;
+        sqlx::query(
+            "UPDATE release_evidence_snapshots SET snapshot_json = 'not-json' WHERE id = 'feed-evidence-120'",
+        )
+        .execute(&pool)
+        .await
+        .expect("corrupt local evidence snapshot");
+
+        let error = list_feed(
+            State(setup_state(pool)),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: None,
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect_err("invalid local evidence must terminate the feed request");
+
+        assert_eq!(error.code(), "internal_error");
     }
 
     #[tokio::test]
