@@ -160,8 +160,9 @@ fn normalize_sqlite_operation(operation: &str) -> String {
 fn normalize_upstream_operation(operation: &str) -> String {
     let operation = operation.trim();
     match operation {
-        "scheduler_wait" | "chat_completions" | "webhook" => operation.to_owned(),
+        "scheduler_wait" | "chat_completions" | "webhook" | "compare" => operation.to_owned(),
         value if value.contains("graphql") => "graphql".to_owned(),
+        value if value.contains("compare") => "compare".to_owned(),
         value if value.contains("release") => "releases".to_owned(),
         value if value.contains("notification") => "notifications".to_owned(),
         value if value.contains("star") => "stars".to_owned(),
@@ -173,8 +174,22 @@ fn normalize_upstream_operation(operation: &str) -> String {
 
 fn normalize_upstream_outcome(outcome: &str) -> String {
     match outcome {
-        "success" | "rate_limited" | "forbidden" | "timeout" | "http_4xx" | "http_5xx"
-        | "transport_error" | "decode_error" | "graphql_error" | "fallback" | "queued"
+        "success"
+        | "rate_limited"
+        | "forbidden"
+        | "timeout"
+        | "http_4xx"
+        | "http_5xx"
+        | "service_unavailable"
+        | "authentication_failed"
+        | "too_many_files"
+        | "attempt_budget_exhausted"
+        | "transport_error"
+        | "decode_error"
+        | "graphql_error"
+        | "fallback"
+        | "enrichment"
+        | "queued"
         | "admitted" => outcome.to_owned(),
         _ => "other".to_owned(),
     }
@@ -591,6 +606,11 @@ impl Metrics {
         self.upstream_duration
             .get_or_create(&labels)
             .observe(elapsed.as_secs_f64());
+    }
+
+    #[allow(dead_code)]
+    pub fn record_github_compare(&self, outcome: &str, elapsed: Duration) {
+        self.record_upstream("github", "compare", outcome, elapsed);
     }
 
     fn normalize_executor(executor: &str) -> String {
@@ -1098,6 +1118,15 @@ pub struct HttpRequestGuard {
     finished: bool,
 }
 
+#[allow(dead_code)]
+pub struct UpstreamGuard {
+    metrics: Option<Arc<Metrics>>,
+    provider: &'static str,
+    operation: &'static str,
+    started_at: Instant,
+    finished: bool,
+}
+
 pub struct WorkerGuard {
     metrics: Option<Arc<Metrics>>,
     executor: &'static str,
@@ -1237,6 +1266,48 @@ impl HttpRequestGuard {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.finish_http(&self.method, &self.route, status, self.started_at.elapsed());
         }
+    }
+}
+
+#[allow(dead_code)]
+impl UpstreamGuard {
+    pub fn new(provider: &'static str, operation: &'static str) -> Self {
+        Self::with_metrics(global(), provider, operation)
+    }
+
+    fn with_metrics(
+        metrics: Option<Arc<Metrics>>,
+        provider: &'static str,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            metrics,
+            provider,
+            operation,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub fn finish(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_upstream(
+                self.provider,
+                self.operation,
+                outcome,
+                self.started_at.elapsed(),
+            );
+        }
+    }
+}
+
+impl Drop for UpstreamGuard {
+    fn drop(&mut self) {
+        self.finish("cancelled");
     }
 }
 
@@ -1413,6 +1484,24 @@ mod tests {
         assert!(body.contains("outcome=\"queued\""));
         assert!(body.contains("outcome=\"admitted\""));
         assert!(body.contains("outcome=\"forbidden\""));
+    }
+
+    #[test]
+    fn github_compare_metrics_keep_low_cardinality_lifecycle_labels() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_enabled(true);
+        metrics.record_github_compare("timeout", Duration::from_millis(12));
+        metrics.record_github_compare("service_unavailable", Duration::from_millis(13));
+        {
+            let mut guard =
+                UpstreamGuard::with_metrics(Some(Arc::clone(&metrics)), "github", "compare");
+            guard.finish("enrichment");
+        }
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("operation=\"compare\""));
+        assert!(body.contains("outcome=\"timeout\""));
+        assert!(body.contains("outcome=\"service_unavailable\""));
+        assert!(body.contains("outcome=\"enrichment\""));
     }
 
     #[test]
