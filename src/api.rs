@@ -24488,11 +24488,28 @@ async fn select_release_compare_baseline_for_release(
     .await
 }
 
+async fn run_compare_request<F, T>(
+    budget: &mut crate::github::CompareBudget,
+    future: F,
+) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>>,
+{
+    budget.run(future).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RELEASE_READING_EVIDENCE_UNAVAILABLE,
+            error.to_string(),
+        )
+    })?
+}
+
 async fn fetch_github_tree_request(
     state: &AppState,
     repo_full_name: &str,
     sha: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubTreeResponse, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/git/trees/{}?recursive=1",
@@ -24507,17 +24524,20 @@ async fn fetch_github_tree_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    response
-        .json::<GitHubTreeResponse>()
-        .await
-        .map_err(ApiError::internal)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        response
+            .json::<GitHubTreeResponse>()
+            .await
+            .map_err(ApiError::internal)
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -24531,6 +24551,7 @@ async fn fetch_github_blob_text_request(
     repo_full_name: &str,
     blob_sha: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<Option<String>, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/git/blobs/{}",
@@ -24545,28 +24566,31 @@ async fn fetch_github_blob_text_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let payload = response
-        .json::<GitHubBlobResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    if payload.encoding != "base64" {
-        return Ok(None);
-    }
-    let encoded = payload.content.replace(['\n', '\r'], "");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(ApiError::internal)?;
-    if bytes.len() > 32 * 1024 {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok())
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let payload = response
+            .json::<GitHubBlobResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        if payload.encoding != "base64" {
+            return Ok(None);
+        }
+        let encoded = payload.content.replace(['\n', '\r'], "");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(ApiError::internal)?;
+        if bytes.len() > 32 * 1024 {
+            return Ok(None);
+        }
+        Ok(String::from_utf8(bytes).ok())
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -24579,6 +24603,7 @@ async fn fetch_github_commit_sha_request(
     repo_full_name: &str,
     reference: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<String, ApiError> {
     let url = format!(
         "https://api.github.com/repos/{repo_full_name}/commits/{}",
@@ -24593,21 +24618,24 @@ async fn fetch_github_commit_sha_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let payload = response
-        .json::<GitHubCommitResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    if payload.sha.trim().is_empty() {
-        return Err(ApiError::internal("github commit response is missing sha"));
-    }
-    Ok(payload.sha)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let payload = response
+            .json::<GitHubCommitResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        if payload.sha.trim().is_empty() {
+            return Err(ApiError::internal("github commit response is missing sha"));
+        }
+        Ok(payload.sha)
+    })
+    .await
 }
 
 fn build_endpoint_tree_compare(
@@ -24697,6 +24725,7 @@ async fn enrich_endpoint_tree_compare(
     base_tree: GitHubTreeResponse,
     head_tree: GitHubTreeResponse,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubCompareResponse, ApiError> {
     let mut enriched = build_endpoint_tree_compare(compare, base_tree.clone(), head_tree.clone());
     let base = base_tree
@@ -24741,13 +24770,15 @@ async fn enrich_endpoint_tree_compare(
         }
         let before_text = match before_sha {
             Some(sha) => {
-                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token, budget)
+                    .await?
             }
             None => None,
         };
         let after_text = match after_sha {
             Some(sha) => {
-                fetch_github_blob_text_request(state, repo_full_name, sha, access_token).await?
+                fetch_github_blob_text_request(state, repo_full_name, sha, access_token, budget)
+                    .await?
             }
             None => None,
         };
@@ -24792,22 +24823,15 @@ async fn fetch_release_compare_snapshot_request(
     access_token: Option<&str>,
 ) -> Result<Option<ReleaseCompareSnapshot>, ApiError> {
     let mut budget = crate::github::CompareBudget::default_for_feed();
-    budget
-        .run(fetch_release_compare_snapshot_request_inner(
-            state,
-            repo_full_name,
-            base_tag,
-            head_tag,
-            access_token,
-        ))
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                RELEASE_READING_EVIDENCE_UNAVAILABLE,
-                error.to_string(),
-            )
-        })?
+    fetch_release_compare_snapshot_request_inner(
+        state,
+        repo_full_name,
+        base_tag,
+        head_tag,
+        access_token,
+        &mut budget,
+    )
+    .await
 }
 
 async fn fetch_release_compare_snapshot_request_inner(
@@ -24816,6 +24840,7 @@ async fn fetch_release_compare_snapshot_request_inner(
     base_tag: &str,
     head_tag: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<Option<ReleaseCompareSnapshot>, ApiError> {
     let payload = fetch_release_compare_payload_request(
         state,
@@ -24824,10 +24849,12 @@ async fn fetch_release_compare_snapshot_request_inner(
         head_tag,
         "...",
         access_token,
+        budget,
     )
     .await?;
     let head_sha =
-        fetch_github_commit_sha_request(state, repo_full_name, head_tag, access_token).await?;
+        fetch_github_commit_sha_request(state, repo_full_name, head_tag, access_token, budget)
+            .await?;
     let relationship_status = payload.status.clone().unwrap_or_default();
     let payload = if compare_requires_endpoint_diff(payload.status.as_deref()) {
         let base_sha = payload
@@ -24837,10 +24864,16 @@ async fn fetch_release_compare_snapshot_request_inner(
             .context("github compare response missing base SHA")
             .map_err(ApiError::internal)?;
         let base_tree =
-            fetch_github_tree_request(state, repo_full_name, base_sha, access_token).await?;
-        let head_tree =
-            fetch_github_tree_request(state, repo_full_name, head_sha.as_str(), access_token)
+            fetch_github_tree_request(state, repo_full_name, base_sha, access_token, budget)
                 .await?;
+        let head_tree = fetch_github_tree_request(
+            state,
+            repo_full_name,
+            head_sha.as_str(),
+            access_token,
+            budget,
+        )
+        .await?;
         enrich_endpoint_tree_compare(
             state,
             repo_full_name,
@@ -24848,6 +24881,7 @@ async fn fetch_release_compare_snapshot_request_inner(
             base_tree,
             head_tree,
             access_token,
+            budget,
         )
         .await?
     } else {
@@ -24892,6 +24926,7 @@ async fn fetch_release_compare_payload_request(
     head_tag: &str,
     separator: &str,
     access_token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> Result<GitHubCompareResponse, ApiError> {
     let compare_ref = format!(
         "{}{separator}{}",
@@ -24911,25 +24946,28 @@ async fn fetch_release_compare_payload_request(
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(ApiError::internal)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(github_rest_compare_http_error(status, &headers, &body));
-    }
-    let pagination_truncated = response
-        .headers()
-        .get(reqwest::header::LINK)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("rel=\"next\""));
-    let mut payload = response
-        .json::<GitHubCompareResponse>()
-        .await
-        .map_err(ApiError::internal)?;
-    validate_github_compare_response(&payload)?;
-    payload.pagination_truncated = pagination_truncated;
-    Ok(payload)
+    run_compare_request(budget, async move {
+        let response = request.send().await.map_err(ApiError::internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(github_rest_compare_http_error(status, &headers, &body));
+        }
+        let pagination_truncated = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("rel=\"next\""));
+        let mut payload = response
+            .json::<GitHubCompareResponse>()
+            .await
+            .map_err(ApiError::internal)?;
+        validate_github_compare_response(&payload)?;
+        payload.pagination_truncated = pagination_truncated;
+        Ok(payload)
+    })
+    .await
 }
 
 async fn fetch_release_compare_snapshot(
@@ -25009,7 +25047,7 @@ fn release_reading_evidence_is_unavailable(
     evidence.iter().any(|item| {
         matches!(
             item.kind.as_str(),
-            "compare_unavailable" | "github_compare_incomplete"
+            "compare_unavailable" | "github_compare_incomplete" | "github_evidence_insufficient"
         )
     })
 }
@@ -25077,9 +25115,7 @@ async fn prepare_release_reading_evidence(
                 )
                 .await
             } {
-                Ok(Some(snapshot))
-                    if snapshot.relationship_status.eq_ignore_ascii_case("ahead") =>
-                {
+                Ok(Some(snapshot)) if compare_status_is_ahead(&snapshot.relationship_status) => {
                     baseline = Some(candidate);
                     verified_snapshot = Some(snapshot);
                     break;
@@ -25174,6 +25210,22 @@ async fn prepare_release_reading_evidence(
             }
         }
     };
+    if !compare_status_is_ahead(&snapshot.relationship_status) {
+        return Ok((
+            format!(
+                "Compare evidence for {}...{} was not an ahead relationship ({}); do not infer a code change.",
+                snapshot.base_tag, snapshot.head_tag, snapshot.relationship_status
+            ),
+            vec![translations::ReleaseReadingEvidence {
+                kind: "github_evidence_insufficient".to_owned(),
+                reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
+                scope: Some(format!(
+                    "compare relationship status: {}",
+                    snapshot.relationship_status
+                )),
+            }],
+        ));
+    }
     if !snapshot.coverage_complete {
         return Ok((
             format!(
@@ -25202,6 +25254,10 @@ async fn prepare_release_reading_evidence(
         )),
     }];
     Ok((evidence_text, evidence))
+}
+
+fn compare_status_is_ahead(status: &str) -> bool {
+    status.eq_ignore_ascii_case("ahead")
 }
 
 #[allow(dead_code)]
@@ -40110,6 +40166,31 @@ body={}
         assert!(compare_requires_endpoint_diff(Some("BEHIND")));
         assert!(!compare_requires_endpoint_diff(Some("ahead")));
         assert!(!compare_requires_endpoint_diff(None));
+    }
+
+    #[test]
+    fn release_compare_reading_requires_ahead_relationship() {
+        assert!(super::compare_status_is_ahead("ahead"));
+        assert!(super::compare_status_is_ahead("AHEAD"));
+        for status in ["identical", "behind", "diverged", ""] {
+            assert!(!super::compare_status_is_ahead(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compare_request_budget_counts_each_nested_request() {
+        let mut budget = crate::github::CompareBudget::new(std::time::Duration::from_secs(1), 2);
+        super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect("first nested request should fit the budget");
+        super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect("second nested request should fit the budget");
+        let error = super::run_compare_request(&mut budget, async { Ok::<_, ApiError>(()) })
+            .await
+            .expect_err("third nested request must exhaust the budget");
+        assert_eq!(error.code(), RELEASE_READING_EVIDENCE_UNAVAILABLE);
+        assert_eq!(budget.attempts(), 2);
     }
 
     #[test]
