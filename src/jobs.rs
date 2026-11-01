@@ -75,6 +75,9 @@ const RELEASE_EVIDENCE_MAX_ATTEMPTS: i64 = 5;
 const RELEASE_EVIDENCE_MAX_FILES: usize = 8;
 const RELEASE_EVIDENCE_MAX_COMMITS: usize = 32;
 const RELEASE_EVIDENCE_MAX_BLOB_BYTES: usize = 32 * 1024;
+// compare + commit + two trees + up to two blobs per changed file. This is a
+// batch-wide cap, including retries across multiple authorized connections.
+const RELEASE_EVIDENCE_MAX_REQUESTS: usize = 4 + RELEASE_EVIDENCE_MAX_FILES * 2;
 const RELEASE_EVIDENCE_RETRY_DELAYS_SECS: [i64; 5] = [30, 120, 600, 1_800, 7_200];
 
 fn is_webhook_push_task_type(task_type: &str) -> bool {
@@ -1422,11 +1425,29 @@ fn release_evidence_transport_failure(error: impl std::fmt::Display) -> ReleaseE
     }
 }
 
+fn release_evidence_budget_failure(
+    error: crate::github::CompareGuardError,
+) -> ReleaseEvidenceFailure {
+    ReleaseEvidenceFailure {
+        code: "github_unavailable".to_owned(),
+        message: format!("GitHub evidence request budget exhausted: {error}"),
+        retryable: true,
+    }
+}
+
+fn release_evidence_budget() -> crate::github::CompareBudget {
+    crate::github::CompareBudget::new(
+        Duration::from_secs(RELEASE_EVIDENCE_COLLECTION_TIMEOUT_SECS),
+        RELEASE_EVIDENCE_MAX_REQUESTS,
+    )
+}
+
 async fn fetch_release_evidence_json<T: DeserializeOwned>(
     state: &AppState,
     path: &str,
     token: Option<&str>,
     audience: &str,
+    budget: &mut crate::github::CompareBudget,
 ) -> std::result::Result<(T, bool), ReleaseEvidenceFailure> {
     let url = state
         .github_rest_api_base
@@ -1441,32 +1462,37 @@ async fn fetch_release_evidence_json<T: DeserializeOwned>(
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(release_evidence_transport_failure)?;
-    let status = response.status();
-    if !status.is_success() {
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        return Err(release_evidence_http_failure(
-            status, &headers, &body, audience,
-        ));
-    }
-    let pagination_truncated = response
-        .headers()
-        .get(reqwest::header::LINK)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("rel=\"next\""));
-    response
-        .json::<T>()
-        .await
-        .map(|payload| (payload, pagination_truncated))
-        .map_err(|error| ReleaseEvidenceFailure {
-            code: "github_evidence_incomplete".to_owned(),
-            message: format!("GitHub evidence response was invalid: {error}"),
-            retryable: true,
+    budget
+        .run(async move {
+            let response = request
+                .send()
+                .await
+                .map_err(release_evidence_transport_failure)?;
+            let status = response.status();
+            if !status.is_success() {
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_default();
+                return Err(release_evidence_http_failure(
+                    status, &headers, &body, audience,
+                ));
+            }
+            let pagination_truncated = response
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("rel=\"next\""));
+            response
+                .json::<T>()
+                .await
+                .map(|payload| (payload, pagination_truncated))
+                .map_err(|error| ReleaseEvidenceFailure {
+                    code: "github_evidence_incomplete".to_owned(),
+                    message: format!("GitHub evidence response was invalid: {error}"),
+                    retryable: true,
+                })
         })
+        .await
+        .map_err(release_evidence_budget_failure)?
 }
 
 async fn fetch_release_evidence_blob(
@@ -1475,14 +1501,16 @@ async fn fetch_release_evidence_blob(
     blob_sha: &str,
     token: Option<&str>,
     audience: &str,
+    budget: &mut crate::github::CompareBudget,
 ) -> std::result::Result<Option<String>, ReleaseEvidenceFailure> {
     let path = format!(
         "repos/{repo_full_name}/git/blobs/{}",
         urlencoding::encode(blob_sha)
     );
-    let (payload, _) =
-        fetch_release_evidence_json::<GitHubEvidenceBlobResponse>(state, &path, token, audience)
-            .await?;
+    let (payload, _) = fetch_release_evidence_json::<GitHubEvidenceBlobResponse>(
+        state, &path, token, audience, budget,
+    )
+    .await?;
     if payload.encoding != "base64" {
         return Ok(None);
     }
@@ -1568,6 +1596,7 @@ async fn collect_release_evidence_with_token(
     state: &AppState,
     request: &ReleaseEvidenceRequest,
     token: Option<&str>,
+    budget: &mut crate::github::CompareBudget,
 ) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
     let audience = request.audience();
     let compare_path = format!(
@@ -1582,6 +1611,7 @@ async fn collect_release_evidence_with_token(
             &compare_path,
             token,
             audience,
+            budget,
         )
         .await?;
     let Some(status) = compare.status.as_deref() else {
@@ -1640,7 +1670,9 @@ async fn collect_release_evidence_with_token(
     );
     let (head_commit, head_commit_paginated) = fetch_release_evidence_json::<
         GitHubEvidenceCommitResponse,
-    >(state, &head_commit_path, token, audience)
+    >(
+        state, &head_commit_path, token, audience, budget
+    )
     .await?;
     let head_sha = head_commit.sha.trim().to_owned();
     if head_sha.is_empty() || head_commit_paginated {
@@ -1661,20 +1693,24 @@ async fn collect_release_evidence_with_token(
         request.repo_full_name,
         urlencoding::encode(&head_sha)
     );
-    let ((base_tree, base_tree_paginated), (head_tree, head_tree_paginated)) = tokio::try_join!(
+    let (base_tree, base_tree_paginated) =
         fetch_release_evidence_json::<GitHubEvidenceTreeResponse>(
             state,
             &base_tree_path,
             token,
             audience,
-        ),
+            budget,
+        )
+        .await?;
+    let (head_tree, head_tree_paginated) =
         fetch_release_evidence_json::<GitHubEvidenceTreeResponse>(
             state,
             &head_tree_path,
             token,
             audience,
-        ),
-    )?;
+            budget,
+        )
+        .await?;
     if base_tree.truncated || head_tree.truncated || base_tree_paginated || head_tree_paginated {
         return Err(ReleaseEvidenceFailure {
             code: "github_evidence_incomplete".to_owned(),
@@ -1760,15 +1796,29 @@ async fn collect_release_evidence_with_token(
         let head_sha = head.and_then(|entry| entry.0.as_deref());
         let base_text = match base_sha {
             Some(sha) => {
-                fetch_release_evidence_blob(state, &request.repo_full_name, sha, token, audience)
-                    .await?
+                fetch_release_evidence_blob(
+                    state,
+                    &request.repo_full_name,
+                    sha,
+                    token,
+                    audience,
+                    budget,
+                )
+                .await?
             }
             None => None,
         };
         let head_text = match head_sha {
             Some(sha) => {
-                fetch_release_evidence_blob(state, &request.repo_full_name, sha, token, audience)
-                    .await?
+                fetch_release_evidence_blob(
+                    state,
+                    &request.repo_full_name,
+                    sha,
+                    token,
+                    audience,
+                    budget,
+                )
+                .await?
             }
             None => None,
         };
@@ -1858,6 +1908,15 @@ async fn collect_release_evidence(
     state: &AppState,
     request: &ReleaseEvidenceRequest,
 ) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
+    let mut budget = release_evidence_budget();
+    collect_release_evidence_with_budget(state, request, &mut budget).await
+}
+
+async fn collect_release_evidence_with_budget(
+    state: &AppState,
+    request: &ReleaseEvidenceRequest,
+    budget: &mut crate::github::CompareBudget,
+) -> std::result::Result<ReleaseEvidenceCollection, ReleaseEvidenceFailure> {
     let tokens = if let Some(user_id) = request.audience_user_id.as_deref() {
         let connections = state
             .load_github_connections(user_id)
@@ -1879,7 +1938,7 @@ async fn collect_release_evidence(
     };
     let mut last_error = None;
     for token in tokens {
-        match collect_release_evidence_with_token(state, request, token.as_deref()).await {
+        match collect_release_evidence_with_token(state, request, token.as_deref(), budget).await {
             Ok(collection) => return Ok(collection),
             Err(error)
                 if error.code == "reauth_required" || error.code.contains("access_denied") =>
@@ -15890,6 +15949,89 @@ mod tests {
         );
         assert_eq!(failure.code, "github_unavailable");
         assert!(failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn authorized_release_evidence_shares_request_budget_across_connections() {
+        let pool = setup_pool().await;
+        let mut state = setup_state(pool.clone());
+        seed_user(&pool, 701, "evidence-budget").await;
+        for (index, token) in [(1_i64, "first-token"), (2_i64, "second-token")] {
+            let encrypted = state
+                .encryption_key
+                .encrypt_str(token)
+                .expect("encrypt evidence budget token");
+            sqlx::query(
+                r#"
+                INSERT INTO github_connections (
+                  id, user_id, github_user_id, login, access_token_ciphertext,
+                  access_token_nonce, scopes, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("evidence-budget-connection-{index}"))
+            .bind("701")
+            .bind(40_701_i64 + index)
+            .bind(format!("evidence-budget-{index}"))
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind("repo")
+            .bind(format!("2026-03-07T00:0{index}:00Z"))
+            .bind(format!("2026-03-07T00:0{index}:00Z"))
+            .execute(&pool)
+            .await
+            .expect("seed evidence budget connection");
+        }
+
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_for_server = std::sync::Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move |_request: Request<Body>| {
+            let request_count = std::sync::Arc::clone(&request_count_for_server);
+            async move {
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"message": "bad credentials"})),
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind evidence budget GitHub mock");
+        let address = listener
+            .local_addr()
+            .expect("read evidence budget mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve evidence budget GitHub mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("own evidence budget state")
+            .github_rest_api_base =
+            Url::parse(&format!("http://{address}/")).expect("parse evidence budget mock URL");
+
+        let request = ReleaseEvidenceRequest {
+            release_id: 701,
+            repo_id: 702,
+            repo_full_name: "acme/evidence-budget".to_owned(),
+            base_tag: "v1.0.0".to_owned(),
+            head_tag: "v1.1.0".to_owned(),
+            audience_user_id: Some("701".to_owned()),
+            source_revision: "evidence-budget-revision".to_owned(),
+        };
+        let mut budget = crate::github::CompareBudget::new(std::time::Duration::from_secs(1), 1);
+        let failure =
+            super::collect_release_evidence_with_budget(state.as_ref(), &request, &mut budget)
+                .await
+                .expect_err("second authorized connection must not reset the budget");
+        assert_eq!(failure.code, "github_unavailable");
+        assert_eq!(budget.attempts(), 1);
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shared budget must stop before the second connection makes a request"
+        );
     }
 
     #[tokio::test]
