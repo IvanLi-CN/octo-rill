@@ -2098,7 +2098,6 @@ async fn persist_release_evidence_collection(
     snapshot_id: &str,
     collection: ReleaseEvidenceCollection,
 ) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
     let snapshot_json = serde_json::to_string(&collection.snapshot)
         .context("serialize collected release evidence")?;
     let (_writer, mut tx) = state
@@ -2110,13 +2109,15 @@ async fn persist_release_evidence_collection(
         )
         .await
         .context("begin release evidence publish")?;
+    let transaction_now = Utc::now().to_rfc3339();
+    let now = transaction_now.clone();
     let snapshot = sqlx::query_as::<_, ReleaseEvidenceSnapshotRow>(&format!(
         "{RELEASE_EVIDENCE_SNAPSHOT_SELECT} WHERE id = ? AND status = 'running' AND task_id = ? AND lease_owner = ? AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?) LIMIT 1"
     ))
     .bind(snapshot_id)
     .bind(task_id)
     .bind(state.runtime_owner_id.as_str())
-    .bind(&now)
+    .bind(&transaction_now)
     .fetch_optional(&mut *tx)
     .await
     .context("check release evidence publish lease")?;
@@ -2199,6 +2200,7 @@ async fn persist_release_evidence_collection(
         .await
         .context("link release evidence index resource")?;
     }
+    let publish_now = Utc::now().to_rfc3339();
     let updated = sqlx::query(
         r#"
         UPDATE release_evidence_snapshots
@@ -2213,11 +2215,11 @@ async fn persist_release_evidence_collection(
     )
     .bind(&snapshot_json)
     .bind(&collection.content_hash)
-    .bind(&now)
+    .bind(&publish_now)
     .bind(snapshot_id)
     .bind(task_id)
     .bind(state.runtime_owner_id.as_str())
-    .bind(&now)
+    .bind(&publish_now)
     .execute(&mut *tx)
     .await
     .context("publish release evidence snapshot")?;
@@ -2228,7 +2230,7 @@ async fn persist_release_evidence_collection(
     sqlx::query(
         "UPDATE content_work_items SET evidence_status = 'ready', updated_at = ? WHERE evidence_snapshot_id = ? AND evidence_status IN ('pending', 'failed')",
     )
-    .bind(&now)
+    .bind(&publish_now)
     .bind(snapshot_id)
     .execute(&mut *tx)
     .await
@@ -2389,6 +2391,26 @@ async fn recover_release_evidence_snapshots(state: &AppState) -> Result<()> {
             .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("recover stale release evidence snapshots")?;
+            sqlx::query(
+                r#"
+                UPDATE content_work_items
+                SET evidence_status = 'failed', updated_at = ?
+                WHERE evidence_status = 'pending'
+                  AND evidence_snapshot_id IN (
+                    SELECT id
+                    FROM release_evidence_snapshots
+                    WHERE status = 'failed'
+                      AND last_error_code IN (
+                        'release_evidence_attempt_limit',
+                        'release_evidence_retry_window_expired'
+                      )
+                  )
+                "#,
+            )
+            .bind(&now)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("mark terminal release evidence work items failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
@@ -8765,6 +8787,26 @@ async fn recover_task_if_stale(
                     .execute(&mut *tx)
                     .await
                     .context("requeue stale release evidence snapshot")?;
+                    sqlx::query(
+                        r#"
+                        UPDATE content_work_items
+                        SET evidence_status = 'failed', updated_at = ?
+                        WHERE evidence_status = 'pending'
+                          AND evidence_snapshot_id IN (
+                            SELECT id
+                            FROM release_evidence_snapshots
+                            WHERE status = 'failed'
+                              AND last_error_code IN (
+                                'release_evidence_attempt_limit',
+                                'release_evidence_retry_window_expired'
+                              )
+                          )
+                        "#,
+                    )
+                    .bind(now.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .context("mark stale terminal evidence work items failed")?;
                 }
                 sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
                     .bind(task_id)
@@ -11441,6 +11483,99 @@ mod tests {
                 .await
                 .expect("load revived task status");
         assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn stale_release_evidence_recovery_fails_linked_work_item_at_terminal_limit() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "stale-evidence-task";
+        let snapshot_id = "stale-evidence-snapshot";
+        seed_task(&pool, task_id, TASK_RELEASE_EVIDENCE, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            "UPDATE job_tasks SET payload_json = ?, runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
+        )
+        .bind(json!({"snapshot_id": snapshot_id}).to_string())
+        .bind("old-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence task lease");
+        sqlx::query(
+            r#"
+            INSERT INTO release_evidence_snapshots (
+              id, request_key, release_id, repo_id, repo_full_name, audience,
+              audience_user_id, source_revision, base_tag, head_tag, status,
+              attempt_count, retry_expires_at, task_id, lease_owner,
+              lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, 90, 91, 'acme/stale-evidence', 'public', NULL,
+                      'stale-revision', 'v1.0.0', 'v1.1.0', 'running', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind("stale-evidence-request")
+        .bind(RELEASE_EVIDENCE_MAX_ATTEMPTS)
+        .bind((Utc::now() + Duration::hours(1)).to_rfc3339())
+        .bind(task_id)
+        .bind("old-owner")
+        .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence snapshot");
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline,
+              variant, target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              evidence_snapshot_id, evidence_status, created_at, updated_at
+            ) VALUES ('stale-evidence-work', 'release', '90', 'polishing',
+                      'public', 'zh-CN', 'stale-source', ?, 'test-model', '{}',
+                      'test-config', 'queued', ?, 'pending', ?, ?)
+            "#,
+        )
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(snapshot_id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed stale evidence work item");
+
+        assert!(
+            recover_task_if_stale(
+                state.as_ref(),
+                task_id,
+                Some("old-owner"),
+                Some("2026-03-06T00:00:00Z"),
+                "2026-03-06T00:01:00Z",
+                super::runtime::RuntimeRecoveryMode::Sweep,
+            )
+            .await
+            .expect("recover stale evidence task")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM release_evidence_snapshots WHERE id = ?",
+            )
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load stale evidence status"),
+            STATUS_FAILED
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT evidence_status FROM content_work_items WHERE id = 'stale-evidence-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load stale evidence work status"),
+            "failed"
+        );
     }
 
     #[tokio::test]
@@ -15549,6 +15684,26 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed exhausted running evidence");
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline,
+              variant, target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              evidence_snapshot_id, evidence_status, created_at, updated_at
+            ) VALUES (
+              'expired-running-work', 'release', '30', 'polishing',
+              'public', 'zh-CN', 'recovery-source', ?, 'test-model',
+              '{}', 'test-config', 'queued', 'expired-running-snapshot', 'pending', ?, ?
+            )
+            "#,
+        )
+        .bind(content_processing::GLOBAL_PROTOCOL_VERSION)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed pending evidence work item");
         recover_release_evidence_snapshots(state.as_ref())
             .await
             .expect("recover exhausted running evidence");
@@ -15562,6 +15717,15 @@ mod tests {
         assert_eq!(
             exhausted_running.1.as_deref(),
             Some("release_evidence_attempt_limit")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT evidence_status FROM content_work_items WHERE id = 'expired-running-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load terminal evidence work status"),
+            "failed"
         );
 
         sqlx::query(
