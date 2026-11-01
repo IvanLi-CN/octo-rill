@@ -32,6 +32,13 @@ use crate::{
 use tower_sessions::Session;
 
 static CONTENT_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
+
+/// Wake the global content scheduler after an asynchronous evidence snapshot
+/// becomes publishable. The evidence worker only updates durable state; this
+/// notification is an in-process optimization and is safe to lose on restart.
+pub fn wake_global_scheduler() {
+    CONTENT_CLAIM_ADMISSION.wake();
+}
 #[cfg(test)]
 static CONTENT_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -502,6 +509,37 @@ struct SourceSnapshot {
     target_slots: Vec<String>,
 }
 
+fn evidence_snapshot_marker(
+    item: &translations::TranslationRequestItemInput,
+) -> (Option<String>, &'static str) {
+    let Some(block) = item.source_blocks.iter().find(|block| {
+        matches!(
+            block.slot.as_str(),
+            "release_evidence_snapshot" | "reading_evidence_snapshot" | "evidence_snapshot"
+        )
+    }) else {
+        return (None, "not_required");
+    };
+    let value = serde_json::from_str::<Value>(&block.text).unwrap_or_else(|_| {
+        json!({
+            "snapshot_id": block.text.trim(),
+            "status": "pending",
+        })
+    });
+    let snapshot_id = value
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let status = match value.get("status").and_then(Value::as_str) {
+        Some("ready") => "ready",
+        Some("failed") | Some("unavailable") => "failed",
+        _ => "pending",
+    };
+    (snapshot_id, status)
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct WorkRow {
@@ -526,6 +564,10 @@ struct WorkRow {
     retry_expires_at: Option<String>,
     retry_after_at: Option<String>,
     created_at: String,
+    #[sqlx(default)]
+    evidence_snapshot_id: Option<String>,
+    #[sqlx(default)]
+    evidence_status: String,
     #[sqlx(default)]
     lease_owner: Option<String>,
     #[sqlx(default)]
@@ -1156,10 +1198,13 @@ async fn submit_item_with_admission(
     // terminal projections remain scheduler-worker responsibilities.
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
+    let (evidence_snapshot_id, evidence_status) = evidence_snapshot_marker(item);
     let snapshot = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
         "source_revision": source_revision_json(item),
+        "evidence_snapshot_id": evidence_snapshot_id.clone(),
+        "evidence_status": evidence_status,
     }))
     .map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
@@ -1332,7 +1377,7 @@ async fn submit_item_with_admission(
             "blocked_config"
         };
         sqlx::query(
-            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, supersedes_work_item_id, attempt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, 0, ?, ?)",
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, supersedes_work_item_id, attempt_count, evidence_snapshot_id, evidence_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, 0, ?, ?, ?, ?)",
         )
         .bind(&work_id)
         .bind(resource_type)
@@ -1349,6 +1394,8 @@ async fn submit_item_with_admission(
         .bind(0_i64)
         .bind(i64::try_from(item.source_blocks.iter().map(|block| block.text.len()).sum::<usize>()).unwrap_or(i64::MAX))
         .bind(&supersedes_work_item_id)
+        .bind(&evidence_snapshot_id)
+        .bind(evidence_status)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -1635,6 +1682,10 @@ pub async fn get_request(
         retry_expires_at: row.get("retry_expires_at"),
         retry_after_at: row.get("retry_after_at"),
         created_at: row.get("created_at"),
+        evidence_snapshot_id: row.try_get("evidence_snapshot_id").ok(),
+        evidence_status: row
+            .try_get("evidence_status")
+            .unwrap_or_else(|_| "not_required".to_owned()),
         lease_owner: row.try_get("lease_owner").ok(),
         lease_expires_at: row.try_get("lease_expires_at").ok(),
         attempt_configuration_snapshot_json: None,
@@ -2373,7 +2424,7 @@ async fn claim_next_with_admission(
 
 async fn has_queued_content_work_item(state: &AppState, manual_limit: i64) -> Result<bool> {
     let exists = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(SELECT 1 FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM content_work_items WHERE status = 'queued' AND evidence_status IN ('not_required', 'ready') AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) LIMIT 1)",
     )
     .bind(manual_limit)
     .fetch_one(&state.pool)
@@ -2442,7 +2493,7 @@ where
         return Ok(None);
     }
     let Some(row) = sqlx::query_as::<_, WorkRow>(
-        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND evidence_status IN ('not_required', 'ready') AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
     .bind(manual_limit)
     .fetch_optional(&mut *tx)
@@ -5443,6 +5494,22 @@ mod tests {
         sqlx::raw_sql(include_str!(
             "../migrations/0092_content_work_supersession_lookup_index.sql"
         ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE content_work_items ADD COLUMN evidence_snapshot_id TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE content_work_items ADD COLUMN evidence_status TEXT NOT NULL DEFAULT 'not_required' CHECK (evidence_status IN ('not_required', 'pending', 'ready', 'failed'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_content_work_items_evidence ON content_work_items(evidence_snapshot_id, evidence_status, status)",
+        )
         .execute(&pool)
         .await
         .unwrap();
@@ -9215,12 +9282,47 @@ mod tests {
             retry_expires_at: None,
             retry_after_at: None,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            evidence_snapshot_id: None,
+            evidence_status: "not_required".to_owned(),
             lease_owner: None,
             lease_expires_at: None,
             attempt_configuration_snapshot_json: None,
             attempt_route_snapshot_json: None,
             attempt_configuration_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn evidence_snapshot_marker_maps_pending_and_ready_states() {
+        let mut item = TranslationRequestItemInput {
+            producer_ref: "evidence-test".to_owned(),
+            kind: "release".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![crate::translations::TranslationSourceBlock {
+                slot: "release_evidence_snapshot".to_owned(),
+                text: r#"{"snapshot_id":"snapshot-1","status":"pending"}"#.to_owned(),
+            }],
+            target_slots: Vec::new(),
+        };
+        assert_eq!(
+            evidence_snapshot_marker(&item),
+            (Some("snapshot-1".to_owned()), "pending")
+        );
+
+        item.source_blocks[0].text = r#"{"snapshot_id":"snapshot-1","status":"ready"}"#.to_owned();
+        assert_eq!(
+            evidence_snapshot_marker(&item),
+            (Some("snapshot-1".to_owned()), "ready")
+        );
+
+        item.source_blocks[0].text = r#"{"snapshot_id":"snapshot-1","status":"failed"}"#.to_owned();
+        assert_eq!(
+            evidence_snapshot_marker(&item),
+            (Some("snapshot-1".to_owned()), "failed")
+        );
     }
 
     #[test]
