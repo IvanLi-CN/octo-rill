@@ -4,7 +4,7 @@ use oauth2::{
     basic::BasicClient,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{PgPool, SqlitePool};
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use url::Url;
 use uuid::Uuid;
@@ -52,6 +52,17 @@ pub struct AppState {
     pub llm_scheduler: Arc<LlmScheduler>,
     pub translation_scheduler: Arc<TranslationSchedulerController>,
     pub runtime_owner_id: String,
+}
+
+#[derive(Clone)]
+pub struct PostgresDataAccess {
+    pub pool: PgPool,
+}
+
+impl std::fmt::Debug for PostgresDataAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresDataAccess").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

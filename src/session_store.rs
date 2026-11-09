@@ -25,6 +25,7 @@ use tower_sessions::{
     session::{Id, Record},
     session_store,
 };
+pub use tower_sessions_sqlx_store::PostgresStore;
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{debug, warn};
 
@@ -39,6 +40,12 @@ const SESSION_TABLE_NAME: &str = "tower_sessions";
 const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
+
+pub type CoordinatedPostgresSessionStore = PostgresStore;
+
+pub async fn migrate_postgres_session_store(store: &PostgresStore) -> sqlx::Result<()> {
+    store.migrate().await
+}
 
 tokio::task_local! {
     static SESSION_BASELINE: RefCell<Option<Record>>;

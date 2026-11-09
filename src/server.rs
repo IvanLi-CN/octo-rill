@@ -19,7 +19,8 @@ use axum::{
 };
 use serde_json::json;
 use sqlx::{
-    SqlitePool,
+    PgPool, SqlitePool,
+    postgres::PgPoolOptions,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use time::Duration;
@@ -851,6 +852,32 @@ fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
                 Ok(true)
             })
         })
+}
+
+pub(crate) fn build_postgres_pool_options(max_connections: usize) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(u32::try_from(max_connections).unwrap_or(32).clamp(1, 64))
+        .min_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                crate::sqlite_write::configure_postgres_connection(connection).await?;
+                Ok(())
+            })
+        })
+}
+
+pub(crate) async fn connect_postgres(database_url: &str, max_connections: usize) -> Result<PgPool> {
+    build_postgres_pool_options(max_connections)
+        .connect(database_url)
+        .await
+        .with_context(|| format!("failed to connect to PostgreSQL at {database_url}"))
+}
+
+pub(crate) async fn run_postgres_migrations(pool: &PgPool) -> Result<()> {
+    sqlx::migrate!("./migrations_pg")
+        .run(pool)
+        .await
+        .context("failed to apply PostgreSQL migrations")
 }
 
 fn build_sqlite_write_pool_options() -> SqlitePoolOptions {
