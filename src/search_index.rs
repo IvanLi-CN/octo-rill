@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{PgPool, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::task::AbortHandle;
 use tower_sessions::Session;
 use tracing::{info, warn};
@@ -39,6 +39,20 @@ const PROJECTION_MAX_ATTEMPTS: i64 = 8;
 const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
 const PROJECTION_FANOUT_BATCH_SIZE: i64 = 100;
 const MISSING_SEARCH_DOCUMENT_ERROR: &str = "missing_search_document";
+
+pub async fn rebuild_postgres_search_index(pool: &PgPool) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE search_documents SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await
+    .context("rebuild PostgreSQL search vectors")?;
+    sqlx::query("ANALYZE search_documents")
+        .execute(pool)
+        .await
+        .context("refresh PostgreSQL search statistics")?;
+    Ok(result.rows_affected())
+}
 
 const PHASES: &[&str] = &[
     "releases",

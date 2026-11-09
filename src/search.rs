@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use axum::http::StatusCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Row, Sqlite};
 
 use crate::{error::ApiError, sqlite_write::SqliteWritePriority, state::AppState};
 
@@ -443,6 +443,65 @@ pub async fn query(
     let rows = builder
         .build_query_as::<SearchDocumentRow>()
         .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| to_result(row, &parsed.terms))
+        .collect())
+}
+
+/// Query the PostgreSQL search projection using its generated `tsvector`
+/// column. Visibility remains relational, so the search index is never an
+/// authorization source of truth.
+pub async fn query_postgres(
+    pool: &PgPool,
+    user_id: &str,
+    parsed: &ParsedSearchQuery,
+) -> Result<Vec<SearchResult>, ApiError> {
+    let ts_query = parsed.terms.join(" & ");
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT d.id, d.resource_type, d.title, d.body, d.repo_full_name, d.translated_text, d.smart_text, d.source_time::text AS source_time, CASE WHEN d.unread THEN 1 ELSE 0 END AS unread, NULL::bigint AS is_following, d.target_path, d.target_url FROM search_documents d WHERE (d.user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(" OR EXISTS (SELECT 1 FROM user_release_visible_repos vr WHERE vr.user_id = ");
+    builder.push_bind(user_id);
+    builder.push(" AND vr.repo_id = d.repo_id))");
+    if let Some(resource_type) = &parsed.resource_type {
+        builder.push(" AND d.resource_type = ");
+        builder.push_bind(resource_type);
+    }
+    if let Some(owner) = &parsed.owner {
+        builder.push(" AND lower(COALESCE(d.owner_login, '')) = lower(");
+        builder.push_bind(owner);
+        builder.push(")");
+    }
+    if let Some(repo) = &parsed.repo {
+        builder.push(" AND lower(COALESCE(d.repo_full_name, '')) LIKE lower(");
+        builder.push_bind(format!("%{}%", escape_like(repo)));
+        builder.push(") ESCAPE '\\'");
+    }
+    if let Some(after) = &parsed.after {
+        builder.push(" AND COALESCE(d.source_time, d.updated_at)::text >= ");
+        builder.push_bind(after);
+    }
+    if let Some(before) = &parsed.before {
+        builder.push(" AND COALESCE(d.source_time, d.updated_at)::text <= ");
+        builder.push_bind(before);
+    }
+    if parsed.unread {
+        builder.push(" AND d.unread");
+    }
+    if !ts_query.is_empty() {
+        builder.push(" AND d.search_vector @@ websearch_to_tsquery('simple', ");
+        builder.push_bind(ts_query);
+        builder.push(")");
+    }
+    builder.push(" ORDER BY COALESCE(d.source_time, d.updated_at) DESC, d.id DESC LIMIT ");
+    builder.push_bind(SEARCH_LIMIT);
+    let rows = builder
+        .build_query_as::<SearchDocumentRow>()
+        .fetch_all(pool)
         .await
         .map_err(ApiError::internal)?;
     Ok(rows
