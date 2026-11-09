@@ -128,6 +128,12 @@ struct TableInfo {
     primary_key_columns: Vec<String>,
 }
 
+#[derive(Debug)]
+struct TargetColumn {
+    name: String,
+    data_type: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -372,6 +378,7 @@ async fn migrate_table(
     batch_size: usize,
 ) -> Result<(u64, u64, String, String)> {
     let select = ordered_select(table);
+    let target_columns = target_columns(pg, table).await?;
     let insert = format!(
         "INSERT INTO {} ({}) VALUES ({})",
         quote_identifier(&table.name),
@@ -382,7 +389,7 @@ async fn migrate_table(
             .collect::<Vec<_>>()
             .join(", "),
         (1..=table.columns.len())
-            .map(|index| format!("${index}"))
+            .map(|index| placeholder(index, &target_columns[index - 1].data_type))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -409,7 +416,7 @@ async fn migrate_table(
         for row in &batch {
             let mut args = PgArguments::default();
             for (index, _) in table.columns.iter().enumerate() {
-                bind_sqlite_value(&mut args, row, index)?;
+                bind_sqlite_value(&mut args, row, index, &target_columns[index].data_type)?;
             }
             sqlx::query_with(&insert, args)
                 .execute(&mut *tx)
@@ -430,7 +437,7 @@ async fn migrate_table(
         for row in &batch {
             let mut args = PgArguments::default();
             for (index, _) in table.columns.iter().enumerate() {
-                bind_sqlite_value(&mut args, row, index)?;
+                bind_sqlite_value(&mut args, row, index, &target_columns[index].data_type)?;
             }
             sqlx::query_with(&insert, args)
                 .execute(&mut *tx)
@@ -456,7 +463,52 @@ async fn migrate_table(
     ))
 }
 
-fn bind_sqlite_value(args: &mut PgArguments, row: &SqliteRow, index: usize) -> Result<()> {
+async fn target_columns(pool: &PgPool, table: &TableInfo) -> Result<Vec<TargetColumn>> {
+    let rows = sqlx::query("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position")
+        .bind(&table.name).fetch_all(pool).await.with_context(|| format!("inspect PostgreSQL table {}", table.name))?;
+    let columns = rows
+        .into_iter()
+        .map(|row| {
+            Ok(TargetColumn {
+                name: row.try_get("column_name")?,
+                data_type: row.try_get("data_type")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if columns.len() != table.columns.len()
+        || columns
+            .iter()
+            .zip(&table.columns)
+            .any(|(target, source)| target.name != *source)
+    {
+        bail!(
+            "PostgreSQL table {} columns do not match the SQLite source",
+            table.name
+        );
+    }
+    Ok(columns)
+}
+
+fn placeholder(index: usize, data_type: &str) -> String {
+    match data_type {
+        "json" => format!("${index}::json"),
+        "jsonb" => format!("${index}::jsonb"),
+        "uuid" => format!("${index}::uuid"),
+        "date" => format!("${index}::date"),
+        "time without time zone" => format!("${index}::time"),
+        "timestamp without time zone" => format!("${index}::timestamp"),
+        "timestamp with time zone" => format!("${index}::timestamptz"),
+        "numeric" => format!("${index}::numeric"),
+        _ => format!("${index}"),
+    }
+}
+
+fn bind_sqlite_value(
+    args: &mut PgArguments,
+    row: &SqliteRow,
+    index: usize,
+    target_type: &str,
+) -> Result<()> {
     let raw = row.try_get_raw(index)?;
     if raw.is_null() {
         args.add(Option::<String>::None)
@@ -464,7 +516,10 @@ fn bind_sqlite_value(args: &mut PgArguments, row: &SqliteRow, index: usize) -> R
         return Ok(());
     }
     let type_name = raw.type_info().to_string().to_ascii_uppercase();
-    if type_name.contains("INT") {
+    if target_type == "boolean" && type_name.contains("INT") {
+        args.add(row.try_get::<i64, _>(index)? != 0)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    } else if type_name.contains("INT") {
         args.add(row.try_get::<i64, _>(index)?)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     } else if type_name.contains("REAL") || type_name.contains("FLOA") || type_name.contains("DOUB")
