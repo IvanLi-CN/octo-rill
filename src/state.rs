@@ -54,6 +54,7 @@ pub struct AppState {
     pub runtime_owner_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct PostgresDataAccess {
     pub pool: PgPool,

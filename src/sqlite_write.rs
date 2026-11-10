@@ -25,6 +25,7 @@ use crate::observability;
 
 pub const SQLITE_WRITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
+#[allow(dead_code)]
 pub async fn configure_postgres_connection(connection: &mut PgConnection) -> sqlx::Result<()> {
     sqlx::query("SET lock_timeout = '5s'")
         .execute(&mut *connection)

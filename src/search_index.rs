@@ -40,6 +40,9 @@ const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
 const PROJECTION_FANOUT_BATCH_SIZE: i64 = 100;
 const MISSING_SEARCH_DOCUMENT_ERROR: &str = "missing_search_document";
 
+// This entry point is retained for the PostgreSQL cutover slice; the running
+// SQLite application will start calling it when the backend switch lands.
+#[allow(dead_code)]
 pub async fn rebuild_postgres_search_index(pool: &PgPool) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE search_documents SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)",

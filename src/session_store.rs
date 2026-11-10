@@ -41,8 +41,10 @@ const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
 
+#[allow(dead_code)]
 pub type CoordinatedPostgresSessionStore = PostgresStore;
 
+#[allow(dead_code)]
 pub async fn migrate_postgres_session_store(store: &PostgresStore) -> sqlx::Result<()> {
     store.migrate().await
 }

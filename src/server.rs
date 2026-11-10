@@ -854,6 +854,9 @@ fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
         })
 }
 
+// These PostgreSQL startup helpers are intentionally staged ahead of the
+// backend switch and are exercised by the migration integration slice.
+#[allow(dead_code)]
 pub(crate) fn build_postgres_pool_options(max_connections: usize) -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(u32::try_from(max_connections).unwrap_or(32).clamp(1, 64))
@@ -866,6 +869,7 @@ pub(crate) fn build_postgres_pool_options(max_connections: usize) -> PgPoolOptio
         })
 }
 
+#[allow(dead_code)]
 pub(crate) async fn connect_postgres(database_url: &str, max_connections: usize) -> Result<PgPool> {
     build_postgres_pool_options(max_connections)
         .connect(database_url)
@@ -873,6 +877,7 @@ pub(crate) async fn connect_postgres(database_url: &str, max_connections: usize)
         .with_context(|| format!("failed to connect to PostgreSQL at {database_url}"))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_postgres_migrations(pool: &PgPool) -> Result<()> {
     sqlx::migrate!("./migrations_pg")
         .run(pool)

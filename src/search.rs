@@ -454,6 +454,9 @@ pub async fn query(
 /// Query the PostgreSQL search projection using its generated `tsvector`
 /// column. Visibility remains relational, so the search index is never an
 /// authorization source of truth.
+// This entry point is retained for the PostgreSQL cutover slice; the running
+// SQLite application will start calling it when the backend switch lands.
+#[allow(dead_code)]
 pub async fn query_postgres(
     pool: &PgPool,
     user_id: &str,
