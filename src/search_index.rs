@@ -73,10 +73,11 @@ pub async fn rebuild_postgres_search_index(pool: &PgPool) -> Result<u64> {
         .execute(pool)
         .await
         .context("refresh PostgreSQL search lane statistics")?;
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
         .fetch_one(pool)
         .await
-        .context("count PostgreSQL search documents after rebuild")
+        .context("count PostgreSQL search documents after rebuild")?;
+    u64::try_from(count).context("PostgreSQL search document count was negative")
 }
 
 const PHASES: &[&str] = &[
