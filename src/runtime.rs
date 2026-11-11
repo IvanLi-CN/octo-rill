@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 use tokio::{
     sync::oneshot,
     task::JoinHandle,
@@ -165,6 +166,78 @@ pub fn stale_cutoff_timestamp(now: DateTime<Utc>) -> String {
     let cutoff = chrono::Duration::from_std(RUNTIME_LEASE_STALE_AFTER)
         .unwrap_or_else(|_| chrono::Duration::seconds(90));
     (now - cutoff).to_rfc3339()
+}
+
+/// Register a runtime owner on PostgreSQL without going through the SQLite
+/// write coordinator. The owner row is deliberately kept as RFC3339 text to
+/// match the migration contract shared with the legacy database.
+#[allow(dead_code)]
+pub async fn register_runtime_owner_postgres(pool: &PgPool, runtime_owner_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at)
+        VALUES ($1, $2, $2, $2)
+        ON CONFLICT (runtime_owner_id) DO UPDATE SET
+          lease_heartbeat_at = EXCLUDED.lease_heartbeat_at,
+          updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(runtime_owner_id)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .context("failed to register PostgreSQL runtime owner")?;
+
+    prune_stale_runtime_owners_postgres(pool, runtime_owner_id).await
+}
+
+/// Refresh one PostgreSQL runtime owner lease. A missing row is treated as a
+/// recoverable startup race and re-registered by the caller.
+#[allow(dead_code)]
+pub async fn touch_runtime_owner_lease_postgres(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        r#"
+        UPDATE runtime_owners
+        SET lease_heartbeat_at = $1, updated_at = $1
+        WHERE runtime_owner_id = $2
+        "#,
+    )
+    .bind(&now)
+    .bind(runtime_owner_id)
+    .execute(pool)
+    .await
+    .context("failed to heartbeat PostgreSQL runtime owner")?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
+/// Best-effort cleanup for owners that have stopped heartbeating. The owner
+/// running the cleanup is always retained, so a delayed cleanup cannot remove
+/// its own lease.
+#[allow(dead_code)]
+pub async fn prune_stale_runtime_owners_postgres(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+) -> Result<()> {
+    let cutoff = stale_cutoff_timestamp(Utc::now());
+    sqlx::query(
+        r#"
+        DELETE FROM runtime_owners
+        WHERE runtime_owner_id <> $1
+          AND lease_heartbeat_at < $2
+        "#,
+    )
+    .bind(runtime_owner_id)
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("failed to prune stale PostgreSQL runtime owners")?;
+    Ok(())
 }
 
 pub async fn register_runtime_owner(state: &AppState) -> Result<()> {
