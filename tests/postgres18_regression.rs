@@ -47,9 +47,10 @@ async fn postgres18_bootstrap_is_repeatable_and_reports_server_version() -> Resu
     let version = sqlx::query_scalar::<_, String>("SHOW server_version")
         .fetch_one(&pool)
         .await?;
-    let version_num = sqlx::query_scalar::<_, i32>("SHOW server_version_num")
-        .fetch_one(&pool)
-        .await?;
+    let version_num =
+        sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await?;
     assert!(
         version_num >= 180000,
         "expected PostgreSQL 18, got {version}"
