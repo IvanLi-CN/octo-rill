@@ -331,6 +331,20 @@ jobs:
     name: Backend Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: octo_rill_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d octo_rill_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -358,6 +372,11 @@ jobs:
 
       - name: Run cargo test
         run: cargo test --locked --all-features
+
+      - name: Run PostgreSQL 18 integration regression
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/octo_rill_test
+        run: cargo test --locked --all-features --test postgres18_regression -- --test-threads=1
 
   frontend-e2e:
     name: Frontend E2E
