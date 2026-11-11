@@ -25,6 +25,8 @@ use tower_sessions::{
     session::{Id, Record},
     session_store,
 };
+#[cfg(feature = "postgres")]
+use tower_sessions_sqlx_store::PostgresStore;
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{debug, warn};
 
@@ -39,6 +41,13 @@ const SESSION_TABLE_NAME: &str = "tower_sessions";
 const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
+#[cfg(feature = "postgres")]
+const POSTGRES_SESSION_SCHEMA: &str = "tower_sessions";
+#[cfg(feature = "postgres")]
+const POSTGRES_SESSION_TABLE: &str = "session";
+#[cfg(feature = "postgres")]
+const POSTGRES_SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str =
+    "postgres session activity refresh failed";
 
 tokio::task_local! {
     static SESSION_BASELINE: RefCell<Option<Record>>;
@@ -630,6 +639,250 @@ impl ExpiredDeletion for CoordinatedSqliteSessionStore {
             Err(error) => Err(session_store::Error::Backend(error.to_string())),
         }
     }
+}
+
+/// PostgreSQL-backed session storage with the same field-level merge semantics
+/// as the legacy SQLite store. The SQLx store's default schema/table names are
+/// deliberately mirrored here so the migration-owned `tower_sessions.session`
+/// table remains the single source of truth.
+#[cfg(feature = "postgres")]
+#[derive(Clone)]
+pub struct CoordinatedPostgresSessionStore {
+    inner: PostgresStore,
+    pool: sqlx::PgPool,
+}
+
+#[cfg(feature = "postgres")]
+impl CoordinatedPostgresSessionStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            inner: PostgresStore::new(pool.clone()),
+            pool,
+        }
+    }
+
+    pub async fn migrate(&self) -> sqlx::Result<()> {
+        self.inner.migrate().await
+    }
+
+    fn map_error(&self, activity_only: bool, error: anyhow::Error) -> session_store::Error {
+        let message = error.to_string();
+        if activity_only && is_retryable_postgres_text(&message) {
+            session_store::Error::Backend(format!(
+                "{POSTGRES_SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX}: {message}"
+            ))
+        } else {
+            session_store::Error::Backend(message)
+        }
+    }
+
+    async fn retry_delay(&self, attempt: usize) {
+        let exponent = attempt.saturating_sub(1).min(5) as u32;
+        tokio::time::sleep(Duration::from_millis(5 * 2u64.pow(exponent))).await;
+    }
+
+    async fn save_once(&self, record: &Record, previous: &Record) -> Result<Record, anyhow::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, (Vec<u8>, OffsetDateTime)>(
+            "SELECT data, expiry_date FROM tower_sessions.session WHERE id = $1 FOR UPDATE",
+        )
+        .bind(record.id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("retryable postgres session conflict: session row disappeared")
+        })?;
+        let mut current_record = rmp_serde::from_slice::<Record>(&current.0)
+            .map_err(|error| anyhow::anyhow!("decode postgres session: {error}"))?;
+        current_record.expiry_date = current.1;
+        let merged = merge_session_record_changes(previous, &current_record, record);
+        let encoded = rmp_serde::to_vec(&merged)
+            .map_err(|error| anyhow::anyhow!("encode postgres session: {error}"))?;
+        sqlx::query("UPDATE tower_sessions.session SET data = $2, expiry_date = $3 WHERE id = $1")
+            .bind(merged.id.to_string())
+            .bind(encoded)
+            .bind(merged.expiry_date)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(merged)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl fmt::Debug for CoordinatedPostgresSessionStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoordinatedPostgresSessionStore")
+            .field("schema", &POSTGRES_SESSION_SCHEMA)
+            .field("table", &POSTGRES_SESSION_TABLE)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl SessionStore for CoordinatedPostgresSessionStore {
+    async fn create(&self, record: &mut Record) -> session_store::Result<()> {
+        let mut encoded = rmp_serde::to_vec(record)
+            .map_err(|error| session_store::Error::Encode(error.to_string()))?;
+        let mut last_error = None;
+        for attempt in 1..=SESSION_WRITE_MAX_ATTEMPTS {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|error| self.map_error(false, anyhow::Error::new(error)))?;
+            let result = sqlx::query(
+                "INSERT INTO tower_sessions.session (id, data, expiry_date) VALUES ($1, $2, $3)",
+            )
+            .bind(record.id.to_string())
+            .bind(&encoded)
+            .bind(record.expiry_date)
+            .execute(&mut *transaction)
+            .await;
+            match result {
+                Ok(_) => {
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|error| self.map_error(false, anyhow::Error::new(error)))?;
+                    set_task_session_baseline(Some(record));
+                    return Ok(());
+                }
+                Err(error) if matches!(&error, sqlx::Error::Database(database_error) if database_error.is_unique_violation()) =>
+                {
+                    transaction.rollback().await.ok();
+                    record.id = Id::default();
+                    encoded = rmp_serde::to_vec(record)
+                        .map_err(|error| session_store::Error::Encode(error.to_string()))?;
+                }
+                Err(error) => {
+                    transaction.rollback().await.ok();
+                    let error = anyhow::Error::new(error);
+                    if is_retryable_postgres_error(&error) && attempt < SESSION_WRITE_MAX_ATTEMPTS {
+                        last_error = Some(error);
+                        self.retry_delay(attempt).await;
+                    } else {
+                        last_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        Err(self.map_error(
+            false,
+            last_error.unwrap_or_else(|| anyhow::anyhow!("postgres session create failed")),
+        ))
+    }
+
+    async fn save(&self, record: &Record) -> session_store::Result<()> {
+        let previous = task_session_baseline_for(&record.id).ok_or_else(|| {
+            session_store::Error::Backend(
+                "retryable postgres session conflict: request baseline unavailable".into(),
+            )
+        })?;
+        let activity_only = session_record_changed_only_by_activity(&previous, record);
+        let mut last_error = None;
+        for attempt in 1..=SESSION_WRITE_MAX_ATTEMPTS {
+            match self.save_once(record, &previous).await {
+                Ok(merged) => {
+                    set_task_session_baseline(Some(&merged));
+                    return Ok(());
+                }
+                Err(error)
+                    if is_retryable_postgres_error(&error)
+                        && attempt < SESSION_WRITE_MAX_ATTEMPTS =>
+                {
+                    last_error = Some(error);
+                    self.retry_delay(attempt).await;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        Err(self.map_error(
+            activity_only,
+            last_error.unwrap_or_else(|| anyhow::anyhow!("postgres session save failed")),
+        ))
+    }
+
+    async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
+        let row = sqlx::query_as::<_, (Vec<u8>,)>(
+            "SELECT data FROM tower_sessions.session WHERE id = $1 AND expiry_date > $2",
+        )
+        .bind(session_id.to_string())
+        .bind(OffsetDateTime::now_utc())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| self.map_error(false, anyhow::Error::new(error)))?;
+        let record = row
+            .map(|(data,)| rmp_serde::from_slice::<Record>(&data))
+            .transpose()
+            .map_err(|error| session_store::Error::Decode(error.to_string()))?;
+        set_task_session_baseline(record.as_ref());
+        Ok(record)
+    }
+
+    async fn delete(&self, session_id: &Id) -> session_store::Result<()> {
+        let mut last_error = None;
+        for attempt in 1..=SESSION_WRITE_MAX_ATTEMPTS {
+            match sqlx::query("DELETE FROM tower_sessions.session WHERE id = $1")
+                .bind(session_id.to_string())
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => {
+                    set_task_session_baseline(None);
+                    return Ok(());
+                }
+                Err(error) => {
+                    let error = anyhow::Error::new(error);
+                    if is_retryable_postgres_error(&error) && attempt < SESSION_WRITE_MAX_ATTEMPTS {
+                        last_error = Some(error);
+                        self.retry_delay(attempt).await;
+                    } else {
+                        last_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        Err(self.map_error(
+            false,
+            last_error.unwrap_or_else(|| anyhow::anyhow!("postgres session delete failed")),
+        ))
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl ExpiredDeletion for CoordinatedPostgresSessionStore {
+    async fn delete_expired(&self) -> session_store::Result<()> {
+        sqlx::query("DELETE FROM tower_sessions.session WHERE expiry_date < CURRENT_TIMESTAMP")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| self.map_error(false, anyhow::Error::new(error)))
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn is_retryable_postgres_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::Database(database_error)) if matches!(database_error.code().as_deref(), Some("40001" | "40P01"))))
+}
+
+#[cfg(feature = "postgres")]
+fn is_retryable_postgres_text(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("40001")
+        || normalized.contains("40p01")
+        || normalized.contains("serialization failure")
+        || normalized.contains("deadlock detected")
+        || normalized.contains("retryable postgres session conflict")
 }
 
 fn session_record_changed_only_by_activity(previous: &Record, next: &Record) -> bool {
