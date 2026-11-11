@@ -3,6 +3,9 @@ name = "octo-rill"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+postgres = ["sqlx/postgres", "tower-sessions-sqlx-store/postgres"]
+
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.101"
