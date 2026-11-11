@@ -1015,6 +1015,10 @@ CREATE TABLE IF NOT EXISTS content_work_items (
     canonical_resource_type, canonical_resource_id, pipeline, variant,
     target_lang, source_hash, protocol_version, model_profile
   ),
+  UNIQUE (
+    id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+    target_lang, source_hash, protocol_version
+  ),
   FOREIGN KEY (supersedes_work_item_id) REFERENCES content_work_items(id)
 );
 
