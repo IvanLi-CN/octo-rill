@@ -19,7 +19,8 @@ use axum::{
 };
 use serde_json::json;
 use sqlx::{
-    SqlitePool,
+    PgPool, SqlitePool,
+    postgres::PgPoolOptions,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use time::Duration;
@@ -853,6 +854,52 @@ fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
         })
 }
 
+#[allow(dead_code)]
+pub(crate) fn build_postgres_pool_options(max_connections: usize) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(u32::try_from(max_connections).unwrap_or(32).clamp(1, 64))
+        .min_connections(1)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                crate::sqlite_write::configure_postgres_connection(connection).await?;
+                Ok(())
+            })
+        })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn connect_postgres(database_url: &str, max_connections: usize) -> Result<PgPool> {
+    build_postgres_pool_options(max_connections)
+        .connect(database_url)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to PostgreSQL at {}",
+                redact_database_url(database_url)
+            )
+        })
+}
+
+#[allow(dead_code)]
+pub(crate) fn redact_database_url(database_url: &str) -> String {
+    Url::parse(database_url)
+        .map(|mut url| {
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid database URL>".to_owned())
+}
+
+#[allow(dead_code)]
+pub(crate) async fn run_postgres_migrations(pool: &PgPool) -> Result<()> {
+    sqlx::migrate!("./migrations_pg")
+        .run(pool)
+        .await
+        .context("failed to apply PostgreSQL migrations")
+}
+
 fn build_sqlite_write_pool_options() -> SqlitePoolOptions {
     SqlitePoolOptions::new()
         .max_connections(1)
@@ -1224,7 +1271,8 @@ mod tests {
         attach_static_site_routes, bootstrap_sqlite_database, build_session_cookie_name,
         build_sqlite_connect_options, build_sqlite_pool_options, build_sqlite_write_pool_options,
         is_hashed_pwa_asset_path, looks_like_static_asset_path, merge_public_metrics_routes,
-        read_sqlite_runtime_pragmas, session_inactivity_expiry, should_serve_spa_shell,
+        read_sqlite_runtime_pragmas, redact_database_url, session_inactivity_expiry,
+        should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -1245,6 +1293,14 @@ mod tests {
     use tower::{ServiceBuilder, ServiceExt};
     use tower_http::cors::CorsLayer;
     use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+
+    #[test]
+    fn postgres_connection_errors_redact_passwords() {
+        let redacted = redact_database_url("postgres://octo:super-secret@db.example/octo");
+        assert_eq!(redacted, "postgres://octo:***@db.example/octo");
+        assert!(!redacted.contains("super-secret"));
+        assert_eq!(redact_database_url("not a url"), "<invalid database URL>");
+    }
     use tracing_subscriber::fmt::MakeWriter;
 
     async fn create_test_session(session: Session) -> StatusCode {
