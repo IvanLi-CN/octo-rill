@@ -182,7 +182,7 @@ CREATE INDEX idx_social_activity_events_user_sort
 CREATE INDEX idx_social_activity_events_user_kind_sort
   ON social_activity_events(user_id, kind, occurred_at DESC, created_at DESC, id DESC);
 CREATE UNIQUE INDEX idx_social_activity_events_dedupe
-  ON social_activity_events(user_id, kind, IFNULL(repo_id, -1), actor_github_user_id, occurred_at)
+  ON social_activity_events(user_id, kind, COALESCE(repo_id, -1), actor_github_user_id, occurred_at)
   WHERE kind NOT IN ('announcement', 'repo_forked');
 CREATE UNIQUE INDEX idx_social_activity_events_github_event_dedupe
   ON social_activity_events(user_id, kind, github_event_id)
@@ -486,12 +486,7 @@ CREATE INDEX idx_search_projection_outbox_poll
 CREATE INDEX idx_search_projection_outbox_failed_resource
   ON search_projection_outbox_failed(resource_type, canonical_resource_type, resource_id);
 CREATE INDEX idx_job_tasks_star_connection_active
-  ON job_tasks(
-    task_type,
-    status,
-    json_extract(payload_json, '$.github_connection_id')
-  )
-  WHERE json_valid(payload_json);
+  ON job_tasks(task_type, status, payload_json);
 CREATE INDEX idx_search_projection_outbox_failed_poll
   ON search_projection_outbox_failed(failed_at, projection_key);
 CREATE INDEX idx_job_tasks_task_type_created_at_id
@@ -502,19 +497,11 @@ CREATE INDEX idx_job_task_events_task_id_event_type_stage
   ON job_task_events(
     task_id,
     event_type,
-    CASE WHEN json_valid(payload_json)
-      THEN json_extract(payload_json, '$.stage')
-      ELSE NULL
-    END
+    payload_json
   );
 CREATE INDEX idx_job_tasks_sync_recent_roots
   ON job_tasks(created_at DESC, id DESC)
-  WHERE task_type = 'sync.subscriptions'
-    AND CASE
-      WHEN json_valid(result_json)
-        THEN COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
-      ELSE 1
-    END;
+  WHERE task_type = 'sync.subscriptions';
 CREATE INDEX idx_release_reading_backfill_runs_status
   ON release_reading_backfill_runs(status, created_at DESC);
 CREATE INDEX idx_release_reading_backfill_items_cursor
@@ -555,7 +542,7 @@ CREATE INDEX idx_release_evidence_snapshot_items_order
 CREATE UNIQUE INDEX idx_release_evidence_task_active_snapshot
   ON job_tasks(
     task_type,
-    json_extract(payload_json, '$.snapshot_id')
+    payload_json
   )
   WHERE task_type = 'release.evidence' AND status IN ('queued', 'running');
 CREATE INDEX idx_content_work_items_evidence

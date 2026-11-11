@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "postgres", allow(dead_code))]
-
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -44,10 +42,13 @@ const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 const POSTGRES_SESSION_SCHEMA: &str = "tower_sessions";
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 const POSTGRES_SESSION_TABLE: &str = "session";
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 const POSTGRES_SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str =
     "postgres session activity refresh failed";
 
@@ -649,12 +650,14 @@ impl ExpiredDeletion for CoordinatedSqliteSessionStore {
 /// table remains the single source of truth.
 #[cfg(feature = "postgres")]
 #[derive(Clone)]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub struct CoordinatedPostgresSessionStore {
     inner: PostgresStore,
     pool: sqlx::PgPool,
 }
 
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 impl CoordinatedPostgresSessionStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
@@ -871,6 +874,7 @@ impl ExpiredDeletion for CoordinatedPostgresSessionStore {
 }
 
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 fn is_retryable_postgres_error(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -878,6 +882,7 @@ fn is_retryable_postgres_error(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 fn is_retryable_postgres_text(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("40001")
