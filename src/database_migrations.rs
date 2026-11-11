@@ -1,6 +1,3 @@
-#![allow(unexpected_cfgs)]
-#![cfg_attr(feature = "postgres", allow(dead_code))]
-
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +24,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// from being copied into PostgreSQL and makes a fresh PostgreSQL 18 database
 /// reproducible from an empty schema.
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg");
 
 #[derive(Debug, Clone)]
@@ -60,6 +58,7 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
 /// may be present after an interrupted bootstrap, so a retry is safe and does
 /// not touch the SQLite history table.
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub async fn run_postgres(pool: &PgPool) -> Result<()> {
     POSTGRES_MIGRATOR
         .run(pool)
@@ -73,6 +72,7 @@ pub async fn run_postgres(pool: &PgPool) -> Result<()> {
 /// migration count.  It catches non-idempotent DDL or trigger creation while
 /// keeping the check independent from application/runtime migrations.
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub async fn verify_postgres_repeatable(pool: &PgPool) -> Result<i64> {
     run_postgres(pool).await?;
     let first =

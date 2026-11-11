@@ -1,6 +1,3 @@
-#![allow(unexpected_cfgs)]
-#![cfg_attr(feature = "postgres", allow(dead_code))]
-
 use std::collections::HashSet;
 
 use axum::http::StatusCode;
@@ -462,6 +459,7 @@ pub async fn query(
 /// predicates as a recovery path for Chinese text, code identifiers and lane
 /// text that the `simple` configuration does not tokenize usefully.
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub async fn query_postgres(
     pool: &PgPool,
     user_id: &str,

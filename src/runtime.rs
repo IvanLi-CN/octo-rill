@@ -171,6 +171,7 @@ pub fn stale_cutoff_timestamp(now: DateTime<Utc>) -> String {
 /// Register a runtime owner on PostgreSQL without going through the SQLite
 /// write coordinator. The owner row is deliberately kept as RFC3339 text to
 /// match the migration contract shared with the legacy database.
+#[cfg(feature = "postgres")]
 #[allow(dead_code)]
 pub async fn register_runtime_owner_postgres(pool: &PgPool, runtime_owner_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
@@ -194,6 +195,7 @@ pub async fn register_runtime_owner_postgres(pool: &PgPool, runtime_owner_id: &s
 
 /// Refresh one PostgreSQL runtime owner lease. A missing row is treated as a
 /// recoverable startup race and re-registered by the caller.
+#[cfg(feature = "postgres")]
 #[allow(dead_code)]
 pub async fn touch_runtime_owner_lease_postgres(
     pool: &PgPool,
@@ -219,6 +221,7 @@ pub async fn touch_runtime_owner_lease_postgres(
 /// Best-effort cleanup for owners that have stopped heartbeating. The owner
 /// running the cleanup is always retained, so a delayed cleanup cannot remove
 /// its own lease.
+#[cfg(feature = "postgres")]
 #[allow(dead_code)]
 pub async fn prune_stale_runtime_owners_postgres(
     pool: &PgPool,

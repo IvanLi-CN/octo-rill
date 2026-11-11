@@ -1,6 +1,3 @@
-#![allow(unexpected_cfgs)]
-#![cfg_attr(feature = "postgres", allow(dead_code))]
-
 use std::{
     ffi::CString,
     io,
@@ -49,6 +46,7 @@ const MISSING_SEARCH_DOCUMENT_ERROR: &str = "missing_search_document";
 /// projection rows themselves. Search documents and user lanes are derived
 /// data, so an operator can safely repeat this after an import or restore.
 #[cfg(feature = "postgres")]
+#[cfg_attr(feature = "postgres", allow(dead_code))]
 pub async fn rebuild_postgres_search_index(pool: &PgPool) -> Result<u64> {
     const INDEXES: &[&str] = &[
         "idx_search_documents_vector",
