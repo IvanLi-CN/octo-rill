@@ -551,19 +551,19 @@ pub async fn query_postgres(
             }
             let pattern = format!("%{}%", escape_like(term));
             builder.push("lower(COALESCE(d.title, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(d.body, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(ul.translated_text, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(d.translated_text, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(d.smart_text, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\' OR lower(COALESCE(ul.smart_text, '')) LIKE lower(");
-            builder.push_bind(&pattern);
+            builder.push_bind(pattern.clone());
             builder.push(") ESCAPE '\\'");
         }
         builder.push(")");
