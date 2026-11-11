@@ -1,4 +1,5 @@
 #![allow(unexpected_cfgs)]
+#![cfg_attr(feature = "postgres", allow(dead_code))]
 
 use std::{
     ffi::CString,
