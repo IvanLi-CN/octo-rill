@@ -135,6 +135,8 @@ The hook migration is implemented in the checked-in `lefthook.yml`: ordinary com
 - Config reference: [docs-site/docs/config.md](./docs-site/docs/config.md) `Chinese`
 - Product notes: [docs-site/docs/product.md](./docs-site/docs/product.md) `Chinese`
 - Internal docs: [docs/README.md](./docs/README.md)
+- PostgreSQL 18 migration operations: [docs/database-migration/operations.md](./docs/database-migration/operations.md)
+- PostgreSQL connection observability: [ops/observability/postgresql.md](./ops/observability/postgresql.md)
 - Architecture: [docs/architecture.md](./docs/architecture.md)
 - Frontend notes: [web/README.md](./web/README.md)
 
