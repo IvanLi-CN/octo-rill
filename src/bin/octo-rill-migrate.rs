@@ -350,7 +350,7 @@ async fn copy_table(
                 .iter()
                 .map(|p| p.as_ref() as &(dyn ToSql + Sync))
                 .collect::<Vec<_>>();
-            pg.execute(&sql, &refs)
+            execute_with_retry(pg, &sql, &refs)
                 .await
                 .with_context(|| format!("insert into {table}"))?;
             total += 1;
@@ -358,6 +358,24 @@ async fn copy_table(
         offset += batch_size as i64;
     }
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+async fn execute_with_retry(pg: &Client, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+    for attempt in 0..=3 {
+        match pg.execute(sql, params).await {
+            Ok(affected) => return Ok(affected),
+            Err(error)
+                if attempt < 3
+                    && error
+                        .code()
+                        .is_some_and(|code| matches!(code.code(), "40001" | "40P01")) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("retry loop returns on every attempt")
 }
 
 async fn checksum_sqlite(
