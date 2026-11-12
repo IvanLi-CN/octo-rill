@@ -135,8 +135,6 @@ hook 迁移已经落地到仓库中的 `lefthook.yml`；普通提交现在只执
 - 配置说明：[docs-site/docs/config.md](./docs-site/docs/config.md)
 - 产品说明：[docs-site/docs/product.md](./docs-site/docs/product.md)
 - 内部文档入口：[docs/README.md](./docs/README.md)
-- PostgreSQL 18 迁移运维：[docs/database-migration/operations.md](./docs/database-migration/operations.md)
-- PostgreSQL 连接观测：[ops/observability/postgresql.md](./ops/observability/postgresql.md)
 - 系统架构：[docs/architecture.md](./docs/architecture.md)
 - 前端说明：[web/README.md](./web/README.md)
 

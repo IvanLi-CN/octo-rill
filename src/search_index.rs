@@ -9,8 +9,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::task::AbortHandle;
 use tower_sessions::Session;
@@ -41,43 +39,6 @@ const PROJECTION_MAX_ATTEMPTS: i64 = 8;
 const PROJECTION_TRANSACTION_BUDGET: Duration = Duration::from_millis(250);
 const PROJECTION_FANOUT_BATCH_SIZE: i64 = 100;
 const MISSING_SEARCH_DOCUMENT_ERROR: &str = "missing_search_document";
-
-/// Rebuild the PostgreSQL search projection indexes without rebuilding the
-/// projection rows themselves. Search documents and user lanes are derived
-/// data, so an operator can safely repeat this after an import or restore.
-#[cfg(feature = "postgres")]
-#[cfg_attr(feature = "postgres", allow(dead_code))]
-pub async fn rebuild_postgres_search_index(pool: &PgPool) -> Result<u64> {
-    const INDEXES: &[&str] = &[
-        "idx_search_documents_vector",
-        "idx_search_documents_title_trgm",
-        "idx_search_documents_body_trgm",
-        "idx_search_documents_repo_trgm",
-        "idx_search_documents_translated_trgm",
-        "idx_search_documents_smart_trgm",
-        "idx_search_document_lanes_translated_trgm",
-        "idx_search_document_lanes_smart_trgm",
-    ];
-    for index in INDEXES {
-        sqlx::query(&format!("REINDEX INDEX CONCURRENTLY {index}"))
-            .execute(pool)
-            .await
-            .with_context(|| format!("rebuild PostgreSQL search index {index}"))?;
-    }
-    sqlx::query("ANALYZE search_documents")
-        .execute(pool)
-        .await
-        .context("refresh PostgreSQL search document statistics")?;
-    sqlx::query("ANALYZE search_document_user_lanes")
-        .execute(pool)
-        .await
-        .context("refresh PostgreSQL search lane statistics")?;
-    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
-        .fetch_one(pool)
-        .await
-        .context("count PostgreSQL search documents after rebuild")?;
-    u64::try_from(count).context("PostgreSQL search document count was negative")
-}
 
 const PHASES: &[&str] = &[
     "releases",
