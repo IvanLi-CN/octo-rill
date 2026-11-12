@@ -9,7 +9,10 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, TypeInfo, ValueRef, sqlite::SqlitePoolOptions};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
 #[derive(Parser, Debug)]
@@ -186,10 +189,11 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     };
     let table_rows = sqlx::query("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .fetch_all(sqlite).await?;
+    let fts_names = fts_shadow_table_names(&table_rows)?;
     for table in table_rows {
         let name: String = table.try_get("name")?;
         let ddl: Option<String> = table.try_get("sql")?;
-        if is_fts_table(&name, ddl.as_deref()) {
+        if fts_names.contains(&name) {
             manifest.tables.insert(
                 name,
                 TableManifest {
@@ -440,13 +444,26 @@ fn to_pg_param(cell: &Cell) -> Box<dyn ToSql + Sync> {
 }
 
 fn is_fts_table(name: &str, ddl: Option<&str>) -> bool {
-    name.ends_with("_content")
-        || name.ends_with("_data")
-        || name.ends_with("_idx")
-        || ddl.is_some_and(|sql| {
-            sql.to_ascii_uppercase().contains("VIRTUAL TABLE")
-                && sql.to_ascii_uppercase().contains("FTS")
-        })
+    let _ = name;
+    ddl.is_some_and(|sql| {
+        sql.to_ascii_uppercase().contains("VIRTUAL TABLE")
+            && sql.to_ascii_uppercase().contains("FTS")
+    })
+}
+
+fn fts_shadow_table_names(rows: &[sqlx::sqlite::SqliteRow]) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let ddl: Option<String> = row.try_get("sql")?;
+        if is_fts_table(&name, ddl.as_deref()) {
+            names.insert(name.clone());
+            for suffix in ["_content", "_data", "_idx", "_docsize", "_config"] {
+                names.insert(format!("{name}{suffix}"));
+            }
+        }
+    }
+    Ok(names)
 }
 fn quote_ident(v: &str) -> String {
     format!("\"{}\"", v.replace('"', "\"\""))
@@ -518,7 +535,7 @@ mod tests {
 
     #[test]
     fn fts_internal_tables_are_skipped() {
-        assert!(is_fts_table("search_documents_content", None));
+        assert!(!is_fts_table("search_documents_content", None));
         assert!(is_fts_table(
             "search_documents",
             Some("CREATE VIRTUAL TABLE search_documents USING fts5(body)")
