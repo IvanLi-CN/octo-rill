@@ -156,6 +156,29 @@ pub struct AppConfig {
     pub logging: LoggingThresholds,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+}
+
+impl DatabaseBackend {
+    pub fn from_url(database_url: &str) -> Result<Self> {
+        let scheme = database_url
+            .split_once(':')
+            .map(|(scheme, _)| scheme)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match scheme.as_str() {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            _ => anyhow::bail!(
+                "unsupported DATABASE_URL scheme '{scheme}' (expected sqlite or postgres)"
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GitHubOAuthConfig {
     pub client_id: String,
@@ -233,6 +256,10 @@ impl fmt::Debug for AppConfig {
 }
 
 impl AppConfig {
+    pub fn database_backend(&self) -> Result<DatabaseBackend> {
+        DatabaseBackend::from_url(&self.database_url)
+    }
+
     pub fn from_env() -> Result<Self> {
         let bind_addr: SocketAddr = env::var("OCTORILL_BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:58090".to_owned())
@@ -418,6 +445,23 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn database_backend_classifies_supported_urls() {
+        assert_eq!(
+            DatabaseBackend::from_url("sqlite:./data.db").unwrap(),
+            DatabaseBackend::Sqlite
+        );
+        assert_eq!(
+            DatabaseBackend::from_url("postgres://user@db/app").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            DatabaseBackend::from_url("postgresql://user@db/app").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert!(DatabaseBackend::from_url("mysql://user@db/app").is_err());
     }
 
     #[test]
