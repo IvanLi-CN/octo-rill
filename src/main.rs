@@ -45,5 +45,14 @@ async fn main() -> Result<()> {
     observability::init_tracing();
 
     let config = config::AppConfig::from_env()?;
+    if std::env::var("OCTORILL_PG_BOOTSTRAP_ONLY").as_deref() == Ok("1") {
+        if config.database_backend()? != config::DatabaseBackend::Postgres {
+            anyhow::bail!("OCTORILL_PG_BOOTSTRAP_ONLY requires a postgres DATABASE_URL");
+        }
+        let runtime = postgres_runtime::connect(&config.database_url, 4).await?;
+        tracing::info!("PostgreSQL runtime baseline and session store are ready");
+        runtime.pool.close().await;
+        return Ok(());
+    }
     server::serve(config).await
 }

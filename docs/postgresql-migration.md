@@ -18,6 +18,16 @@ POSTGRES_URL=postgres://user:password@127.0.0.1:5432/octo_rill \
 cargo run --bin octo-rill-migrate -- preflight
 ```
 
+PostgreSQL runtime 本身可用以下入口做无业务写入 smoke check：
+
+```sh
+OCTORILL_PG_BOOTSTRAP_ONLY=1 \
+DATABASE_URL=postgres://user:password@127.0.0.1:5432/octo_rill \
+cargo run --bin octo-rill
+```
+
+该入口只执行 PostgreSQL 18 版本检查、baseline 和 Session schema 初始化，然后正常退出。
+
 生产副本演练在 Agent VM 内执行。生产 secrets、上游凭据和真实服务网络不作为迁移输入；只复制经授权的 SQLite 快照及脱敏配置。Compose 使用 `compose.postgres.yml`：PostgreSQL 18 健康后先运行一次性 migration 容器，migration 成功后才允许 server 容器启动。
 
 演练命令使用固定会话 ID，避免误用其他 VM：
