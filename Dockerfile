@@ -29,7 +29,6 @@ ENV APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-COPY migrations_pg ./migrations_pg
 COPY --from=web-builder /app/web/dist ./web/dist
 
 RUN cargo build --release --locked

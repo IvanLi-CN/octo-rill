@@ -27,7 +27,6 @@ struct SourceVisitor {
     structural_issues: Vec<String>,
     sqlite_write_issues: Vec<String>,
     test_only_depth: usize,
-    postgres_only_depth: usize,
     sqlite_writer_closure_depth: usize,
     read_only_transaction_depth: usize,
     pool_aliases: BTreeSet<String>,
@@ -45,16 +44,12 @@ impl<'ast> Visit<'ast> for SourceVisitor {
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         let previous_test_only_depth = self.test_only_depth;
-        let previous_postgres_only_depth = self.postgres_only_depth;
         let previous_pool_aliases = self.pool_aliases.clone();
         let previous_connection_aliases = self.connection_aliases.clone();
         let previous_transaction_aliases = self.transaction_aliases.clone();
         let previous_read_only_transaction_depth = self.read_only_transaction_depth;
         if has_cfg_test(&item.attrs) {
             self.test_only_depth += 1;
-        }
-        if has_cfg_feature_postgres(&item.attrs) {
-            self.postgres_only_depth += 1;
         }
         for input in &item.sig.inputs {
             if let FnArg::Typed(typed_pattern) = input
@@ -76,7 +71,6 @@ impl<'ast> Visit<'ast> for SourceVisitor {
         }
         visit::visit_item_fn(self, item);
         self.test_only_depth = previous_test_only_depth;
-        self.postgres_only_depth = previous_postgres_only_depth;
         self.pool_aliases = previous_pool_aliases;
         self.connection_aliases = previous_connection_aliases;
         self.transaction_aliases = previous_transaction_aliases;
@@ -148,7 +142,6 @@ impl<'ast> Visit<'ast> for SourceVisitor {
         let is_explicit_read_only_transaction =
             self.read_only_transaction_depth > 0 && expression.method == "begin";
         if self.test_only_depth == 0
-            && self.postgres_only_depth == 0
             && is_direct_pool_write(
                 expression,
                 &self.pool_aliases,
@@ -331,46 +324,6 @@ fn has_cfg_test(attributes: &[Attribute]) -> bool {
         };
         predicates.iter().any(cfg_predicate_is_test_only)
     })
-}
-
-fn has_cfg_feature_postgres(attributes: &[Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
-        let Meta::List(list) = &attribute.meta else {
-            return false;
-        };
-        if !attribute.path().is_ident("cfg") {
-            return false;
-        }
-        let Ok(predicates) = list
-            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
-        else {
-            return false;
-        };
-        predicates.iter().any(cfg_predicate_is_postgres)
-    })
-}
-
-fn cfg_predicate_is_postgres(predicate: &Meta) -> bool {
-    match predicate {
-        Meta::NameValue(value) if value.path.is_ident("feature") => {
-            let Expr::Lit(expression) = &value.value else {
-                return false;
-            };
-            let syn::Lit::Str(feature) = &expression.lit else {
-                return false;
-            };
-            feature.value() == "postgres"
-        }
-        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
-            let Ok(predicates) = list.parse_args_with(
-                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
-            ) else {
-                return false;
-            };
-            predicates.iter().any(cfg_predicate_is_postgres)
-        }
-        _ => false,
-    }
 }
 
 fn cfg_predicate_is_test_only(predicate: &Meta) -> bool {

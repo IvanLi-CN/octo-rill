@@ -18,16 +18,8 @@
 "src/github.rs|allow|dead_code" = 12
 "src/metrics.rs|allow|dead_code" = 3
 "src/observability.rs|allow|dead_code" = 1
-"src/runtime.rs|allow|dead_code" = 3
-"src/server.rs|allow|dead_code" = 4
-"src/sqlite_write.rs|allow|dead_code" = 1
-"src/state.rs|allow|dead_code" = 1
 "src/sync.rs|allow|clippy::too_many_arguments" = 1
 "src/sync.rs|allow|dead_code" = 14
 "src/translations.rs|allow|clippy::too_many_arguments" = 1
 "src/translations.rs|allow|dead_code" = 5
 "src/webhook_push.rs|allow|clippy::too_many_arguments" = 3
-"src/database_migrations.rs|allow|dead_code" = 3
-"src/search.rs|allow|dead_code" = 1
-"src/search_index.rs|allow|dead_code" = 1
-"src/session_store.rs|allow|dead_code" = 7

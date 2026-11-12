@@ -3,9 +3,6 @@ name = "octo-rill"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-postgres = ["sqlx/postgres", "tower-sessions-sqlx-store/postgres"]
-
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.101"
@@ -29,7 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 semver = "1.0.27"
 sha2 = "0.10.9"
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "postgres", "macros", "migrate", "chrono"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full", "test-util"] }
 tokio-stream = "0.1.17"
@@ -38,7 +35,7 @@ tower = { version = "0.5.2", features = ["util"] }
 tower-cookies = "0.11.0"
 tower-http = { version = "0.6.8", features = ["trace", "cors", "fs", "request-id"] }
 tower-sessions = "0.14.0"
-tower-sessions-sqlx-store = { version = "0.15.0", features = ["sqlite", "postgres"] }
+tower-sessions-sqlx-store = { version = "0.15.0", features = ["sqlite"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 url = "2.5.8"
