@@ -110,6 +110,16 @@ async fn main() -> Result<()> {
 }
 
 async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> {
+    let server_version_num: i64 = pg
+        .query_one("SHOW server_version_num", &[])
+        .await
+        .context("read PostgreSQL server_version_num")?
+        .get::<_, String>(0)
+        .parse()
+        .context("parse PostgreSQL server_version_num")?;
+    if server_version_num < 180000 {
+        bail!("PostgreSQL 18 is required; server_version_num={server_version_num}");
+    }
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(sqlite)
         .await?;
@@ -133,7 +143,7 @@ async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> 
         .get::<_, String>(0);
     let available = filesystem_available_bytes(&data_dir)?;
     println!(
-        "source_bytes={source_bytes} authoritative_tables={} estimated_target_bytes={estimated} safety_bytes={}",
+        "server_version_num={server_version_num} source_bytes={source_bytes} authoritative_tables={} estimated_target_bytes={estimated} safety_bytes={}",
         rows.len(),
         args.safety_bytes
     );
@@ -146,8 +156,23 @@ async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> 
 
 async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
     preflight(sqlite, pg, args).await?;
-    pg.batch_execute(include_str!("../../migrations_pg/0001_runtime.sql"))
-        .await?;
+    pg.batch_execute(
+        "SELECT pg_advisory_lock(hashtextextended('octo-rill:pg18-import', 0)); BEGIN;",
+    )
+    .await
+    .context("acquire PostgreSQL migration lock")?;
+    let baseline_result = pg
+        .batch_execute(include_str!("../../migrations_pg/0001_runtime.sql"))
+        .await;
+    if let Err(error) = baseline_result {
+        let _ = pg.batch_execute("ROLLBACK; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));").await;
+        return Err(error.into());
+    }
+    pg.batch_execute(
+        "COMMIT; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));",
+    )
+    .await
+    .context("commit PostgreSQL runtime baseline")?;
     let mut manifest = Manifest {
         source: args.sqlite_source.clone(),
         target: redact_target(&args.postgres_url),
