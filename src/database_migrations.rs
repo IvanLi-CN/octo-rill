@@ -4,9 +4,6 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha384};
 use sqlx::{SqlitePool, migrate::Migrator};
 
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
-
 const LEGACY_SEARCH_MIGRATION_VERSION: i64 = 81;
 const LEGACY_SEARCH_MIGRATION_SQL: &[u8] =
     include_bytes!("../migrations/legacy/0081_command_palette_search.sql");
@@ -18,14 +15,6 @@ const LEGACY_SEARCH_SCHEDULER_INDEX_MIGRATION_CHECKSUM: &[u8; 48] = &[
 ];
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-
-/// The PostgreSQL history is deliberately independent from the legacy SQLite
-/// history.  Keeping a separate compiled migrator prevents SQLite checksums
-/// from being copied into PostgreSQL and makes a fresh PostgreSQL 18 database
-/// reproducible from an empty schema.
-#[cfg(feature = "postgres")]
-#[cfg_attr(feature = "postgres", allow(dead_code))]
-static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg");
 
 #[derive(Debug, Clone)]
 struct AppliedMigration {
@@ -49,51 +38,6 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     apply_migrations(pool)
         .await
         .with_context(|| format!("failed to apply pending SQLx migrations: {pending:?}"))
-}
-
-/// Apply the PostgreSQL 18 baseline and all follow-up migrations.
-///
-/// SQLx owns the `_sqlx_migrations` table and serializes concurrent migrator
-/// runs.  The migration files themselves use `IF NOT EXISTS` for objects that
-/// may be present after an interrupted bootstrap, so a retry is safe and does
-/// not touch the SQLite history table.
-#[cfg(feature = "postgres")]
-#[cfg_attr(feature = "postgres", allow(dead_code))]
-pub async fn run_postgres(pool: &PgPool) -> Result<()> {
-    POSTGRES_MIGRATOR
-        .run(pool)
-        .await
-        .context("failed to apply PostgreSQL 18 database migrations")
-}
-
-/// Verify that PostgreSQL initialization is repeatable.
-///
-/// This intentionally runs the same migrator twice and compares the successful
-/// migration count.  It catches non-idempotent DDL or trigger creation while
-/// keeping the check independent from application/runtime migrations.
-#[cfg(feature = "postgres")]
-#[cfg_attr(feature = "postgres", allow(dead_code))]
-pub async fn verify_postgres_repeatable(pool: &PgPool) -> Result<i64> {
-    run_postgres(pool).await?;
-    let first =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = TRUE")
-            .fetch_one(pool)
-            .await
-            .context("count PostgreSQL migrations after first initialization")?;
-
-    run_postgres(pool).await?;
-    let second =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = TRUE")
-            .fetch_one(pool)
-            .await
-            .context("count PostgreSQL migrations after repeat initialization")?;
-
-    if first != second {
-        bail!(
-            "PostgreSQL migration history changed on repeat initialization: first={first}, second={second}"
-        );
-    }
-    Ok(second)
 }
 
 async fn apply_migrations(pool: &SqlitePool) -> Result<()> {
@@ -1554,32 +1498,5 @@ mod tests {
             .expect("read retained provider-call association"),
             1
         );
-    }
-
-    #[test]
-    fn postgres_baseline_is_independent_from_sqlite_history() {
-        let baseline = include_str!("../migrations_pg/0001_baseline.sql");
-        assert!(baseline.contains("CREATE EXTENSION IF NOT EXISTS pg_trgm"));
-        assert!(baseline.contains("CREATE SCHEMA IF NOT EXISTS tower_sessions"));
-        assert!(baseline.contains("CREATE TABLE IF NOT EXISTS migration_control"));
-        assert!(!baseline.contains("PRAGMA "));
-        assert!(!baseline.contains("_sqlx_migrations"));
-    }
-
-    #[test]
-    fn postgres_migration_files_have_projection_layers() {
-        let sources = [
-            include_str!("../migrations_pg/0001_baseline.sql"),
-            include_str!("../migrations_pg/0002_indexes.sql"),
-            include_str!("../migrations_pg/0003_triggers.sql"),
-            include_str!("../migrations_pg/0004_constraints.sql"),
-        ];
-        assert!(sources[1].contains("USING GIN"));
-        assert!(sources[2].contains("LANGUAGE plpgsql"));
-        assert!(sources[3].contains("to_regclass"));
-        for source in sources {
-            assert!(!source.contains("CREATE VIRTUAL TABLE"));
-            assert!(!source.contains("BEGIN IMMEDIATE"));
-        }
     }
 }

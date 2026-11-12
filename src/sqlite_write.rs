@@ -12,8 +12,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use sqlx::{
-    Connection, PgConnection, Sqlite, SqliteConnection, SqlitePool, Transaction,
-    TransactionManager, sqlite::SqliteTransactionManager,
+    Connection, Sqlite, SqliteConnection, SqlitePool, Transaction, TransactionManager,
+    sqlite::SqliteTransactionManager,
 };
 use tokio::{
     sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
@@ -24,18 +24,6 @@ use tracing::{debug, warn};
 use crate::observability;
 
 pub const SQLITE_WRITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-
-#[allow(dead_code)]
-pub async fn configure_postgres_connection(connection: &mut PgConnection) -> sqlx::Result<()> {
-    sqlx::query("SET lock_timeout = '5s'")
-        .execute(&mut *connection)
-        .await
-        .map(|_| ())?;
-    sqlx::query("SET statement_timeout = '30s'")
-        .execute(connection)
-        .await
-        .map(|_| ())
-}
 const FOREGROUND_DEADLINE: Duration = Duration::from_millis(900);
 const BACKGROUND_DEADLINE: Duration = Duration::from_millis(2500);
 const BEST_EFFORT_DEADLINE: Duration = BACKGROUND_DEADLINE;

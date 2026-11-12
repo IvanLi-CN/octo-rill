@@ -12,10 +12,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OBS = ROOT / "ops" / "observability"
 REQUIRED_UIDS = {"octorill-overview", "octorill-http-sse", "octorill-sqlite", "octorill-queues", "octorill-upstream"}
-REQUIRED_DOCS = {
-    ROOT / "docs" / "database-migration" / "operations.md",
-    OBS / "postgresql.md",
-}
 METRIC = re.compile(r"\boctorill_[a-z][a-z0-9_]*")
 GRAFANA_SELECTOR = 'service=~"$service",environment=~"$environment",instance=~"$instance"'
 
@@ -78,9 +74,6 @@ def main() -> int:
     ):
         if not required.exists():
             errors.append(f"missing observability asset {required}")
-    for required in REQUIRED_DOCS:
-        if not required.exists():
-            errors.append(f"missing observability documentation {required}")
     if errors:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)

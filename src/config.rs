@@ -14,24 +14,6 @@ use crate::observability::LoggingThresholds;
 
 const DEFAULT_PUBLIC_METRICS_CORS_ORIGINS: &str = "https://ivanli.cc,http://127.0.0.1:12620";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DatabaseBackend {
-    Sqlite,
-    Postgres,
-}
-
-impl DatabaseBackend {
-    pub fn from_url(database_url: &str) -> Result<Self> {
-        if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
-            Ok(Self::Postgres)
-        } else if database_url.starts_with("sqlite:") {
-            Ok(Self::Sqlite)
-        } else {
-            anyhow::bail!("DATABASE_URL must use sqlite: or postgres://")
-        }
-    }
-}
-
 pub fn public_metrics_cors_origins_from_env() -> Result<Vec<HeaderValue>> {
     let configured = env::var("OCTORILL_PUBLIC_METRICS_CORS_ORIGINS")
         .unwrap_or_else(|_| DEFAULT_PUBLIC_METRICS_CORS_ORIGINS.to_owned());
@@ -269,7 +251,6 @@ impl AppConfig {
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./.data/octo-rill.db".to_owned());
-        DatabaseBackend::from_url(&database_url).context("invalid DATABASE_URL backend")?;
         let sqlite_pool_max_connections =
             parse_bounded_positive_usize_env("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", false, 32)?
                 .unwrap_or_else(|| {
@@ -756,23 +737,5 @@ mod tests {
             .expect("fallback for unsupported runtime time zone");
 
         assert_eq!(resolved, crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE);
-    }
-
-    #[test]
-    fn database_backend_detects_postgres_urls() {
-        assert_eq!(
-            DatabaseBackend::from_url("postgres://octo@db/octo").unwrap(),
-            DatabaseBackend::Postgres
-        );
-        assert_eq!(
-            DatabaseBackend::from_url("postgresql://octo@db/octo").unwrap(),
-            DatabaseBackend::Postgres
-        );
-    }
-
-    #[test]
-    fn database_backend_rejects_unknown_urls() {
-        let error = DatabaseBackend::from_url("mysql://octo@db/octo").unwrap_err();
-        assert!(error.to_string().contains("DATABASE_URL"));
     }
 }
