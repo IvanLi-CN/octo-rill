@@ -68,6 +68,8 @@ struct Manifest {
 struct TableManifest {
     rows: u64,
     sha256: String,
+    #[serde(default)]
+    target_sha256: String,
     skipped: bool,
     reason: Option<String>,
 }
@@ -168,6 +170,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 TableManifest {
                     rows: 0,
                     sha256: String::new(),
+                    target_sha256: String::new(),
                     skipped: true,
                     reason: Some("SQLite FTS5 is a rebuildable projection".into()),
                 },
@@ -182,11 +185,13 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 .with_context(|| format!("create target table {name}"))?;
         }
         let (rows, sha) = copy_table(sqlite, pg, &name, &columns, args.batch_size).await?;
+        let target_sha = checksum_postgres(pg, &name).await?;
         manifest.tables.insert(
             name,
             TableManifest {
                 rows,
                 sha256: sha,
+                target_sha256: target_sha,
                 skipped: false,
                 reason: None,
             },
@@ -225,11 +230,15 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             )
             .await?
             .get(0);
-        if source_rows != target_rows as u64 || source_sha != table.sha256 {
+        let target_sha = checksum_postgres(pg, name).await?;
+        if source_rows != target_rows as u64
+            || source_sha != table.sha256
+            || (!table.target_sha256.is_empty() && target_sha != table.target_sha256)
+        {
             bail!(
-                "verification failed for {name}: source rows/hash {source_rows}/{source_sha}, manifest {}/{} target rows {target_rows}",
-                table.rows,
-                table.sha256
+                "verification failed for {name}: source rows/hash {source_rows}/{source_sha}, target rows/hash {target_rows}/{target_sha}, manifest source/target {}/{}",
+                table.sha256,
+                table.target_sha256
             );
         }
     }
@@ -238,6 +247,20 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         expected.tables.values().filter(|t| !t.skipped).count()
     );
     Ok(())
+}
+
+async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
+    let query = format!(
+        "SELECT row_to_json(row)::text FROM (SELECT * FROM octo_rill.{}) AS row ORDER BY ctid",
+        quote_ident(table)
+    );
+    let rows = pg.query(&query, &[]).await?;
+    let mut hasher = Sha256::new();
+    for row in rows {
+        let value: String = row.get(0);
+        hasher.update(value.as_bytes());
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn rebuild(pg: &mut Client) -> Result<()> {
