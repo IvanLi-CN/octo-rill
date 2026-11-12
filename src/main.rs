@@ -49,7 +49,15 @@ async fn main() -> Result<()> {
         if config.database_backend()? != config::DatabaseBackend::Postgres {
             anyhow::bail!("OCTORILL_PG_BOOTSTRAP_ONLY requires a postgres DATABASE_URL");
         }
-        let runtime = postgres_runtime::connect(&config.database_url, 4).await?;
+        let max_connections = std::env::var("OCTORILL_PG_POOL_MAX_CONNECTIONS")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("invalid OCTORILL_PG_POOL_MAX_CONNECTIONS"))
+            })
+            .transpose()?
+            .unwrap_or(8);
+        let runtime = postgres_runtime::connect(&config.database_url, max_connections).await?;
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
         return Ok(());
