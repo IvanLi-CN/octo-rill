@@ -19,6 +19,7 @@ mod metrics;
 mod observability;
 mod online_migrations;
 mod passkeys;
+mod postgres_runtime;
 mod public_metrics;
 mod release_links;
 mod runtime;
