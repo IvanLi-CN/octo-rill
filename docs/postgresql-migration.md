@@ -6,6 +6,8 @@
 
 SQLite FTS5 内部表被记录为可重建投影并跳过导入。`rebuild` 负责启用 `pg_trgm`，应用专用的全文检索配置和 GIN/trigram 索引应由 PostgreSQL 迁移定义创建。FTS 排名不属于权威数据一致性条件。
 
+长期运行时的连接池和 Session 初始化位于 `src/postgres_runtime.rs`：它强制 PostgreSQL 18 版本门禁，执行独立 baseline，并使用 MessagePack `bytea` 的 PostgreSQL session store。业务模块仍需逐步把现有 SQLite 查询和写入协调器切换到该 runtime。
+
 ## 本地验证
 
 ```sh
