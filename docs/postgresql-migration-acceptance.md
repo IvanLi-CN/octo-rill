@@ -8,7 +8,7 @@
 | 独立 SQLx migration history | `migrations_pg/` 与 `postgres_database_migrations` 测试 | 已证明 |
 | Session store | PostgreSQL `tower_sessions` store、MessagePack `bytea` 校验和 expiry 校验 | 已证明 |
 | 任务认领事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、`40001`/`40P01` 重试测试 | 已证明 |
-| SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；6 项迁移器测试通过 | 已证明 |
+| SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；7 项迁移器测试通过，并在导入前检查 `users`、`github_connections`、`job_tasks` 核心权威表 | 已证明 |
 | Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
 | PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务和部分管理员路由（包括用户列表）已接入 | 部分证明 |
 | 完整业务 worker | 同步和日报任务目前只入 PostgreSQL 队列，尚未由 PG-native worker 执行 | 未完成 |
