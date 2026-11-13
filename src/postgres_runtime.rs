@@ -106,7 +106,7 @@ impl PostgresRuntime {
         runtime_owner_id: &str,
         registry: &crate::postgres_worker::TaskExecutorRegistry,
     ) -> Result<bool> {
-        crate::postgres_worker::run_once(&self.pool, runtime_owner_id, registry).await
+        crate::postgres_worker::run_registered_once(&self.pool, runtime_owner_id, registry).await
     }
 }
 

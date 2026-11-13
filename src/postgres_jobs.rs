@@ -33,8 +33,26 @@ pub async fn claim_next_queued_task(
     runtime_owner_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedTask>> {
+    claim_next_queued_task_for_types(pool, runtime_owner_id, now, None).await
+}
+
+/// Claim one queued task whose type is present in `allowed_task_types`.
+///
+/// An empty allow-list returns no task. This prevents a partially migrated
+/// worker from claiming business tasks that do not yet have a PostgreSQL
+/// executor.
+pub async fn claim_next_queued_task_for_types(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+    now: DateTime<Utc>,
+    allowed_task_types: Option<&[String]>,
+) -> Result<Option<ClaimedTask>> {
+    if allowed_task_types.is_some_and(<[String]>::is_empty) {
+        return Ok(None);
+    }
+    let allowed_task_types = allowed_task_types.map(|types| types.to_vec());
     for attempt in 0..=MAX_TRANSACTION_RETRIES {
-        match claim_once(pool, runtime_owner_id, now).await {
+        match claim_once(pool, runtime_owner_id, now, allowed_task_types.as_deref()).await {
             Ok(task) => return Ok(task),
             Err(error)
                 if attempt < MAX_TRANSACTION_RETRIES
@@ -147,6 +165,7 @@ async fn claim_once(
     pool: &PgPool,
     runtime_owner_id: &str,
     now: DateTime<Utc>,
+    allowed_task_types: Option<&[String]>,
 ) -> Result<Option<ClaimedTask>> {
     let mut tx = pool.begin().await.context("begin PostgreSQL task claim")?;
     let task = sqlx::query_as::<Postgres, ClaimedTask>(
@@ -164,12 +183,14 @@ async fn claim_once(
                 AND running.status = 'running'
             )
           )
+          AND ($2::text[] IS NULL OR candidate.task_type = ANY($2))
         ORDER BY candidate.created_at ASC, candidate.id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         "#,
     )
     .bind(now)
+    .bind(allowed_task_types)
     .fetch_optional(&mut *tx)
     .await
     .context("select PostgreSQL queued task")?;
@@ -239,5 +260,6 @@ mod tests {
         assert!(source.contains("40001") && source.contains("40P01"));
         assert!(source.contains("runtime_owner_id = $6"));
         assert!(source.contains("task.completed"));
+        assert!(source.contains("task_type = ANY($2)"));
     }
 }
