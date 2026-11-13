@@ -31,7 +31,7 @@ cargo run --bin octo-rill
 
 该入口只执行 PostgreSQL 18 版本检查、baseline 和 Session schema 初始化，然后正常退出。
 
-生产副本演练在 Agent VM 内执行。生产 secrets、上游凭据和真实服务网络不作为迁移输入；只复制经授权的 SQLite 快照及脱敏配置。Compose 使用 `compose.postgres.yml`：PostgreSQL 18 健康后先运行一次性 migration 容器，migration 成功后才允许 server 容器启动。
+生产副本演练在 Agent VM 内执行。生产 secrets、上游凭据和真实服务网络不作为迁移输入；只复制经授权的 SQLite 快照及脱敏配置。Compose 使用 `compose.postgres.yml`：PostgreSQL 18 健康后先运行一次性 migration 容器，migration 成功后才允许 server 容器启动。server 服务显式传入 `OCTORILL_PUBLIC_BASE_URL`、`OCTORILL_ENCRYPTION_KEY_BASE64` 和 GitHub OAuth 三项必需配置；变量缺失时 Compose 直接拒绝展开，避免迁移成功后服务因配置不完整启动失败。
 
 演练命令使用固定会话 ID，避免误用其他 VM：
 
