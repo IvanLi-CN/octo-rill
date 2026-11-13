@@ -24,9 +24,14 @@ use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDe
 use tracing::{info, warn};
 
 use crate::{
-    config::AppConfig, crypto::EncryptedSecret, local_id, postgres_runtime::PostgresRuntime,
-    postgres_runtime_owner, postgres_tasks::NotificationsExecutor,
-    postgres_worker::TaskExecutorRegistry, state::GitHubOAuthClient,
+    config::AppConfig,
+    crypto::EncryptedSecret,
+    local_id,
+    postgres_runtime::PostgresRuntime,
+    postgres_runtime_owner,
+    postgres_tasks::{NotificationsExecutor, ReleasesExecutor},
+    postgres_worker::TaskExecutorRegistry,
+    state::GitHubOAuthClient,
 };
 
 #[derive(Clone)]
@@ -58,6 +63,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .build()
         .context("build PostgreSQL service HTTP client")?;
     let task_registry = TaskExecutorRegistry::builder()
+        .register(
+            "sync.releases",
+            ReleasesExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
         .register(
             "sync.notifications",
             NotificationsExecutor::new(
