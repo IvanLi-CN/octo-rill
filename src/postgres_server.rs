@@ -69,6 +69,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/releases", get(list_releases))
         .route("/api/notifications", get(list_notifications))
         .route("/api/repos/following", get(list_following_repos))
+        .route(
+            "/api/repos/{owner}/{repo}/following",
+            axum::routing::put(follow_repo).delete(unfollow_repo),
+        )
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
@@ -830,6 +834,102 @@ async fn list_following_repos(
             json!({"following_count": items.len(), "associated_count": associated_items.len(), "items": items, "associated_items": associated_items}),
         ),
     )
+}
+
+async fn follow_repo(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path((owner, repo)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_following(&state, &session, &owner, &repo, true).await
+}
+
+async fn unfollow_repo(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path((owner, repo)): Path<(String, String)>,
+) -> impl IntoResponse {
+    set_following(&state, &session, &owner, &repo, false).await
+}
+
+async fn set_following(
+    state: &PostgresServerState,
+    session: &Session,
+    owner: &str,
+    repo: &str,
+    following: bool,
+) -> axum::response::Response {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let full_name = format!("{owner}/{repo}");
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE public.user_repo_associations SET is_following = $1, follow_state_source = 'user_explicit', updated_at = $2 WHERE user_id = $3 AND repo_full_name_lower = lower($4)",
+    )
+    .bind(if following { 1_i64 } else { 0_i64 })
+    .bind(&now)
+    .bind(&user_id)
+    .bind(&full_name)
+    .execute(&state.runtime.pool)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 0 => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "repository_not_found"})),
+        )
+            .into_response(),
+        Ok(_) => match sqlx::query_as::<_, PgFollowingRepoRow>(
+            "SELECT repo_id, repo_full_name AS full_name, owner_login, repo_name AS name, COALESCE(html_url, 'https://github.com/' || repo_full_name) AS html_url, description, is_private, first_source, first_associated_at, last_seen_at, is_following, follow_state_source, owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image, has_personal_owned_source, has_github_star_source, has_manual_feed_source FROM public.user_repo_associations WHERE user_id = $1 AND repo_full_name_lower = lower($2)",
+        )
+        .bind(&user_id)
+        .bind(&full_name)
+        .fetch_one(&state.runtime.pool)
+        .await
+        {
+            Ok(row) => (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "repo_id": row.repo_id,
+                    "full_name": row.full_name,
+                    "owner_login": row.owner_login,
+                    "name": row.name,
+                    "html_url": row.html_url,
+                    "description": row.description,
+                    "is_private": row.is_private.map(|v| v != 0),
+                    "is_following": row.is_following != 0,
+                    "follow_state_source": row.follow_state_source,
+                    "repo_visual": {"owner_avatar_url": row.owner_avatar_url, "open_graph_image_url": row.open_graph_image_url, "uses_custom_open_graph_image": row.uses_custom_open_graph_image.unwrap_or_default() != 0}
+                })),
+            )
+                .into_response(),
+            Err(error) => {
+                warn!(%error, "PostgreSQL following repository readback failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "database_error"})),
+                )
+                    .into_response()
+            }
+        },
+        Err(error) => {
+            warn!(%error, "PostgreSQL following repository update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
