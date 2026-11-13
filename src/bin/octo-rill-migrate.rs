@@ -665,4 +665,28 @@ mod tests {
         assert_eq!(ordered[0].0, "users");
         assert_eq!(ordered[1].0, "notes");
     }
+
+    #[test]
+    fn cyclic_foreign_key_dependencies_fail_closed() {
+        let tables = vec![
+            (
+                "a".to_owned(),
+                Vec::new(),
+                "a ddl".to_owned(),
+                vec!["b".to_owned()],
+            ),
+            (
+                "b".to_owned(),
+                Vec::new(),
+                "b ddl".to_owned(),
+                vec!["a".to_owned()],
+            ),
+        ];
+        let error = order_tables_by_dependencies(tables).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cyclic SQLite foreign-key dependencies")
+        );
+    }
 }
