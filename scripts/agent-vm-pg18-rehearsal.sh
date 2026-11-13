@@ -12,6 +12,13 @@ run_vm() {
   AGENT_VM_SESSION_ID="$AGENT_VM_SESSION_ID" bun "$AGENT_VM_SCRIPT" "$@"
 }
 
+remote_value() {
+  case "$1" in
+    (*"'"*) echo "remote Agent VM values may not contain single quotes" >&2; exit 2 ;;
+    (*) printf "'%s'" "$1" ;;
+  esac
+}
+
 echo "checking Agent VM control-plane health"
 doctor_json="$(run_vm doctor)"
 if [[ "$doctor_json" != *'"ready":true'* ]]; then
@@ -36,10 +43,11 @@ if [[ -n "$AGENT_VM_APP_BINARY" ]]; then
 else
   app_command=''
 fi
-run_vm exec -- sh -lc "
+remote_env="export POSTGRES_URL=$(remote_value "${POSTGRES_URL:-}"); export SQLITE_SOURCE=$(remote_value "${SQLITE_SOURCE:-}"); export MIGRATION_MANIFEST=$(remote_value "${MIGRATION_MANIFEST:-}"); export MIGRATION_TARGET_PATH=$(remote_value "${MIGRATION_TARGET_PATH:-}"); export MIGRATION_SAFETY_BYTES=$(remote_value "${MIGRATION_SAFETY_BYTES:-1073741824}"); export OCTORILL_ENCRYPTION_KEY_BASE64=$(remote_value "${OCTORILL_ENCRYPTION_KEY_BASE64:-}"); export GITHUB_CLIENT_ID=$(remote_value "${GITHUB_CLIENT_ID:-}"); export GITHUB_CLIENT_SECRET=$(remote_value "${GITHUB_CLIENT_SECRET:-}"); export GITHUB_OAUTH_REDIRECT_URL=$(remote_value "${GITHUB_OAUTH_REDIRECT_URL:-}"); export OCTORILL_BIND_ADDR=$(remote_value "${OCTORILL_BIND_ADDR:-127.0.0.1:3018}");"
+run_vm exec -- sh -lc "$remote_env
   set -eu
   cd /workspace/worktrees/$AGENT_VM_WORKTREE_NAME/src
-  if [[ '$AGENT_VM_MIGRATION_BINARY' == '' ]]; then
+  if [ -z '$AGENT_VM_MIGRATION_BINARY' ]; then
     cargo test --bin octo-rill-migrate --locked
   fi
   test -n \"\${POSTGRES_URL:-}\" || { echo 'POSTGRES_URL is required inside the VM' >&2; exit 3; }
@@ -47,12 +55,13 @@ run_vm exec -- sh -lc "
   SQLITE_SOURCE=\"\${SQLITE_SOURCE:?SQLITE_SOURCE is required inside the VM}\" \\
     POSTGRES_URL=\"\$POSTGRES_URL\" \\
     MIGRATION_MANIFEST=\"\$MIGRATION_MANIFEST\" \\
+    MIGRATION_SAFETY_BYTES=\"\$MIGRATION_SAFETY_BYTES\" \\
     MIGRATION_TARGET_PATH=\"\${MIGRATION_TARGET_PATH:-}\" \\
     $migration_command preflight
-  SQLITE_SOURCE=\"\$SQLITE_SOURCE\" POSTGRES_URL=\"\$POSTGRES_URL\" MIGRATION_MANIFEST=\"\$MIGRATION_MANIFEST\" MIGRATION_TARGET_PATH=\"\${MIGRATION_TARGET_PATH:-}\" $migration_command import
-  SQLITE_SOURCE=\"\$SQLITE_SOURCE\" POSTGRES_URL=\"\$POSTGRES_URL\" MIGRATION_MANIFEST=\"\$MIGRATION_MANIFEST\" MIGRATION_TARGET_PATH=\"\${MIGRATION_TARGET_PATH:-}\" $migration_command verify
+  SQLITE_SOURCE=\"\$SQLITE_SOURCE\" POSTGRES_URL=\"\$POSTGRES_URL\" MIGRATION_MANIFEST=\"\$MIGRATION_MANIFEST\" MIGRATION_SAFETY_BYTES=\"\$MIGRATION_SAFETY_BYTES\" MIGRATION_TARGET_PATH=\"\${MIGRATION_TARGET_PATH:-}\" $migration_command import
+  SQLITE_SOURCE=\"\$SQLITE_SOURCE\" POSTGRES_URL=\"\$POSTGRES_URL\" MIGRATION_MANIFEST=\"\$MIGRATION_MANIFEST\" MIGRATION_SAFETY_BYTES=\"\$MIGRATION_SAFETY_BYTES\" MIGRATION_TARGET_PATH=\"\${MIGRATION_TARGET_PATH:-}\" $migration_command verify
   POSTGRES_URL=\"\$POSTGRES_URL\" $migration_command rebuild
-  if [[ -n '$app_command' ]]; then
+  if [ -n '$app_command' ]; then
     OCTORILL_PG_BOOTSTRAP_ONLY=1 OCTORILL_PG_TASK_CLAIM_SMOKE=1 DATABASE_URL=\"\$POSTGRES_URL\" \\
       OCTORILL_ENCRYPTION_KEY_BASE64=\"\${OCTORILL_ENCRYPTION_KEY_BASE64:?OCTORILL_ENCRYPTION_KEY_BASE64 is required for app smoke}\" \\
       GITHUB_CLIENT_ID=\"\${GITHUB_CLIENT_ID:?GITHUB_CLIENT_ID is required for app smoke}\" \\
@@ -77,7 +86,7 @@ run_vm exec -- sh -lc "
       fi
       sleep 1
     done
-    if [[ "\$app_ready" != 1 ]]; then
+    if [ "\$app_ready" != 1 ]; then
       cat /tmp/octo-rill-pg18-server.log >&2
       kill "\$app_pid" 2>/dev/null || true
       wait "\$app_pid" 2>/dev/null || true
