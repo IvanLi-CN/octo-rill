@@ -103,6 +103,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/overview", get(admin_jobs_overview))
         .route("/api/admin/dashboard", get(admin_dashboard))
+        .route("/api/admin/jobs/events", get(admin_job_events))
         .route("/api/admin/users", get(admin_users))
         .route(
             "/api/admin/users/{user_id}",
@@ -2212,6 +2213,50 @@ async fn admin_dashboard(
         }
         (Err(error), _) | (_, Err(error)) => {
             warn!(%error, "PostgreSQL admin dashboard query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_job_events(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    match sqlx::query(
+        "SELECT id, task_id, event_type, payload_json, created_at FROM public.job_task_events ORDER BY created_at DESC, id DESC LIMIT 200",
+    )
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => {
+            use sqlx::Row;
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.get::<String, _>("id"),
+                        "task_id": row.get::<String, _>("task_id"),
+                        "event_type": row.get::<String, _>("event_type"),
+                        "payload": serde_json::from_str::<serde_json::Value>(&row.get::<String, _>("payload_json")).unwrap_or(json!({})),
+                        "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                axum::Json(json!({"items": items, "source": "postgresql"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL admin task events query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
