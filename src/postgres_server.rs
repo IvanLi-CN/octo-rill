@@ -103,6 +103,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/admin/users/{user_id}",
             get(admin_user_detail).patch(admin_patch_user),
         )
+        .route(
+            "/api/admin/users/{user_id}/profile",
+            get(admin_user_profile),
+        )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
@@ -2255,6 +2259,54 @@ async fn admin_patch_user(
         Err(error) => {
             let _ = tx.rollback().await;
             warn!(%error, "PostgreSQL admin user update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_user_profile(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    match sqlx::query(
+        "SELECT id, daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at, webhook_push_enabled, webhook_push_desired_state \
+         FROM public.users WHERE id = $1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "user_id": row.get::<String, _>("id"),
+                    "daily_brief_schedule_local_time": row.get::<String, _>("daily_brief_schedule_local_time"),
+                    "daily_brief_time_zone": row.get::<Option<String>, _>("daily_brief_time_zone"),
+                    "include_own_releases": row.get::<i64, _>("include_own_releases") != 0,
+                    "last_active_at": row.get::<Option<String>, _>("last_active_at"),
+                    "webhook_push_enabled": row.get::<i64, _>("webhook_push_enabled") != 0,
+                    "webhook_push_desired_state": row.get::<String, _>("webhook_push_desired_state"),
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "user_not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL admin user profile query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
