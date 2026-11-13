@@ -99,7 +99,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/overview", get(admin_jobs_overview))
         .route("/api/admin/users", get(admin_users))
-        .route("/api/admin/users/{user_id}", get(admin_user_detail))
+        .route(
+            "/api/admin/users/{user_id}",
+            get(admin_user_detail).patch(admin_patch_user),
+        )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
@@ -2107,6 +2110,151 @@ async fn admin_user_detail(
             .into_response(),
         Err(error) => {
             warn!(%error, user_id = %user_id, "PostgreSQL admin user detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminUserPatch {
+    is_admin: Option<bool>,
+    is_disabled: Option<bool>,
+}
+
+async fn admin_patch_user(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(target_user_id): Path<String>,
+    axum::Json(patch): axum::Json<AdminUserPatch>,
+) -> impl IntoResponse {
+    let Ok(acting_user_id) = require_admin(&state, &session).await else {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"code": "admin_required"})),
+        )
+            .into_response();
+    };
+    if patch.is_admin.is_none() && patch.is_disabled.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "empty_patch"})),
+        )
+            .into_response();
+    }
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            warn!(%error, "PostgreSQL admin user patch transaction failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response();
+        }
+    };
+    let target = sqlx::query(
+        "SELECT is_admin, is_disabled, paused_at FROM public.users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(&target_user_id)
+    .fetch_optional(&mut *tx)
+    .await;
+    let Some(target) = (match target {
+        Ok(row) => row,
+        Err(error) => {
+            let _ = tx.rollback().await;
+            warn!(%error, "PostgreSQL admin user lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response();
+        }
+    }) else {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "user_not_found"})),
+        )
+            .into_response();
+    };
+    use sqlx::Row;
+    let current_admin = target.get::<i64, _>("is_admin") != 0;
+    let current_disabled = target.get::<i64, _>("is_disabled") != 0;
+    let paused = target.get::<Option<String>, _>("paused_at").is_some();
+    let next_admin = patch.is_admin.unwrap_or(current_admin);
+    let next_disabled = patch.is_disabled.unwrap_or(current_disabled);
+    let admin_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public.users WHERE is_admin = 1")
+            .fetch_one(&mut *tx)
+            .await;
+    let active_admin_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM public.users WHERE is_admin = 1 AND is_disabled = 0 AND paused_at IS NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await;
+    let (Ok(admin_count), Ok(active_admin_count)) = (admin_count, active_admin_count) else {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "database_error"})),
+        )
+            .into_response();
+    };
+    if acting_user_id == target_user_id && next_disabled {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"code": "cannot_disable_self"})),
+        )
+            .into_response();
+    }
+    if current_admin && !next_admin && admin_count <= 1
+        || current_admin
+            && !current_disabled
+            && !paused
+            && (!next_admin || next_disabled)
+            && active_admin_count <= 1
+    {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"code": "last_admin_guard"})),
+        )
+            .into_response();
+    }
+    let now = Utc::now();
+    match sqlx::query(
+        "UPDATE public.users SET is_admin = $1, is_disabled = $2, updated_at = $3 WHERE id = $4",
+    )
+    .bind(if next_admin { 1_i64 } else { 0 })
+    .bind(if next_disabled { 1_i64 } else { 0 })
+    .bind(now)
+    .bind(&target_user_id)
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(_) => match tx.commit().await {
+            Ok(()) => (
+                StatusCode::OK,
+                axum::Json(json!({"id": target_user_id, "is_admin": next_admin, "is_disabled": next_disabled})),
+            )
+                .into_response(),
+            Err(error) => {
+                warn!(%error, "PostgreSQL admin user patch commit failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "database_error"})),
+                )
+                    .into_response()
+            }
+        },
+        Err(error) => {
+            let _ = tx.rollback().await;
+            warn!(%error, "PostgreSQL admin user update failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
