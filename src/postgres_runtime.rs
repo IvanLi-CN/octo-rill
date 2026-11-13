@@ -49,6 +49,38 @@ pub async fn verify_session_store(pool: &PgPool, sample_limit: i64) -> Result<us
     Ok(rows.len())
 }
 
+/// Refuse to expose the PG service until the migration importer has created
+/// the authoritative application tables. Runtime-only bootstrap tables are
+/// intentionally excluded so `OCTORILL_PG_BOOTSTRAP_ONLY=1` remains useful.
+pub async fn verify_application_schema(pool: &PgPool) -> Result<()> {
+    let required = [
+        "users",
+        "github_connections",
+        "job_tasks",
+        "job_task_events",
+        "search_documents",
+    ];
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)",
+    )
+    .bind(&required)
+    .fetch_all(pool)
+    .await
+    .context("inspect PostgreSQL application schema")?;
+    let missing = required
+        .iter()
+        .filter(|name| !rows.iter().any(|found| found == *name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "PostgreSQL application schema is incomplete; migration import is required before service startup: missing {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for PostgresRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresRuntime")
@@ -116,5 +148,20 @@ mod tests {
         assert!(MIN_POSTGRES_VERSION_NUM >= 180_000);
         assert!(18_0000_i64 >= MIN_POSTGRES_VERSION_NUM);
         assert!(17_9999_i64 < MIN_POSTGRES_VERSION_NUM);
+    }
+
+    #[test]
+    fn application_schema_gate_requires_authoritative_tables() {
+        let source = include_str!("postgres_runtime.rs");
+        for table in [
+            "users",
+            "github_connections",
+            "job_tasks",
+            "job_task_events",
+            "search_documents",
+        ] {
+            assert!(source.contains(table));
+        }
+        assert!(source.contains("migration import is required before service startup"));
     }
 }

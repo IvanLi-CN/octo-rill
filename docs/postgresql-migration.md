@@ -58,3 +58,4 @@ bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-mi
 Agent VM 中的 PostgreSQL 18.7 bootstrap smoke 已验证独立的 `public._sqlx_migrations`、`octo_rill.schema_migrations`、`octo_rill.migration_manifests` 和 `octo_rill.tower_sessions` 均可幂等初始化。
 
 后续 Agent VM 复测还验证了自引用 `job_tasks` 表、UTC 文本到 `timestamptz` 的导入转换、连续两次 import/verify 幂等，以及真实 PG18 任务认领：`t1` 变为 `running`，写入一条 `task.running` 事件，`t2` 保持 queued。
+PG 服务绑定监听器前会检查 `users`、`github_connections`、`job_tasks`、`job_task_events` 和 `search_documents` 是否存在；缺少任一表时启动失败并要求先完成迁移导入，避免 runtime baseline 被误当成可上线数据库。

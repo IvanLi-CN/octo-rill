@@ -44,6 +44,7 @@ struct PostgresServerState {
 /// implementation; unsupported routes therefore fail closed at the boundary.
 pub async fn serve(config: AppConfig) -> Result<()> {
     let runtime = crate::postgres_runtime::connect_from_config(&config).await?;
+    crate::postgres_runtime::verify_application_schema(&runtime.pool).await?;
     let owner_id: Arc<str> = local_id::generate_local_id().into();
     postgres_runtime_owner::register(&runtime.pool, &owner_id, Utc::now()).await?;
 
