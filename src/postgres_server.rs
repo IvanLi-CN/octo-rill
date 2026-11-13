@@ -68,6 +68,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
         .route("/api/me/linuxdo", get(me_linuxdo))
+        .route("/api/me/passkeys", get(me_passkeys))
         .route("/api/me/github-connections", get(me_github_connections))
         .route(
             "/api/me/github-connections/{connection_id}",
@@ -443,6 +444,54 @@ async fn me_linuxdo(
         ),
         Err(error) => {
             warn!(%error, user_id = %user_id, "PostgreSQL LinuxDo connection lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
+}
+
+async fn me_passkeys(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match sqlx::query(
+        "SELECT id, label, created_at, last_used_at FROM public.user_passkeys \
+         WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => {
+            use sqlx::Row;
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.get::<String, _>("id"),
+                        "label": row.get::<String, _>("label"),
+                        "created_at": row.get::<String, _>("created_at"),
+                        "last_used_at": row.get::<Option<String>, _>("last_used_at"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, axum::Json(json!({"items": items})))
+        }
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL passkey lookup failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
