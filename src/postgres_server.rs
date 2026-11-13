@@ -72,7 +72,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 }
 
 async fn health(State(state): State<PostgresServerState>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.runtime.pool)
         .await
     {
