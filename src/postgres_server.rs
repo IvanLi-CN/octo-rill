@@ -98,6 +98,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::post(cancel_task),
         )
         .route("/api/admin/jobs/overview", get(admin_jobs_overview))
+        .route("/api/admin/users", get(admin_users))
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
@@ -1985,6 +1986,73 @@ async fn admin_jobs_overview(
         }
         Err(error) => {
             warn!(%error, "PostgreSQL admin job overview query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminUsersQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+async fn admin_users(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<AdminUsersQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100) as i64;
+    let page = query.page.unwrap_or(1).max(1) as i64;
+    let offset = (page - 1).saturating_mul(page_size);
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public.users")
+        .fetch_one(&state.runtime.pool)
+        .await;
+    let rows = sqlx::query(
+        "SELECT id, github_user_id, login, name, email, is_admin, is_disabled, paused_at, created_at, updated_at \
+         FROM public.users ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
+    )
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.runtime.pool)
+    .await;
+    match (total, rows) {
+        (Ok(total), Ok(rows)) => {
+            use sqlx::Row;
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.get::<String, _>("id"),
+                        "github_user_id": row.get::<Option<i64>, _>("github_user_id"),
+                        "login": row.get::<Option<String>, _>("login"),
+                        "name": row.get::<Option<String>, _>("name"),
+                        "email": row.get::<Option<String>, _>("email"),
+                        "is_admin": row.get::<i64, _>("is_admin") != 0,
+                        "is_disabled": row.get::<i64, _>("is_disabled") != 0,
+                        "paused_at": row.get::<Option<String>, _>("paused_at"),
+                        "created_at": row.get::<String, _>("created_at"),
+                        "updated_at": row.get::<String, _>("updated_at"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                axum::Json(
+                    json!({"items": items, "page": page, "page_size": page_size, "total": total}),
+                ),
+            )
+                .into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            warn!(%error, "PostgreSQL admin users query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
