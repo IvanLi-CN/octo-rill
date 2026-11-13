@@ -37,22 +37,7 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         bail!("PostgreSQL 18 is required; server_version_num={version_num}");
     }
 
-    let mut migration_tx = pool
-        .begin()
-        .await
-        .context("begin PostgreSQL runtime baseline")?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('octo-rill:runtime-baseline', 0))")
-        .execute(&mut *migration_tx)
-        .await
-        .context("lock PostgreSQL runtime baseline")?;
-    sqlx::raw_sql(include_str!("../migrations_pg/0001_runtime.sql"))
-        .execute(&mut *migration_tx)
-        .await
-        .context("apply PostgreSQL runtime baseline")?;
-    migration_tx
-        .commit()
-        .await
-        .context("commit PostgreSQL runtime baseline")?;
+    crate::postgres_database_migrations::run(&pool).await?;
 
     let sessions = session_store::postgres_session_store(pool.clone())?;
     sessions
