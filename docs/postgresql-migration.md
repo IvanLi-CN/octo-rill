@@ -35,12 +35,12 @@ cargo run --bin octo-rill
 
 ```sh
 export AGENT_VM_SESSION_ID=octo-rill-pg18
-AGENT_VM_SCRIPT=/Users/ivan/.agents/resources/skills/vendor/shared/IvanLi-CN/agent-vm/skills/agent-vm/scripts/agent_vm.ts
+AGENT_VM_SCRIPT=/Users/ivan/.agents/skills/agent-vm/scripts/agent_vm.ts
 bun "$AGENT_VM_SCRIPT" doctor
 bun "$AGENT_VM_SCRIPT" status
 bun "$AGENT_VM_SCRIPT" acquire
 bun "$AGENT_VM_SCRIPT" sync --name octo-rill-pg18-migration
-bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-migration && cargo test --bin octo-rill-migrate'
+bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-migration/src && cargo test --bin octo-rill-migrate'
 ```
 
 本次执行记录：`doctor` 返回 `maintenance_unhealthy`，`status` 返回 `effective_lease=false`，因此 VM 演练状态为 `not_run`，没有伪造通过证据。
