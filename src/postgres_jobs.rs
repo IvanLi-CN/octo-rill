@@ -52,7 +52,7 @@ pub async fn claim_next_queued_task_for_types(
     }
     let allowed_task_types = allowed_task_types.map(|types| types.to_vec());
     for attempt in 0..=MAX_TRANSACTION_RETRIES {
-        match claim_once(pool, runtime_owner_id, now, allowed_task_types.as_deref()).await {
+        match claim_once(pool, runtime_owner_id, now, allowed_task_types.as_ref()).await {
             Ok(task) => return Ok(task),
             Err(error)
                 if attempt < MAX_TRANSACTION_RETRIES
@@ -165,7 +165,7 @@ async fn claim_once(
     pool: &PgPool,
     runtime_owner_id: &str,
     now: DateTime<Utc>,
-    allowed_task_types: Option<&[String]>,
+    allowed_task_types: Option<&Vec<String>>,
 ) -> Result<Option<ClaimedTask>> {
     let mut tx = pool.begin().await.context("begin PostgreSQL task claim")?;
     let task = sqlx::query_as::<Postgres, ClaimedTask>(
