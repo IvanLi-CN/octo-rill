@@ -1,0 +1,27 @@
+# PostgreSQL 18 迁移验收证据
+
+本文记录当前分支的可复核证据，不把未执行的线上切换或未完成的业务迁移标记为通过。
+
+| 门槛 | 当前证据 | 状态 |
+| --- | --- | --- |
+| PostgreSQL 18 版本门禁 | `src/postgres_runtime.rs` 检查 `server_version_num >= 180000`；对应单元测试通过 | 已证明 |
+| 独立 SQLx migration history | `migrations_pg/` 与 `postgres_database_migrations` 测试 | 已证明 |
+| Session store | PostgreSQL `tower_sessions` store、MessagePack `bytea` 校验和 expiry 校验 | 已证明 |
+| 任务认领事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、`40001`/`40P01` 重试测试 | 已证明 |
+| SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；6 项迁移器测试通过 | 已证明 |
+| Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
+| PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务和部分管理员路由已接入 | 部分证明 |
+| 完整业务 worker | 同步和日报任务目前只入 PostgreSQL 队列，尚未由 PG-native worker 执行 | 未完成 |
+| 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
+| Agent VM 生产副本演练 | 既有脱敏夹具演练证据已记录；当前最新二进制的重复 PG18 容器演练因 VM 无缓存镜像且无法拉取未重做 | 未证明 |
+| PR 收口 | 当前分支尚未推送或创建远端 PR | 未完成 |
+
+## 可重复检查
+
+```sh
+cargo check --all-targets --locked
+cargo test --locked postgres_ -- --nocapture
+cargo test --locked --bin octo-rill-migrate -- --nocapture
+```
+
+提交前还会执行仓库现有 lefthook；Biome 当前仅报告仓库既有 schema 版本提示和两个 warning，不修改无关前端文件。
