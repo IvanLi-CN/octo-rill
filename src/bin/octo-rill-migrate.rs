@@ -182,7 +182,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         .batch_execute(concat!(
             include_str!("../../migrations_pg/0001_runtime.sql"),
             "\n",
-            include_str!("../../migrations_pg/0002_task_runtime.sql")
+            include_str!("../../migrations_pg/0002_task_runtime.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0003_runtime_owners.sql")
         ))
         .await;
     if let Err(error) = baseline_result {

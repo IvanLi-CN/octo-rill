@@ -22,6 +22,7 @@ mod passkeys;
 mod postgres_database_migrations;
 mod postgres_jobs;
 mod postgres_runtime;
+mod postgres_runtime_owner;
 mod postgres_write;
 mod public_metrics;
 mod release_links;
@@ -54,8 +55,14 @@ async fn main() -> Result<()> {
         }
         let runtime = postgres_runtime::connect_from_config(&config).await?;
         if std::env::var("OCTORILL_PG_TASK_CLAIM_SMOKE").as_deref() == Ok("1") {
+            let owner_id = "bootstrap-smoke";
+            postgres_runtime_owner::register(&runtime.pool, owner_id, chrono::Utc::now()).await?;
+            let heartbeat =
+                postgres_runtime_owner::heartbeat(&runtime.pool, owner_id, chrono::Utc::now())
+                    .await?;
+            tracing::info!(heartbeat, "PostgreSQL runtime owner lease is ready");
             let task = runtime
-                .claim_next_queued_task("bootstrap-smoke", chrono::Utc::now())
+                .claim_next_queued_task(owner_id, chrono::Utc::now())
                 .await?;
             tracing::info!(
                 claimed = task.is_some(),
