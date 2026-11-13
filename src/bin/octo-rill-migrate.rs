@@ -330,9 +330,12 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             .await?
             .get(0);
         let target_sha = checksum_postgres(pg, name).await?;
-        if source_rows != target_rows as u64
+        let append_only_event_log = name == "job_task_events";
+        if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64)
             || source_sha != table.sha256
-            || (!table.target_sha256.is_empty() && target_sha != table.target_sha256)
+            || (!append_only_event_log
+                && !table.target_sha256.is_empty()
+                && target_sha != table.target_sha256)
         {
             bail!(
                 "verification failed for {name}: source rows/hash {source_rows}/{source_sha}, target rows/hash {target_rows}/{target_sha}, manifest source/target {}/{}",
@@ -346,6 +349,18 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         expected.tables.values().filter(|t| !t.skipped).count()
     );
     Ok(())
+}
+
+fn verification_counts_match(
+    append_only_event_log: bool,
+    source_rows: u64,
+    target_rows: u64,
+) -> bool {
+    if append_only_event_log {
+        target_rows >= source_rows
+    } else {
+        source_rows == target_rows
+    }
 }
 
 async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
@@ -761,6 +776,15 @@ mod tests {
             missing_authoritative_tables(&found),
             vec!["github_connections", "job_tasks"]
         );
+    }
+
+    #[test]
+    fn append_only_event_log_accepts_runtime_rows_after_snapshot() {
+        assert!(verification_counts_match(true, 0, 2));
+        assert!(verification_counts_match(true, 4, 6));
+        assert!(!verification_counts_match(true, 4, 3));
+        assert!(!verification_counts_match(false, 4, 5));
+        assert!(verification_counts_match(false, 4, 4));
     }
 
     #[test]
