@@ -67,6 +67,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/search", get(search))
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
+        .route("/api/releases/{release_id}/detail", get(release_detail))
         .route("/api/notifications", get(list_notifications))
         .route("/api/repos/following", get(list_following_repos))
         .route(
@@ -632,6 +633,67 @@ async fn list_releases(
         Err(error) => {
             warn!(%error, "PostgreSQL releases query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
+        }
+    }
+}
+
+async fn release_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(release_id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let row = sqlx::query(
+        "SELECT r.release_id, r.repo_id, r.tag_name, r.name, r.body, r.html_url, r.published_at, r.is_prerelease, r.is_draft, r.created_at, r.updated_at, sr.full_name FROM public.repo_releases r JOIN public.user_release_visible_repos sr ON sr.user_id = $1 AND sr.repo_id = r.repo_id WHERE r.release_id = $2 LIMIT 1",
+    )
+    .bind(&user_id)
+    .bind(release_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match row {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "release_id": row.get::<i64, _>("release_id").to_string(),
+                    "repo_full_name": row.get::<String, _>("full_name"),
+                    "tag_name": row.get::<String, _>("tag_name"),
+                    "name": row.get::<Option<String>, _>("name"),
+                    "body": row.get::<Option<String>, _>("body"),
+                    "html_url": row.get::<String, _>("html_url"),
+                    "published_at": row.get::<Option<String>, _>("published_at"),
+                    "is_prerelease": row.get::<i64, _>("is_prerelease") != 0,
+                    "is_draft": row.get::<i64, _>("is_draft") != 0,
+                    "translated": null,
+                    "smart": null
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL release detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
         }
     }
 }
