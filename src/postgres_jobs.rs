@@ -1,0 +1,148 @@
+//! PostgreSQL task coordination primitives.
+//!
+//! This module is deliberately independent from the legacy SQLite worker. It
+//! provides the transaction boundary that the PostgreSQL application runtime
+//! will use while the remaining request handlers are being moved over.
+
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sqlx::{FromRow, PgPool, Postgres};
+use tokio::time::{Duration, sleep};
+
+const MAX_TRANSACTION_RETRIES: usize = 3;
+
+#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+pub struct ClaimedTask {
+    pub id: String,
+    pub task_type: String,
+    pub source: String,
+    pub requested_by: Option<String>,
+    pub payload_json: String,
+    pub cancel_requested: i64,
+}
+
+/// Claim one eligible queued task atomically.
+///
+/// The complete select/update/event sequence runs in one transaction. Row
+/// locks are skipped so concurrent workers do not wait behind a task another
+/// worker is already claiming. Serialization failures and deadlocks retry the
+/// whole transaction, never an individual statement.
+pub async fn claim_next_queued_task(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ClaimedTask>> {
+    for attempt in 0..=MAX_TRANSACTION_RETRIES {
+        match claim_once(pool, runtime_owner_id, now).await {
+            Ok(task) => return Ok(task),
+            Err(error)
+                if attempt < MAX_TRANSACTION_RETRIES
+                    && error
+                        .downcast_ref::<sqlx::Error>()
+                        .is_some_and(is_retryable_sqlx_error) =>
+            {
+                sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow!("PostgreSQL task claim retry loop exhausted"))
+}
+
+async fn claim_once(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ClaimedTask>> {
+    let mut tx = pool.begin().await.context("begin PostgreSQL task claim")?;
+    let task = sqlx::query_as::<Postgres, ClaimedTask>(
+        r#"
+        SELECT id, task_type, source, requested_by, payload_json, cancel_requested
+        FROM job_tasks AS candidate
+        WHERE candidate.status = 'queued'
+          AND (candidate.available_at IS NULL OR candidate.available_at <= $1)
+          AND (
+            candidate.task_type NOT IN ('sync.subscriptions', 'retry.recent_failures')
+            OR NOT EXISTS (
+              SELECT 1
+              FROM job_tasks AS running
+              WHERE running.task_type = candidate.task_type
+                AND running.status = 'running'
+            )
+          )
+        ORDER BY candidate.created_at ASC, candidate.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        "#,
+    )
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("select PostgreSQL queued task")?;
+
+    let Some(task) = task else {
+        tx.commit().await.context("commit empty PostgreSQL claim")?;
+        return Ok(None);
+    };
+
+    let claimed = sqlx::query_as::<Postgres, ClaimedTask>(
+        r#"
+        UPDATE job_tasks
+        SET status = 'running',
+            started_at = $1,
+            runtime_owner_id = $2,
+            lease_heartbeat_at = $1,
+            updated_at = $1
+        WHERE id = $3 AND status = 'queued'
+        RETURNING id, task_type, source, requested_by, payload_json, cancel_requested
+        "#,
+    )
+    .bind(now)
+    .bind(runtime_owner_id)
+    .bind(&task.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("claim PostgreSQL queued task")?;
+
+    let Some(claimed) = claimed else {
+        tx.commit().await.context("commit lost PostgreSQL claim")?;
+        return Ok(None);
+    };
+
+    let event_payload = serde_json::json!({
+        "task_id": claimed.id,
+        "status": "running",
+    });
+    sqlx::query(
+        r#"
+        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+        VALUES ($1, $2, 'task.running', $3, $4)
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(&claimed.id)
+    .bind(serde_json::to_string(&event_payload).context("serialize task event")?)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("record PostgreSQL task claim event")?;
+
+    tx.commit().await.context("commit PostgreSQL task claim")?;
+    Ok(Some(claimed))
+}
+
+fn is_retryable_sqlx_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().is_some_and(|code| code == "40001" || code == "40P01"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn claim_contract_uses_skip_locked_and_returning() {
+        let source = include_str!("postgres_jobs.rs");
+        assert!(source.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(source.contains("RETURNING id, task_type"));
+        assert!(source.contains("40001") && source.contains("40P01"));
+    }
+}

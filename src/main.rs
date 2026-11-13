@@ -20,6 +20,7 @@ mod observability;
 mod online_migrations;
 mod passkeys;
 mod postgres_database_migrations;
+mod postgres_jobs;
 mod postgres_runtime;
 mod postgres_write;
 mod public_metrics;
@@ -52,6 +53,15 @@ async fn main() -> Result<()> {
             anyhow::bail!("OCTORILL_PG_BOOTSTRAP_ONLY requires a postgres DATABASE_URL");
         }
         let runtime = postgres_runtime::connect_from_config(&config).await?;
+        if std::env::var("OCTORILL_PG_TASK_CLAIM_SMOKE").as_deref() == Ok("1") {
+            let task = runtime
+                .claim_next_queued_task("bootstrap-smoke", chrono::Utc::now())
+                .await?;
+            tracing::info!(
+                claimed = task.is_some(),
+                "PostgreSQL task claim contract is ready"
+            );
+        }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
         return Ok(());

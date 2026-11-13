@@ -4,6 +4,8 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_sessions_sqlx_store::PostgresStore;
 
 use crate::config::AppConfig;
+use crate::postgres_jobs::ClaimedTask;
+use chrono::{DateTime, Utc};
 
 const MIN_POSTGRES_VERSION_NUM: i64 = 180_000;
 
@@ -21,6 +23,17 @@ impl std::fmt::Debug for PostgresRuntime {
             .field("pool", &"<postgres pool>")
             .field("sessions", &self.sessions)
             .finish()
+    }
+}
+
+impl PostgresRuntime {
+    /// Claim a queued task using the PostgreSQL worker transaction contract.
+    pub async fn claim_next_queued_task(
+        &self,
+        runtime_owner_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ClaimedTask>> {
+        crate::postgres_jobs::claim_next_queued_task(&self.pool, runtime_owner_id, now).await
     }
 }
 

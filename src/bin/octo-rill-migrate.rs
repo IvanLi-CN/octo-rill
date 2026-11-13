@@ -5,6 +5,7 @@
 //! SQLite source and can be rerun against an isolated PostgreSQL database.
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -86,6 +87,7 @@ struct TableManifest {
 enum Cell {
     Null,
     Text(String),
+    Timestamp(Option<DateTime<Utc>>),
     Integer(i64),
     Real(f64),
     Blob(Vec<u8>),
@@ -177,7 +179,11 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     .await
     .context("acquire PostgreSQL migration lock")?;
     let baseline_result = pg
-        .batch_execute(include_str!("../../migrations_pg/0001_runtime.sql"))
+        .batch_execute(concat!(
+            include_str!("../../migrations_pg/0001_runtime.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0002_task_runtime.sql")
+        ))
         .await;
     if let Err(error) = baseline_result {
         let _ = pg.batch_execute("ROLLBACK; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));").await;
@@ -222,7 +228,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let columns = column_names(sqlite, &name).await?;
         if let Some(ddl) = ddl {
             let translated = translate_ddl(&ddl, &name)?;
-            let dependencies = referenced_tables(&ddl);
+            let dependencies = referenced_tables(&name, &ddl);
             tables.push((name, columns, translated, dependencies));
         } else {
             tables.push((name, columns, String::new(), Vec::new()));
@@ -267,6 +273,13 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     tokio::fs::write(&args.manifest, serde_json::to_vec_pretty(&manifest)?)
         .await
         .with_context(|| format!("write manifest {}", args.manifest.display()))?;
+    let manifest_json = serde_json::to_value(&manifest).context("serialize migration manifest")?;
+    pg.execute(
+        "INSERT INTO octo_rill.migration_manifests (source_snapshot, manifest) VALUES ($1, $2)",
+        &[&args.sqlite_source, &manifest_json],
+    )
+    .await
+    .context("persist migration manifest")?;
     println!("import complete: {}", args.manifest.display());
     Ok(())
 }
@@ -278,7 +291,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let (source_rows, source_sha) = checksum_sqlite(sqlite, name, &columns).await?;
         let target_rows: i64 = pg
             .query_one(
-                &format!("SELECT count(*) FROM octo_rill.{}", quote_ident(name)),
+                &format!("SELECT count(*) FROM public.{}", quote_ident(name)),
                 &[],
             )
             .await?
@@ -304,7 +317,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 
 async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
     let query = format!(
-        "SELECT row_to_json(row)::text FROM (SELECT * FROM octo_rill.{} ORDER BY ctid) AS row",
+        "SELECT row_to_json(row)::text FROM (SELECT * FROM public.{} ORDER BY ctid) AS row",
         quote_ident(table)
     );
     let rows = pg.query(&query, &[]).await?;
@@ -335,6 +348,7 @@ async fn copy_table(
     columns: &[String],
     batch_size: usize,
 ) -> Result<(u64, String)> {
+    let target_types = target_column_types(pg, table, columns).await?;
     let mut offset = 0i64;
     let mut total = 0u64;
     let mut hasher = Sha256::new();
@@ -356,11 +370,18 @@ async fn copy_table(
             let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
             hasher.update(&encoded);
             let placeholders = (1..=columns.len())
-                .map(|i| format!("${i}"))
+                .zip(target_types.iter())
+                .map(|(i, target_type)| {
+                    if target_type.as_deref() == Some("timestamp with time zone") {
+                        format!("${i}::timestamptz")
+                    } else {
+                        format!("${i}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "INSERT INTO octo_rill.{} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+                "INSERT INTO public.{} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
                 quote_ident(table),
                 columns
                     .iter()
@@ -369,7 +390,17 @@ async fn copy_table(
                     .join(","),
                 placeholders
             );
-            let params = cells.iter().map(to_pg_param).collect::<Vec<_>>();
+            let params = cells
+                .iter()
+                .zip(target_types.iter())
+                .map(|(cell, target_type)| -> Result<Box<dyn ToSql + Sync>> {
+                    if target_type.as_deref() == Some("timestamp with time zone") {
+                        Ok(to_pg_param(&cell_as_timestamp(cell)?))
+                    } else {
+                        Ok(to_pg_param(cell))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
             let refs = params
                 .iter()
                 .map(|p| p.as_ref() as &(dyn ToSql + Sync))
@@ -382,6 +413,28 @@ async fn copy_table(
         offset += batch_size as i64;
     }
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+async fn target_column_types(
+    pg: &Client,
+    table: &str,
+    columns: &[String],
+) -> Result<Vec<Option<String>>> {
+    let rows = pg
+        .query(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+            &[&table],
+        )
+        .await
+        .with_context(|| format!("inspect PostgreSQL target columns for {table}"))?;
+    let types = rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(columns
+        .iter()
+        .map(|column| types.get(column).cloned())
+        .collect())
 }
 
 async fn execute_with_retry(pg: &Client, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
@@ -470,15 +523,30 @@ fn cell_debug(cell: &Cell) -> serde_json::Value {
     match cell {
         Cell::Null => serde_json::Value::Null,
         Cell::Text(v) => serde_json::json!({"t":v}),
+        Cell::Timestamp(v) => serde_json::json!({"t":v.map(|value| value.to_rfc3339())}),
         Cell::Integer(v) => serde_json::json!({"i":v}),
         Cell::Real(v) => serde_json::json!({"r":v}),
         Cell::Blob(v) => serde_json::json!({"b":hex::encode(v)}),
     }
 }
+
+fn cell_as_timestamp(cell: &Cell) -> Result<Cell> {
+    match cell {
+        Cell::Null => Ok(Cell::Timestamp(None)),
+        Cell::Text(value) => Ok(Cell::Timestamp(Some(
+            DateTime::parse_from_rfc3339(value)
+                .with_context(|| format!("parse UTC timestamp {value:?}"))?
+                .with_timezone(&Utc),
+        ))),
+        other => Ok(other.clone()),
+    }
+}
+
 fn to_pg_param(cell: &Cell) -> Box<dyn ToSql + Sync> {
     match cell {
         Cell::Null => Box::new(None::<String>),
         Cell::Text(v) => Box::new(v.clone()),
+        Cell::Timestamp(v) => Box::new(*v),
         Cell::Integer(v) => Box::new(*v),
         Cell::Real(v) => Box::new(*v),
         Cell::Blob(v) => Box::new(v.clone()),
@@ -508,7 +576,7 @@ fn fts_shadow_table_names(rows: &[sqlx::sqlite::SqliteRow]) -> Result<HashSet<St
     Ok(names)
 }
 
-fn referenced_tables(ddl: &str) -> Vec<String> {
+fn referenced_tables(table_name: &str, ddl: &str) -> Vec<String> {
     let tokens = ddl.split_whitespace().collect::<Vec<_>>();
     let mut references = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -526,7 +594,7 @@ fn referenced_tables(ddl: &str) -> Vec<String> {
                 character == '"' || character == '`' || character == '[' || character == ']'
             })
             .to_owned();
-        if !name.is_empty() {
+        if !name.is_empty() && !name.eq_ignore_ascii_case(table_name) {
             references.push(name);
         }
     }
@@ -609,7 +677,10 @@ fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
     if sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE") {
         bail!("virtual table {table} must be rebuilt as a PostgreSQL projection");
     }
-    Ok(format!("SET search_path TO octo_rill, public; {sql};"))
+    // Application queries use PostgreSQL's public schema. The control tables
+    // remain in octo_rill, so every generated DDL explicitly puts public
+    // first while retaining the control schema as a fallback.
+    Ok(format!("SET search_path TO public, octo_rill; {sql};"))
 }
 
 #[cfg(test)]
@@ -664,6 +735,17 @@ mod tests {
         let ordered = order_tables_by_dependencies(tables).unwrap();
         assert_eq!(ordered[0].0, "users");
         assert_eq!(ordered[1].0, "notes");
+    }
+
+    #[test]
+    fn self_referencing_foreign_keys_do_not_form_a_dependency_cycle() {
+        assert!(
+            referenced_tables(
+                "job_tasks",
+                "FOREIGN KEY(parent_task_id) REFERENCES job_tasks(id)"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
