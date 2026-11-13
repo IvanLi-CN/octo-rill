@@ -24,7 +24,7 @@ PostgreSQL runtime 本身可用以下入口做无业务写入 smoke check：
 
 ```sh
 OCTORILL_PG_BOOTSTRAP_ONLY=1 \
-OCTORILL_PG_POOL_MAX_CONNECTIONS=8 \
+OCTORILL_DB_POOL_MAX_CONNECTIONS=8 \
 DATABASE_URL=postgres://user:password@127.0.0.1:5432/octo_rill \
 cargo run --bin octo-rill
 ```
