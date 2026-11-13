@@ -202,6 +202,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     let table_rows = sqlx::query("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .fetch_all(sqlite).await?;
     let fts_names = fts_shadow_table_names(&table_rows)?;
+    let mut tables = Vec::new();
     for table in table_rows {
         let name: String = table.try_get("name")?;
         let ddl: Option<String> = table.try_get("sql")?;
@@ -225,6 +226,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 .await
                 .with_context(|| format!("create target table {name}"))?;
         }
+        tables.push((name, columns));
+    }
+    for (name, columns) in tables {
         let (rows, sha) = copy_table(sqlite, pg, &name, &columns, args.batch_size).await?;
         let target_sha = checksum_postgres(pg, &name).await?;
         manifest.tables.insert(
