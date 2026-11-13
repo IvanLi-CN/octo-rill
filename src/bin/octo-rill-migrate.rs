@@ -296,7 +296,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 
 async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
     let query = format!(
-        "SELECT row_to_json(row)::text FROM (SELECT * FROM octo_rill.{}) AS row ORDER BY ctid",
+        "SELECT row_to_json(row)::text FROM (SELECT * FROM octo_rill.{} ORDER BY ctid) AS row",
         quote_ident(table)
     );
     let rows = pg.query(&query, &[]).await?;
