@@ -8,7 +8,7 @@
 | Rust 全量回归 | `cargo test --locked --quiet`：主二进制 1249 passed、3 ignored；迁移器 7 passed | 已证明 |
 | 独立 SQLx migration history | `migrations_pg/` 与 `postgres_database_migrations` 测试 | 已证明 |
 | Session store | PostgreSQL `tower_sessions` store、MessagePack `bytea` 校验和 expiry 校验 | 已证明 |
-| 任务认领事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、`40001`/`40P01` 重试测试 | 已证明 |
+| 任务认领与终结事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、owner lease 校验的终结更新、`task.running`/`task.completed` 事件和 `40001`/`40P01` 重试测试 | 已证明 |
 | SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；7 项迁移器测试通过，并在导入前检查 `users`、`github_connections`、`job_tasks` 核心权威表 | 已证明 |
 | Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
 | PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务、webhook 设置和部分管理员路由（包括 dashboard 汇总、任务事件、用户列表、用户详情、profile 读取与受保护的用户状态更新）已接入 | 部分证明 |
