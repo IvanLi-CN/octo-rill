@@ -74,6 +74,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::put(follow_repo).delete(unfollow_repo),
         )
         .route("/api/tasks/{task_id}/events", get(task_events))
+        .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
@@ -834,6 +835,31 @@ async fn list_following_repos(
             json!({"following_count": items.len(), "associated_count": associated_items.len(), "items": items, "associated_items": associated_items}),
         ),
     )
+}
+
+async fn public_metrics(State(state): State<PostgresServerState>) -> impl IntoResponse {
+    let repositories = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT repo_full_name) FROM public.search_documents WHERE repo_full_name IS NOT NULL",
+    )
+    .fetch_one(&state.runtime.pool)
+    .await;
+    match repositories {
+        Ok(value) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "deduplicatedRepositories": {"value": value, "trend": []},
+                "pressure": {"value": 0.0, "trend": []},
+                "freshness": []
+            })),
+        ),
+        Err(error) => {
+            warn!(%error, "PostgreSQL public metrics query failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": "metrics_unavailable"})),
+            )
+        }
+    }
 }
 
 async fn follow_repo(
