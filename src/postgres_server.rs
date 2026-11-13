@@ -62,7 +62,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/api/me", get(me))
+        .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/search", get(search))
+        .route("/api/starred", get(list_starred))
+        .route("/api/releases", get(list_releases))
+        .route("/api/notifications", get(list_notifications))
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
@@ -416,6 +420,236 @@ async fn me(State(state): State<PostgresServerState>, session: Session) -> impl 
             "dashboard": {"daily_boundary_local": "00:00", "daily_boundary_time_zone": null, "daily_boundary_utc_offset_minutes": 0, "include_own_releases": row.include_own_releases != 0}
         })),
     )
+}
+
+async fn me_resume(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let now = Utc::now();
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            warn!(%error, "PostgreSQL account resume transaction failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    };
+    let disabled = sqlx::query_scalar::<_, i64>(
+        "SELECT is_disabled FROM public.users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await;
+    let Some(disabled) = (match disabled {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "PostgreSQL account resume lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    }) else {
+        let _ = tx.rollback().await;
+        let _ = session.clear().await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "session user not found"})),
+        );
+    };
+    if disabled != 0 {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"code": "account_disabled"})),
+        );
+    }
+    if let Err(error) = sqlx::query(
+        "UPDATE public.users SET paused_at = NULL, last_active_at = $1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await
+    {
+        warn!(%error, "PostgreSQL account resume update failed");
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "database_error"})),
+        );
+    }
+    let task_id = local_id::generate_local_id();
+    let payload = json!({"user_id": user_id});
+    if let Err(error) = sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'sync.access_refresh', 'queued', 'api.me_resume', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(payload.to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    {
+        warn!(%error, "PostgreSQL account resume task enqueue failed");
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "database_error"})),
+        );
+    }
+    if let Err(error) = tx.commit().await {
+        warn!(%error, "PostgreSQL account resume transaction commit failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "database_error"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "status": "enabled",
+            "access_sync": {"task_id": task_id, "task_type": "sync.access_refresh", "event_path": null, "reason": "account_resumed"},
+            "sync_enqueue_error": null
+        })),
+    )
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+struct PgStarredRepoItem {
+    repo_id: i64,
+    full_name: String,
+    description: Option<String>,
+    html_url: String,
+    stargazed_at: Option<String>,
+    is_private: i64,
+}
+
+async fn list_starred(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match sqlx::query_as::<_, PgStarredRepoItem>(
+        "SELECT repo_id, full_name, description, html_url, stargazed_at, is_private FROM public.starred_repos WHERE user_id = $1 ORDER BY stargazed_at DESC LIMIT 2000",
+    )
+    .bind(user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(items) => (StatusCode::OK, axum::Json(json!(items))),
+        Err(error) => {
+            warn!(%error, "PostgreSQL starred repositories query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
+        }
+    }
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+struct PgReleaseItem {
+    full_name: String,
+    tag_name: String,
+    name: Option<String>,
+    published_at: Option<String>,
+    html_url: String,
+    is_prerelease: i64,
+    is_draft: i64,
+}
+
+async fn list_releases(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match sqlx::query_as::<_, PgReleaseItem>(
+        "SELECT sr.full_name, r.tag_name, r.name, r.published_at, r.html_url, r.is_prerelease, r.is_draft FROM public.repo_releases r JOIN public.user_release_visible_repos sr ON sr.user_id = $1 AND sr.repo_id = r.repo_id ORDER BY COALESCE(r.published_at, r.created_at) DESC LIMIT 200",
+    )
+    .bind(user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(items) => (StatusCode::OK, axum::Json(json!(items))),
+        Err(error) => {
+            warn!(%error, "PostgreSQL releases query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
+        }
+    }
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+struct PgNotificationItem {
+    thread_id: String,
+    repo_full_name: Option<String>,
+    subject_title: Option<String>,
+    subject_type: Option<String>,
+    reason: Option<String>,
+    updated_at: Option<String>,
+    unread: i64,
+    html_url: Option<String>,
+}
+
+async fn list_notifications(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match sqlx::query_as::<_, PgNotificationItem>(
+        "SELECT thread_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, html_url FROM public.notifications WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200",
+    )
+    .bind(user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(items) => (StatusCode::OK, axum::Json(json!(items))),
+        Err(error) => {
+            warn!(%error, "PostgreSQL notifications query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
