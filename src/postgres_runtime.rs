@@ -1,3 +1,4 @@
+use crate::session_store;
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_sessions_sqlx_store::PostgresStore;
@@ -53,11 +54,7 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         .await
         .context("commit PostgreSQL runtime baseline")?;
 
-    let sessions = PostgresStore::new(pool.clone())
-        .with_schema_name("octo_rill")
-        .map_err(|error| anyhow::anyhow!("configure PostgreSQL session schema: {error}"))?
-        .with_table_name("tower_sessions")
-        .map_err(|error| anyhow::anyhow!("configure PostgreSQL session table: {error}"))?;
+    let sessions = session_store::postgres_session_store(pool.clone())?;
     sessions
         .migrate()
         .await
