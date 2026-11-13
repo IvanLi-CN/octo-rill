@@ -69,6 +69,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me/personal-repos", get(personal_repos))
         .route("/api/me/linuxdo", get(me_linuxdo))
         .route("/api/me/passkeys", get(me_passkeys))
+        .route(
+            "/api/me/webhook-push",
+            get(webhook_push_settings).patch(patch_webhook_push_settings),
+        )
         .route("/api/me/github-connections", get(me_github_connections))
         .route(
             "/api/me/github-connections/{connection_id}",
@@ -505,6 +509,174 @@ async fn me_passkeys(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
             )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookPushPatch {
+    desired_state: Option<String>,
+}
+
+async fn webhook_push_settings(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query(
+        "SELECT include_own_releases, webhook_push_enabled, webhook_push_desired_state, webhook_push_last_completed_check_at \
+         FROM public.users WHERE id = $1 AND is_disabled = 0",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "desired_state": row.get::<String, _>("webhook_push_desired_state"),
+                    "enabled": row.get::<i64, _>("webhook_push_enabled") != 0,
+                    "include_own_releases": row.get::<i64, _>("include_own_releases") != 0,
+                    "callback_ready": false,
+                    "last_completed_check_at": row.get::<Option<String>, _>("webhook_push_last_completed_check_at"),
+                    "summary": {"total": 0, "registered": 0, "missing": 0, "errors": 0, "pending": 0},
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "user_not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL webhook settings query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn patch_webhook_push_settings(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    axum::Json(patch): axum::Json<WebhookPushPatch>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let Some(desired_state) = patch
+        .desired_state
+        .filter(|value| matches!(value.as_str(), "enabled" | "paused" | "deleted"))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "invalid_desired_state"})),
+        )
+            .into_response();
+    };
+    let now = Utc::now();
+    let task_id = local_id::generate_local_id();
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            warn!(%error, "PostgreSQL webhook settings transaction failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response();
+        }
+    };
+    let updated = sqlx::query(
+        "UPDATE public.users SET webhook_push_desired_state = $1, webhook_push_enabled = $2, updated_at = $3 WHERE id = $4 AND is_disabled = 0 AND paused_at IS NULL",
+    )
+    .bind(&desired_state)
+    .bind(if desired_state == "enabled" { 1_i64 } else { 0_i64 })
+    .bind(now)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 1 => {
+            let payload = json!({"user_id": user_id, "desired_state": desired_state});
+            let queued = sqlx::query(
+                "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'webhook.push.reconcile', 'queued', 'api.webhook_push', $2, $3, $4, $4)",
+            )
+            .bind(&task_id)
+            .bind(&user_id)
+            .bind(payload.to_string())
+            .bind(now)
+            .execute(&mut *tx)
+            .await;
+            match queued {
+                Ok(_) => match tx.commit().await {
+                    Ok(()) => (
+                        StatusCode::ACCEPTED,
+                        axum::Json(json!({"desired_state": desired_state, "task_id": task_id, "status": "queued"})),
+                    )
+                        .into_response(),
+                    Err(error) => {
+                        warn!(%error, "PostgreSQL webhook settings commit failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"code": "database_error"})),
+                        )
+                            .into_response()
+                    }
+                },
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    warn!(%error, "PostgreSQL webhook reconcile enqueue failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"code": "database_error"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"code": "user_not_found_or_inactive"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            warn!(%error, "PostgreSQL webhook settings update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
         }
     }
 }
