@@ -698,6 +698,7 @@ mod tests {
         assert!(ddl.contains("BYTEA"));
         assert!(!ddl.contains("AUTOINCREMENT"));
         assert!(!ddl.contains("COLLATE NOCASE"));
+        assert!(ddl.contains("SET search_path TO public, octo_rill"));
     }
 
     #[test]
