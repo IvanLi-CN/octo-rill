@@ -91,30 +91,35 @@ impl TaskExecutor for NotificationsExecutor {
                     &connection.access_token_nonce,
                 )
                 .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
-            let response = self
-                .http
-                .get(format!(
-                    "{GITHUB_API}/notifications?all=true&per_page=50&page=1"
-                ))
-                .bearer_auth(token)
-                .header(reqwest::header::USER_AGENT, "OctoRill")
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await
-                .context("fetch GitHub notifications")?;
-            let status = response.status();
-            if !status.is_success() {
-                bail!("GitHub notifications returned HTTP {status}");
+            for page in 1..=20 {
+                let response = self
+                    .http
+                    .get(format!(
+                        "{GITHUB_API}/notifications?all=true&per_page=50&page={page}"
+                    ))
+                    .bearer_auth(&token)
+                    .header(reqwest::header::USER_AGENT, "OctoRill")
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .send()
+                    .await
+                    .context("fetch GitHub notifications")?;
+                let status = response.status();
+                if !status.is_success() {
+                    bail!("GitHub notifications returned HTTP {status}");
+                }
+                let notifications = response
+                    .json::<Vec<Value>>()
+                    .await
+                    .context("decode GitHub notifications")?;
+                for notification in &notifications {
+                    upsert_notification(&self.pool, &user_id, notification).await?;
+                }
+                total += notifications.len();
+                if notifications.len() < 50 {
+                    break;
+                }
             }
-            let notifications = response
-                .json::<Vec<Value>>()
-                .await
-                .context("decode GitHub notifications")?;
-            for notification in &notifications {
-                upsert_notification(&self.pool, &user_id, notification).await?;
-            }
-            total += notifications.len();
         }
         Ok(json!({"notifications": total, "user_id": user_id}).to_string())
     }
@@ -150,44 +155,51 @@ impl TaskExecutor for ReleasesExecutor {
         if connections.is_empty() {
             bail!("sync.releases has no GitHub connection for user {user_id}");
         }
-        let token = self
-            .encryption_key
-            .decrypt_str(
-                &connections[0].access_token_ciphertext,
-                &connections[0].access_token_nonce,
-            )
-            .with_context(|| format!("decrypt GitHub connection {}", connections[0].id))?;
         let now = Utc::now().to_rfc3339();
         let mut total = 0usize;
-        for repo in &repos {
-            let response = self
-                .http
-                .get(format!(
-                    "{GITHUB_API}/repos/{}/releases?per_page=50&page=1",
-                    repo.full_name
-                ))
-                .bearer_auth(&token)
-                .header(reqwest::header::USER_AGENT, "OctoRill")
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await
-                .context("fetch GitHub releases")?;
-            let status = response.status();
-            if !status.is_success() {
-                bail!(
-                    "GitHub releases returned HTTP {status} for {}",
-                    repo.full_name
-                );
+        for connection in connections {
+            let token = self
+                .encryption_key
+                .decrypt_str(
+                    &connection.access_token_ciphertext,
+                    &connection.access_token_nonce,
+                )
+                .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
+            for repo in &repos {
+                for page in 1..=20 {
+                    let response = self
+                        .http
+                        .get(format!(
+                            "{GITHUB_API}/repos/{}/releases?per_page=50&page={page}",
+                            repo.full_name
+                        ))
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, "OctoRill")
+                        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                        .send()
+                        .await
+                        .context("fetch GitHub releases")?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        bail!(
+                            "GitHub releases returned HTTP {status} for {}",
+                            repo.full_name
+                        );
+                    }
+                    let releases = response
+                        .json::<Vec<Value>>()
+                        .await
+                        .context("decode GitHub releases")?;
+                    for release in &releases {
+                        upsert_release(&self.pool, &user_id, repo, release, &now).await?;
+                    }
+                    total += releases.len();
+                    if releases.len() < 50 {
+                        break;
+                    }
+                }
             }
-            let releases = response
-                .json::<Vec<Value>>()
-                .await
-                .context("decode GitHub releases")?;
-            for release in &releases {
-                upsert_release(&self.pool, &user_id, repo, release, &now).await?;
-            }
-            total += releases.len();
         }
         Ok(json!({"releases": total, "repositories": repos.len(), "user_id": user_id}).to_string())
     }
@@ -289,6 +301,7 @@ mod tests {
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
         assert!(source.contains("decrypt_str"));
         assert!(source.contains("requested_by"));
+        assert!(source.contains("page in 1..=20"));
     }
 
     #[test]
