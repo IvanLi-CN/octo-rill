@@ -4,9 +4,9 @@
 
 迁移器分为 `preflight`、`import`、`verify` 和 `rebuild` 四个命令。`preflight` 以 SQLite 有效页大小扣除 freelist 后的估算值乘以 2，再加安全余量作为目标空间门槛，并读取 PostgreSQL `data_directory` 所在文件系统的可用空间；空间不足会在写入前失败。迁移容器与 PostgreSQL 分离时，通过 `MIGRATION_TARGET_PATH` 指向共享数据卷的可见路径，Compose 已将该路径设置为 `/var/lib/postgresql`。该门槛是动态的，不要求固定磁盘容量。
 
-SQLite FTS5 内部表被记录为可重建投影并跳过导入。`rebuild` 负责启用 `pg_trgm`，应用专用的全文检索配置和 GIN/trigram 索引应由 PostgreSQL 迁移定义创建。FTS 排名不属于权威数据一致性条件。
+SQLite FTS5 内部表被记录为可重建投影并跳过导入。PostgreSQL baseline 创建 `public.search_documents` 和用户 lane 投影，使用 `octo_rill_simple`、生成的 `tsvector`、GIN 与 trigram 索引；`rebuild` 会分析并重建这些索引。FTS 排名不属于权威数据一致性条件。
 
-长期运行时的连接池和 Session 初始化位于 `src/postgres_runtime.rs`：它强制 PostgreSQL 18 版本门禁，执行独立 baseline，并使用 MessagePack `bytea` 的 PostgreSQL session store。业务模块仍需逐步把现有 SQLite 查询和写入协调器切换到该 runtime。
+长期运行时的连接池和 Session 初始化位于 `src/postgres_runtime.rs`：它强制 PostgreSQL 18 版本门禁，执行独立 baseline，校验最多 256 条持久 session 的 MessagePack `bytea` 和 expiry，并使用 PostgreSQL session store。业务模块仍需逐步把现有 SQLite 查询和写入协调器切换到该 runtime。
 
 任务协调的 PostgreSQL 垂直切片位于 `src/postgres_jobs.rs`。它使用稳定的 `created_at, id` 排序、`FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING` 和 `40001`/`40P01` 全事务重试；`src/postgres_runtime_owner.rs` 同时提供 runtime owner 的注册和心跳持久化。`OCTORILL_PG_TASK_CLAIM_SMOKE=1` 可在 bootstrap smoke 中实际写入 owner lease、认领一个 queued 任务并写入 `task.running` 事件。
 
