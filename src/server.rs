@@ -77,6 +77,11 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
 ];
 
 pub async fn serve(config: AppConfig) -> Result<()> {
+    if config.database_backend()? == crate::config::DatabaseBackend::Postgres {
+        anyhow::bail!(
+            "PostgreSQL DATABASE_URL requires the PostgreSQL application runtime; refusing to start the SQLite-only service"
+        );
+    }
     observability::set_logging_thresholds(config.logging.clone());
     let metrics_config = crate::metrics::MetricsConfig::from_env()?;
     let metrics = crate::metrics::install_global(Arc::new(crate::metrics::Metrics::new()));
