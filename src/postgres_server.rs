@@ -77,6 +77,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/me/webhook-push",
             get(webhook_push_settings).patch(patch_webhook_push_settings),
         )
+        .route(
+            "/api/me/webhook-push/reconcile",
+            axum::routing::post(reconcile_webhook_push),
+        )
         .route("/api/me/github-connections", get(me_github_connections))
         .route(
             "/api/me/github-connections/{connection_id}",
@@ -658,6 +662,104 @@ async fn delete_passkey(
 #[derive(Debug, Deserialize)]
 struct WebhookPushPatch {
     desired_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookReconcileRequest {
+    repo_id: Option<i64>,
+}
+
+async fn reconcile_webhook_push(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    request: Option<axum::Json<WebhookReconcileRequest>>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let config = sqlx::query(
+        "SELECT include_own_releases, webhook_push_desired_state FROM public.users WHERE id = $1 AND is_disabled = 0",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    let Some(config) = (match config {
+        Ok(config) => config,
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL webhook reconcile config lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response();
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "user_not_found"})),
+        )
+            .into_response();
+    };
+    use sqlx::Row;
+    let include_own_releases = config.get::<i64, _>("include_own_releases") != 0;
+    let desired_state = config.get::<String, _>("webhook_push_desired_state");
+    if !include_own_releases && desired_state == "enabled" {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "code": "my_releases_disabled",
+                "message": "请先开启“我的发布”。"
+            })),
+        )
+            .into_response();
+    }
+    let task_id = local_id::generate_local_id();
+    let now = Utc::now();
+    let repo_id = request.and_then(|body| body.repo_id);
+    let payload = json!({
+        "user_id": user_id,
+        "operation": "reconcile",
+        "repo_id": repo_id,
+        "trigger": "manual"
+    });
+    match sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'webhook.push.manage', 'queued', 'webhook_push', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(payload.to_string())
+    .bind(now)
+    .execute(&state.runtime.pool)
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({
+                "mode": "task_id",
+                "task_id": task_id,
+                "task_type": "webhook.push.manage",
+                "status": "queued"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL webhook reconcile enqueue failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn webhook_push_settings(
