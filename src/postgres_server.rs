@@ -68,6 +68,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
         .route("/api/me/github-connections", get(me_github_connections))
+        .route(
+            "/api/me/github-connections/{connection_id}",
+            axum::routing::delete(delete_github_connection),
+        )
         .route("/api/me/profile", get(me_profile).patch(update_me_profile))
         .route("/api/me/api-keys", get(list_api_keys).post(create_api_key))
         .route(
@@ -450,6 +454,91 @@ async fn me_github_connections(
         ),
         Err(error) => {
             warn!(%error, user_id = %user_id, "PostgreSQL GitHub connection lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
+}
+
+async fn delete_github_connection(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(connection_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub connection delete transaction failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    };
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM public.github_connections WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&mut *tx)
+    .await;
+    let count = match count {
+        Ok(count) => count,
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub connection count failed");
+            let _ = tx.rollback().await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    };
+    if count <= 1 {
+        let _ = tx.rollback().await;
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"code": "last_github_connection_guard"})),
+        );
+    }
+    let deleted =
+        sqlx::query("DELETE FROM public.github_connections WHERE id = $1 AND user_id = $2")
+            .bind(&connection_id)
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await;
+    match deleted {
+        Ok(result) if result.rows_affected() == 1 => match tx.commit().await {
+            Ok(()) => (StatusCode::NO_CONTENT, axum::Json(json!({}))),
+            Err(error) => {
+                warn!(%error, "PostgreSQL GitHub connection delete commit failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "database_error"})),
+                )
+            }
+        },
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"code": "github_connection_not_found"})),
+            )
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub connection delete failed");
+            let _ = tx.rollback().await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
