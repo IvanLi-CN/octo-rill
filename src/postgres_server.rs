@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::{FromRow, Postgres, QueryBuilder};
 use std::convert::Infallible;
+use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
 use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDeletion};
 use tracing::{info, warn};
@@ -79,6 +80,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         task_types = ?state.task_registry.registered_task_types(),
         "PostgreSQL task executors registered"
     );
+    let worker_registry = state.task_registry.clone();
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -209,13 +211,33 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             .clone()
             .continuously_delete_expired(Duration::from_secs(60)),
     );
+    let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
+    let worker_pool = runtime.pool.clone();
+    let worker_owner = owner_id.clone();
+    let worker = tokio::spawn(async move {
+        if std::env::var("OCTORILL_PG_WORKER_ENABLED").as_deref() != Ok("1") {
+            return Ok::<(), anyhow::Error>(());
+        }
+        crate::postgres_worker::run_registered_until_shutdown(
+            &worker_pool,
+            &worker_owner,
+            &worker_registry,
+            worker_shutdown_rx,
+            Duration::from_millis(250),
+        )
+        .await
+    });
 
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("PostgreSQL service exited");
+    let _ = worker_shutdown.send(true);
     heartbeat.abort();
     session_cleanup.abort();
+    if let Ok(Err(error)) = worker.await {
+        warn!(%error, "PostgreSQL worker stopped with an error");
+    }
     postgres_runtime_owner::unregister(&runtime.pool, &owner_id).await?;
     runtime.pool.close().await;
     serve_result
