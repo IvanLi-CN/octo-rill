@@ -5,6 +5,7 @@
 | 门槛 | 当前证据 | 状态 |
 | --- | --- | --- |
 | PostgreSQL 18 版本门禁 | `src/postgres_runtime.rs` 检查 `server_version_num >= 180000`；对应单元测试通过 | 已证明 |
+| Rust 全量回归 | `cargo test --locked --quiet`：主二进制 1249 passed、3 ignored；迁移器 7 passed | 已证明 |
 | 独立 SQLx migration history | `migrations_pg/` 与 `postgres_database_migrations` 测试 | 已证明 |
 | Session store | PostgreSQL `tower_sessions` store、MessagePack `bytea` 校验和 expiry 校验 | 已证明 |
 | 任务认领事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、`40001`/`40P01` 重试测试 | 已证明 |
