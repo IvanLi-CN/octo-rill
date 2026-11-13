@@ -50,3 +50,5 @@ bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-mi
 当前应用业务模块仍以 SQLite 类型为编译时边界；在完成逐模块 PostgreSQL runtime 改造前，不应把该 Compose 文件用于线上切换。线上停机、旧容器停止、数据卷切换和回滚均需要另行授权。
 
 在业务 runtime 改造完成前，普通服务入口检测到 PostgreSQL `DATABASE_URL` 会在绑定监听地址前拒绝启动；`OCTORILL_PG_BOOTSTRAP_ONLY=1` 仍仅用于数据库 bootstrap smoke check。
+
+Agent VM 中的 PostgreSQL 18.7 bootstrap smoke 已验证独立的 `public._sqlx_migrations`、`octo_rill.schema_migrations`、`octo_rill.migration_manifests` 和 `octo_rill.tower_sessions` 均可幂等初始化。
