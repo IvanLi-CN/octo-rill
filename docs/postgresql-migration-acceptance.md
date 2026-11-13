@@ -13,9 +13,9 @@
 | Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
 | PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务、webhook 设置与 reconcile 入队、LinuxDo 解绑、passkey 删除，以及管理员任务详情/取消/重试、用户状态更新和日报调度槽读写已接入 | 部分证明 |
 | PG task lifecycle | `postgres_worker` 已统一 claim、取消、executor 成功/失败、owner-checked finalize、按注册类型过滤和可停止轮询；bootstrap smoke 覆盖 | 已证明 |
-| 完整业务 worker | `sync.notifications` 已接入 GitHub REST、凭据解密、幂等 PostgreSQL upsert 和生产 worker；同步 releases、日报、webhook 等 executor 尚未接入 | 部分完成 |
+| 完整业务 worker | `sync.notifications` 与 `sync.releases` 已接入 GitHub REST、凭据解密、幂等 PostgreSQL upsert 和生产 worker；日报、webhook 等 executor 尚未接入 | 部分完成 |
 | 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
-| Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify、bootstrap task claim→finalize；服务 worker 启动后仅注册类型可认领，未注册的 `sync.releases` 保持 queued；演练后容器与 VM 已清理 | 已证明 |
+| Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify；worker 实际执行 `sync.releases` 并将零变更任务终结为 succeeded；演练后容器与 VM 已清理 | 已证明 |
 | PR 收口 | 当前分支尚未推送或创建远端 PR | 未完成 |
 
 ## 可重复检查
