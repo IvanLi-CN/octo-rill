@@ -53,7 +53,7 @@ bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-mi
 
 当前应用业务模块仍以 SQLite 类型为编译时边界；PG service boundary 已能独立启动并提供数据库健康/版本探针，但业务路由尚未全部迁移。在完成逐模块 PostgreSQL runtime 改造前，不应把该 Compose 文件用于线上切换。线上停机、旧容器停止、数据卷切换和回滚均需要另行授权。
 
-普通服务入口检测到 PostgreSQL `DATABASE_URL` 后进入独立的 PG service boundary；当前提供 `/health`、`/version`、GitHub OAuth `/auth/github/login` 与 `/auth/github/callback`、基于 PostgreSQL store 的 `/auth/logout`、受 session 保护的 `/api/me`、`/api/me/resume`、`/api/starred`、`/api/releases`、`/api/notifications`、全文搜索 `/api/search` 和任务 SSE `/api/tasks/{task_id}/events`。OAuth 回调会在 PostgreSQL 事务中 upsert 用户、GitHub connection，并把加密 token 写入独立连接表；回调依赖现有 GitHub OAuth 配置，演练不调用生产上游。恢复账户和访问同步任务也在同一 PostgreSQL 事务中更新用户并入队。其余未迁移业务路由保持未注册，搜索首版固定返回 canonical 投影并继续补齐原 SQLite 的配额、lane 和关注关系语义。`OCTORILL_PG_BOOTSTRAP_ONLY=1` 仍仅用于数据库 bootstrap smoke check。
+普通服务入口检测到 PostgreSQL `DATABASE_URL` 后进入独立的 PG service boundary；当前提供 `/health`、`/version`、GitHub OAuth `/auth/github/login` 与 `/auth/github/callback`、基于 PostgreSQL store 的 `/auth/logout`、受 session 保护的 `/api/me`、`/api/me/resume`、`/api/me/personal-repos`、`/api/starred`、`/api/releases`、`/api/notifications`、全文搜索 `/api/search` 和任务 SSE `/api/tasks/{task_id}/events`。OAuth 回调会在 PostgreSQL 事务中 upsert 用户、GitHub connection，并把加密 token 写入独立连接表；回调依赖现有 GitHub OAuth 配置，演练不调用生产上游。恢复账户和访问同步任务也在同一 PostgreSQL 事务中更新用户并入队。其余未迁移业务路由保持未注册，搜索首版固定返回 canonical 投影并继续补齐原 SQLite 的配额、lane 和关注关系语义。`OCTORILL_PG_BOOTSTRAP_ONLY=1` 仍仅用于数据库 bootstrap smoke check。
 
 Agent VM 中的 PostgreSQL 18.7 bootstrap smoke 已验证独立的 `public._sqlx_migrations`、`octo_rill.schema_migrations`、`octo_rill.migration_manifests` 和 `octo_rill.tower_sessions` 均可幂等初始化。
 

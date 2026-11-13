@@ -63,6 +63,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/version", get(version))
         .route("/api/me", get(me))
         .route("/api/me/resume", axum::routing::post(me_resume))
+        .route("/api/me/personal-repos", get(personal_repos))
         .route("/api/search", get(search))
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
@@ -650,6 +651,96 @@ async fn list_notifications(
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
         }
     }
+}
+
+#[derive(Debug, FromRow)]
+struct PgPersonalRepoRow {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    updated_at: Option<String>,
+    release_count: i64,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+}
+
+async fn personal_repos(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let owner_login = match sqlx::query_scalar::<_, String>(
+        "SELECT login FROM public.users WHERE id = $1 AND is_disabled = 0",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(login)) => login,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"code": "unauthorized"})),
+            );
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL personal repository owner lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    };
+    let rows = match sqlx::query_as::<_, PgPersonalRepoRow>(
+        "SELECT ob.repo_id, ob.repo_full_name AS full_name, split_part(ob.repo_full_name, '/', 1) AS owner_login, split_part(ob.repo_full_name, '/', 2) AS name, 'https://github.com/' || ob.repo_full_name AS html_url, ob.updated_at, (SELECT COUNT(*) FROM public.repo_releases r WHERE r.repo_id = ob.repo_id AND COALESCE(r.is_draft, 0) = 0) AS release_count, ob.owner_avatar_url, ob.open_graph_image_url, ob.uses_custom_open_graph_image FROM public.owned_repo_star_baselines ob WHERE ob.user_id = $1 AND position('/' in ob.repo_full_name) > 1 AND lower(split_part(ob.repo_full_name, '/', 1)) = lower($2) ORDER BY lower(ob.repo_full_name) ASC",
+    )
+    .bind(&user_id)
+    .bind(&owner_login)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "PostgreSQL personal repositories query failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})));
+        }
+    };
+    let repos = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "repo_id": row.repo_id,
+                "full_name": row.full_name,
+                "owner_login": row.owner_login,
+                "name": row.name,
+                "html_url": row.html_url,
+                "updated_at": row.updated_at,
+                "release_count": row.release_count,
+                "repo_visual": {
+                    "owner_avatar_url": row.owner_avatar_url,
+                    "open_graph_image_url": row.open_graph_image_url,
+                    "uses_custom_open_graph_image": row.uses_custom_open_graph_image.unwrap_or_default() != 0
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        axum::Json(json!({"owner_login": owner_login, "total_count": repos.len(), "repos": repos})),
+    )
 }
 
 #[derive(Debug, Deserialize)]
