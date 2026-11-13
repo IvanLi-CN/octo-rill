@@ -44,6 +44,15 @@ mod worker_backoff;
 use anyhow::Result;
 use dotenvy::{dotenv, from_filename};
 
+struct BootstrapSmokeExecutor;
+
+#[async_trait::async_trait]
+impl postgres_worker::TaskExecutor for BootstrapSmokeExecutor {
+    async fn execute(&self, _task: &postgres_jobs::ClaimedTask) -> Result<String> {
+        Ok(r#"{"smoke":true}"#.to_owned())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     from_filename(".env.local").ok();
@@ -63,27 +72,19 @@ async fn main() -> Result<()> {
                 postgres_runtime_owner::heartbeat(&runtime.pool, owner_id, chrono::Utc::now())
                     .await?;
             tracing::info!(heartbeat, "PostgreSQL runtime owner lease is ready");
-            let task = runtime
-                .claim_next_queued_task(owner_id, chrono::Utc::now())
-                .await?;
-            tracing::info!(
-                claimed = task.is_some(),
-                "PostgreSQL task claim contract is ready"
-            );
-            if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1")
-                && let Some(task) = task
-            {
-                let finalized = runtime
-                    .finalize_task(
-                        &task.id,
-                        owner_id,
-                        "succeeded",
-                        Some(r#"{"smoke":true}"#),
-                        None,
-                        chrono::Utc::now(),
-                    )
+            if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1") {
+                let ran = runtime
+                    .run_task_once(owner_id, &BootstrapSmokeExecutor)
                     .await?;
-                tracing::info!(finalized, task_id = %task.id, "PostgreSQL task finalization contract is ready");
+                tracing::info!(ran, "PostgreSQL task execution lifecycle is ready");
+            } else {
+                let task = runtime
+                    .claim_next_queued_task(owner_id, chrono::Utc::now())
+                    .await?;
+                tracing::info!(
+                    claimed = task.is_some(),
+                    "PostgreSQL task claim contract is ready"
+                );
             }
         }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
