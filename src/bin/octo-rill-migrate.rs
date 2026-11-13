@@ -173,6 +173,7 @@ async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> 
 
 async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
     preflight(sqlite, pg, args).await?;
+    validate_authoritative_source_tables(sqlite).await?;
     pg.batch_execute(
         "SELECT pg_advisory_lock(hashtextextended('octo-rill:pg18-import', 0)); BEGIN;",
     )
@@ -286,6 +287,34 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     .context("persist migration manifest")?;
     println!("import complete: {}", args.manifest.display());
     Ok(())
+}
+
+async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'github_connections', 'job_tasks')",
+    )
+    .fetch_all(sqlite)
+    .await
+    .context("inspect authoritative SQLite tables")?;
+    let found = rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("name"))
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    let missing = missing_authoritative_tables(&found);
+    if !missing.is_empty() {
+        bail!(
+            "authoritative SQLite snapshot is incomplete; missing tables: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn missing_authoritative_tables(found: &HashSet<String>) -> Vec<&'static str> {
+    ["users", "github_connections", "job_tasks"]
+        .into_iter()
+        .filter(|name| !found.contains(*name))
+        .collect()
 }
 
 async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
@@ -723,6 +752,15 @@ mod tests {
     fn target_redaction_does_not_write_password() {
         let redacted = redact_target("postgres://user:secret@example.test:5432/db");
         assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn authoritative_snapshot_gate_reports_missing_core_tables() {
+        let found = HashSet::from(["users".to_owned()]);
+        assert_eq!(
+            missing_authoritative_tables(&found),
+            vec!["github_connections", "job_tasks"]
+        );
     }
 
     #[test]
