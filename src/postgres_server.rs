@@ -68,6 +68,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
         .route("/api/notifications", get(list_notifications))
+        .route("/api/repos/following", get(list_following_repos))
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
@@ -740,6 +741,94 @@ async fn personal_repos(
     (
         StatusCode::OK,
         axum::Json(json!({"owner_login": owner_login, "total_count": repos.len(), "repos": repos})),
+    )
+}
+
+#[derive(Debug, FromRow)]
+struct PgFollowingRepoRow {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    description: Option<String>,
+    is_private: Option<i64>,
+    first_source: Option<String>,
+    first_associated_at: Option<String>,
+    last_seen_at: Option<String>,
+    is_following: i64,
+    follow_state_source: Option<String>,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+    has_personal_owned_source: i64,
+    has_github_star_source: i64,
+    has_manual_feed_source: i64,
+}
+
+async fn list_following_repos(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let rows = match sqlx::query_as::<_, PgFollowingRepoRow>(
+        "SELECT repo_id, repo_full_name AS full_name, owner_login, repo_name AS name, COALESCE(html_url, 'https://github.com/' || repo_full_name) AS html_url, description, is_private, first_source, first_associated_at, last_seen_at, is_following, follow_state_source, owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image, has_personal_owned_source, has_github_star_source, has_manual_feed_source FROM public.user_repo_associations WHERE user_id = $1 ORDER BY is_following DESC, lower(repo_full_name) ASC",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "PostgreSQL following repositories query failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})));
+        }
+    };
+    let associated_items = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "repo_id": row.repo_id,
+                "full_name": row.full_name,
+                "owner_login": row.owner_login,
+                "name": row.name,
+                "html_url": row.html_url,
+                "description": row.description,
+                "is_private": row.is_private.map(|v| v != 0),
+                "first_source": row.first_source,
+                "first_associated_at": row.first_associated_at,
+                "last_seen_at": row.last_seen_at,
+                "is_following": row.is_following != 0,
+                "follow_state_source": row.follow_state_source,
+                "repo_visual": {"owner_avatar_url": row.owner_avatar_url, "open_graph_image_url": row.open_graph_image_url, "uses_custom_open_graph_image": row.uses_custom_open_graph_image.unwrap_or_default() != 0},
+                "sources": {"personal_owned": row.has_personal_owned_source != 0, "github_star": row.has_github_star_source != 0, "manual_feed": row.has_manual_feed_source != 0}
+            })
+        })
+        .collect::<Vec<_>>();
+    let items = associated_items
+        .iter()
+        .filter(|item| {
+            item.get("is_following")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        axum::Json(
+            json!({"following_count": items.len(), "associated_count": associated_items.len(), "items": items, "associated_items": associated_items}),
+        ),
     )
 }
 
