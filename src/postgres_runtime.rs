@@ -1,6 +1,6 @@
 use crate::session_store;
 use anyhow::{Context, Result, bail};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tower_sessions_sqlx_store::PostgresStore;
 
 use crate::config::AppConfig;
@@ -15,6 +15,38 @@ const MIN_POSTGRES_VERSION_NUM: i64 = 180_000;
 pub struct PostgresRuntime {
     pub pool: PgPool,
     pub sessions: PostgresStore,
+}
+
+/// Validate the persisted session representation before the service accepts
+/// traffic. The SQLx session store owns writes, while this check makes the
+/// migration boundary auditable: every sampled row must still be a valid
+/// MessagePack `tower_sessions::Record` and have a non-null expiry.
+pub async fn verify_session_store(pool: &PgPool, sample_limit: i64) -> Result<usize> {
+    let sample_limit = sample_limit.max(1);
+    let rows = sqlx::query(
+        "SELECT id, data, expiry_date FROM octo_rill.tower_sessions ORDER BY id LIMIT $1",
+    )
+    .bind(sample_limit)
+    .fetch_all(pool)
+    .await
+    .context("read PostgreSQL session verification sample")?;
+
+    for row in &rows {
+        let id: String = row.try_get("id").context("decode PostgreSQL session id")?;
+        let data: Vec<u8> = row
+            .try_get("data")
+            .with_context(|| format!("decode PostgreSQL session data for {id}"))?;
+        let expiry: Option<chrono::DateTime<chrono::Utc>> = row
+            .try_get("expiry_date")
+            .with_context(|| format!("decode PostgreSQL session expiry for {id}"))?;
+        if expiry.is_none() {
+            bail!("PostgreSQL session {id} has no expiry_date");
+        }
+        rmp_serde::from_slice::<tower_sessions::session::Record>(&data)
+            .with_context(|| format!("decode MessagePack PostgreSQL session {id}"))?;
+    }
+
+    Ok(rows.len())
 }
 
 impl std::fmt::Debug for PostgresRuntime {
@@ -61,6 +93,8 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         .migrate()
         .await
         .context("migrate PostgreSQL session store")?;
+
+    verify_session_store(&pool, 256).await?;
 
     Ok(PostgresRuntime { pool, sessions })
 }
