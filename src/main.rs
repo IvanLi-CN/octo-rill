@@ -23,6 +23,7 @@ mod postgres_database_migrations;
 mod postgres_jobs;
 mod postgres_runtime;
 mod postgres_runtime_owner;
+mod postgres_server;
 mod postgres_write;
 mod public_metrics;
 mod release_links;

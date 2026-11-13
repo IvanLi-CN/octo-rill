@@ -48,6 +48,18 @@ pub async fn heartbeat(pool: &PgPool, owner_id: &str, now: DateTime<Utc>) -> Res
     .context("heartbeat PostgreSQL runtime owner")
 }
 
+pub async fn unregister(pool: &PgPool, owner_id: &str) -> Result<()> {
+    execute_with_retry(|| async {
+        sqlx::query("DELETE FROM public.runtime_owners WHERE runtime_owner_id = $1")
+            .bind(owner_id)
+            .execute(pool)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .context("unregister PostgreSQL runtime owner")
+}
+
 async fn execute_with_retry<T, F, Fut>(mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
