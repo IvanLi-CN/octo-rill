@@ -13,6 +13,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::stream;
+use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{FromRow, Postgres, QueryBuilder};
@@ -22,13 +23,17 @@ use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDe
 use tracing::{info, warn};
 
 use crate::{
-    config::AppConfig, local_id, postgres_runtime::PostgresRuntime, postgres_runtime_owner,
+    config::AppConfig, crypto::EncryptedSecret, local_id, postgres_runtime::PostgresRuntime,
+    postgres_runtime_owner, state::GitHubOAuthClient,
 };
 
 #[derive(Clone)]
 struct PostgresServerState {
     runtime: PostgresRuntime,
     owner_id: Arc<str>,
+    github_oauth: GitHubOAuthClient,
+    http: reqwest::Client,
+    encryption_key: crate::crypto::EncryptionKey,
 }
 
 /// PostgreSQL-native service boundary.
@@ -45,6 +50,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let state = PostgresServerState {
         runtime: runtime.clone(),
         owner_id: owner_id.clone(),
+        github_oauth: crate::state::build_oauth_client(&config)?,
+        http: reqwest::Client::builder()
+            .user_agent("OctoRill")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build PostgreSQL service HTTP client")?,
+        encryption_key: config.encryption_key.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -52,6 +64,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me", get(me))
         .route("/api/search", get(search))
         .route("/api/tasks/{task_id}/events", get(task_events))
+        .route("/auth/github/login", get(github_login))
+        .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
         .with_state(state);
     let session_layer =
@@ -114,6 +128,190 @@ async fn logout(session: Session) -> impl IntoResponse {
             )
         }
     }
+}
+
+const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
+const SESSION_KEY_USER_ID: &str = "user_id";
+
+async fn github_login(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let (auth_url, csrf_token) = state
+        .github_oauth
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("read:user".to_owned()))
+        .add_scope(Scope::new("user:email".to_owned()))
+        .add_scope(Scope::new("notifications".to_owned()))
+        .add_scope(Scope::new("public_repo".to_owned()))
+        .url();
+    if session
+        .insert(SESSION_KEY_OAUTH_STATE, csrf_token.secret())
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::response::Redirect::to("/").into_response(),
+        )
+            .into_response();
+    }
+    axum::response::Redirect::to(auth_url.as_str()).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCallbackQuery {
+    code: String,
+    state: String,
+}
+
+async fn github_callback(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<GitHubCallbackQuery>,
+) -> impl IntoResponse {
+    let expected = session
+        .get::<String>(SESSION_KEY_OAUTH_STATE)
+        .await
+        .ok()
+        .flatten();
+    let _ = session.remove::<String>(SESSION_KEY_OAUTH_STATE).await;
+    if expected.as_deref() != Some(query.state.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "invalid_oauth_state"})),
+        )
+            .into_response();
+    }
+    let token = match state
+        .github_oauth
+        .exchange_code(AuthorizationCode::new(query.code))
+        .request_async(&state.http)
+        .await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub token exchange failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"code": "github_token_exchange_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let access_token = token.access_token().secret().to_owned();
+    let scopes = token
+        .scopes()
+        .map(|scopes| {
+            scopes
+                .iter()
+                .map(|scope| scope.as_ref())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let user = match crate::github::fetch_user(&state.http, &access_token).await {
+        Ok(user) => user,
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub user lookup failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"code": "github_user_lookup_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let email = if user.email.is_some() {
+        user.email.clone()
+    } else {
+        crate::github::fetch_primary_email(&state.http, &access_token)
+            .await
+            .ok()
+            .flatten()
+    };
+    let encrypted = match state.encryption_key.encrypt_str(&access_token) {
+        Ok(encrypted) => encrypted,
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub token encryption failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "token_encryption_failed"})),
+            )
+                .into_response();
+        }
+    };
+    match persist_github_login(&state, &user, email.as_deref(), &scopes, encrypted).await {
+        Ok(user_id) => match session.insert(SESSION_KEY_USER_ID, user_id).await {
+            Ok(()) => axum::response::Redirect::to("/").into_response(),
+            Err(error) => {
+                warn!(%error, "PostgreSQL login session save failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "session_save_failed"})),
+                )
+                    .into_response()
+            }
+        },
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub login persistence failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "login_persistence_failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn persist_github_login(
+    state: &PostgresServerState,
+    user: &crate::github::GitHubUser,
+    email: Option<&str>,
+    scopes: &str,
+    encrypted: EncryptedSecret,
+) -> Result<String, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = state.runtime.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO public.users (id, github_user_id, login, name, avatar_url, email, created_at, updated_at, last_active_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$7) \
+         ON CONFLICT (github_user_id) DO UPDATE SET login=EXCLUDED.login, name=EXCLUDED.name, avatar_url=EXCLUDED.avatar_url, email=EXCLUDED.email, updated_at=EXCLUDED.updated_at, last_active_at=EXCLUDED.last_active_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    let user_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.users WHERE github_user_id = $1 LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO public.github_connections (id,user_id,github_user_id,login,name,avatar_url,email,access_token_ciphertext,access_token_nonce,scopes,linked_at,updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) \
+         ON CONFLICT (github_user_id) DO UPDATE SET user_id=EXCLUDED.user_id,login=EXCLUDED.login,name=EXCLUDED.name,avatar_url=EXCLUDED.avatar_url,email=EXCLUDED.email,access_token_ciphertext=EXCLUDED.access_token_ciphertext,access_token_nonce=EXCLUDED.access_token_nonce,scopes=EXCLUDED.scopes,updated_at=EXCLUDED.updated_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&user_id)
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(encrypted.ciphertext)
+    .bind(encrypted.nonce)
+    .bind(scopes)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(user_id)
 }
 
 #[derive(sqlx::FromRow)]
