@@ -601,7 +601,7 @@ async fn delete_passkey(
                 sqlx::query(
                     "UPDATE public.users SET passkey_user_handle_uuid = NULL, updated_at = $1 WHERE id = $2",
                 )
-                .bind(Utc::now())
+                .bind(Utc::now().to_rfc3339())
                 .bind(&user_id)
                 .execute(&mut *tx)
                 .await?;
@@ -862,7 +862,7 @@ async fn patch_webhook_push_settings(
     )
     .bind(&desired_state)
     .bind(if desired_state == "enabled" { 1_i64 } else { 0_i64 })
-    .bind(now)
+    .bind(now.to_rfc3339())
     .bind(&user_id)
     .execute(&mut *tx)
     .await;
@@ -1234,7 +1234,7 @@ async fn me_resume(
     if let Err(error) = sqlx::query(
         "UPDATE public.users SET paused_at = NULL, last_active_at = $1, updated_at = $1 WHERE id = $2",
     )
-    .bind(now)
+    .bind(now.to_rfc3339())
     .bind(&user_id)
     .execute(&mut *tx)
     .await
@@ -2741,7 +2741,7 @@ async fn admin_patch_user(
     )
     .bind(if next_admin { 1_i64 } else { 0 })
     .bind(if next_disabled { 1_i64 } else { 0 })
-    .bind(now)
+    .bind(now.to_rfc3339())
     .bind(&target_user_id)
     .execute(&mut *tx)
     .await
