@@ -707,7 +707,8 @@ fn filesystem_available_bytes(path: &std::path::Path) -> Result<u64> {
         return Err(std::io::Error::last_os_error()).context("stat PostgreSQL filesystem");
     }
     let stat = unsafe { stat.assume_init() };
-    Ok(u64::from(stat.f_bavail) * stat.f_frsize)
+    let available = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
+    Ok(u64::try_from(available).unwrap_or(u64::MAX))
 }
 
 fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
