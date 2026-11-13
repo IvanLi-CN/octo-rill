@@ -50,6 +50,63 @@ pub async fn claim_next_queued_task(
     Err(anyhow!("PostgreSQL task claim retry loop exhausted"))
 }
 
+/// Finalize a task only while the current runtime owner still owns its lease.
+/// The status update and terminal event are committed atomically.
+pub async fn finalize_task(
+    pool: &PgPool,
+    task_id: &str,
+    runtime_owner_id: &str,
+    status: &str,
+    result_json: Option<&str>,
+    error_message: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !matches!(status, "succeeded" | "failed" | "cancelled") {
+        return Err(anyhow!("invalid terminal PostgreSQL task status: {status}"));
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin PostgreSQL task finalize")?;
+    let updated = sqlx::query(
+        "UPDATE public.job_tasks SET status = $1, result_json = $2, error_message = $3, finished_at = $4, updated_at = $4 WHERE id = $5 AND status = 'running' AND runtime_owner_id = $6",
+    )
+    .bind(status)
+    .bind(result_json)
+    .bind(error_message)
+    .bind(now)
+    .bind(task_id)
+    .bind(runtime_owner_id)
+    .execute(&mut *tx)
+    .await
+    .context("finalize PostgreSQL task")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback()
+            .await
+            .context("rollback lost PostgreSQL task finalize")?;
+        return Ok(false);
+    }
+    let payload = serde_json::json!({
+        "task_id": task_id,
+        "status": status,
+        "error": error_message,
+    });
+    sqlx::query(
+        "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) VALUES ($1, $2, 'task.completed', $3, $4)",
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(task_id)
+    .bind(serde_json::to_string(&payload).context("serialize PostgreSQL task completion event")?)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .context("record PostgreSQL task completion event")?;
+    tx.commit()
+        .await
+        .context("commit PostgreSQL task finalize")?;
+    Ok(true)
+}
+
 async fn claim_once(
     pool: &PgPool,
     runtime_owner_id: &str,
@@ -144,5 +201,7 @@ mod tests {
         assert!(source.contains("FOR UPDATE SKIP LOCKED"));
         assert!(source.contains("RETURNING id, task_type"));
         assert!(source.contains("40001") && source.contains("40P01"));
+        assert!(source.contains("runtime_owner_id = $6"));
+        assert!(source.contains("task.completed"));
     }
 }

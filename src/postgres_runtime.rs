@@ -99,6 +99,28 @@ impl PostgresRuntime {
     ) -> Result<Option<ClaimedTask>> {
         crate::postgres_jobs::claim_next_queued_task(&self.pool, runtime_owner_id, now).await
     }
+
+    /// Finalize a task through the same owner-checked transaction boundary.
+    pub async fn finalize_task(
+        &self,
+        task_id: &str,
+        runtime_owner_id: &str,
+        status: &str,
+        result_json: Option<&str>,
+        error_message: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        crate::postgres_jobs::finalize_task(
+            &self.pool,
+            task_id,
+            runtime_owner_id,
+            status,
+            result_json,
+            error_message,
+            now,
+        )
+        .await
+    }
 }
 
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PostgresRuntime> {
