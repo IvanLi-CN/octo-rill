@@ -69,6 +69,21 @@ async fn main() -> Result<()> {
                 claimed = task.is_some(),
                 "PostgreSQL task claim contract is ready"
             );
+            if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1")
+                && let Some(task) = task
+            {
+                let finalized = runtime
+                    .finalize_task(
+                        &task.id,
+                        owner_id,
+                        "succeeded",
+                        Some(r#"{"smoke":true}"#),
+                        None,
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                tracing::info!(finalized, task_id = %task.id, "PostgreSQL task finalization contract is ready");
+            }
         }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
