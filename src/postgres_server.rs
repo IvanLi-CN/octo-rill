@@ -118,6 +118,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/admin/jobs/realtime/{task_id}/cancel",
             axum::routing::post(admin_cancel_task),
         )
+        .route("/api/admin/jobs/realtime/{task_id}", get(admin_task_detail))
         .route(
             "/api/admin/jobs/realtime/{task_id}/retry",
             axum::routing::post(admin_retry_task),
@@ -2900,6 +2901,70 @@ async fn admin_cancel_task(
             .into_response(),
         Err(error) => {
             warn!(%error, task_id = %task_id, "PostgreSQL admin task cancellation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_task_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    let task = sqlx::query(
+        "SELECT id, task_type, status, source, requested_by, payload_json, result_json, error_message, cancel_requested, runtime_owner_id, lease_heartbeat_at, created_at, started_at, finished_at, updated_at FROM public.job_tasks WHERE id = $1",
+    )
+    .bind(&task_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match task {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            let event_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM public.job_task_events WHERE task_id = $1",
+            )
+            .bind(&task_id)
+            .fetch_one(&state.runtime.pool)
+            .await
+            .unwrap_or_default();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "id": row.get::<String, _>("id"),
+                    "task_type": row.get::<String, _>("task_type"),
+                    "status": row.get::<String, _>("status"),
+                    "source": row.get::<String, _>("source"),
+                    "requested_by": row.get::<Option<String>, _>("requested_by"),
+                    "payload": serde_json::from_str::<serde_json::Value>(&row.get::<String, _>("payload_json")).unwrap_or(json!({})),
+                    "result": row.get::<Option<String>, _>("result_json").and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
+                    "error": row.get::<Option<String>, _>("error_message"),
+                    "cancel_requested": row.get::<i64, _>("cancel_requested") != 0,
+                    "runtime_owner_id": row.get::<Option<String>, _>("runtime_owner_id"),
+                    "lease_heartbeat_at": row.get::<Option<chrono::DateTime<Utc>>, _>("lease_heartbeat_at"),
+                    "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at"),
+                    "started_at": row.get::<Option<chrono::DateTime<Utc>>, _>("started_at"),
+                    "finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
+                    "updated_at": row.get::<chrono::DateTime<Utc>, _>("updated_at"),
+                    "event_count": event_count,
+                    "source": "postgresql"
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "task_not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, task_id = %task_id, "PostgreSQL admin task detail query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
