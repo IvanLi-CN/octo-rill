@@ -77,6 +77,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
         .route("/api/dashboard/feed", get(dashboard_feed))
+        .route("/api/briefs", get(list_briefs))
+        .route("/api/briefs/{brief_id}", get(get_brief))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
@@ -981,6 +983,140 @@ async fn dashboard_feed(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
             )
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PgBriefRow {
+    id: String,
+    date: String,
+    window_start_utc: Option<String>,
+    window_end_utc: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    content_markdown: String,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn brief_json(
+    state: &PostgresServerState,
+    row: PgBriefRow,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let release_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT release_id FROM public.brief_release_memberships WHERE brief_id = $1 ORDER BY ordinal ASC",
+    )
+    .bind(&row.id)
+    .fetch_all(&state.runtime.pool)
+    .await?
+    .into_iter()
+    .map(|id| id.to_string())
+    .collect::<Vec<_>>();
+    let release_count = release_ids.len();
+    let preview: String = row.content_markdown.chars().take(600).collect();
+    Ok(json!({
+        "id": row.id,
+        "date": row.date,
+        "window_start": row.window_start_utc,
+        "window_end": row.window_end_utc,
+        "effective_time_zone": row.effective_time_zone,
+        "effective_local_boundary": row.effective_local_boundary,
+        "release_count": release_count,
+        "release_ids": release_ids,
+        "preview_markdown": preview,
+        "covers_repo_stars": row.content_markdown.contains("### 获星"),
+        "covers_followers": row.content_markdown.contains("### 关注"),
+        "content_markdown": row.content_markdown,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at
+    }))
+}
+
+async fn list_briefs(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let rows = sqlx::query_as::<_, PgBriefRow>(
+        "SELECT id, date, window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary, content_markdown, created_at, updated_at FROM public.briefs WHERE user_id = $1 ORDER BY COALESCE(window_end_utc::text, created_at::text) DESC, created_at DESC, id DESC",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.runtime.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let mut items = Vec::with_capacity(rows.len());
+            for row in rows {
+                match brief_json(&state, row).await {
+                    Ok(item) => items.push(item),
+                    Err(error) => {
+                        warn!(%error, "PostgreSQL brief membership query failed");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"code": "database_error"})),
+                        );
+                    }
+                }
+            }
+            (StatusCode::OK, axum::Json(json!(items)))
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL briefs query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
+}
+
+async fn get_brief(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(brief_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query_as::<_, PgBriefRow>(
+        "SELECT id, date, window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary, content_markdown, created_at, updated_at FROM public.briefs WHERE user_id = $1 AND id = $2",
+    )
+    .bind(&user_id)
+    .bind(&brief_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => match brief_json(&state, row).await {
+            Ok(item) => (StatusCode::OK, axum::Json(item)).into_response(),
+            Err(error) => {
+                warn!(%error, "PostgreSQL brief membership query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+            }
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, axum::Json(json!({"code": "not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL brief query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
         }
     }
 }
