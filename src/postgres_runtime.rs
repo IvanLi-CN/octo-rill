@@ -31,10 +31,12 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         .await
         .context("connect PostgreSQL runtime")?;
 
-    let version_num: i64 = sqlx::query_scalar("SHOW server_version_num")
+    let version_num: i64 = sqlx::query_scalar::<_, String>("SHOW server_version_num")
         .fetch_one(&pool)
         .await
-        .context("read PostgreSQL server_version_num")?;
+        .context("read PostgreSQL server_version_num")?
+        .parse()
+        .context("parse PostgreSQL server_version_num")?;
     if version_num < MIN_POSTGRES_VERSION_NUM {
         bail!("PostgreSQL 18 is required; server_version_num={version_num}");
     }
