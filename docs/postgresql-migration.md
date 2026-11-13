@@ -8,7 +8,7 @@ SQLite FTS5 内部表被记录为可重建投影并跳过导入。`rebuild` 负�
 
 长期运行时的连接池和 Session 初始化位于 `src/postgres_runtime.rs`：它强制 PostgreSQL 18 版本门禁，执行独立 baseline，并使用 MessagePack `bytea` 的 PostgreSQL session store。业务模块仍需逐步把现有 SQLite 查询和写入协调器切换到该 runtime。
 
-任务协调的 PostgreSQL 垂直切片位于 `src/postgres_jobs.rs`。它使用稳定的 `created_at, id` 排序、`FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING` 和 `40001`/`40P01` 全事务重试；`OCTORILL_PG_TASK_CLAIM_SMOKE=1` 可在 bootstrap smoke 中实际认领一个 queued 任务并写入 `task.running` 事件。
+任务协调的 PostgreSQL 垂直切片位于 `src/postgres_jobs.rs`。它使用稳定的 `created_at, id` 排序、`FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING` 和 `40001`/`40P01` 全事务重试；`src/postgres_runtime_owner.rs` 同时提供 runtime owner 的注册和心跳持久化。`OCTORILL_PG_TASK_CLAIM_SMOKE=1` 可在 bootstrap smoke 中实际写入 owner lease、认领一个 queued 任务并写入 `task.running` 事件。
 
 ## 本地验证
 
