@@ -12,7 +12,7 @@
 | SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；8 项迁移器测试通过，并在导入前检查 `users`、`github_connections`、`job_tasks` 核心权威表；追加型 `job_task_events` 允许快照后保留运行时事件 | 已证明 |
 | Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
 | PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务、webhook 设置与 reconcile 入队、LinuxDo 解绑、passkey 删除，以及管理员任务详情/取消/重试、用户状态更新和日报调度槽读写已接入 | 部分证明 |
-| PG task lifecycle | `postgres_worker::run_once` 已统一 claim、取消、executor 成功/失败和 owner-checked finalize；同步、日报、webhook 等业务 executor 尚未接入 | 部分完成 |
+| PG task lifecycle | `postgres_worker::run_once` 已统一 claim、取消、executor 成功/失败和 owner-checked finalize，并由 bootstrap smoke 覆盖；同步、日报、webhook 等业务 executor 尚未接入 | 部分完成 |
 | 完整业务 worker | 同步和日报任务目前只入 PostgreSQL 队列，尚未由 PG-native worker 执行 | 未完成 |
 | 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
 | Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify、bootstrap task claim→finalize 及运行时事件追加校验；演练后容器与 VM 已清理 | 已证明 |
