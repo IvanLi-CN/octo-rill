@@ -66,6 +66,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
         .route("/api/me/profile", get(me_profile).patch(update_me_profile))
+        .route("/api/me/api-keys", get(list_api_keys).post(create_api_key))
+        .route(
+            "/api/me/api-keys/{api_key_id}",
+            axum::routing::delete(delete_api_key),
+        )
         .route("/api/search", get(search))
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
@@ -650,6 +655,148 @@ async fn update_me_profile(
                 axum::Json(json!({"code": "database_error"})),
             )
                 .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PgCreateApiKeyRequest {
+    name: Option<String>,
+}
+
+async fn list_api_keys(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match sqlx::query(
+        "SELECT id, name, masked_key, created_at, last_used_at FROM public.user_api_keys WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => {
+            use sqlx::Row;
+            let items = rows
+                .into_iter()
+                .map(|row| json!({"id": row.get::<String, _>("id"), "name": row.get::<String, _>("name"), "masked_key": row.get::<String, _>("masked_key"), "created_at": row.get::<String, _>("created_at"), "last_used_at": row.get::<Option<String>, _>("last_used_at")}))
+                .collect::<Vec<_>>();
+            (StatusCode::OK, axum::Json(json!({"items": items})))
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL API key listing failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
+        }
+    }
+}
+
+async fn create_api_key(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    axum::Json(request): axum::Json<PgCreateApiKeyRequest>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let name = match crate::api_keys::normalize_name(request.name.as_deref()) {
+        Ok(name) => name,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": "invalid_name", "message": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let plaintext = crate::api_keys::generate_api_key_plaintext();
+    let encrypted = match state.encryption_key.encrypt_str(&plaintext) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "PostgreSQL API key encryption failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "encryption_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let id = local_id::generate_local_id();
+    let now = Utc::now().to_rfc3339();
+    let hash = crate::api_keys::hash_api_key(&plaintext);
+    let prefix = crate::api_keys::key_prefix(&plaintext);
+    let masked = crate::api_keys::mask_api_key(&plaintext);
+    match sqlx::query(
+        "INSERT INTO public.user_api_keys (id, user_id, name, key_hash, key_ciphertext, key_nonce, key_prefix, masked_key, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(&id)
+    .bind(&user_id)
+    .bind(&name)
+    .bind(&hash)
+    .bind(encrypted.ciphertext)
+    .bind(encrypted.nonce)
+    .bind(&prefix)
+    .bind(&masked)
+    .bind(&now)
+    .execute(&state.runtime.pool)
+    .await
+    {
+        Ok(_) => (StatusCode::CREATED, axum::Json(json!({"item": {"id": id, "name": name, "masked_key": masked, "created_at": now, "last_used_at": null}, "api_key": plaintext}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL API key insert failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+        }
+    }
+}
+
+async fn delete_api_key(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(api_key_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query("UPDATE public.user_api_keys SET revoked_at = $1 WHERE id = $2 AND user_id = $3 AND revoked_at IS NULL")
+        .bind(Utc::now().to_rfc3339())
+        .bind(&api_key_id)
+        .bind(&user_id)
+        .execute(&state.runtime.pool)
+        .await
+    {
+        Ok(result) if result.rows_affected() == 1 => (StatusCode::NO_CONTENT, axum::Json(json!({}))).into_response(),
+        Ok(_) => (StatusCode::NOT_FOUND, axum::Json(json!({"code": "not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL API key revoke failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
         }
     }
 }
