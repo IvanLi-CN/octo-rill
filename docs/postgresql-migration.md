@@ -62,3 +62,5 @@ PG 服务绑定监听器前会检查 `users`、`github_connections`、`job_tasks
 PG service boundary 还提供 `/api/me/profile` 的 PostgreSQL 读取与更新，更新仅作用于未禁用且未暂停账户，并复用现有用户偏好字段。
 
 账户 API key 的列出、创建和撤销也已切换到 PostgreSQL `user_api_keys`，明文只在创建响应中返回，持久化仍使用哈希和加密密文。
+
+`/api/auth/bind-context` 已接入 PostgreSQL service boundary，继续读取 session 中待绑定的 LinuxDo/passkey 上下文。

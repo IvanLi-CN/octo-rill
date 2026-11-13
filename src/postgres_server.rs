@@ -31,6 +31,7 @@ use crate::{
 struct PostgresServerState {
     runtime: PostgresRuntime,
     owner_id: Arc<str>,
+    linuxdo_available: bool,
     github_oauth: GitHubOAuthClient,
     http: reqwest::Client,
     encryption_key: crate::crypto::EncryptionKey,
@@ -51,6 +52,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let state = PostgresServerState {
         runtime: runtime.clone(),
         owner_id: owner_id.clone(),
+        linuxdo_available: config.linuxdo.is_some(),
         github_oauth: crate::state::build_oauth_client(&config)?,
         http: reqwest::Client::builder()
             .user_agent("OctoRill")
@@ -71,6 +73,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/me/api-keys/{api_key_id}",
             axum::routing::delete(delete_api_key),
         )
+        .route("/api/auth/bind-context", get(auth_bind_context))
         .route("/api/search", get(search))
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
@@ -799,6 +802,30 @@ async fn delete_api_key(
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
         }
     }
+}
+
+async fn auth_bind_context(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let pending_linuxdo = session
+        .get::<serde_json::Value>("pending_linuxdo")
+        .await
+        .ok()
+        .flatten();
+    let pending_passkey = session
+        .get::<serde_json::Value>("pending_passkey_credential")
+        .await
+        .ok()
+        .flatten();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "linuxdo_available": state.linuxdo_available,
+            "pending_linuxdo": pending_linuxdo,
+            "pending_passkey": pending_passkey
+        })),
+    )
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
