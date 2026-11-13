@@ -3,15 +3,20 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
     routing::get,
 };
 use chrono::Utc;
+use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{FromRow, Postgres, QueryBuilder};
+use std::convert::Infallible;
 use tokio::time::{MissedTickBehavior, interval};
 use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDeletion};
 use tracing::{info, warn};
@@ -46,6 +51,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/version", get(version))
         .route("/api/me", get(me))
         .route("/api/search", get(search))
+        .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/auth/logout", get(logout))
         .with_state(state);
     let session_layer =
@@ -324,6 +330,59 @@ async fn search(
             "index_status": "ready"
         })),
     )
+}
+
+#[derive(Debug, FromRow)]
+struct PgTaskEventRow {
+    id: String,
+    event_type: String,
+    payload_json: String,
+    created_at: chrono::DateTime<Utc>,
+}
+
+async fn task_events(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let Some(user_id) = session
+        .get::<String>("user_id")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let owned = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM public.job_tasks WHERE id = $1 AND requested_by = $2",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .fetch_one(&state.runtime.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if owned == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let rows = sqlx::query_as::<_, PgTaskEventRow>(
+        "SELECT id, event_type, payload_json, created_at \
+         FROM public.job_task_events WHERE task_id = $1 ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&task_id)
+    .fetch_all(&state.runtime.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events = rows.into_iter().map(|row| {
+        Ok(Event::default()
+            .id(row.id)
+            .event(row.event_type)
+            .data(row.payload_json)
+            .comment(row.created_at.to_rfc3339()))
+    });
+    Ok(Sse::new(stream::iter(events)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn health(State(state): State<PostgresServerState>) -> impl IntoResponse {
