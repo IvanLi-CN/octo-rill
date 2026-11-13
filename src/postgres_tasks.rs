@@ -28,6 +28,20 @@ pub struct ReleasesExecutor {
     encryption_key: EncryptionKey,
 }
 
+#[derive(Clone)]
+pub struct StarredExecutor {
+    pool: PgPool,
+    http: Client,
+    encryption_key: EncryptionKey,
+}
+
+#[derive(Clone)]
+pub struct CompositeSyncExecutor {
+    starred: StarredExecutor,
+    releases: ReleasesExecutor,
+    notifications: NotificationsExecutor,
+}
+
 impl ReleasesExecutor {
     pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
         Self {
@@ -48,6 +62,26 @@ impl NotificationsExecutor {
     }
 }
 
+impl StarredExecutor {
+    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+        Self {
+            pool,
+            http,
+            encryption_key,
+        }
+    }
+}
+
+impl CompositeSyncExecutor {
+    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+        Self {
+            starred: StarredExecutor::new(pool.clone(), http.clone(), encryption_key.clone()),
+            releases: ReleasesExecutor::new(pool.clone(), http.clone(), encryption_key.clone()),
+            notifications: NotificationsExecutor::new(pool, http, encryption_key),
+        }
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct GithubTokenRow {
     id: String,
@@ -59,6 +93,117 @@ struct GithubTokenRow {
 struct StarredRepoRow {
     repo_id: i64,
     full_name: String,
+}
+
+#[derive(Debug, FromRow)]
+struct GithubConnectionRow {
+    id: String,
+    access_token_ciphertext: Vec<u8>,
+    access_token_nonce: Vec<u8>,
+}
+
+#[async_trait]
+impl TaskExecutor for StarredExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if task.task_type != "sync.starred" {
+            bail!("starred executor received {}", task.task_type);
+        }
+        let payload: Value =
+            serde_json::from_str(&task.payload_json).context("decode sync.starred task payload")?;
+        let user_id = task_user_id(&payload, task)
+            .ok_or_else(|| anyhow!("sync.starred task has no user_id"))?;
+        let connections = sqlx::query_as::<_, GithubConnectionRow>(
+            "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
+        )
+        .bind(&user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load PostgreSQL starred repository connections")?;
+        if connections.is_empty() {
+            bail!("sync.starred has no GitHub connection for user {user_id}");
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut total = 0usize;
+        for connection in connections {
+            let token = self
+                .encryption_key
+                .decrypt_str(
+                    &connection.access_token_ciphertext,
+                    &connection.access_token_nonce,
+                )
+                .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
+            for page in 1..=20 {
+                let response = self
+                    .http
+                    .get(format!(
+                        "{GITHUB_API}/user/starred?per_page=100&page={page}"
+                    ))
+                    .bearer_auth(&token)
+                    .header(reqwest::header::USER_AGENT, "OctoRill")
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .send()
+                    .await
+                    .context("fetch GitHub starred repositories")?;
+                let status = response.status();
+                if !status.is_success() {
+                    bail!("GitHub starred repositories returned HTTP {status}");
+                }
+                let repos = response
+                    .json::<Vec<Value>>()
+                    .await
+                    .context("decode GitHub starred repositories")?;
+                for repo in &repos {
+                    upsert_starred_repo(&self.pool, &user_id, repo, &now).await?;
+                }
+                total += repos.len();
+                if repos.len() < 100 {
+                    break;
+                }
+            }
+        }
+        Ok(json!({"repositories": total, "user_id": user_id}).to_string())
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for CompositeSyncExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if !matches!(task.task_type.as_str(), "sync.all" | "sync.access_refresh") {
+            bail!("composite sync executor received {}", task.task_type);
+        }
+        let starred: Value = self
+            .starred
+            .execute(&ClaimedTask {
+                task_type: "sync.starred".to_owned(),
+                ..task.clone()
+            })
+            .await
+            .and_then(|value| serde_json::from_str(&value).context("decode starred sync result"))?;
+        let releases: Value = self
+            .releases
+            .execute(&ClaimedTask {
+                task_type: "sync.releases".to_owned(),
+                ..task.clone()
+            })
+            .await
+            .and_then(|value| serde_json::from_str(&value).context("decode release sync result"))?;
+        let notifications: Value = self
+            .notifications
+            .execute(&ClaimedTask {
+                task_type: "sync.notifications".to_owned(),
+                ..task.clone()
+            })
+            .await
+            .and_then(|value| {
+                serde_json::from_str(&value).context("decode notification sync result")
+            })?;
+        Ok(
+            json!({"starred": starred, "releases": releases, "notifications": notifications})
+                .to_string(),
+        )
+    }
 }
 
 #[async_trait]
@@ -269,6 +414,45 @@ async fn upsert_notification(pool: &PgPool, user_id: &str, notification: &Value)
     Ok(())
 }
 
+async fn upsert_starred_repo(pool: &PgPool, user_id: &str, repo: &Value, now: &str) -> Result<()> {
+    let repo_id = repo
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("GitHub starred repository has no numeric id"))?;
+    let full_name = repo
+        .get("full_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let owner_login = repo
+        .get("owner")
+        .and_then(|owner| owner.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO public.starred_repos (id, user_id, repo_id, full_name, owner_login, name, description, html_url, stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT (user_id, repo_id) DO UPDATE SET full_name = EXCLUDED.full_name, owner_login = EXCLUDED.owner_login, name = EXCLUDED.name, description = EXCLUDED.description, html_url = EXCLUDED.html_url, is_private = EXCLUDED.is_private, updated_at = EXCLUDED.updated_at, owner_avatar_url = EXCLUDED.owner_avatar_url, open_graph_image_url = EXCLUDED.open_graph_image_url, uses_custom_open_graph_image = EXCLUDED.uses_custom_open_graph_image, repo_stargazer_count = EXCLUDED.repo_stargazer_count, repo_stargazer_count_updated_at = EXCLUDED.repo_stargazer_count_updated_at",
+    )
+    .bind(format!("{user_id}:{repo_id}"))
+    .bind(user_id)
+    .bind(repo_id)
+    .bind(full_name)
+    .bind(owner_login)
+    .bind(repo.get("name").and_then(Value::as_str).unwrap_or_default())
+    .bind(repo.get("description").and_then(Value::as_str))
+    .bind(repo.get("html_url").and_then(Value::as_str).unwrap_or_default())
+    .bind(repo.get("created_at").and_then(Value::as_str))
+    .bind(if repo.get("private").and_then(Value::as_bool).unwrap_or(false) { 1_i64 } else { 0_i64 })
+    .bind(now)
+    .bind(repo.get("owner").and_then(|owner| owner.get("avatar_url")).and_then(Value::as_str))
+    .bind(repo.get("open_graph_image_url").and_then(Value::as_str))
+    .bind(if repo.get("has_discussions").and_then(Value::as_bool).unwrap_or(false) { 1_i64 } else { 0_i64 })
+    .bind(repo.get("stargazers_count").and_then(Value::as_i64))
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("upsert PostgreSQL starred repository")?;
+    Ok(())
+}
+
 fn required_string(value: &Value, key: &str) -> Result<String> {
     value
         .get(key)
@@ -297,8 +481,13 @@ mod tests {
         let source = include_str!("postgres_tasks.rs");
         assert!(source.contains("sync.notifications"));
         assert!(source.contains("sync.releases"));
+        assert!(source.contains("sync.starred"));
+        assert!(source.contains("sync.all"));
+        assert!(source.contains("sync.access_refresh"));
+        assert!(source.contains("/user/starred?per_page=100&page="));
         assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
+        assert!(source.contains("ON CONFLICT (user_id, repo_id)"));
         assert!(source.contains("decrypt_str"));
         assert!(source.contains("requested_by"));
         assert!(source.contains("page in 1..=20"));

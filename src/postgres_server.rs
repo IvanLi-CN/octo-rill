@@ -29,7 +29,9 @@ use crate::{
     local_id,
     postgres_runtime::PostgresRuntime,
     postgres_runtime_owner,
-    postgres_tasks::{NotificationsExecutor, ReleasesExecutor},
+    postgres_tasks::{
+        CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor, StarredExecutor,
+    },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
 };
@@ -64,6 +66,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("build PostgreSQL service HTTP client")?;
     let task_registry = TaskExecutorRegistry::builder()
         .register(
+            "sync.starred",
+            StarredExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
+        .register(
             "sync.releases",
             ReleasesExecutor::new(
                 runtime.pool.clone(),
@@ -74,6 +84,22 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .register(
             "sync.notifications",
             NotificationsExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
+        .register(
+            "sync.all",
+            CompositeSyncExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
+        .register(
+            "sync.access_refresh",
+            CompositeSyncExecutor::new(
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
