@@ -45,6 +45,8 @@ bun "$AGENT_VM_SCRIPT" sync --name octo-rill-pg18-migration
 bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-migration/src && cargo test --bin octo-rill-migrate'
 ```
 
+完整演练脚本在 VM 内依次执行 `preflight`、`import`、`verify` 和 `rebuild`；设置 `AGENT_VM_MIGRATION_BINARY` 可使用宿主机构建的 Linux 迁移器，设置 `AGENT_VM_APP_BINARY` 并提供应用 smoke 所需 secrets 可继续执行 PostgreSQL runtime owner、Session 和任务认领探针。
+
 如果 VM 镜像没有匹配的 Rust 工具链，可先在宿主机构建 Linux 迁移器，再设置 `AGENT_VM_MIGRATION_BINARY`；演练脚本会上传该二进制并在 VM 内执行同样的预检和迁移命令。
 
 本次 Agent VM 验证使用 PostgreSQL 18.7 和脱敏 SQLite 夹具完成了容量预检、导入、校验、搜索投影重建及重复导入；两次导入后权威表行数保持 `users=2`、`notes=2`。该夹具验证不替代线上数据库副本演练。
