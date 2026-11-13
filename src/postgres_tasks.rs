@@ -83,7 +83,6 @@ impl TaskExecutor for NotificationsExecutor {
         }
 
         let mut total = 0usize;
-        let now = Utc::now().to_rfc3339();
         for connection in connections {
             let token = self
                 .encryption_key
@@ -113,7 +112,7 @@ impl TaskExecutor for NotificationsExecutor {
                 .await
                 .context("decode GitHub notifications")?;
             for notification in &notifications {
-                upsert_notification(&self.pool, &user_id, notification, &now).await?;
+                upsert_notification(&self.pool, &user_id, notification).await?;
             }
             total += notifications.len();
         }
@@ -227,12 +226,7 @@ async fn upsert_release(
     Ok(())
 }
 
-async fn upsert_notification(
-    pool: &PgPool,
-    user_id: &str,
-    notification: &Value,
-    now: &str,
-) -> Result<()> {
+async fn upsert_notification(pool: &PgPool, user_id: &str, notification: &Value) -> Result<()> {
     let thread_id = required_string(notification, "id")?;
     let subject = notification.get("subject").unwrap_or(&Value::Null);
     let repository = notification.get("repository").unwrap_or(&Value::Null);
@@ -256,7 +250,7 @@ async fn upsert_notification(
     .bind(notification.get("reason").and_then(Value::as_str))
     .bind(updated_at)
     .bind(if unread { 1_i64 } else { 0_i64 })
-    .bind(notification.get("url").and_then(Value::as_str).or_else(|| notification.get("html_url").and_then(Value::as_str)).or(Some(now)))
+    .bind(notification.get("url").and_then(Value::as_str).or_else(|| notification.get("html_url").and_then(Value::as_str)))
     .execute(pool)
     .await
     .context("upsert PostgreSQL notification")?;
