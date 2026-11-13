@@ -102,6 +102,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::post(cancel_task),
         )
         .route("/api/admin/jobs/overview", get(admin_jobs_overview))
+        .route("/api/admin/dashboard", get(admin_dashboard))
         .route("/api/admin/users", get(admin_users))
         .route(
             "/api/admin/users/{user_id}",
@@ -2166,6 +2167,51 @@ async fn admin_jobs_overview(
         }
         Err(error) => {
             warn!(%error, "PostgreSQL admin job overview query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_dashboard(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    let users = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_disabled = 0 AND paused_at IS NULL), COUNT(*) FILTER (WHERE is_admin = 1)
+         FROM public.users",
+    )
+    .fetch_one(&state.runtime.pool)
+    .await;
+    let tasks = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM public.job_tasks GROUP BY status ORDER BY status",
+    )
+    .fetch_all(&state.runtime.pool)
+    .await;
+    match (users, tasks) {
+        (Ok((total_users, active_users, admin_users)), Ok(tasks)) => {
+            let task_counts = tasks
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "source": "postgresql",
+                    "generated_at": Utc::now(),
+                    "users": {"total": total_users, "active": active_users, "admins": admin_users},
+                    "tasks": {"counts": task_counts},
+                })),
+            )
+                .into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            warn!(%error, "PostgreSQL admin dashboard query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
