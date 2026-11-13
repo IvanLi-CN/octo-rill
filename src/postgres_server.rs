@@ -123,6 +123,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/admin/jobs/realtime/{task_id}/retry",
             axum::routing::post(admin_retry_task),
         )
+        .route("/api/admin/jobs/scheduled", get(admin_scheduled_slots))
+        .route(
+            "/api/admin/jobs/scheduled/{hour_utc}",
+            axum::routing::patch(admin_patch_scheduled_slot),
+        )
         .route(
             "/api/admin/users/{user_id}",
             get(admin_user_detail).patch(admin_patch_user),
@@ -2965,6 +2970,121 @@ async fn admin_task_detail(
             .into_response(),
         Err(error) => {
             warn!(%error, task_id = %task_id, "PostgreSQL admin task detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminScheduledSlotPatch {
+    enabled: bool,
+}
+
+async fn admin_scheduled_slots(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    match sqlx::query(
+        "SELECT hour_utc, enabled, last_dispatch_at, updated_at FROM public.daily_brief_hour_slots ORDER BY hour_utc ASC",
+    )
+    .fetch_all(&state.runtime.pool)
+    .await
+    {
+        Ok(rows) => {
+            use sqlx::Row;
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "hour_utc": row.get::<i64, _>("hour_utc"),
+                        "enabled": row.get::<i64, _>("enabled") != 0,
+                        "last_dispatch_at": row.get::<Option<String>, _>("last_dispatch_at"),
+                        "updated_at": row.get::<String, _>("updated_at"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (StatusCode::OK, axum::Json(json!({"items": items}))).into_response()
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL scheduled slot query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_patch_scheduled_slot(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(hour_utc): Path<i64>,
+    axum::Json(patch): axum::Json<AdminScheduledSlotPatch>,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    if !(0..=23).contains(&hour_utc) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "invalid_hour_utc", "message": "hour_utc must be 0..23"})),
+        )
+            .into_response();
+    }
+    let updated_at = Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        "UPDATE public.daily_brief_hour_slots SET enabled = $1, updated_at = $2 WHERE hour_utc = $3",
+    )
+    .bind(if patch.enabled { 1_i64 } else { 0_i64 })
+    .bind(&updated_at)
+    .bind(hour_utc)
+    .execute(&state.runtime.pool)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 1 => match sqlx::query(
+            "SELECT hour_utc, enabled, last_dispatch_at, updated_at FROM public.daily_brief_hour_slots WHERE hour_utc = $1",
+        )
+        .bind(hour_utc)
+        .fetch_one(&state.runtime.pool)
+        .await
+        {
+            Ok(row) => {
+                use sqlx::Row;
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "hour_utc": row.get::<i64, _>("hour_utc"),
+                        "enabled": row.get::<i64, _>("enabled") != 0,
+                        "last_dispatch_at": row.get::<Option<String>, _>("last_dispatch_at"),
+                        "updated_at": row.get::<String, _>("updated_at"),
+                    })),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                warn!(%error, hour_utc, "PostgreSQL scheduled slot reload failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "database_error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "scheduled_slot_not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, hour_utc, "PostgreSQL scheduled slot update failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),

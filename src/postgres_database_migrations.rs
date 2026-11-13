@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 4);
+        assert_eq!(MIGRATOR.iter().count(), 5);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
     }
 }
