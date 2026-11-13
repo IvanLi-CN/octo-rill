@@ -80,6 +80,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/briefs", get(list_briefs))
         .route("/api/briefs/{brief_id}", get(get_brief))
         .route("/api/briefs/generate", axum::routing::post(generate_brief))
+        .route("/api/sync/starred", axum::routing::post(sync_starred))
+        .route("/api/sync/all", axum::routing::post(sync_all))
+        .route("/api/sync/releases", axum::routing::post(sync_releases))
+        .route(
+            "/api/sync/notifications",
+            axum::routing::post(sync_notifications),
+        )
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
@@ -1159,6 +1166,86 @@ async fn generate_brief(
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
         }
     }
+}
+
+async fn enqueue_sync_task(
+    state: &PostgresServerState,
+    session: &Session,
+    task_type: &str,
+    source: &str,
+) -> axum::response::Response {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let task_id = local_id::generate_local_id();
+    let now = Utc::now();
+    let payload = json!({"user_id": user_id});
+    match sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, $2, 'queued', $3, $4, $5, $6, $6)",
+    )
+    .bind(&task_id)
+    .bind(task_type)
+    .bind(source)
+    .bind(&user_id)
+    .bind(payload.to_string())
+    .bind(now)
+    .execute(&state.runtime.pool)
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({"mode": "task_id", "task_id": task_id, "task_type": task_type, "status": "queued"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, task_type, "PostgreSQL sync task enqueue failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn sync_starred(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    enqueue_sync_task(&state, &session, "sync.starred", "api.sync.starred").await
+}
+
+async fn sync_all(State(state): State<PostgresServerState>, session: Session) -> impl IntoResponse {
+    enqueue_sync_task(&state, &session, "sync.all", "api.sync.all").await
+}
+
+async fn sync_releases(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    enqueue_sync_task(&state, &session, "sync.releases", "api.sync.releases").await
+}
+
+async fn sync_notifications(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    enqueue_sync_task(
+        &state,
+        &session,
+        "sync.notifications",
+        "api.sync.notifications",
+    )
+    .await
 }
 
 async fn follow_repo(
