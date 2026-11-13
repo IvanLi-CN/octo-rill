@@ -67,6 +67,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me", get(me))
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
+        .route("/api/me/linuxdo", get(me_linuxdo))
         .route("/api/me/github-connections", get(me_github_connections))
         .route(
             "/api/me/github-connections/{connection_id}",
@@ -385,6 +386,69 @@ struct GithubConnectionRow {
     scopes: String,
     linked_at: String,
     updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LinuxDoConnectionRow {
+    linuxdo_user_id: i64,
+    username: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    trust_level: i64,
+    active: i64,
+    silenced: i64,
+    linked_at: String,
+    updated_at: String,
+}
+
+async fn me_linuxdo(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let rows = sqlx::query_as::<_, LinuxDoConnectionRow>(
+        "SELECT linuxdo_user_id, username, name, avatar_url, trust_level, active, silenced, linked_at, updated_at \
+         FROM public.linuxdo_connections WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match rows {
+        Ok(connection) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "available": state.linuxdo_available,
+                "connection": connection.map(|row| json!({
+                    "linuxdo_user_id": row.linuxdo_user_id,
+                    "username": row.username,
+                    "name": row.name,
+                    "avatar_url": row.avatar_url,
+                    "trust_level": row.trust_level,
+                    "active": row.active != 0,
+                    "silenced": row.silenced != 0,
+                    "linked_at": row.linked_at,
+                    "updated_at": row.updated_at,
+                })),
+            })),
+        ),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL LinuxDo connection lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
 }
 
 async fn me_github_connections(
