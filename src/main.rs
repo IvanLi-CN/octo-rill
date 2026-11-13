@@ -24,6 +24,7 @@ mod postgres_jobs;
 mod postgres_runtime;
 mod postgres_runtime_owner;
 mod postgres_server;
+pub mod postgres_worker;
 mod postgres_write;
 mod public_metrics;
 mod release_links;
