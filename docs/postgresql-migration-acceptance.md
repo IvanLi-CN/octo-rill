@@ -5,7 +5,7 @@
 | 门槛 | 当前证据 | 状态 |
 | --- | --- | --- |
 | PostgreSQL 18 版本门禁 | `src/postgres_runtime.rs` 检查 `server_version_num >= 180000`；对应单元测试通过 | 已证明 |
-| Rust 全量回归 | `RUST_TEST_THREADS=4 cargo test --locked --quiet`：主二进制 1253 passed、3 ignored；迁移器 8 passed | 已证明 |
+| Rust 全量回归 | `RUST_TEST_THREADS=4 cargo test --locked --quiet`：主二进制 1254 passed、3 ignored；迁移器 8 passed | 已证明 |
 | 独立 SQLx migration history | `migrations_pg/` 与 `postgres_database_migrations` 测试 | 已证明 |
 | Session store | PostgreSQL `tower_sessions` store、MessagePack `bytea` 校验和 expiry 校验 | 已证明 |
 | 任务认领与终结事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、owner lease 校验的终结更新、`task.running`/`task.completed` 事件和 `40001`/`40P01` 重试测试 | 已证明 |
@@ -15,7 +15,7 @@
 | PG task lifecycle | `postgres_worker` 已统一 claim、取消、executor 成功/失败、owner-checked finalize、按注册类型过滤和可停止轮询；bootstrap smoke 覆盖 | 已证明 |
 | 完整业务 worker | `sync.notifications` 已接入 GitHub REST、凭据解密、幂等 PostgreSQL upsert 和生产 worker；同步 releases、日报、webhook 等 executor 尚未接入 | 部分完成 |
 | 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
-| Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify、bootstrap task claim→finalize 及运行时事件追加校验；演练后容器与 VM 已清理 | 已证明 |
+| Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify、bootstrap task claim→finalize；服务 worker 启动后仅注册类型可认领，未注册的 `sync.releases` 保持 queued；演练后容器与 VM 已清理 | 已证明 |
 | PR 收口 | 当前分支尚未推送或创建远端 PR | 未完成 |
 
 ## 可重复检查
