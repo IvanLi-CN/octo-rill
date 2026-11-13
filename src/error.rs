@@ -95,12 +95,8 @@ impl ApiError {
         let is_background_admission = display_lower
             .contains("sqlite background writer admission denied")
             || error_chain_lower.contains("sqlite background writer admission denied");
-        let is_postgres_retryable = error_chain_lower.contains("sqlstate: 40001")
-            || error_chain_lower.contains("sqlstate 40001")
-            || error_chain_lower.contains("sqlstate: 40p01")
-            || error_chain_lower.contains("sqlstate 40p01")
-            || error_chain_lower.contains("serialization failure")
-            || error_chain_lower.contains("deadlock detected");
+        let is_postgres_retryable =
+            crate::postgres_write::contains_retryable_sqlstate(&error_chain_lower);
         if is_write_deadline || is_write_busy || is_session_conflict || is_background_admission {
             return Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
