@@ -60,10 +60,6 @@ impl ApiError {
         self.code == "sqlite_write_retryable"
     }
 
-    pub fn is_postgres_write_retryable(&self) -> bool {
-        self.code == "postgres_write_retryable"
-    }
-
     pub(crate) fn into_anyhow(self) -> anyhow::Error {
         anyhow::Error::new(self)
     }
@@ -253,7 +249,6 @@ mod tests {
             "db error: SQLSTATE 40P01 deadlock detected"
         ));
 
-        assert!(error.is_postgres_write_retryable());
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
