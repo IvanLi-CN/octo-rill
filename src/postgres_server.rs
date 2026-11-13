@@ -5,6 +5,7 @@ use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, rou
 use chrono::Utc;
 use serde_json::json;
 use tokio::time::{MissedTickBehavior, interval};
+use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDeletion};
 use tracing::{info, warn};
 
 use crate::{
@@ -35,7 +36,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .route("/auth/logout", get(logout))
         .with_state(state);
+    let session_layer =
+        crate::session_store::CoordinatedSessionLayer::new(runtime.sessions.clone())
+            .with_name("octo_rill_sid")
+            .with_secure(config.public_base_url.scheme() == "https")
+            .with_same_site(SameSite::Lax)
+            .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
+    let app = app.layer(session_layer);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -60,15 +69,35 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             }
         }
     });
+    let session_cleanup = tokio::spawn(
+        runtime
+            .sessions
+            .clone()
+            .continuously_delete_expired(Duration::from_secs(60)),
+    );
 
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("PostgreSQL service exited");
     heartbeat.abort();
+    session_cleanup.abort();
     postgres_runtime_owner::unregister(&runtime.pool, &owner_id).await?;
     runtime.pool.close().await;
     serve_result
+}
+
+async fn logout(session: Session) -> impl IntoResponse {
+    match session.delete().await {
+        Ok(()) => (StatusCode::NO_CONTENT, axum::Json(json!({}))),
+        Err(error) => {
+            warn!(%error, "PostgreSQL session logout failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"ok": false, "error": "session_delete_failed"})),
+            )
+        }
+    }
 }
 
 async fn health(State(state): State<PostgresServerState>) -> impl IntoResponse {
