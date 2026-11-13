@@ -42,6 +42,14 @@ pub struct CompositeSyncExecutor {
     notifications: NotificationsExecutor,
 }
 
+#[derive(Clone)]
+pub struct WebhookExecutor {
+    pool: PgPool,
+    http: Client,
+    encryption_key: EncryptionKey,
+    public_base_url: String,
+}
+
 impl ReleasesExecutor {
     pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
         Self {
@@ -82,6 +90,22 @@ impl CompositeSyncExecutor {
     }
 }
 
+impl WebhookExecutor {
+    pub fn new(
+        pool: PgPool,
+        http: Client,
+        encryption_key: EncryptionKey,
+        public_base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            pool,
+            http,
+            encryption_key,
+            public_base_url: public_base_url.into(),
+        }
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct GithubTokenRow {
     id: String,
@@ -100,6 +124,238 @@ struct GithubConnectionRow {
     id: String,
     access_token_ciphertext: Vec<u8>,
     access_token_nonce: Vec<u8>,
+}
+
+#[derive(Debug, FromRow)]
+struct WebhookCredentialRow {
+    webhook_push_desired_state: String,
+    webhook_push_secret_ciphertext: Option<Vec<u8>>,
+    webhook_push_secret_nonce: Option<Vec<u8>>,
+    webhook_push_callback_key: Option<String>,
+    token_ciphertext: Option<Vec<u8>>,
+    token_nonce: Option<Vec<u8>>,
+}
+
+#[derive(Debug, FromRow)]
+struct WebhookRepoRow {
+    repo_id: i64,
+    owner_login: String,
+    repo_name: String,
+    repo_full_name: String,
+    hook_id: Option<i64>,
+}
+
+#[async_trait]
+impl TaskExecutor for WebhookExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if !matches!(
+            task.task_type.as_str(),
+            "webhook.push.manage" | "webhook.push.reconcile"
+        ) {
+            bail!("webhook executor received {}", task.task_type);
+        }
+        let payload: Value =
+            serde_json::from_str(&task.payload_json).context("decode webhook task payload")?;
+        let user_id =
+            task_user_id(&payload, task).ok_or_else(|| anyhow!("webhook task has no user_id"))?;
+        let credentials = sqlx::query_as::<_, WebhookCredentialRow>(
+            "SELECT u.webhook_push_desired_state, u.webhook_push_secret_ciphertext, u.webhook_push_secret_nonce, u.webhook_push_callback_key, p.token_ciphertext, p.token_nonce FROM public.users u LEFT JOIN public.reaction_pat_tokens p ON p.user_id = u.id WHERE u.id = $1 AND u.is_disabled = 0",
+        )
+        .bind(&user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load PostgreSQL webhook credentials")?
+        .ok_or_else(|| anyhow!("webhook user is missing or disabled"))?;
+        let desired_state = payload
+            .get("desired_state")
+            .and_then(Value::as_str)
+            .unwrap_or(&credentials.webhook_push_desired_state);
+        let token_ciphertext = credentials
+            .token_ciphertext
+            .as_deref()
+            .ok_or_else(|| anyhow!("webhook user has no GitHub PAT"))?;
+        let token_nonce = credentials
+            .token_nonce
+            .as_deref()
+            .ok_or_else(|| anyhow!("webhook user has no GitHub PAT nonce"))?;
+        let token = self
+            .encryption_key
+            .decrypt_str(token_ciphertext, token_nonce)
+            .context("decrypt webhook GitHub PAT")?;
+        let callback_key = credentials
+            .webhook_push_callback_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("webhook user has no callback key"))?;
+        let secret = match (
+            credentials.webhook_push_secret_ciphertext.as_deref(),
+            credentials.webhook_push_secret_nonce.as_deref(),
+        ) {
+            (Some(ciphertext), Some(nonce)) => Some(
+                self.encryption_key
+                    .decrypt_str(ciphertext, nonce)
+                    .context("decrypt webhook callback secret")?,
+            ),
+            _ => None,
+        };
+        let callback_url = format!(
+            "{}/api/webhooks/github/releases?key={}",
+            self.public_base_url.trim_end_matches('/'),
+            callback_key
+        );
+        let repo_id = payload.get("repo_id").and_then(Value::as_i64);
+        let repos = sqlx::query_as::<_, WebhookRepoRow>(
+            "SELECT repo_id, owner_login, repo_name, repo_full_name, hook_id, callback_url FROM public.webhook_push_repos WHERE user_id = $1 AND ($2::bigint IS NULL OR repo_id = $2) ORDER BY repo_id",
+        )
+        .bind(&user_id)
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load PostgreSQL webhook repository state")?;
+        let mut registered = 0usize;
+        let mut removed = 0usize;
+        for repo in repos {
+            if desired_state == "enabled" {
+                if let Some(secret) = secret.as_deref() {
+                    if ensure_github_hook(
+                        &self.http,
+                        &token,
+                        &repo.repo_full_name,
+                        &callback_url,
+                        secret,
+                    )
+                    .await?
+                    {
+                        registered += 1;
+                    }
+                    mark_webhook_repo(
+                        &self.pool,
+                        &user_id,
+                        &repo,
+                        &callback_url,
+                        "registered",
+                        None,
+                    )
+                    .await?;
+                }
+            } else if let Some(hook_id) = repo.hook_id {
+                if remove_github_hook(&self.http, &token, &repo.repo_full_name, hook_id).await? {
+                    removed += 1;
+                }
+                mark_webhook_repo(
+                    &self.pool,
+                    &user_id,
+                    &repo,
+                    &callback_url,
+                    "delete_pending",
+                    None,
+                )
+                .await?;
+            }
+        }
+        Ok(json!({"user_id": user_id, "desired_state": desired_state, "registered": registered, "removed": removed}).to_string())
+    }
+}
+
+async fn ensure_github_hook(
+    http: &Client,
+    token: &str,
+    full_name: &str,
+    callback_url: &str,
+    secret: &str,
+) -> Result<bool> {
+    let hooks =
+        github_request(http, token, format!("{GITHUB_API}/repos/{full_name}/hooks")).await?;
+    let existing = hooks.as_array().into_iter().flatten().find(|hook| {
+        hook.get("config")
+            .and_then(|config| config.get("url"))
+            .and_then(Value::as_str)
+            == Some(callback_url)
+    });
+    if existing.is_some() {
+        return Ok(false);
+    }
+    let response = http
+        .post(format!("{GITHUB_API}/repos/{full_name}/hooks"))
+        .bearer_auth(token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&json!({"name": "web", "active": true, "events": ["release"], "config": {"url": callback_url, "content_type": "json", "secret": secret, "insecure_ssl": "0"}}))
+        .send()
+        .await
+        .context("create GitHub release webhook")?;
+    if !response.status().is_success() {
+        bail!("GitHub webhook create returned HTTP {}", response.status());
+    }
+    Ok(true)
+}
+
+async fn remove_github_hook(
+    http: &Client,
+    token: &str,
+    full_name: &str,
+    hook_id: i64,
+) -> Result<bool> {
+    let response = http
+        .delete(format!("{GITHUB_API}/repos/{full_name}/hooks/{hook_id}"))
+        .bearer_auth(token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .context("delete GitHub release webhook")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !response.status().is_success() {
+        bail!("GitHub webhook delete returned HTTP {}", response.status());
+    }
+    Ok(true)
+}
+
+async fn github_request(http: &Client, token: &str, url: String) -> Result<Value> {
+    let response = http
+        .get(url)
+        .bearer_auth(token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .context("list GitHub hooks")?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("GitHub hooks returned HTTP {status}");
+    }
+    response.json().await.context("decode GitHub hooks")
+}
+
+async fn mark_webhook_repo(
+    pool: &PgPool,
+    user_id: &str,
+    repo: &WebhookRepoRow,
+    callback_url: &str,
+    status: &str,
+    hook_id: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO public.webhook_push_repos (user_id, repo_id, owner_login, repo_name, repo_full_name, hook_id, callback_url, status, permission_paused, updated_at) VALUES ($1, $2, $3, $4, $5, COALESCE($6, $7), $8, $9, 0, $10) ON CONFLICT (user_id, repo_id) DO UPDATE SET hook_id = COALESCE(EXCLUDED.hook_id, public.webhook_push_repos.hook_id), callback_url = EXCLUDED.callback_url, status = EXCLUDED.status, permission_paused = 0, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(user_id)
+    .bind(repo.repo_id)
+    .bind(&repo.owner_login)
+    .bind(&repo.repo_name)
+    .bind(&repo.repo_full_name)
+    .bind(hook_id)
+    .bind(repo.hook_id)
+    .bind(callback_url)
+    .bind(status)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .context("persist PostgreSQL webhook repository state")?;
+    Ok(())
 }
 
 #[async_trait]
@@ -490,6 +746,9 @@ mod tests {
         assert!(source.contains("sync.all"));
         assert!(source.contains("sync.access_refresh"));
         assert!(source.contains("/user/starred?per_page=100&page="));
+        assert!(source.contains("webhook.push.manage"));
+        assert!(source.contains("webhook.push.reconcile"));
+        assert!(source.contains("/hooks"));
         assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
         assert!(source.contains("ON CONFLICT (user_id, repo_id)"));

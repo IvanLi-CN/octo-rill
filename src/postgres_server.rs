@@ -31,6 +31,7 @@ use crate::{
     postgres_runtime_owner,
     postgres_tasks::{
         CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor, StarredExecutor,
+        WebhookExecutor,
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
@@ -103,6 +104,24 @@ pub async fn serve(config: AppConfig) -> Result<()> {
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
+            ),
+        )
+        .register(
+            "webhook.push.manage",
+            WebhookExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+                config.public_base_url.to_string(),
+            ),
+        )
+        .register(
+            "webhook.push.reconcile",
+            WebhookExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+                config.public_base_url.to_string(),
             ),
         )
         .build();
