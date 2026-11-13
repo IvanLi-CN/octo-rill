@@ -222,13 +222,21 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let columns = column_names(sqlite, &name).await?;
         if let Some(ddl) = ddl {
             let translated = translate_ddl(&ddl, &name)?;
-            pg.batch_execute(&translated)
+            let dependencies = referenced_tables(&ddl);
+            tables.push((name, columns, translated, dependencies));
+        } else {
+            tables.push((name, columns, String::new(), Vec::new()));
+        }
+    }
+    let tables = order_tables_by_dependencies(tables)?;
+    for (name, _, ddl, _) in &tables {
+        if !ddl.is_empty() {
+            pg.batch_execute(ddl)
                 .await
                 .with_context(|| format!("create target table {name}"))?;
         }
-        tables.push((name, columns));
     }
-    for (name, columns) in tables {
+    for (name, columns, _, _) in tables {
         let (rows, sha) = copy_table(sqlite, pg, &name, &columns, args.batch_size).await?;
         let target_sha = checksum_postgres(pg, &name).await?;
         manifest.tables.insert(
@@ -499,6 +507,60 @@ fn fts_shadow_table_names(rows: &[sqlx::sqlite::SqliteRow]) -> Result<HashSet<St
     }
     Ok(names)
 }
+
+fn referenced_tables(ddl: &str) -> Vec<String> {
+    let tokens = ddl.split_whitespace().collect::<Vec<_>>();
+    let mut references = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.eq_ignore_ascii_case("REFERENCES") {
+            continue;
+        }
+        let Some(reference) = tokens.get(index + 1) else {
+            continue;
+        };
+        let name = reference
+            .split('(')
+            .next()
+            .unwrap_or(reference)
+            .trim_matches(|character| {
+                character == '"' || character == '`' || character == '[' || character == ']'
+            })
+            .to_owned();
+        if !name.is_empty() {
+            references.push(name);
+        }
+    }
+    references
+}
+
+fn order_tables_by_dependencies(
+    tables: Vec<(String, Vec<String>, String, Vec<String>)>,
+) -> Result<Vec<(String, Vec<String>, String, Vec<String>)>> {
+    let mut pending = tables
+        .into_iter()
+        .map(|table| (table.0.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let Some(name) = pending
+            .iter()
+            .find(|(_, (_, _, _, dependencies))| {
+                dependencies
+                    .iter()
+                    .all(|dependency| !pending.contains_key(dependency))
+            })
+            .map(|(name, _)| name.clone())
+        else {
+            let cycle = pending.keys().cloned().collect::<Vec<_>>().join(", ");
+            bail!("cyclic SQLite foreign-key dependencies cannot be created safely: {cycle}");
+        };
+        if let Some((_, table)) = pending.remove_entry(&name) {
+            ordered.push(table);
+        }
+    }
+    Ok(ordered)
+}
+
 fn quote_ident(v: &str) -> String {
     format!("\"{}\"", v.replace('"', "\"\""))
 }
@@ -581,5 +643,26 @@ mod tests {
     fn target_redaction_does_not_write_password() {
         let redacted = redact_target("postgres://user:secret@example.test:5432/db");
         assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn referenced_tables_are_created_before_dependents() {
+        let tables = vec![
+            (
+                "notes".to_owned(),
+                vec!["id".to_owned()],
+                "notes ddl".to_owned(),
+                vec!["users".to_owned()],
+            ),
+            (
+                "users".to_owned(),
+                vec!["id".to_owned()],
+                "users ddl".to_owned(),
+                Vec::new(),
+            ),
+        ];
+        let ordered = order_tables_by_dependencies(tables).unwrap();
+        assert_eq!(ordered[0].0, "users");
+        assert_eq!(ordered[1].0, "notes");
     }
 }
