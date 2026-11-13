@@ -13,7 +13,7 @@
 | PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务和部分管理员路由（包括用户列表、用户详情与受保护的用户状态更新）已接入 | 部分证明 |
 | 完整业务 worker | 同步和日报任务目前只入 PostgreSQL 队列，尚未由 PG-native worker 执行 | 未完成 |
 | 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
-| Agent VM 生产副本演练 | 既有脱敏夹具演练证据已记录；当前最新二进制的重复 PG18 容器演练因 VM 无缓存镜像且无法拉取未重做 | 未证明 |
+| Agent VM 生产副本演练 | 当前 HEAD 的 Linux x86_64 二进制在 Agent VM 的 PostgreSQL 18.7 上完成动态容量门禁、import、verify、rebuild、重复 import/verify、bootstrap task claim、server health、metrics 和未认证同步保护；演练后容器与 VM 已清理 | 已证明 |
 | PR 收口 | 当前分支尚未推送或创建远端 PR | 未完成 |
 
 ## 可重复检查

@@ -19,7 +19,8 @@ OctoRill 的运行时仍以 SQLite 为主，无法在停机迁移后直接使用
 - `cargo test --locked --bin octo-rill-migrate -- --nocapture`
 - Compose YAML 依赖和必需环境变量契约检查
 - Linux x86_64 目标构建
+- Agent VM PostgreSQL 18.7 演练：容量门禁、import、verify、rebuild、重复导入、task claim、health、metrics 和未认证保护
 
 ## 当前发布边界
 
-本分支尚未声明线上切换完成。PostgreSQL 原生 worker 执行链、部分管理员/webhook 业务路由以及最新二进制的 Agent VM PG18 容器演练仍需完成后，才满足完整 PR 验收和线上切换前置条件。
+本分支尚未声明线上切换完成。PostgreSQL 原生 worker 执行链和部分管理员/webhook 业务路由仍需完成后，才满足完整 PR 验收和线上切换前置条件。
