@@ -21,7 +21,7 @@ OctoRill 的运行时仍以 SQLite 为主，无法在停机迁移后直接使用
 - `RUST_TEST_THREADS=4 cargo test --locked --quiet`：主二进制 1255 passed、0 failed、3 ignored；迁移器 8 passed
 - Compose YAML 依赖和必需环境变量契约检查
 - Linux x86_64 目标构建
-- Agent VM PostgreSQL 18.7 演练：容量门禁、import、verify、rebuild、重复导入、task claim→finalize，以及 `sync.releases` 零变更任务由 worker 成功终结
+- Agent VM PostgreSQL 18.7 演练：当前 HEAD 完成容量门禁、import、verify、rebuild；此前同一迁移链路完成重复导入、task claim→finalize，以及 `sync.releases` 零变更任务由 worker 成功终结
 
 ## 当前发布边界
 
