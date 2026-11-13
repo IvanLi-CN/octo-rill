@@ -283,6 +283,9 @@ fn task_user_id(payload: &Value, task: &ClaimedTask) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{ClaimedTask, task_user_id};
+    use serde_json::json;
+
     #[test]
     fn notification_executor_rejects_other_task_types() {
         let source = include_str!("postgres_tasks.rs");
@@ -292,5 +295,21 @@ mod tests {
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
         assert!(source.contains("decrypt_str"));
         assert!(source.contains("requested_by"));
+    }
+
+    #[test]
+    fn task_user_id_falls_back_to_legacy_requester() {
+        let task = ClaimedTask {
+            id: "task".to_owned(),
+            task_type: "sync.releases".to_owned(),
+            source: "test".to_owned(),
+            requested_by: Some("legacy-user".to_owned()),
+            payload_json: "{}".to_owned(),
+            cancel_requested: 0,
+        };
+        assert_eq!(
+            task_user_id(&json!({}), &task).as_deref(),
+            Some("legacy-user")
+        );
     }
 }
