@@ -30,8 +30,8 @@ use crate::{
     postgres_runtime::PostgresRuntime,
     postgres_runtime_owner,
     postgres_tasks::{
-        CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor, StarredExecutor,
-        WebhookExecutor,
+        BriefExecutor, CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor,
+        StarredExecutor, WebhookExecutor,
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
@@ -124,6 +124,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
                 config.public_base_url.to_string(),
             ),
         )
+        .register("brief.generate", BriefExecutor::new(runtime.pool.clone()))
+        .register("brief.daily_slot", BriefExecutor::new(runtime.pool.clone()))
         .build();
     let state = PostgresServerState {
         runtime: runtime.clone(),

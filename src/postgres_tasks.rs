@@ -50,6 +50,11 @@ pub struct WebhookExecutor {
     public_base_url: String,
 }
 
+#[derive(Clone)]
+pub struct BriefExecutor {
+    pool: PgPool,
+}
+
 impl ReleasesExecutor {
     pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
         Self {
@@ -106,6 +111,12 @@ impl WebhookExecutor {
     }
 }
 
+impl BriefExecutor {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct GithubTokenRow {
     id: String,
@@ -143,6 +154,83 @@ struct WebhookRepoRow {
     repo_name: String,
     repo_full_name: String,
     hook_id: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+struct BriefReleaseRow {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+}
+
+#[async_trait]
+impl TaskExecutor for BriefExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if !matches!(
+            task.task_type.as_str(),
+            "brief.generate" | "brief.daily_slot"
+        ) {
+            bail!("brief executor received {}", task.task_type);
+        }
+        let payload: Value =
+            serde_json::from_str(&task.payload_json).context("decode brief task payload")?;
+        let user_id =
+            task_user_id(&payload, task).ok_or_else(|| anyhow!("brief task has no user_id"))?;
+        let releases = sqlx::query_as::<_, BriefReleaseRow>(
+            "SELECT tag_name, name, body, html_url FROM public.releases WHERE user_id = $1 ORDER BY COALESCE(published_at, created_at) DESC, release_id DESC LIMIT 50",
+        )
+        .bind(&user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load PostgreSQL releases for brief")?;
+        let date = Utc::now().date_naive().to_string();
+        let now = Utc::now();
+        let mut markdown = String::from("# 每日简报\n\n");
+        markdown.push_str("## 项目更新\n\n");
+        if releases.is_empty() {
+            markdown.push_str("过去窗口没有新的发布。\n");
+        } else {
+            for release in &releases {
+                let title = release
+                    .name
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(release.tag_name.as_str());
+                let summary = release
+                    .body
+                    .as_deref()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default();
+                markdown.push_str(&format!(
+                    "- [{}]({}) {}\n",
+                    title, release.html_url, summary
+                ));
+            }
+        }
+        let brief_id = format!("{user_id}:{date}");
+        sqlx::query(
+            "INSERT INTO public.briefs (id, user_id, date, window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary, generation_source, content_markdown, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'postgres_deterministic', $8, $9, $9) ON CONFLICT (user_id, date) DO UPDATE SET content_markdown = EXCLUDED.content_markdown, generation_source = EXCLUDED.generation_source, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&brief_id)
+        .bind(&user_id)
+        .bind(&date)
+        .bind(now - chrono::Duration::days(1))
+        .bind(now)
+        .bind("UTC")
+        .bind("00:00")
+        .bind(&markdown)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("upsert PostgreSQL brief")?;
+        Ok(
+            json!({"brief_id": brief_id, "user_id": user_id, "releases": releases.len()})
+                .to_string(),
+        )
+    }
 }
 
 #[async_trait]
@@ -753,6 +841,8 @@ mod tests {
         assert!(source.contains("webhook.push.manage"));
         assert!(source.contains("webhook.push.reconcile"));
         assert!(source.contains("/hooks"));
+        assert!(source.contains("brief.generate"));
+        assert!(source.contains("postgres_deterministic"));
         assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
         assert!(source.contains("ON CONFLICT (user_id, repo_id)"));
