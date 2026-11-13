@@ -64,6 +64,42 @@ pub async fn finalize_task(
     if !matches!(status, "succeeded" | "failed" | "cancelled") {
         return Err(anyhow!("invalid terminal PostgreSQL task status: {status}"));
     }
+    for attempt in 0..=MAX_TRANSACTION_RETRIES {
+        match finalize_once(
+            pool,
+            task_id,
+            runtime_owner_id,
+            status,
+            result_json,
+            error_message,
+            now,
+        )
+        .await
+        {
+            Ok(finalized) => return Ok(finalized),
+            Err(error)
+                if attempt < MAX_TRANSACTION_RETRIES
+                    && error
+                        .downcast_ref::<sqlx::Error>()
+                        .is_some_and(is_retryable_sqlx_error) =>
+            {
+                sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow!("PostgreSQL task finalize retry loop exhausted"))
+}
+
+async fn finalize_once(
+    pool: &PgPool,
+    task_id: &str,
+    runtime_owner_id: &str,
+    status: &str,
+    result_json: Option<&str>,
+    error_message: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
     let mut tx = pool
         .begin()
         .await
