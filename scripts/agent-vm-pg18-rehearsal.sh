@@ -59,5 +59,32 @@ run_vm exec -- sh -lc "
       GITHUB_CLIENT_SECRET=\"\${GITHUB_CLIENT_SECRET:?GITHUB_CLIENT_SECRET is required for app smoke}\" \\
       GITHUB_OAUTH_REDIRECT_URL=\"\${GITHUB_OAUTH_REDIRECT_URL:?GITHUB_OAUTH_REDIRECT_URL is required for app smoke}\" \\
       $app_command
+    DATABASE_URL="\$POSTGRES_URL" \\
+      OCTORILL_ENCRYPTION_KEY_BASE64="\$OCTORILL_ENCRYPTION_KEY_BASE64" \\
+      GITHUB_CLIENT_ID="\$GITHUB_CLIENT_ID" \\
+      GITHUB_CLIENT_SECRET="\$GITHUB_CLIENT_SECRET" \\
+      GITHUB_OAUTH_REDIRECT_URL="\$GITHUB_OAUTH_REDIRECT_URL" \\
+      OCTORILL_BIND_ADDR="\${OCTORILL_BIND_ADDR:-127.0.0.1:3018}" \\
+      $app_command >/tmp/octo-rill-pg18-server.log 2>&1 &
+    app_pid=\$!
+    app_url="http://\${OCTORILL_BIND_ADDR:-127.0.0.1:3018}"
+    app_ready=0
+    for _ in \$(seq 1 30); do
+      if curl -fsS "\$app_url/health" >/tmp/octo-rill-pg18-health.json 2>/dev/null; then
+        curl -fsS "\$app_url/version" >/tmp/octo-rill-pg18-version.json
+        app_ready=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ "\$app_ready" != 1 ]]; then
+      cat /tmp/octo-rill-pg18-server.log >&2
+      kill "\$app_pid" 2>/dev/null || true
+      wait "\$app_pid" 2>/dev/null || true
+      echo 'PostgreSQL service health probe failed' >&2
+      exit 4
+    fi
+    kill -INT "\$app_pid"
+    wait "\$app_pid"
   fi
 "
