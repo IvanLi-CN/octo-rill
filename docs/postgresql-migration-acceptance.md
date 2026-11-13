@@ -10,7 +10,7 @@
 | 任务认领事务 | `FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING`、`40001`/`40P01` 重试测试 | 已证明 |
 | SQLite 离线导入器 | `octo-rill-migrate` 的 snapshot/import/verify/rebuild 实现；7 项迁移器测试通过，并在导入前检查 `users`、`github_connections`、`job_tasks` 核心权威表 | 已证明 |
 | Compose 启动门禁 | migration `service_completed_successfully` 后才启动 server；必需配置变量缺失时拒绝展开 | 已证明 |
-| PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务和部分管理员路由（包括用户列表）已接入 | 部分证明 |
+| PostgreSQL service boundary | health、session、账户、搜索、feed、brief、任务和部分管理员路由（包括用户列表与用户详情）已接入 | 部分证明 |
 | 完整业务 worker | 同步和日报任务目前只入 PostgreSQL 队列，尚未由 PG-native worker 执行 | 未完成 |
 | 全量业务路由 | 管理员写操作、webhook、LinuxDo/passkey 写流程及其他 SQLite 路由仍未全部迁移 | 未完成 |
 | Agent VM 生产副本演练 | 既有脱敏夹具演练证据已记录；当前最新二进制的重复 PG18 容器演练因 VM 无缓存镜像且无法拉取未重做 | 未证明 |
