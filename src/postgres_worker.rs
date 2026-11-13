@@ -21,6 +21,15 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, task: &ClaimedTask) -> Result<String>;
 }
 
+pub struct BootstrapSmokeExecutor;
+
+#[async_trait]
+impl TaskExecutor for BootstrapSmokeExecutor {
+    async fn execute(&self, _task: &ClaimedTask) -> Result<String> {
+        Ok(r#"{"smoke":true}"#.to_owned())
+    }
+}
+
 /// Dispatch PostgreSQL tasks to explicitly registered business executors.
 ///
 /// Keeping the registry separate from the durable claim/finalize lifecycle

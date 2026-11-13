@@ -9,6 +9,10 @@ use chrono::{DateTime, Utc};
 
 const MIN_POSTGRES_VERSION_NUM: i64 = 180_000;
 
+fn postgres_version_supported(version_num: i64) -> bool {
+    version_num >= MIN_POSTGRES_VERSION_NUM
+}
+
 /// Runtime-owned PostgreSQL resources. The migration utility uses the same
 /// baseline, but this type is intended for the long-lived application process.
 #[derive(Clone)]
@@ -63,7 +67,7 @@ pub async fn verify_application_schema(pool: &PgPool) -> Result<()> {
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)",
     )
-    .bind(&required)
+    .bind(required)
     .fetch_all(pool)
     .await
     .context("inspect PostgreSQL application schema")?;
@@ -123,7 +127,7 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         .context("read PostgreSQL server_version_num")?
         .parse()
         .context("parse PostgreSQL server_version_num")?;
-    if version_num < MIN_POSTGRES_VERSION_NUM {
+    if !postgres_version_supported(version_num) {
         bail!("PostgreSQL 18 is required; server_version_num={version_num}");
     }
 
@@ -154,9 +158,9 @@ mod tests {
 
     #[test]
     fn postgres_version_gate_matches_major_18_boundary() {
-        assert!(MIN_POSTGRES_VERSION_NUM >= 180_000);
-        assert!(18_0000_i64 >= MIN_POSTGRES_VERSION_NUM);
-        assert!(17_9999_i64 < MIN_POSTGRES_VERSION_NUM);
+        assert!(postgres_version_supported(180_000));
+        assert!(postgres_version_supported(180_001));
+        assert!(!postgres_version_supported(179_999));
     }
 
     #[test]

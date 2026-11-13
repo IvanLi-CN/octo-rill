@@ -45,15 +45,6 @@ mod worker_backoff;
 use anyhow::Result;
 use dotenvy::{dotenv, from_filename};
 
-struct BootstrapSmokeExecutor;
-
-#[async_trait::async_trait]
-impl postgres_worker::TaskExecutor for BootstrapSmokeExecutor {
-    async fn execute(&self, _task: &postgres_jobs::ClaimedTask) -> Result<String> {
-        Ok(r#"{"smoke":true}"#.to_owned())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     from_filename(".env.local").ok();
@@ -75,7 +66,7 @@ async fn main() -> Result<()> {
             tracing::info!(heartbeat, "PostgreSQL runtime owner lease is ready");
             if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1") {
                 let registry = postgres_worker::TaskExecutorRegistry::builder()
-                    .register("sync.releases", BootstrapSmokeExecutor)
+                    .register("sync.releases", postgres_worker::BootstrapSmokeExecutor)
                     .build();
                 let ran = runtime
                     .run_registered_task_once(owner_id, &registry)

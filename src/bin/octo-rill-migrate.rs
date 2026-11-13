@@ -653,9 +653,9 @@ fn referenced_tables(table_name: &str, ddl: &str) -> Vec<String> {
     references
 }
 
-fn order_tables_by_dependencies(
-    tables: Vec<(String, Vec<String>, String, Vec<String>)>,
-) -> Result<Vec<(String, Vec<String>, String, Vec<String>)>> {
+type TableSpec = (String, Vec<String>, String, Vec<String>);
+
+fn order_tables_by_dependencies(tables: Vec<TableSpec>) -> Result<Vec<TableSpec>> {
     let mut pending = tables
         .into_iter()
         .map(|table| (table.0.clone(), table))
@@ -707,7 +707,7 @@ fn filesystem_available_bytes(path: &std::path::Path) -> Result<u64> {
         return Err(std::io::Error::last_os_error()).context("stat PostgreSQL filesystem");
     }
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Ok(u64::from(stat.f_bavail) * stat.f_frsize)
 }
 
 fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
@@ -725,7 +725,6 @@ fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
         .replace(" BLOB", " BYTEA")
         .replace(" INTEGER", " BIGINT")
         .replace(" REAL", " DOUBLE PRECISION");
-    sql = sql.replace("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP");
     if sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE") {
         bail!("virtual table {table} must be rebuilt as a PostgreSQL projection");
     }
