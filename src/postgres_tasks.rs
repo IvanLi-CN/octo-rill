@@ -69,15 +69,12 @@ impl TaskExecutor for NotificationsExecutor {
         }
         let payload: Value = serde_json::from_str(&task.payload_json)
             .context("decode sync.notifications task payload")?;
-        let user_id = payload
-            .get("user_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("sync.notifications task payload has no user_id"))?;
+        let user_id = task_user_id(&payload, task)
+            .ok_or_else(|| anyhow!("sync.notifications task has no user_id"))?;
         let connections = sqlx::query_as::<_, GithubTokenRow>(
             "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
         )
-        .bind(user_id)
+        .bind(&user_id)
         .fetch_all(&self.pool)
         .await
         .context("load PostgreSQL GitHub notification connections")?;
@@ -116,7 +113,7 @@ impl TaskExecutor for NotificationsExecutor {
                 .await
                 .context("decode GitHub notifications")?;
             for notification in &notifications {
-                upsert_notification(&self.pool, user_id, notification, &now).await?;
+                upsert_notification(&self.pool, &user_id, notification, &now).await?;
             }
             total += notifications.len();
         }
@@ -132,22 +129,19 @@ impl TaskExecutor for ReleasesExecutor {
         }
         let payload: Value = serde_json::from_str(&task.payload_json)
             .context("decode sync.releases task payload")?;
-        let user_id = payload
-            .get("user_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("sync.releases task payload has no user_id"))?;
+        let user_id = task_user_id(&payload, task)
+            .ok_or_else(|| anyhow!("sync.releases task has no user_id"))?;
         let repos = sqlx::query_as::<_, StarredRepoRow>(
             "SELECT repo_id, full_name FROM public.starred_repos WHERE user_id = $1 ORDER BY repo_id",
         )
-        .bind(user_id)
+        .bind(&user_id)
         .fetch_all(&self.pool)
         .await
         .context("load PostgreSQL starred repositories")?;
         let connections = sqlx::query_as::<_, GithubTokenRow>(
             "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
         )
-        .bind(user_id)
+        .bind(&user_id)
         .fetch_all(&self.pool)
         .await
         .context("load PostgreSQL GitHub release connections")?;
@@ -192,7 +186,7 @@ impl TaskExecutor for ReleasesExecutor {
                 .await
                 .context("decode GitHub releases")?;
             for release in &releases {
-                upsert_release(&self.pool, user_id, repo, release, &now).await?;
+                upsert_release(&self.pool, &user_id, repo, release, &now).await?;
             }
             total += releases.len();
         }
@@ -278,6 +272,15 @@ fn required_string(value: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("GitHub notification has no {key}"))
 }
 
+fn task_user_id(payload: &Value, task: &ClaimedTask) -> Option<String> {
+    payload
+        .get("user_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| task.requested_by.clone().filter(|value| !value.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -288,5 +291,6 @@ mod tests {
         assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
         assert!(source.contains("ON CONFLICT (user_id, release_id)"));
         assert!(source.contains("decrypt_str"));
+        assert!(source.contains("requested_by"));
     }
 }
