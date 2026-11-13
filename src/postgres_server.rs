@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use crate::{
     config::AppConfig, crypto::EncryptedSecret, local_id, postgres_runtime::PostgresRuntime,
-    postgres_runtime_owner, state::GitHubOAuthClient,
+    postgres_runtime_owner, postgres_tasks::NotificationsExecutor,
+    postgres_worker::TaskExecutorRegistry, state::GitHubOAuthClient,
 };
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ struct PostgresServerState {
     github_oauth: GitHubOAuthClient,
     http: reqwest::Client,
     encryption_key: crate::crypto::EncryptionKey,
+    task_registry: TaskExecutorRegistry,
 }
 
 /// PostgreSQL-native service boundary.
@@ -49,18 +51,34 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let owner_id: Arc<str> = local_id::generate_local_id().into();
     postgres_runtime_owner::register(&runtime.pool, &owner_id, Utc::now()).await?;
 
+    let http = reqwest::Client::builder()
+        .user_agent("OctoRill")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build PostgreSQL service HTTP client")?;
+    let task_registry = TaskExecutorRegistry::builder()
+        .register(
+            "sync.notifications",
+            NotificationsExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
+        .build();
     let state = PostgresServerState {
         runtime: runtime.clone(),
         owner_id: owner_id.clone(),
         linuxdo_available: config.linuxdo.is_some(),
         github_oauth: crate::state::build_oauth_client(&config)?,
-        http: reqwest::Client::builder()
-            .user_agent("OctoRill")
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("build PostgreSQL service HTTP client")?,
+        http,
         encryption_key: config.encryption_key.clone(),
+        task_registry,
     };
+    info!(
+        task_types = ?state.task_registry.registered_task_types(),
+        "PostgreSQL task executors registered"
+    );
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
