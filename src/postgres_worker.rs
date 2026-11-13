@@ -4,10 +4,11 @@
 //! durable lifecycle around them so every executor gets the same claim,
 //! cancellation and owner-checked finalization semantics.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::PgPool;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::postgres_jobs::ClaimedTask;
 
@@ -16,12 +17,68 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, task: &ClaimedTask) -> Result<String>;
 }
 
+/// Dispatch PostgreSQL tasks to explicitly registered business executors.
+///
+/// Keeping the registry separate from the durable claim/finalize lifecycle
+/// lets each business vertical migrate independently while preserving one
+/// owner-checked state transition for every task.
+#[derive(Default, Clone)]
+pub struct TaskExecutorRegistry {
+    handlers: Arc<HashMap<String, Arc<dyn TaskExecutor>>>,
+}
+
+impl TaskExecutorRegistry {
+    pub fn builder() -> TaskExecutorRegistryBuilder {
+        TaskExecutorRegistryBuilder::default()
+    }
+
+    pub fn registered_task_types(&self) -> Vec<String> {
+        let mut task_types = self.handlers.keys().cloned().collect::<Vec<_>>();
+        task_types.sort();
+        task_types
+    }
+}
+
+#[derive(Default)]
+pub struct TaskExecutorRegistryBuilder {
+    handlers: HashMap<String, Arc<dyn TaskExecutor>>,
+}
+
+impl TaskExecutorRegistryBuilder {
+    pub fn register<E>(mut self, task_type: impl Into<String>, executor: E) -> Self
+    where
+        E: TaskExecutor + 'static,
+    {
+        self.handlers.insert(task_type.into(), Arc::new(executor));
+        self
+    }
+
+    pub fn build(self) -> TaskExecutorRegistry {
+        TaskExecutorRegistry {
+            handlers: Arc::new(self.handlers),
+        }
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for TaskExecutorRegistry {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        let executor = self.handlers.get(&task.task_type).ok_or_else(|| {
+            anyhow!(
+                "no PostgreSQL task executor registered for task type {}",
+                task.task_type
+            )
+        })?;
+        executor.execute(task).await
+    }
+}
+
 /// Execute at most one queued PostgreSQL task.
 ///
 /// A missing task is a normal idle result. Cancellation is finalized without
 /// invoking the business executor. Executor failures are persisted as failed
 /// task results and returned to the caller after the durable state transition.
-pub async fn run_once<E: TaskExecutor>(
+pub async fn run_once<E: TaskExecutor + ?Sized>(
     pool: &PgPool,
     runtime_owner_id: &str,
     executor: &E,
@@ -81,6 +138,17 @@ pub async fn run_once<E: TaskExecutor>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct TestExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for TestExecutor {
+        async fn execute(&self, _task: &ClaimedTask) -> Result<String> {
+            Ok("{}".to_owned())
+        }
+    }
+
     #[test]
     fn runner_contract_uses_claim_cancel_and_owner_checked_finalize() {
         let source = include_str!("postgres_worker.rs");
@@ -88,5 +156,17 @@ mod tests {
         assert!(source.contains("cancel_requested"));
         assert!(source.contains("finalize_task"));
         assert!(source.contains("TaskExecutor"));
+    }
+
+    #[test]
+    fn registry_keeps_explicit_task_type_boundary() {
+        let registry = TaskExecutorRegistry::builder()
+            .register("sync.access_refresh", TestExecutor)
+            .register("brief.generate", TestExecutor)
+            .build();
+        assert_eq!(
+            registry.registered_task_types(),
+            vec!["brief.generate", "sync.access_refresh"]
+        );
     }
 }
