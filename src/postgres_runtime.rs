@@ -121,6 +121,15 @@ impl PostgresRuntime {
         )
         .await
     }
+
+    /// Run one PostgreSQL task through an injected business executor.
+    pub async fn run_task_once<E: crate::postgres_worker::TaskExecutor>(
+        &self,
+        runtime_owner_id: &str,
+        executor: &E,
+    ) -> Result<bool> {
+        crate::postgres_worker::run_once(&self.pool, runtime_owner_id, executor).await
+    }
 }
 
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PostgresRuntime> {
