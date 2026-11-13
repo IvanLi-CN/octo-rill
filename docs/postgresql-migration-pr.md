@@ -8,7 +8,7 @@ OctoRill 的运行时仍以 SQLite 为主，无法在停机迁移后直接使用
 
 - 增加独立的 PostgreSQL SQLx migration history、PG 18 版本门禁、Session store、runtime owner，以及带 owner lease 校验和终结事件的任务协调事务。
 - 增加项目内 Rust `octo-rill-migrate`，支持动态容量预检、SQLite 快照导入、幂等重跑、manifest/checksum、verify 和搜索投影 rebuild。
-- 增加 PG service boundary，迁移核心账户、搜索、feed、brief、任务、指标，以及 LinuxDo/passkey 解绑和部分管理员读写路径。
+- 增加 PG service boundary，迁移核心账户、搜索、feed、brief、任务、指标、webhook reconcile 入队，以及 LinuxDo/passkey 解绑和部分管理员读写路径。
 - 增加 Compose 中 PostgreSQL、一次性 migration 和 server 的启动依赖及必需配置门禁。
 - 保留 SQLite 原卷只读迁移输入，并在导入前检查核心权威表存在。
 
