@@ -99,6 +99,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/overview", get(admin_jobs_overview))
         .route("/api/admin/users", get(admin_users))
+        .route("/api/admin/users/{user_id}", get(admin_user_detail))
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
@@ -2053,6 +2054,59 @@ async fn admin_users(
         }
         (Err(error), _) | (_, Err(error)) => {
             warn!(%error, "PostgreSQL admin users query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_user_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
+    }
+    match sqlx::query(
+        "SELECT id, github_user_id, login, name, email, is_admin, is_disabled, paused_at, created_at, updated_at, last_active_at, include_own_releases \
+         FROM public.users WHERE id = $1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "id": row.get::<String, _>("id"),
+                    "github_user_id": row.get::<Option<i64>, _>("github_user_id"),
+                    "login": row.get::<Option<String>, _>("login"),
+                    "name": row.get::<Option<String>, _>("name"),
+                    "email": row.get::<Option<String>, _>("email"),
+                    "is_admin": row.get::<i64, _>("is_admin") != 0,
+                    "is_disabled": row.get::<i64, _>("is_disabled") != 0,
+                    "paused_at": row.get::<Option<String>, _>("paused_at"),
+                    "created_at": row.get::<String, _>("created_at"),
+                    "updated_at": row.get::<String, _>("updated_at"),
+                    "last_active_at": row.get::<Option<String>, _>("last_active_at"),
+                    "include_own_releases": row.get::<i64, _>("include_own_releases") != 0,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "user_not_found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL admin user detail query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
