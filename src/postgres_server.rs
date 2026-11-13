@@ -74,6 +74,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::put(follow_repo).delete(unfollow_repo),
         )
         .route("/api/tasks/{task_id}/events", get(task_events))
+        .route("/api/tasks/{task_id}", get(task_status))
+        .route(
+            "/api/tasks/{task_id}/cancel",
+            axum::routing::post(cancel_task),
+        )
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/feed", get(feed))
         .route("/api/dashboard/feed", get(dashboard_feed))
@@ -1213,6 +1218,92 @@ async fn enqueue_sync_task(
                 axum::Json(json!({"code": "database_error"})),
             )
                 .into_response()
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PgTaskStatusRow {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    requested_by: Option<String>,
+    payload_json: String,
+    result_json: Option<String>,
+    error_message: Option<String>,
+    cancel_requested: i64,
+    created_at: chrono::DateTime<Utc>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    finished_at: Option<chrono::DateTime<Utc>>,
+}
+
+async fn task_status(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query_as::<_, PgTaskStatusRow>(
+        "SELECT id, task_type, status, source, requested_by, payload_json, result_json, error_message, cancel_requested, created_at, started_at, finished_at FROM public.job_tasks WHERE id = $1 AND requested_by = $2",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            axum::Json(json!({"id": row.id, "task_id": row.id, "task_type": row.task_type, "status": row.status, "source": row.source, "requested_by": row.requested_by, "payload": serde_json::from_str::<serde_json::Value>(&row.payload_json).unwrap_or(json!({})), "result": row.result_json.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()), "error": row.error_message, "cancel_requested": row.cancel_requested != 0, "created_at": row.created_at, "started_at": row.started_at, "finished_at": row.finished_at})),
+        ).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, axum::Json(json!({"code": "not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL task status query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+        }
+    }
+}
+
+async fn cancel_task(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query("UPDATE public.job_tasks SET cancel_requested = 1, updated_at = $1 WHERE id = $2 AND requested_by = $3 AND status IN ('queued', 'running')")
+        .bind(Utc::now())
+        .bind(&task_id)
+        .bind(&user_id)
+        .execute(&state.runtime.pool)
+        .await
+    {
+        Ok(result) if result.rows_affected() == 1 => (StatusCode::OK, axum::Json(json!({"task_id": task_id, "cancel_requested": true}))).into_response(),
+        Ok(_) => (StatusCode::NOT_FOUND, axum::Json(json!({"code": "not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL task cancellation failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
         }
     }
 }
