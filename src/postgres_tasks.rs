@@ -216,15 +216,15 @@ impl TaskExecutor for WebhookExecutor {
         for repo in repos {
             if desired_state == "enabled" {
                 if let Some(secret) = secret.as_deref() {
-                    if ensure_github_hook(
+                    let created_hook_id = ensure_github_hook(
                         &self.http,
                         &token,
                         &repo.repo_full_name,
                         &callback_url,
                         secret,
                     )
-                    .await?
-                    {
+                    .await?;
+                    if created_hook_id.is_some() {
                         registered += 1;
                     }
                     mark_webhook_repo(
@@ -233,7 +233,7 @@ impl TaskExecutor for WebhookExecutor {
                         &repo,
                         &callback_url,
                         "registered",
-                        None,
+                        created_hook_id.or(repo.hook_id),
                     )
                     .await?;
                 }
@@ -262,7 +262,7 @@ async fn ensure_github_hook(
     full_name: &str,
     callback_url: &str,
     secret: &str,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     let hooks =
         github_request(http, token, format!("{GITHUB_API}/repos/{full_name}/hooks")).await?;
     let existing = hooks.as_array().into_iter().flatten().find(|hook| {
@@ -271,8 +271,8 @@ async fn ensure_github_hook(
             .and_then(Value::as_str)
             == Some(callback_url)
     });
-    if existing.is_some() {
-        return Ok(false);
+    if let Some(existing) = existing {
+        return Ok(existing.get("id").and_then(Value::as_i64));
     }
     let response = http
         .post(format!("{GITHUB_API}/repos/{full_name}/hooks"))
@@ -287,7 +287,12 @@ async fn ensure_github_hook(
     if !response.status().is_success() {
         bail!("GitHub webhook create returned HTTP {}", response.status());
     }
-    Ok(true)
+    Ok(response
+        .json::<Value>()
+        .await
+        .context("decode created GitHub webhook")?
+        .get("id")
+        .and_then(Value::as_i64))
 }
 
 async fn remove_github_hook(
@@ -340,7 +345,7 @@ async fn mark_webhook_repo(
     hook_id: Option<i64>,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO public.webhook_push_repos (user_id, repo_id, owner_login, repo_name, repo_full_name, hook_id, callback_url, status, permission_paused, updated_at) VALUES ($1, $2, $3, $4, $5, COALESCE($6, $7), $8, $9, 0, $10) ON CONFLICT (user_id, repo_id) DO UPDATE SET hook_id = COALESCE(EXCLUDED.hook_id, public.webhook_push_repos.hook_id), callback_url = EXCLUDED.callback_url, status = EXCLUDED.status, permission_paused = 0, updated_at = EXCLUDED.updated_at",
+        "INSERT INTO public.webhook_push_repos (user_id, repo_id, owner_login, repo_name, repo_full_name, hook_id, callback_url, status, permission_paused, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9) ON CONFLICT (user_id, repo_id) DO UPDATE SET hook_id = EXCLUDED.hook_id, callback_url = EXCLUDED.callback_url, status = EXCLUDED.status, permission_paused = 0, updated_at = EXCLUDED.updated_at",
     )
     .bind(user_id)
     .bind(repo.repo_id)
@@ -348,7 +353,6 @@ async fn mark_webhook_repo(
     .bind(&repo.repo_name)
     .bind(&repo.repo_full_name)
     .bind(hook_id)
-    .bind(repo.hook_id)
     .bind(callback_url)
     .bind(status)
     .bind(Utc::now())
