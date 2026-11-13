@@ -70,6 +70,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me/linuxdo", get(me_linuxdo))
         .route("/api/me/passkeys", get(me_passkeys))
         .route(
+            "/api/me/passkeys/{passkey_id}",
+            axum::routing::delete(delete_passkey),
+        )
+        .route(
             "/api/me/webhook-push",
             get(webhook_push_settings).patch(patch_webhook_push_settings),
         )
@@ -78,6 +82,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/me/github-connections/{connection_id}",
             axum::routing::delete(delete_github_connection),
         )
+        .route("/api/me/linuxdo", axum::routing::delete(delete_linuxdo))
         .route("/api/me/profile", get(me_profile).patch(update_me_profile))
         .route("/api/me/api-keys", get(list_api_keys).post(create_api_key))
         .route(
@@ -467,6 +472,46 @@ async fn me_linuxdo(
     }
 }
 
+async fn delete_linuxdo(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query("DELETE FROM public.linuxdo_connections WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&state.runtime.pool)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "available": state.linuxdo_available,
+                "connection": null,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL LinuxDo connection deletion failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn me_passkeys(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -511,6 +556,101 @@ async fn me_passkeys(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
             )
+        }
+    }
+}
+
+async fn delete_passkey(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(passkey_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let deleted = async {
+        let mut tx = state.runtime.pool.begin().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM public.user_passkeys WHERE id = $1 AND user_id = $2 RETURNING id",
+        )
+        .bind(&passkey_id)
+        .bind(&user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if deleted.is_some() {
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM public.user_passkeys WHERE user_id = $1",
+            )
+            .bind(&user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if remaining == 0 {
+                sqlx::query(
+                    "UPDATE public.users SET passkey_user_handle_uuid = NULL, updated_at = $1 WHERE id = $2",
+                )
+                .bind(Utc::now())
+                .bind(&user_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(deleted)
+    }
+    .await;
+    match deleted {
+        Ok(Some(_)) => match sqlx::query(
+            "SELECT id, label, created_at, last_used_at FROM public.user_passkeys WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&user_id)
+        .fetch_all(&state.runtime.pool)
+        .await
+        {
+            Ok(rows) => {
+                use sqlx::Row;
+                let items = rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "id": row.get::<String, _>("id"),
+                            "label": row.get::<String, _>("label"),
+                            "created_at": row.get::<String, _>("created_at"),
+                            "last_used_at": row.get::<Option<String>, _>("last_used_at"),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (StatusCode::OK, axum::Json(json!({"items": items}))).into_response()
+            }
+            Err(error) => {
+                warn!(%error, user_id = %user_id, "PostgreSQL passkey reload failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"code": "database_error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "passkey_not_found", "message": "passkey not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, passkey_id = %passkey_id, "PostgreSQL passkey deletion failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
         }
     }
 }
