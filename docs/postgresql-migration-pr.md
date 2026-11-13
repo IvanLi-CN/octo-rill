@@ -18,7 +18,7 @@ OctoRill 的运行时仍以 SQLite 为主，无法在停机迁移后直接使用
 - `cargo check --all-targets --locked`
 - `cargo test --locked postgres_ -- --nocapture`
 - `cargo test --locked --bin octo-rill-migrate -- --nocapture`
-- 上一版 HEAD 的 `RUST_TEST_THREADS=4 cargo test --locked --quiet`：主二进制 1254 passed、3 ignored，迁移器 8 passed；本次 executor 改动后的全量运行在既有锁竞争测试处中止，需最终重跑确认
+- `RUST_TEST_THREADS=4 cargo test --locked --quiet`：主二进制 1255 passed、3 ignored，迁移器 8 passed
 - Compose YAML 依赖和必需环境变量契约检查
 - Linux x86_64 目标构建
 - Agent VM PostgreSQL 18.7 演练：容量门禁、import、verify、rebuild、重复导入、task claim→finalize，以及 `sync.releases` 零变更任务由 worker 成功终结
