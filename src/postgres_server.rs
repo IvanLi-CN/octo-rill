@@ -79,6 +79,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/dashboard/feed", get(dashboard_feed))
         .route("/api/briefs", get(list_briefs))
         .route("/api/briefs/{brief_id}", get(get_brief))
+        .route("/api/briefs/generate", axum::routing::post(generate_brief))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
@@ -1117,6 +1118,45 @@ async fn get_brief(
         Err(error) => {
             warn!(%error, "PostgreSQL brief query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+        }
+    }
+}
+
+async fn generate_brief(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let task_id = local_id::generate_local_id();
+    let now = Utc::now();
+    let payload = json!({"user_id": user_id});
+    match sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'brief.generate', 'queued', 'api.briefs.generate', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(payload.to_string())
+    .bind(now)
+    .execute(&state.runtime.pool)
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({"mode": "task_id", "task_id": task_id, "task_type": "brief.generate", "status": "queued"})),
+        ),
+        Err(error) => {
+            warn!(%error, "PostgreSQL brief task enqueue failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"})))
         }
     }
 }
