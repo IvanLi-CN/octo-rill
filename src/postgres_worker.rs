@@ -203,6 +203,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn registry_rejects_unregistered_task_type() {
+        let registry = TaskExecutorRegistry::builder()
+            .register("sync.access_refresh", TestExecutor)
+            .build();
+        let task = ClaimedTask {
+            id: "task-1".to_owned(),
+            task_type: "brief.generate".to_owned(),
+            source: "test".to_owned(),
+            requested_by: None,
+            payload_json: "{}".to_owned(),
+            cancel_requested: 0,
+        };
+        let error = registry
+            .execute(&task)
+            .await
+            .expect_err("unknown task type");
+        assert!(error.to_string().contains("brief.generate"));
+    }
+
     #[test]
     fn worker_loop_has_shutdown_and_polling_contract() {
         let source = include_str!("postgres_worker.rs");
