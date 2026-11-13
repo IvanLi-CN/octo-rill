@@ -67,6 +67,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me", get(me))
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
+        .route("/api/me/github-connections", get(me_github_connections))
         .route("/api/me/profile", get(me_profile).patch(update_me_profile))
         .route("/api/me/api-keys", get(list_api_keys).post(create_api_key))
         .route(
@@ -367,6 +368,94 @@ struct MeRow {
     name: Option<String>,
     avatar_url: Option<String>,
     email: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct GithubConnectionRow {
+    id: String,
+    github_user_id: i64,
+    login: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    email: Option<String>,
+    scopes: String,
+    linked_at: String,
+    updated_at: String,
+}
+
+async fn me_github_connections(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT (is_disabled = 0 AND paused_at IS NULL) FROM public.users WHERE id = $1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match active {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({"code": "account_inactive"})),
+            );
+        }
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"code": "unauthorized", "message": "session user not found"})),
+            );
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL GitHub connection access check failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            );
+        }
+    }
+    let rows = sqlx::query_as::<_, GithubConnectionRow>(
+        "SELECT id, github_user_id, login, name, avatar_url, email, scopes, linked_at, updated_at \
+         FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.runtime.pool)
+    .await;
+    match rows {
+        Ok(rows) => (
+            StatusCode::OK,
+            axum::Json(json!({"items": rows.into_iter().map(|row| json!({
+                "id": row.id,
+                "github_user_id": row.github_user_id,
+                "login": row.login,
+                "name": row.name,
+                "avatar_url": row.avatar_url,
+                "email": row.email,
+                "scopes": row.scopes,
+                "linked_at": row.linked_at,
+                "updated_at": row.updated_at,
+            })).collect::<Vec<_>>() })),
+        ),
+        Err(error) => {
+            warn!(%error, user_id = %user_id, "PostgreSQL GitHub connection lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
 }
 
 async fn me(State(state): State<PostgresServerState>, session: Session) -> impl IntoResponse {
