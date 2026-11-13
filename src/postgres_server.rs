@@ -75,6 +75,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
+        .route("/api/feed", get(feed))
+        .route("/api/dashboard/feed", get(dashboard_feed))
         .route("/auth/github/login", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
@@ -857,6 +859,127 @@ async fn public_metrics(State(state): State<PostgresServerState>) -> impl IntoRe
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(json!({"error": "metrics_unavailable"})),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PgFeedQuery {
+    limit: Option<i64>,
+}
+
+async fn load_feed_items(
+    state: &PostgresServerState,
+    user_id: &str,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    #[derive(Debug, FromRow)]
+    struct Row {
+        id: String,
+        resource_type: String,
+        title: Option<String>,
+        body: Option<String>,
+        repo_full_name: Option<String>,
+        source_time: Option<String>,
+        unread: Option<i64>,
+        target_url: Option<String>,
+    }
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT id, resource_type, title, body, repo_full_name, source_time, unread, target_url FROM public.search_documents WHERE (user_id IS NULL OR user_id = $1) ORDER BY source_time DESC NULLS LAST, id DESC LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(limit.clamp(1, 100))
+    .fetch_all(&state.runtime.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "kind": row.resource_type,
+                "ts": row.source_time.clone().unwrap_or_default(),
+                "id": row.id,
+                "repo_full_name": row.repo_full_name,
+                "title": row.title,
+                "body": row.body,
+                "body_truncated": false,
+                "subtitle": null,
+                "reason": null,
+                "subject_type": null,
+                "html_url": row.target_url,
+                "unread": row.unread,
+                "repo_visual": null,
+                "actor": null,
+                "translated": null,
+                "smart": null,
+                "reactions": null
+            })
+        })
+        .collect())
+}
+
+async fn feed(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<PgFeedQuery>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match load_feed_items(&state, &user_id, query.limit.unwrap_or(30)).await {
+        Ok(items) => (
+            StatusCode::OK,
+            axum::Json(json!({"items": items, "next_cursor": null})),
+        ),
+        Err(error) => {
+            warn!(%error, "PostgreSQL feed query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+        }
+    }
+}
+
+async fn dashboard_feed(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<PgFeedQuery>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    match load_feed_items(&state, &user_id, query.limit.unwrap_or(30)).await {
+        Ok(items) => {
+            let count = items.len();
+            (
+                StatusCode::OK,
+                axum::Json(
+                    json!({"sections": [{"id": "pg-canonical", "display_date": null, "kind": "raw", "window_start": null, "window_end": null, "brief": null, "items": items, "supplemental_items": [], "supplemental_next_cursor": null, "items_next_cursor": null, "item_count": count, "activity_count": count, "can_generate_brief": false}], "next_cursor": null}),
+                ),
+            )
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL dashboard feed query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
             )
         }
     }
