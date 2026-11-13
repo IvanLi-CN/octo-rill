@@ -100,13 +100,13 @@ impl PostgresRuntime {
         crate::postgres_jobs::claim_next_queued_task(&self.pool, runtime_owner_id, now).await
     }
 
-    /// Run one PostgreSQL task through an injected business executor.
-    pub async fn run_task_once<E: crate::postgres_worker::TaskExecutor>(
+    /// Run one task through the runtime's explicit task-type registry.
+    pub async fn run_registered_task_once(
         &self,
         runtime_owner_id: &str,
-        executor: &E,
+        registry: &crate::postgres_worker::TaskExecutorRegistry,
     ) -> Result<bool> {
-        crate::postgres_worker::run_once(&self.pool, runtime_owner_id, executor).await
+        crate::postgres_worker::run_once(&self.pool, runtime_owner_id, registry).await
     }
 }
 

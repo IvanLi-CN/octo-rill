@@ -73,8 +73,11 @@ async fn main() -> Result<()> {
                     .await?;
             tracing::info!(heartbeat, "PostgreSQL runtime owner lease is ready");
             if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1") {
+                let registry = postgres_worker::TaskExecutorRegistry::builder()
+                    .register("sync.releases", BootstrapSmokeExecutor)
+                    .build();
                 let ran = runtime
-                    .run_task_once(owner_id, &BootstrapSmokeExecutor)
+                    .run_registered_task_once(owner_id, &registry)
                     .await?;
                 tracing::info!(ran, "PostgreSQL task execution lifecycle is ready");
             } else {
