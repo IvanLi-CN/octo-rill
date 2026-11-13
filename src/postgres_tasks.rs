@@ -1,0 +1,158 @@
+//! PostgreSQL-native business task executors.
+//!
+//! Each executor owns one business vertical's upstream calls and PostgreSQL
+//! writes. Durable claim/finalize semantics remain in `postgres_worker`.
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use chrono::Utc;
+use reqwest::Client;
+use serde_json::{Value, json};
+use sqlx::{FromRow, PgPool};
+
+use crate::{crypto::EncryptionKey, postgres_jobs::ClaimedTask, postgres_worker::TaskExecutor};
+
+const GITHUB_API: &str = "https://api.github.com";
+
+#[derive(Clone)]
+pub struct NotificationsExecutor {
+    pool: PgPool,
+    http: Client,
+    encryption_key: EncryptionKey,
+}
+
+impl NotificationsExecutor {
+    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+        Self {
+            pool,
+            http,
+            encryption_key,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct GithubTokenRow {
+    id: String,
+    access_token_ciphertext: Vec<u8>,
+    access_token_nonce: Vec<u8>,
+}
+
+#[async_trait]
+impl TaskExecutor for NotificationsExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if task.task_type != "sync.notifications" {
+            bail!("notifications executor received {}", task.task_type);
+        }
+        let payload: Value = serde_json::from_str(&task.payload_json)
+            .context("decode sync.notifications task payload")?;
+        let user_id = payload
+            .get("user_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("sync.notifications task payload has no user_id"))?;
+        let connections = sqlx::query_as::<_, GithubTokenRow>(
+            "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load PostgreSQL GitHub notification connections")?;
+        if connections.is_empty() {
+            bail!("sync.notifications has no GitHub connection for user {user_id}");
+        }
+
+        let mut total = 0usize;
+        let now = Utc::now().to_rfc3339();
+        for connection in connections {
+            let token = self
+                .encryption_key
+                .decrypt_str(
+                    &connection.access_token_ciphertext,
+                    &connection.access_token_nonce,
+                )
+                .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
+            let response = self
+                .http
+                .get(format!(
+                    "{GITHUB_API}/notifications?all=true&per_page=50&page=1"
+                ))
+                .bearer_auth(token)
+                .header(reqwest::header::USER_AGENT, "OctoRill")
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await
+                .context("fetch GitHub notifications")?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("GitHub notifications returned HTTP {status}");
+            }
+            let notifications = response
+                .json::<Vec<Value>>()
+                .await
+                .context("decode GitHub notifications")?;
+            for notification in &notifications {
+                upsert_notification(&self.pool, user_id, notification, &now).await?;
+            }
+            total += notifications.len();
+        }
+        Ok(json!({"notifications": total, "user_id": user_id}).to_string())
+    }
+}
+
+async fn upsert_notification(
+    pool: &PgPool,
+    user_id: &str,
+    notification: &Value,
+    now: &str,
+) -> Result<()> {
+    let thread_id = required_string(notification, "id")?;
+    let subject = notification.get("subject").unwrap_or(&Value::Null);
+    let repository = notification.get("repository").unwrap_or(&Value::Null);
+    let updated_at = notification
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let unread = notification
+        .get("unread")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    sqlx::query(
+        "INSERT INTO public.notifications (id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, url, html_url, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, NULL) ON CONFLICT (user_id, thread_id) DO UPDATE SET repo_full_name = EXCLUDED.repo_full_name, subject_title = EXCLUDED.subject_title, subject_type = EXCLUDED.subject_type, reason = EXCLUDED.reason, updated_at = EXCLUDED.updated_at, unread = EXCLUDED.unread, url = EXCLUDED.url, html_url = EXCLUDED.html_url",
+    )
+    .bind(thread_id.clone())
+    .bind(user_id)
+    .bind(thread_id)
+    .bind(repository.get("full_name").and_then(Value::as_str))
+    .bind(subject.get("title").and_then(Value::as_str))
+    .bind(subject.get("type").and_then(Value::as_str))
+    .bind(notification.get("reason").and_then(Value::as_str))
+    .bind(updated_at)
+    .bind(if unread { 1_i64 } else { 0_i64 })
+    .bind(notification.get("url").and_then(Value::as_str).or_else(|| notification.get("html_url").and_then(Value::as_str)).or(Some(now)))
+    .execute(pool)
+    .await
+    .context("upsert PostgreSQL notification")?;
+    Ok(())
+}
+
+fn required_string(value: &Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("GitHub notification has no {key}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn notification_executor_rejects_other_task_types() {
+        let source = include_str!("postgres_tasks.rs");
+        assert!(source.contains("sync.notifications"));
+        assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
+        assert!(source.contains("decrypt_str"));
+    }
+}
