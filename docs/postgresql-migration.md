@@ -1,12 +1,14 @@
 # PostgreSQL 18 迁移实现契约
 
-本仓库提供 `octo-rill-migrate` 作为 SQLite 快照到 PostgreSQL 18 的离线迁移边界。迁移器只读取 SQLite 源卷，并将权威表按批次写入独立的 `octo_rill` schema；源文件不会被覆盖。重复执行使用 `ON CONFLICT DO NOTHING`，随后由 manifest 校验行数和确定性 SHA-256 摘要。长期运行时使用独立的 PostgreSQL SQLx migrator，不读取或复用 SQLite 的 `_sqlx_migrations` 历史。
+本仓库提供 `octo-rill-migrate` 作为 SQLite 快照到 PostgreSQL 18 的离线迁移边界。迁移器只读取 SQLite 源卷，并将业务权威表按批次写入 PostgreSQL `public` schema；迁移控制表和审计 manifest 位于独立的 `octo_rill` schema，源文件不会被覆盖。重复执行使用 `ON CONFLICT DO NOTHING`，随后由 manifest 校验行数和确定性 SHA-256 摘要，并把 manifest 同步写入 `octo_rill.migration_manifests`。长期运行时使用独立的 PostgreSQL SQLx migrator，不读取或复用 SQLite 的 `_sqlx_migrations` 历史。
 
 迁移器分为 `preflight`、`import`、`verify` 和 `rebuild` 四个命令。`preflight` 以 SQLite 有效页大小扣除 freelist 后的估算值乘以 2，再加安全余量作为目标空间门槛，并读取 PostgreSQL `data_directory` 所在文件系统的可用空间；空间不足会在写入前失败。迁移容器与 PostgreSQL 分离时，通过 `MIGRATION_TARGET_PATH` 指向共享数据卷的可见路径，Compose 已将该路径设置为 `/var/lib/postgresql`。该门槛是动态的，不要求固定磁盘容量。
 
 SQLite FTS5 内部表被记录为可重建投影并跳过导入。`rebuild` 负责启用 `pg_trgm`，应用专用的全文检索配置和 GIN/trigram 索引应由 PostgreSQL 迁移定义创建。FTS 排名不属于权威数据一致性条件。
 
 长期运行时的连接池和 Session 初始化位于 `src/postgres_runtime.rs`：它强制 PostgreSQL 18 版本门禁，执行独立 baseline，并使用 MessagePack `bytea` 的 PostgreSQL session store。业务模块仍需逐步把现有 SQLite 查询和写入协调器切换到该 runtime。
+
+任务协调的 PostgreSQL 垂直切片位于 `src/postgres_jobs.rs`。它使用稳定的 `created_at, id` 排序、`FOR UPDATE SKIP LOCKED`、条件 `UPDATE ... RETURNING` 和 `40001`/`40P01` 全事务重试；`OCTORILL_PG_TASK_CLAIM_SMOKE=1` 可在 bootstrap smoke 中实际认领一个 queued 任务并写入 `task.running` 事件。
 
 ## 本地验证
 
@@ -52,3 +54,5 @@ bun "$AGENT_VM_SCRIPT" exec -- sh -lc 'cd /workspace/worktrees/octo-rill-pg18-mi
 在业务 runtime 改造完成前，普通服务入口检测到 PostgreSQL `DATABASE_URL` 会在绑定监听地址前拒绝启动；`OCTORILL_PG_BOOTSTRAP_ONLY=1` 仍仅用于数据库 bootstrap smoke check。
 
 Agent VM 中的 PostgreSQL 18.7 bootstrap smoke 已验证独立的 `public._sqlx_migrations`、`octo_rill.schema_migrations`、`octo_rill.migration_manifests` 和 `octo_rill.tower_sessions` 均可幂等初始化。
+
+后续 Agent VM 复测还验证了自引用 `job_tasks` 表、UTC 文本到 `timestamptz` 的导入转换、连续两次 import/verify 幂等，以及真实 PG18 任务认领：`t1` 变为 `running`，写入一条 `task.running` 事件，`t2` 保持 queued。
