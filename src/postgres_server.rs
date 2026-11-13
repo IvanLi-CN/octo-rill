@@ -65,6 +65,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/me", get(me))
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
+        .route("/api/me/profile", get(me_profile).patch(update_me_profile))
         .route("/api/search", get(search))
         .route("/api/starred", get(list_starred))
         .route("/api/releases", get(list_releases))
@@ -555,6 +556,102 @@ async fn me_resume(
             "sync_enqueue_error": null
         })),
     )
+}
+
+#[derive(Debug, FromRow)]
+struct PgProfileRow {
+    daily_brief_schedule_local_time: String,
+    daily_brief_time_zone: Option<String>,
+    include_own_releases: i64,
+    last_active_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PgProfilePatch {
+    daily_brief_time_zone: String,
+    include_own_releases: Option<bool>,
+}
+
+async fn me_profile(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    match sqlx::query_as::<_, PgProfileRow>(
+        "SELECT daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at FROM public.users WHERE id = $1 AND is_disabled = 0 AND paused_at IS NULL",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            axum::Json(json!({"user_id": user_id, "daily_brief_schedule_local_time": row.daily_brief_schedule_local_time, "daily_brief_time_zone": row.daily_brief_time_zone.unwrap_or_else(|| "UTC".to_owned()), "include_own_releases": row.include_own_releases != 0, "last_active_at": row.last_active_at})),
+        ).into_response(),
+        Ok(None) => (StatusCode::UNAUTHORIZED, axum::Json(json!({"code": "unauthorized"}))).into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL profile query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+        }
+    }
+}
+
+async fn update_me_profile(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    axum::Json(request): axum::Json<PgProfilePatch>,
+) -> impl IntoResponse {
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        )
+            .into_response();
+    };
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE public.users SET daily_brief_time_zone = $1, include_own_releases = COALESCE($2, include_own_releases), updated_at = $3 WHERE id = $4 AND is_disabled = 0 AND paused_at IS NULL",
+    )
+    .bind(request.daily_brief_time_zone.trim())
+    .bind(request.include_own_releases.map(|value| if value { 1_i64 } else { 0_i64 }))
+    .bind(&now)
+    .bind(&user_id)
+    .execute(&state.runtime.pool)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 1 => {
+            me_profile(State(state), session).await.into_response()
+        }
+        Ok(_) => (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "PostgreSQL profile update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
