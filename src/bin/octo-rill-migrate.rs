@@ -184,7 +184,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             "\n",
             include_str!("../../migrations_pg/0002_task_runtime.sql"),
             "\n",
-            include_str!("../../migrations_pg/0003_runtime_owners.sql")
+            include_str!("../../migrations_pg/0003_runtime_owners.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0004_search_projection.sql")
         ))
         .await;
     if let Err(error) = baseline_result {
@@ -333,13 +335,17 @@ async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
 
 async fn rebuild(pg: &mut Client) -> Result<()> {
     pg.batch_execute(
-        "SET search_path TO octo_rill, public; CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+        "SELECT pg_advisory_lock(hashtextextended('octo-rill:pg18-rebuild', 0));\
+         CREATE EXTENSION IF NOT EXISTS pg_trgm;\
+         ANALYZE public.search_documents;\
+         ANALYZE public.search_document_user_lanes;\
+         REINDEX INDEX public.idx_search_documents_pg_vector;\
+         REINDEX INDEX public.idx_search_lanes_pg_vector;\
+         SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-rebuild', 0));",
     )
     .await
-    .context("enable PostgreSQL search extension")?;
-    println!(
-        "search projection rebuild hook completed; application-specific GIN/trigram indexes are created by PostgreSQL migrations"
-    );
+    .context("rebuild PostgreSQL search projection")?;
+    println!("search projection rebuilt: generated tsvectors analyzed and GIN indexes reindexed");
     Ok(())
 }
 
