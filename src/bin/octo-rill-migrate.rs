@@ -40,6 +40,11 @@ struct Args {
     batch_size: usize,
     #[arg(long, env = "MIGRATION_SAFETY_BYTES", default_value_t = 1_073_741_824)]
     safety_bytes: u64,
+    /// Filesystem path visible to the migration process for the PostgreSQL data volume.
+    /// Set this when PostgreSQL runs in a separate container and its data directory
+    /// is not visible in the migration container.
+    #[arg(long, env = "MIGRATION_TARGET_PATH")]
+    target_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -139,18 +144,25 @@ async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> 
         .saturating_sub(freelist_bytes(sqlite).await?)
         .saturating_mul(2)
         .saturating_add(args.safety_bytes);
-    let data_dir = pg
+    let reported_data_dir = pg
         .query_one("SHOW data_directory", &[])
         .await
         .context("read PostgreSQL data directory")?
         .get::<_, String>(0);
-    let available = filesystem_available_bytes(&data_dir)?;
+    let target_path = args
+        .target_path
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new(&reported_data_dir));
+    let available = filesystem_available_bytes(target_path)?;
     println!(
         "server_version_num={server_version_num} source_bytes={source_bytes} authoritative_tables={} estimated_target_bytes={estimated} safety_bytes={}",
         rows.len(),
         args.safety_bytes
     );
-    println!("target_data_directory={data_dir} target_free_bytes={available}");
+    println!(
+        "target_data_directory={reported_data_dir} target_filesystem_path={} target_free_bytes={available}",
+        target_path.display()
+    );
     if estimated == 0 || available < estimated {
         bail!("capacity gate failed: target_free_bytes={available}, required_bytes={estimated}")
     }
@@ -499,10 +511,10 @@ fn redact_target(v: &str) -> String {
     }
 }
 
-fn filesystem_available_bytes(path: &str) -> Result<u64> {
+fn filesystem_available_bytes(path: &std::path::Path) -> Result<u64> {
     use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
-    let path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
-        .context("invalid PostgreSQL data directory")?;
+    let path =
+        CString::new(path.as_os_str().as_bytes()).context("invalid PostgreSQL data directory")?;
     let mut stat = MaybeUninit::<libc::statvfs>::uninit();
     let rc = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
     if rc != 0 {

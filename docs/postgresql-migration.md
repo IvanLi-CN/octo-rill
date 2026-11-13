@@ -2,7 +2,7 @@
 
 本仓库提供 `octo-rill-migrate` 作为 SQLite 快照到 PostgreSQL 18 的离线迁移边界。迁移器只读取 SQLite 源卷，并将权威表按批次写入独立的 `octo_rill` schema；源文件不会被覆盖。重复执行使用 `ON CONFLICT DO NOTHING`，随后由 manifest 校验行数和确定性 SHA-256 摘要。
 
-迁移器分为 `preflight`、`import`、`verify` 和 `rebuild` 四个命令。`preflight` 以 SQLite 有效页大小扣除 freelist 后的估算值乘以 2，再加安全余量作为目标空间门槛，并读取 PostgreSQL `data_directory` 的可用空间；空间不足会在写入前失败。该门槛是动态的，不要求固定磁盘容量。
+迁移器分为 `preflight`、`import`、`verify` 和 `rebuild` 四个命令。`preflight` 以 SQLite 有效页大小扣除 freelist 后的估算值乘以 2，再加安全余量作为目标空间门槛，并读取 PostgreSQL `data_directory` 所在文件系统的可用空间；空间不足会在写入前失败。迁移容器与 PostgreSQL 分离时，通过 `MIGRATION_TARGET_PATH` 指向共享数据卷的可见路径，Compose 已将该路径设置为 `/var/lib/postgresql`。该门槛是动态的，不要求固定磁盘容量。
 
 SQLite FTS5 内部表被记录为可重建投影并跳过导入。`rebuild` 负责启用 `pg_trgm`，应用专用的全文检索配置和 GIN/trigram 索引应由 PostgreSQL 迁移定义创建。FTS 排名不属于权威数据一致性条件。
 

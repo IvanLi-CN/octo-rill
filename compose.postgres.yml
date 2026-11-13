@@ -28,9 +28,11 @@ services:
       POSTGRES_URL: postgres://${POSTGRES_USER:-octo_rill}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-octo_rill}
       MIGRATION_MANIFEST: /migration-output/manifest.json
       MIGRATION_SAFETY_BYTES: ${MIGRATION_SAFETY_BYTES:-1073741824}
+      MIGRATION_TARGET_PATH: /var/lib/postgresql
     volumes:
       - ${SQLITE_SOURCE_DIR:?set SQLITE_SOURCE_DIR}:/migration-source:ro
       - migration-output:/migration-output
+      - pg-data:/var/lib/postgresql:ro
     command: ["/app/octo-rill-migrate", "import"]
 
   server:
