@@ -1,9 +1,17 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::json;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use tokio::time::{MissedTickBehavior, interval};
 use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDeletion};
 use tracing::{info, warn};
@@ -37,6 +45,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/api/me", get(me))
+        .route("/api/search", get(search))
         .route("/auth/logout", get(logout))
         .with_state(state);
     let session_layer =
@@ -201,6 +210,118 @@ async fn me(State(state): State<PostgresServerState>, session: Session) -> impl 
             },
             "access_sync": {"task_id": null, "task_type": null, "event_path": null, "reason": "none"},
             "dashboard": {"daily_boundary_local": "00:00", "daily_boundary_time_zone": null, "daily_boundary_utc_offset_minutes": 0, "include_own_releases": row.include_own_releases != 0}
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct PgSearchRow {
+    id: String,
+    resource_type: String,
+    title: Option<String>,
+    body: Option<String>,
+    repo_full_name: Option<String>,
+    source_time: Option<String>,
+    unread: Option<i64>,
+    target_path: Option<String>,
+    target_url: Option<String>,
+}
+
+async fn search(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(request): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
+        );
+    };
+    let raw_query = request.q.unwrap_or_default();
+    let parsed = match crate::search::parse_query(&raw_query) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": error.code()})),
+            );
+        }
+    };
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT id, resource_type, title, body, repo_full_name, source_time, unread, target_path, target_url \
+         FROM public.search_documents WHERE (user_id IS NULL OR user_id = ",
+    );
+    query.push_bind(&user_id).push(")");
+    if !parsed.terms.is_empty() {
+        query
+            .push(" AND search_vector @@ websearch_to_tsquery('octo_rill_simple', ")
+            .push_bind(parsed.terms.join(" "))
+            .push(")");
+    }
+    if let Some(resource_type) = parsed.resource_type {
+        query.push(" AND resource_type = ").push_bind(resource_type);
+    }
+    if let Some(owner) = parsed.owner {
+        query.push(" AND owner_login = ").push_bind(owner);
+    }
+    if let Some(repo) = parsed.repo {
+        query.push(" AND repo_full_name = ").push_bind(repo);
+    }
+    if parsed.unread {
+        query.push(" AND unread <> 0");
+    }
+    query.push(" ORDER BY source_time DESC NULLS LAST, id DESC LIMIT 20");
+    let rows = match query
+        .build_query_as::<PgSearchRow>()
+        .fetch_all(&state.runtime.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "PostgreSQL search query failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "search_failed"})),
+            );
+        }
+    };
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let repository = row.repo_full_name.as_ref().and_then(|full_name| {
+                full_name
+                    .split_once('/')
+                    .map(|(owner, name)| json!({"owner": owner, "name": name, "full_name": full_name}))
+            });
+            json!({
+                "id": row.id,
+                "type": row.resource_type,
+                "title": row.title.unwrap_or_default(),
+                "excerpt": row.body.map(|body| body.chars().take(240).collect::<String>()),
+                "repository": repository,
+                "updated_at": row.source_time,
+                "source_time": row.source_time,
+                "unread": row.unread.unwrap_or_default() != 0,
+                "is_following": null,
+                "matched_lane": "canonical",
+                "matched_lanes": ["canonical"],
+                "target": row.target_path.or(row.target_url).map(|href| json!({"href": href, "lane": null})),
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "items": items,
+            "remaining_requests": crate::search::SEARCH_RATE_LIMIT - 1,
+            "reset_at": (chrono::Utc::now() + chrono::Duration::seconds(crate::search::SEARCH_RATE_WINDOW_SECONDS)).to_rfc3339(),
+            "index_status": "ready"
         })),
     )
 }
