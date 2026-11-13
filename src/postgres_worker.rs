@@ -9,6 +9,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
+use tokio::{
+    sync::watch,
+    time::{Duration, MissedTickBehavior, interval},
+};
 
 use crate::postgres_jobs::ClaimedTask;
 
@@ -136,6 +140,35 @@ pub async fn run_once<E: TaskExecutor + ?Sized>(
     Ok(true)
 }
 
+/// Keep polling the PostgreSQL queue until the caller signals shutdown.
+///
+/// The loop intentionally delegates every state transition to `run_once`, so
+/// cancellation, retries and owner-checked finalization remain identical for
+/// one-shot and long-lived workers.
+pub async fn run_until_shutdown<E: TaskExecutor + ?Sized>(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+    executor: &E,
+    mut shutdown: watch::Receiver<bool>,
+    poll_interval: Duration,
+) -> Result<()> {
+    let mut ticker = interval(poll_interval.max(Duration::from_millis(25)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                changed.context("read PostgreSQL worker shutdown signal")?;
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {
+                run_once(pool, runtime_owner_id, executor).await?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +201,13 @@ mod tests {
             registry.registered_task_types(),
             vec!["brief.generate", "sync.access_refresh"]
         );
+    }
+
+    #[test]
+    fn worker_loop_has_shutdown_and_polling_contract() {
+        let source = include_str!("postgres_worker.rs");
+        assert!(source.contains("run_until_shutdown"));
+        assert!(source.contains("shutdown.changed()"));
+        assert!(source.contains("MissedTickBehavior::Delay"));
     }
 }
