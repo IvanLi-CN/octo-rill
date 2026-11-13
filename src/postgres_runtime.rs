@@ -3,6 +3,8 @@ use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_sessions_sqlx_store::PostgresStore;
 
+use crate::config::AppConfig;
+
 const MIN_POSTGRES_VERSION_NUM: i64 = 180_000;
 
 /// Runtime-owned PostgreSQL resources. The migration utility uses the same
@@ -46,6 +48,14 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
         .context("migrate PostgreSQL session store")?;
 
     Ok(PostgresRuntime { pool, sessions })
+}
+
+pub async fn connect_from_config(config: &AppConfig) -> Result<PostgresRuntime> {
+    connect(
+        &config.database_url,
+        config.database_pool_max_connections as u32,
+    )
+    .await
 }
 
 #[cfg(test)]

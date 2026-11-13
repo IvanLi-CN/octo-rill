@@ -50,11 +50,7 @@ async fn main() -> Result<()> {
         if config.database_backend()? != config::DatabaseBackend::Postgres {
             anyhow::bail!("OCTORILL_PG_BOOTSTRAP_ONLY requires a postgres DATABASE_URL");
         }
-        let runtime = postgres_runtime::connect(
-            &config.database_url,
-            config.database_pool_max_connections as u32,
-        )
-        .await?;
+        let runtime = postgres_runtime::connect_from_config(&config).await?;
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
         return Ok(());
