@@ -63,6 +63,9 @@ pub async fn verify_application_schema(pool: &PgPool) -> Result<()> {
         "job_tasks",
         "job_task_events",
         "search_documents",
+        "content_work_items",
+        "translation_work_items",
+        "briefs",
     ];
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)",
@@ -172,6 +175,9 @@ mod tests {
             "job_tasks",
             "job_task_events",
             "search_documents",
+            "content_work_items",
+            "translation_work_items",
+            "briefs",
         ] {
             assert!(source.contains(table));
         }
