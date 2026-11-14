@@ -269,6 +269,11 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             pg.batch_execute(ddl)
                 .await
                 .with_context(|| format!("create target table {name}"))?;
+            for index_ddl in unique_index_ddls(sqlite, name).await? {
+                pg.batch_execute(&index_ddl)
+                    .await
+                    .with_context(|| format!("create target unique index for {name}"))?;
+            }
         }
     }
     for (name, columns, _, _) in tables {
@@ -739,6 +744,27 @@ fn filesystem_available_bytes(path: &std::path::Path) -> Result<u64> {
     let stat = unsafe { stat.assume_init() };
     let available = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
     Ok(u64::try_from(available).unwrap_or(u64::MAX))
+}
+
+async fn unique_index_ddls(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL AND sql LIKE 'CREATE UNIQUE INDEX%' ORDER BY name",
+    )
+    .bind(table)
+    .fetch_all(sqlite)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let ddl: String = row.try_get("sql")?;
+            Ok(translate_index_ddl(&ddl))
+        })
+        .collect()
+}
+
+fn translate_index_ddl(ddl: &str) -> String {
+    let mut sql = ddl.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS");
+    sql = sql.replace("COLLATE NOCASE", "");
+    format!("SET search_path TO public, octo_rill; {sql};")
 }
 
 fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
