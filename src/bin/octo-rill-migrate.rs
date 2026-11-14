@@ -5,8 +5,10 @@
 //! SQLite source and can be rerun against an isolated PostgreSQL database.
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
+use futures_util::SinkExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, TypeInfo, ValueRef, sqlite::SqlitePoolOptions};
@@ -280,7 +282,19 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         pg.batch_execute("BEGIN")
             .await
             .with_context(|| format!("begin copy transaction for {name}"))?;
-        let copy_result = copy_table(sqlite, pg, &name, &columns, args.batch_size).await;
+        let target_rows: i64 = pg
+            .query_one(
+                &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
+                &[],
+            )
+            .await
+            .with_context(|| format!("count target table {name}"))?
+            .get(0);
+        let copy_result = if target_rows == 0 {
+            copy_table_bulk(sqlite, pg, &name, &columns, args.batch_size).await
+        } else {
+            copy_table(sqlite, pg, &name, &columns, args.batch_size).await
+        };
         let (rows, sha) = match copy_result {
             Ok(result) => result,
             Err(error) => {
@@ -529,6 +543,106 @@ async fn copy_table(
         offset += batch_size as i64;
     }
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+async fn copy_table_bulk(
+    sqlite: &SqlitePool,
+    pg: &mut Client,
+    table: &str,
+    columns: &[String],
+    batch_size: usize,
+) -> Result<(u64, String)> {
+    let target_types = target_column_types(pg, table, columns).await?;
+    let copy_sql = format!(
+        "COPY public.{} ({}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        quote_ident(table),
+        columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let sink = pg.copy_in::<_, Bytes>(&copy_sql).await?;
+    futures_util::pin_mut!(sink);
+    let mut offset = 0i64;
+    let mut total = 0u64;
+    let mut hasher = Sha256::new();
+    loop {
+        let query = format!(
+            "SELECT * FROM {} LIMIT ? OFFSET ?",
+            quote_sqlite_ident(table)
+        );
+        let rows = sqlx::query(&query)
+            .bind(batch_size as i64)
+            .bind(offset)
+            .fetch_all(sqlite)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut payload = Vec::new();
+        for row in rows {
+            let cells = row_values(&row)?;
+            let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
+            hasher.update(&encoded);
+            for (index, (cell, target_type)) in cells.iter().zip(target_types.iter()).enumerate() {
+                if index > 0 {
+                    payload.push(b',');
+                }
+                let value = csv_cell(cell, target_type.as_deref());
+                match value {
+                    None => payload.extend_from_slice(b"\\N"),
+                    Some(value) => {
+                        payload.push(b'"');
+                        for byte in value.bytes() {
+                            if byte == b'"' {
+                                payload.push(b'"');
+                            }
+                            payload.push(byte);
+                        }
+                        payload.push(b'"');
+                    }
+                }
+            }
+            payload.push(b'\n');
+            total += 1;
+        }
+        sink.as_mut().send(payload.into()).await?;
+        offset += batch_size as i64;
+    }
+    sink.as_mut().finish().await?;
+    Ok((total, hex::encode(hasher.finalize())))
+}
+
+fn csv_cell(cell: &Cell, target_type: Option<&str>) -> Option<String> {
+    match cell {
+        Cell::Null => None,
+        Cell::Text(value) => {
+            if target_type == Some("boolean") {
+                Some(
+                    (matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "t" | "yes"
+                    ))
+                    .to_string(),
+                )
+            } else if target_type == Some("bytea") {
+                Some(format!("\\x{}", hex::encode(value.as_bytes())))
+            } else {
+                Some(value.clone())
+            }
+        }
+        Cell::Integer(value) => {
+            if target_type == Some("boolean") {
+                Some((*value != 0).to_string())
+            } else {
+                Some(value.to_string())
+            }
+        }
+        Cell::Real(value) => Some(value.to_string()),
+        Cell::Blob(value) => Some(format!("\\x{}", hex::encode(value))),
+        Cell::Timestamp(value) => value.map(|value| value.to_rfc3339()),
+    }
 }
 
 fn is_timestamp_type(data_type: Option<&str>) -> bool {
