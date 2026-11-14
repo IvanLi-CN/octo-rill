@@ -282,6 +282,13 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         pg.batch_execute("BEGIN")
             .await
             .with_context(|| format!("begin copy transaction for {name}"))?;
+        let source_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {}",
+            quote_sqlite_ident(&name)
+        ))
+        .fetch_one(sqlite)
+        .await
+        .with_context(|| format!("count source table {name}"))?;
         let target_rows: i64 = pg
             .query_one(
                 &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
@@ -290,7 +297,12 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             .await
             .with_context(|| format!("count target table {name}"))?
             .get(0);
-        let copy_result = if target_rows == 0 {
+        let copy_result = if target_rows > 0 && target_rows == source_rows {
+            Ok((
+                source_rows as u64,
+                checksum_sqlite(sqlite, &name, &columns).await?.1,
+            ))
+        } else if target_rows == 0 {
             copy_table_bulk(sqlite, pg, &name, &columns, args.batch_size).await
         } else {
             copy_table(sqlite, pg, &name, &columns, args.batch_size).await
