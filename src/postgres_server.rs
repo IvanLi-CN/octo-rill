@@ -237,7 +237,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route(
             "/translate/requests/{request_id}/stream",
-            any(postgres_capability_unavailable),
+            get(stream_translation_request),
         )
         .route(
             "/translate/releases/batch",
@@ -3893,6 +3893,45 @@ async fn resolve_translation_results(
         StatusCode::OK,
         axum::Json(json!({"resolved": resolved, "status": "completed"})),
     )
+}
+
+async fn stream_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let Some(user_id) = session
+        .get::<String>("user_id")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let row = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, status, result_status, title_zh, summary_md, body_md FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let payload = json!({
+        "request_id": row.0,
+        "status": row.1,
+        "result_status": row.2,
+        "title_zh": row.3,
+        "summary_md": row.4,
+        "body_md": row.5,
+    });
+    let event = Event::default()
+        .event("translation.status")
+        .data(payload.to_string());
+    Ok(Sse::new(stream::iter([Ok(event)])).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn shutdown_signal() {
