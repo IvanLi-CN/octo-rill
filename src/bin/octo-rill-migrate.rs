@@ -707,18 +707,19 @@ async fn checksum_sqlite(
     table: &str,
     columns: &[String],
 ) -> Result<(u64, String)> {
-    let rows = sqlx::query(&format!("SELECT * FROM {}", quote_sqlite_ident(table)))
-        .fetch_all(sqlite)
-        .await?;
     let mut hasher = Sha256::new();
-    for row in &rows {
-        let cells = row_values(row)?;
+    let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
+    let mut rows = sqlx::query(&query).fetch(sqlite);
+    let mut total = 0u64;
+    while let Some(row) = rows.try_next().await? {
+        let cells = row_values(&row)?;
         hasher.update(serde_json::to_vec(
             &cells.iter().map(cell_debug).collect::<Vec<_>>(),
         )?);
+        total += 1;
     }
     let _ = columns;
-    Ok((rows.len() as u64, hex::encode(hasher.finalize())))
+    Ok((total, hex::encode(hasher.finalize())))
 }
 
 async fn column_names(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {
