@@ -9,7 +9,7 @@ use axum::{
         IntoResponse,
         sse::{Event, Sse},
     },
-    routing::get,
+    routing::{any, get},
 };
 use chrono::Utc;
 use futures_util::stream;
@@ -218,6 +218,61 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
+        .route("/translate/requests", any(postgres_capability_unavailable))
+        .route(
+            "/translate/requests/{request_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/translate/requests/{request_id}/retry",
+            any(postgres_capability_unavailable),
+        )
+        .route("/translate/results", any(postgres_capability_unavailable))
+        .route(
+            "/translate/requests/{request_id}/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/translate/releases/batch",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/translate/releases/batch/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route("/translate/release", any(postgres_capability_unavailable))
+        .route(
+            "/translate/release/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/status",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/requests",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/requests/{request_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/attempt-events",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/batches",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/batches/{batch_id}",
+            any(postgres_capability_unavailable),
+        )
         .route("/api/feed", get(feed))
         .route("/api/dashboard/feed", get(dashboard_feed))
         .route("/api/briefs", get(list_briefs))
@@ -3595,6 +3650,16 @@ async fn version() -> axum::Json<serde_json::Value> {
         "version": info.version,
         "source": info.source,
     }))
+}
+
+async fn postgres_capability_unavailable() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(json!({
+            "code": "postgres_capability_unavailable",
+            "message": "this capability is not yet available on the PostgreSQL runtime"
+        })),
+    )
 }
 
 async fn shutdown_signal() {
