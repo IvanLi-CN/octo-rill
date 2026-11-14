@@ -225,11 +225,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route(
             "/translate/requests/{request_id}",
-            any(postgres_capability_unavailable),
+            get(get_translation_request),
         )
         .route(
             "/translate/requests/{request_id}/retry",
-            any(postgres_capability_unavailable),
+            axum::routing::post(retry_translation_request),
         )
         .route("/translate/results", any(postgres_capability_unavailable))
         .route(
@@ -3775,6 +3775,76 @@ async fn submit_translation_request(
             json!({"mode": "task_id", "request_id": request_id, "work_item_id": work_item_id, "status": "queued"}),
         ),
     )
+}
+
+async fn get_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, mode, status, kind, variant, entity_id, title_zh, summary_md, body_md FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match row {
+        Ok(Some((id, mode, status, kind, variant, entity_id, title_zh, summary_md, body_md))) => (
+            StatusCode::OK,
+            axum::Json(
+                json!({"id": id, "request_id": id, "mode": mode, "status": status, "kind": kind, "variant": variant, "entity_id": entity_id, "result": {"title_zh": title_zh, "summary_md": summary_md, "body_md": body_md}}),
+            ),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "translation_request_not_found"})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_request_failed"})),
+        ),
+    }
+}
+
+async fn retry_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let result = sqlx::query(
+        "UPDATE public.translation_requests SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND scope_user_id = $2 AND status IN ('failed', 'completed')",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .execute(&state.runtime.pool)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 1 => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({"request_id": request_id, "status": "queued"})),
+        ),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "translation_request_not_retryable"})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_retry_failed"})),
+        ),
+    }
 }
 
 async fn shutdown_signal() {
