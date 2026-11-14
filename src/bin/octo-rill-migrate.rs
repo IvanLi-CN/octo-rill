@@ -5,7 +5,7 @@
 //! SQLite source and can be rerun against an isolated PostgreSQL database.
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -624,11 +624,16 @@ fn cell_debug(cell: &Cell) -> serde_json::Value {
 fn cell_as_timestamp(cell: &Cell) -> Result<Cell> {
     match cell {
         Cell::Null => Ok(Cell::Timestamp(None)),
-        Cell::Text(value) => Ok(Cell::Timestamp(Some(
-            DateTime::parse_from_rfc3339(value)
-                .with_context(|| format!("parse UTC timestamp {value:?}"))?
-                .with_timezone(&Utc),
-        ))),
+        Cell::Text(value) => {
+            let timestamp = DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                        .map(|value| value.and_utc())
+                })
+                .with_context(|| format!("parse UTC timestamp {value:?}"))?;
+            Ok(Cell::Timestamp(Some(timestamp)))
+        }
         other => Ok(other.clone()),
     }
 }
