@@ -5,8 +5,10 @@
 //! SQLite source and can be rerun against an isolated PostgreSQL database.
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use bytes::Bytes;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
+use futures_util::{SinkExt, TryStreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, TypeInfo, ValueRef, sqlite::SqlitePoolOptions};
@@ -179,6 +181,20 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     )
     .await
     .context("acquire PostgreSQL migration lock")?;
+    // The PostgreSQL runtime migrations contain foreign keys to the legacy
+    // users table. Create that authoritative table from the snapshot before
+    // applying the runtime baseline; the full table pass below remains
+    // idempotent and will reuse this definition.
+    let users_ddl: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+            .fetch_one(sqlite)
+            .await
+            .context("read users table definition")?;
+    let users_ddl =
+        users_ddl.ok_or_else(|| anyhow::anyhow!("users table definition is missing"))?;
+    pg.batch_execute(&translate_ddl(&users_ddl, "users")?)
+        .await
+        .context("create PostgreSQL users prerequisite")?;
     let baseline_result = pg
         .batch_execute(concat!(
             include_str!("../../migrations_pg/0001_runtime.sql"),
@@ -187,13 +203,38 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             "\n",
             include_str!("../../migrations_pg/0003_runtime_owners.sql"),
             "\n",
-            include_str!("../../migrations_pg/0004_search_projection.sql")
+            include_str!("../../migrations_pg/0004_search_projection.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0005_scheduler_slots.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0006_content_processing.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0007_translation_runtime.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0008_llm_translation_audit.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0009_brief_runtime.sql")
         ))
         .await;
     if let Err(error) = baseline_result {
         let _ = pg.batch_execute("ROLLBACK; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));").await;
         return Err(error.into());
     }
+    pg.batch_execute(
+        "DO $$ BEGIN
+           IF EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'tower_sessions'
+               AND column_name = 'expiry_date' AND data_type = 'bigint'
+           ) THEN
+             ALTER TABLE public.tower_sessions
+               ALTER COLUMN expiry_date TYPE timestamptz
+               USING to_timestamp(expiry_date);
+           END IF;
+         END $$;",
+    )
+    .await
+    .context("normalize tower session expiry type")?;
     pg.batch_execute(
         "COMMIT; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));",
     )
@@ -245,11 +286,60 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             pg.batch_execute(ddl)
                 .await
                 .with_context(|| format!("create target table {name}"))?;
+            for index_ddl in unique_index_ddls(sqlite, name).await? {
+                pg.batch_execute(&index_ddl)
+                    .await
+                    .with_context(|| format!("create target unique index for {name}"))?;
+            }
         }
     }
     for (name, columns, _, _) in tables {
-        let (rows, sha) = copy_table(sqlite, pg, &name, &columns, args.batch_size).await?;
-        let target_sha = checksum_postgres(pg, &name).await?;
+        pg.batch_execute("BEGIN")
+            .await
+            .with_context(|| format!("begin copy transaction for {name}"))?;
+        let source_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {}",
+            quote_sqlite_ident(&name)
+        ))
+        .fetch_one(sqlite)
+        .await
+        .with_context(|| format!("count source table {name}"))?;
+        let target_rows: i64 = pg
+            .query_one(
+                &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
+                &[],
+            )
+            .await
+            .with_context(|| format!("count target table {name}"))?
+            .get(0);
+        let copy_result = if target_rows > 0 && target_rows == source_rows {
+            Ok((source_rows as u64, String::new()))
+        } else if target_rows == 0 {
+            copy_table_bulk(sqlite, pg, &name, &columns, args.batch_size).await
+        } else {
+            copy_table(sqlite, pg, &name, &columns, args.batch_size).await
+        };
+        let (rows, sha) = match copy_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = pg.batch_execute("ROLLBACK").await;
+                return Err(error).with_context(|| format!("copy table {name}"));
+            }
+        };
+        let target_sha = if sha.is_empty() {
+            String::new()
+        } else {
+            match checksum_postgres(pg, &name).await {
+                Ok(checksum) => checksum,
+                Err(error) => {
+                    let _ = pg.batch_execute("ROLLBACK").await;
+                    return Err(error).with_context(|| format!("checksum target table {name}"));
+                }
+            }
+        };
+        pg.batch_execute("COMMIT")
+            .await
+            .with_context(|| format!("commit copy transaction for {name}"))?;
         manifest.tables.insert(
             name,
             TableManifest {
@@ -291,7 +381,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 
 async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'github_connections', 'job_tasks')",
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'github_connections', 'job_tasks', 'content_work_items', 'translation_work_items')",
     )
     .fetch_all(sqlite)
     .await
@@ -311,10 +401,16 @@ async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()>
 }
 
 fn missing_authoritative_tables(found: &HashSet<String>) -> Vec<&'static str> {
-    ["users", "github_connections", "job_tasks"]
-        .into_iter()
-        .filter(|name| !found.contains(*name))
-        .collect()
+    [
+        "users",
+        "github_connections",
+        "job_tasks",
+        "content_work_items",
+        "translation_work_items",
+    ]
+    .into_iter()
+    .filter(|name| !found.contains(*name))
+    .collect()
 }
 
 async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
@@ -332,7 +428,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let target_sha = checksum_postgres(pg, name).await?;
         let append_only_event_log = name == "job_task_events";
         if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64)
-            || source_sha != table.sha256
+            || (!table.sha256.is_empty() && source_sha != table.sha256)
             || (!append_only_event_log
                 && !table.target_sha256.is_empty()
                 && target_sha != table.target_sha256)
@@ -368,9 +464,10 @@ async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
         "SELECT row_to_json(row)::text FROM (SELECT * FROM public.{} ORDER BY ctid) AS row",
         quote_ident(table)
     );
-    let rows = pg.query(&query, &[]).await?;
     let mut hasher = Sha256::new();
-    for row in rows {
+    let stream = pg.query_raw(&query, std::iter::empty::<&str>()).await?;
+    futures_util::pin_mut!(stream);
+    while let Some(row) = stream.try_next().await? {
         let value: String = row.get(0);
         hasher.update(value.as_bytes());
     }
@@ -424,7 +521,7 @@ async fn copy_table(
             let placeholders = (1..=columns.len())
                 .zip(target_types.iter())
                 .map(|(i, target_type)| {
-                    if target_type.as_deref() == Some("timestamp with time zone") {
+                    if is_timestamp_type(target_type.as_deref()) {
                         format!("${i}::timestamptz")
                     } else {
                         format!("${i}")
@@ -446,8 +543,18 @@ async fn copy_table(
                 .iter()
                 .zip(target_types.iter())
                 .map(|(cell, target_type)| -> Result<Box<dyn ToSql + Sync>> {
-                    if target_type.as_deref() == Some("timestamp with time zone") {
+                    if is_timestamp_type(target_type.as_deref()) {
                         Ok(to_pg_param(&cell_as_timestamp(cell)?))
+                    } else if target_type.as_deref() == Some("boolean") {
+                        match cell {
+                            Cell::Integer(value) => Ok(Box::new(*value != 0)),
+                            Cell::Null => Ok(Box::new(None::<bool>)),
+                            Cell::Text(value) => Ok(Box::new(matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "1" | "true" | "t" | "yes"
+                            ))),
+                            other => Ok(to_pg_param(other)),
+                        }
                     } else {
                         Ok(to_pg_param(cell))
                     }
@@ -465,6 +572,109 @@ async fn copy_table(
         offset += batch_size as i64;
     }
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+async fn copy_table_bulk(
+    sqlite: &SqlitePool,
+    pg: &mut Client,
+    table: &str,
+    columns: &[String],
+    batch_size: usize,
+) -> Result<(u64, String)> {
+    let target_types = target_column_types(pg, table, columns).await?;
+    let copy_sql = format!(
+        "COPY public.{} ({}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        quote_ident(table),
+        columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let sink = pg.copy_in::<_, Bytes>(&copy_sql).await?;
+    futures_util::pin_mut!(sink);
+    let mut total = 0u64;
+    let mut hasher = Sha256::new();
+    let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
+    let mut rows = sqlx::query(&query).fetch(sqlite);
+    let mut payload = Vec::new();
+    let mut batch_rows = 0usize;
+    loop {
+        let Some(row) = rows.try_next().await? else {
+            break;
+        };
+        let cells = row_values(&row)?;
+        let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
+        hasher.update(&encoded);
+        for (index, (cell, target_type)) in cells.iter().zip(target_types.iter()).enumerate() {
+            if index > 0 {
+                payload.push(b',');
+            }
+            let value = csv_cell(cell, target_type.as_deref());
+            match value {
+                None => payload.extend_from_slice(b"\\N"),
+                Some(value) => {
+                    payload.push(b'"');
+                    for byte in value.bytes() {
+                        if byte == b'"' {
+                            payload.push(b'"');
+                        }
+                        payload.push(byte);
+                    }
+                    payload.push(b'"');
+                }
+            }
+        }
+        payload.push(b'\n');
+        total += 1;
+        batch_rows += 1;
+        if batch_rows >= batch_size {
+            sink.as_mut()
+                .send(std::mem::take(&mut payload).into())
+                .await?;
+            batch_rows = 0;
+        }
+    }
+    if !payload.is_empty() {
+        sink.as_mut().send(payload.into()).await?;
+    }
+    sink.as_mut().finish().await?;
+    Ok((total, hex::encode(hasher.finalize())))
+}
+
+fn csv_cell(cell: &Cell, target_type: Option<&str>) -> Option<String> {
+    match cell {
+        Cell::Null => None,
+        Cell::Text(value) => {
+            if target_type == Some("boolean") {
+                Some(
+                    (matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "t" | "yes"
+                    ))
+                    .to_string(),
+                )
+            } else if target_type == Some("bytea") {
+                Some(format!("\\x{}", hex::encode(value.as_bytes())))
+            } else {
+                Some(value.clone())
+            }
+        }
+        Cell::Integer(value) => {
+            if target_type == Some("boolean") {
+                Some((*value != 0).to_string())
+            } else {
+                Some(value.to_string())
+            }
+        }
+        Cell::Real(value) => Some(value.to_string()),
+        Cell::Blob(value) => Some(format!("\\x{}", hex::encode(value))),
+        Cell::Timestamp(value) => value.map(|value| value.to_rfc3339()),
+    }
+}
+
+fn is_timestamp_type(data_type: Option<&str>) -> bool {
+    data_type.is_some_and(|value| value.starts_with("timestamp"))
 }
 
 async fn target_column_types(
@@ -512,18 +722,19 @@ async fn checksum_sqlite(
     table: &str,
     columns: &[String],
 ) -> Result<(u64, String)> {
-    let rows = sqlx::query(&format!("SELECT * FROM {}", quote_sqlite_ident(table)))
-        .fetch_all(sqlite)
-        .await?;
     let mut hasher = Sha256::new();
-    for row in &rows {
-        let cells = row_values(row)?;
+    let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
+    let mut rows = sqlx::query(&query).fetch(sqlite);
+    let mut total = 0u64;
+    while let Some(row) = rows.try_next().await? {
+        let cells = row_values(&row)?;
         hasher.update(serde_json::to_vec(
             &cells.iter().map(cell_debug).collect::<Vec<_>>(),
         )?);
+        total += 1;
     }
     let _ = columns;
-    Ok((rows.len() as u64, hex::encode(hasher.finalize())))
+    Ok((total, hex::encode(hasher.finalize())))
 }
 
 async fn column_names(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {
@@ -585,11 +796,16 @@ fn cell_debug(cell: &Cell) -> serde_json::Value {
 fn cell_as_timestamp(cell: &Cell) -> Result<Cell> {
     match cell {
         Cell::Null => Ok(Cell::Timestamp(None)),
-        Cell::Text(value) => Ok(Cell::Timestamp(Some(
-            DateTime::parse_from_rfc3339(value)
-                .with_context(|| format!("parse UTC timestamp {value:?}"))?
-                .with_timezone(&Utc),
-        ))),
+        Cell::Text(value) => {
+            let timestamp = DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                        .map(|value| value.and_utc())
+                })
+                .with_context(|| format!("parse UTC timestamp {value:?}"))?;
+            Ok(Cell::Timestamp(Some(timestamp)))
+        }
         other => Ok(other.clone()),
     }
 }
@@ -711,6 +927,36 @@ fn filesystem_available_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(u64::try_from(available).unwrap_or(u64::MAX))
 }
 
+async fn unique_index_ddls(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL AND sql LIKE 'CREATE UNIQUE INDEX%' ORDER BY name",
+    )
+    .bind(table)
+    .fetch_all(sqlite)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let ddl: String = row.try_get("sql")?;
+            Ok(translate_index_ddl(&ddl))
+        })
+        .filter(|ddl| match ddl {
+            Ok(sql) => {
+                let normalized = sql.to_ascii_lowercase();
+                !normalized.contains("json_extract(")
+                    && !normalized.contains("json_type(")
+                    && !normalized.contains("ifnull(")
+            }
+            Err(_) => true,
+        })
+        .collect()
+}
+
+fn translate_index_ddl(ddl: &str) -> String {
+    let mut sql = ddl.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS");
+    sql = sql.replace("COLLATE NOCASE", "");
+    format!("SET search_path TO public, octo_rill; {sql};")
+}
+
 fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
     let mut sql = if ddl
         .to_ascii_uppercase()
@@ -720,12 +966,19 @@ fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
     } else {
         ddl.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS")
     };
-    sql = sql.replace("AUTOINCREMENT", "");
-    sql = sql.replace("COLLATE NOCASE", "");
+    sql = sql
+        .replace("AUTOINCREMENT", "")
+        .replace("autoincrement", "");
+    sql = sql
+        .replace("COLLATE NOCASE", "")
+        .replace("collate nocase", "");
     sql = sql
         .replace(" BLOB", " BYTEA")
+        .replace(" blob", " BYTEA")
         .replace(" INTEGER", " BIGINT")
-        .replace(" REAL", " DOUBLE PRECISION");
+        .replace(" integer", " BIGINT")
+        .replace(" REAL", " DOUBLE PRECISION")
+        .replace(" real", " DOUBLE PRECISION");
     if sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE") {
         bail!("virtual table {table} must be rebuilt as a PostgreSQL projection");
     }
@@ -774,7 +1027,12 @@ mod tests {
         let found = HashSet::from(["users".to_owned()]);
         assert_eq!(
             missing_authoritative_tables(&found),
-            vec!["github_connections", "job_tasks"]
+            vec![
+                "github_connections",
+                "job_tasks",
+                "content_work_items",
+                "translation_work_items",
+            ]
         );
     }
 
