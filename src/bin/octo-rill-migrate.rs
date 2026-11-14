@@ -187,7 +187,15 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             "\n",
             include_str!("../../migrations_pg/0003_runtime_owners.sql"),
             "\n",
-            include_str!("../../migrations_pg/0004_search_projection.sql")
+            include_str!("../../migrations_pg/0004_search_projection.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0005_scheduler_slots.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0006_content_processing.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0007_translation_runtime.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0008_llm_translation_audit.sql")
         ))
         .await;
     if let Err(error) = baseline_result {
