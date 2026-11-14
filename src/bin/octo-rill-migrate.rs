@@ -758,6 +758,13 @@ async fn unique_index_ddls(sqlite: &SqlitePool, table: &str) -> Result<Vec<Strin
             let ddl: String = row.try_get("sql")?;
             Ok(translate_index_ddl(&ddl))
         })
+        .filter(|ddl| match ddl {
+            Ok(sql) => {
+                let normalized = sql.to_ascii_lowercase();
+                !normalized.contains("json_extract(") && !normalized.contains("json_type(")
+            }
+            Err(_) => true,
+        })
         .collect()
 }
 
