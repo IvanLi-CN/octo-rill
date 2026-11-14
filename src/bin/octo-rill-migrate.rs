@@ -195,7 +195,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             "\n",
             include_str!("../../migrations_pg/0007_translation_runtime.sql"),
             "\n",
-            include_str!("../../migrations_pg/0008_llm_translation_audit.sql")
+            include_str!("../../migrations_pg/0008_llm_translation_audit.sql"),
+            "\n",
+            include_str!("../../migrations_pg/0009_brief_runtime.sql")
         ))
         .await;
     if let Err(error) = baseline_result {

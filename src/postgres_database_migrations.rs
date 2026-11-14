@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 8);
+        assert_eq!(MIGRATOR.iter().count(), 9);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -46,5 +46,10 @@ mod tests {
             .expect("translation audit migration");
         assert!(audit.sql.contains("translation_attempt_events"));
         assert!(audit.sql.contains("llm_recovery_flags"));
+        let brief = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 9)
+            .expect("brief migration");
+        assert!(brief.sql.contains("briefs"));
     }
 }
