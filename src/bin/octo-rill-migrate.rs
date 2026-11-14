@@ -776,12 +776,19 @@ fn translate_ddl(ddl: &str, table: &str) -> Result<String> {
     } else {
         ddl.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS")
     };
-    sql = sql.replace("AUTOINCREMENT", "");
-    sql = sql.replace("COLLATE NOCASE", "");
+    sql = sql
+        .replace("AUTOINCREMENT", "")
+        .replace("autoincrement", "");
+    sql = sql
+        .replace("COLLATE NOCASE", "")
+        .replace("collate nocase", "");
     sql = sql
         .replace(" BLOB", " BYTEA")
+        .replace(" blob", " BYTEA")
         .replace(" INTEGER", " BIGINT")
-        .replace(" REAL", " DOUBLE PRECISION");
+        .replace(" integer", " BIGINT")
+        .replace(" REAL", " DOUBLE PRECISION")
+        .replace(" real", " DOUBLE PRECISION");
     if sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE") {
         bail!("virtual table {table} must be rebuilt as a PostgreSQL projection");
     }
