@@ -3707,9 +3707,10 @@ async fn submit_translation_request(
             );
         }
     };
+    let source_hash = crate::ai::sha256_hex(&format!("{source_blocks_json}\n{target_slots_json}"));
     let dedupe_key = format!(
-        "{}:{}:{}:{}:{}",
-        user_id, item.kind, item.entity_id, item.variant, item.target_lang
+        "{}:{}:{}:{}:{}:{}",
+        user_id, item.kind, item.entity_id, item.variant, item.target_lang, source_hash
     );
     let mut tx = match state.runtime.pool.begin().await {
         Ok(tx) => tx,
@@ -3721,7 +3722,7 @@ async fn submit_translation_request(
         }
     };
     let work_result = sqlx::query(
-        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default','pending',$8,$9,0,$10,'queued',$11,$11) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
+        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default',$8,$9,$10,0,$11,'queued',$12,$12) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
     )
     .bind(&work_item_id)
     .bind(&dedupe_key)
@@ -3730,6 +3731,7 @@ async fn submit_translation_request(
     .bind(&item.variant)
     .bind(&item.entity_id)
     .bind(&item.target_lang)
+    .bind(&source_hash)
     .bind(&source_blocks_json)
     .bind(&target_slots_json)
     .bind(now + chrono::Duration::milliseconds(item.max_wait_ms.max(0)))
@@ -3743,7 +3745,7 @@ async fn submit_translation_request(
         );
     }
     let request_result = sqlx::query(
-        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,$2,'postgres','user',$3,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,$12,'queued',$13,$13)",
+        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,$2,'postgres','user',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'queued',$14,$14)",
     )
     .bind(&request_id)
     .bind(&request.mode)
@@ -3754,6 +3756,7 @@ async fn submit_translation_request(
     .bind(&item.entity_id)
     .bind(&item.target_lang)
     .bind(item.max_wait_ms.max(0))
+    .bind(&source_hash)
     .bind(&source_blocks_json)
     .bind(&target_slots_json)
     .bind(&work_item_id)
