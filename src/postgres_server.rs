@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{Json, Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse,
@@ -35,6 +35,7 @@ use crate::{
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
+    translations::TranslationSubmitRequest,
 };
 
 #[derive(Clone)]
@@ -218,7 +219,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
-        .route("/translate/requests", any(postgres_capability_unavailable))
+        .route(
+            "/translate/requests",
+            axum::routing::post(submit_translation_request),
+        )
         .route(
             "/translate/requests/{request_id}",
             any(postgres_capability_unavailable),
@@ -3659,6 +3663,114 @@ async fn postgres_capability_unavailable() -> impl IntoResponse {
             "code": "postgres_capability_unavailable",
             "message": "this capability is not yet available on the PostgreSQL runtime"
         })),
+    )
+}
+
+async fn submit_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Json(request): Json<TranslationSubmitRequest>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let Some(item) = request
+        .item
+        .or_else(|| request.items.and_then(|mut items| items.pop()))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "translation_item_required"})),
+        );
+    };
+    let now = Utc::now();
+    let work_item_id = local_id::generate_local_id();
+    let request_id = local_id::generate_local_id();
+    let source_blocks_json = match serde_json::to_string(&item.source_blocks) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": "invalid_source_blocks"})),
+            );
+        }
+    };
+    let target_slots_json = match serde_json::to_string(&item.target_slots) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": "invalid_target_slots"})),
+            );
+        }
+    };
+    let dedupe_key = format!(
+        "{}:{}:{}:{}:{}",
+        user_id, item.kind, item.entity_id, item.variant, item.target_lang
+    );
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    let work_result = sqlx::query(
+        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default','pending',$8,$9,0,$10,'queued',$11,$11) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
+    )
+    .bind(&work_item_id)
+    .bind(&dedupe_key)
+    .bind(&user_id)
+    .bind(&item.kind)
+    .bind(&item.variant)
+    .bind(&item.entity_id)
+    .bind(&item.target_lang)
+    .bind(&source_blocks_json)
+    .bind(&target_slots_json)
+    .bind(now + chrono::Duration::milliseconds(item.max_wait_ms.max(0)))
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if work_result.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    let request_result = sqlx::query(
+        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,$2,'postgres','user',$3,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,$12,'queued',$13,$13)",
+    )
+    .bind(&request_id)
+    .bind(&request.mode)
+    .bind(&user_id)
+    .bind(&item.producer_ref)
+    .bind(&item.kind)
+    .bind(&item.variant)
+    .bind(&item.entity_id)
+    .bind(&item.target_lang)
+    .bind(item.max_wait_ms.max(0))
+    .bind(&source_blocks_json)
+    .bind(&target_slots_json)
+    .bind(&work_item_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if request_result.is_err() || tx.commit().await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(
+            json!({"mode": "task_id", "request_id": request_id, "work_item_id": work_item_id, "status": "queued"}),
+        ),
     )
 }
 
