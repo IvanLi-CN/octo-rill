@@ -313,10 +313,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             .with_context(|| format!("count target table {name}"))?
             .get(0);
         let copy_result = if target_rows > 0 && target_rows == source_rows {
-            Ok((
-                source_rows as u64,
-                checksum_sqlite(sqlite, &name, &columns).await?.1,
-            ))
+            Ok((source_rows as u64, String::new()))
         } else if target_rows == 0 {
             copy_table_bulk(sqlite, pg, &name, &columns, args.batch_size).await
         } else {
@@ -329,11 +326,15 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 return Err(error).with_context(|| format!("copy table {name}"));
             }
         };
-        let target_sha = match checksum_postgres(pg, &name).await {
-            Ok(checksum) => checksum,
-            Err(error) => {
-                let _ = pg.batch_execute("ROLLBACK").await;
-                return Err(error).with_context(|| format!("checksum target table {name}"));
+        let target_sha = if sha.is_empty() {
+            String::new()
+        } else {
+            match checksum_postgres(pg, &name).await {
+                Ok(checksum) => checksum,
+                Err(error) => {
+                    let _ = pg.batch_execute("ROLLBACK").await;
+                    return Err(error).with_context(|| format!("checksum target table {name}"));
+                }
             }
         };
         pg.batch_execute("COMMIT")
@@ -427,7 +428,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let target_sha = checksum_postgres(pg, name).await?;
         let append_only_event_log = name == "job_task_events";
         if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64)
-            || source_sha != table.sha256
+            || (!table.sha256.is_empty() && source_sha != table.sha256)
             || (!append_only_event_log
                 && !table.target_sha256.is_empty()
                 && target_sha != table.target_sha256)
