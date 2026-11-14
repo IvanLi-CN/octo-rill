@@ -277,8 +277,27 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         }
     }
     for (name, columns, _, _) in tables {
-        let (rows, sha) = copy_table(sqlite, pg, &name, &columns, args.batch_size).await?;
-        let target_sha = checksum_postgres(pg, &name).await?;
+        pg.batch_execute("BEGIN")
+            .await
+            .with_context(|| format!("begin copy transaction for {name}"))?;
+        let copy_result = copy_table(sqlite, pg, &name, &columns, args.batch_size).await;
+        let (rows, sha) = match copy_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = pg.batch_execute("ROLLBACK").await;
+                return Err(error).with_context(|| format!("copy table {name}"));
+            }
+        };
+        let target_sha = match checksum_postgres(pg, &name).await {
+            Ok(checksum) => checksum,
+            Err(error) => {
+                let _ = pg.batch_execute("ROLLBACK").await;
+                return Err(error).with_context(|| format!("checksum target table {name}"));
+            }
+        };
+        pg.batch_execute("COMMIT")
+            .await
+            .with_context(|| format!("commit copy transaction for {name}"))?;
         manifest.tables.insert(
             name,
             TableManifest {
