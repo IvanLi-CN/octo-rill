@@ -10,7 +10,10 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool};
 
-use crate::{crypto::EncryptionKey, postgres_jobs::ClaimedTask, postgres_worker::TaskExecutor};
+use crate::{
+    config::AiConfig, crypto::EncryptionKey, postgres_jobs::ClaimedTask,
+    postgres_worker::TaskExecutor,
+};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -53,6 +56,13 @@ pub struct WebhookExecutor {
 #[derive(Clone)]
 pub struct BriefExecutor {
     pool: PgPool,
+}
+
+#[derive(Clone)]
+pub struct TranslationExecutor {
+    pool: PgPool,
+    http: Client,
+    ai: Option<AiConfig>,
 }
 
 impl ReleasesExecutor {
@@ -114,6 +124,94 @@ impl WebhookExecutor {
 impl BriefExecutor {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+}
+
+impl TranslationExecutor {
+    pub fn new(pool: PgPool, http: Client, ai: Option<AiConfig>) -> Self {
+        Self { pool, http, ai }
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for TranslationExecutor {
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if task.task_type != "translation.generate" {
+            bail!("translation executor received {}", task.task_type);
+        }
+        let payload: Value =
+            serde_json::from_str(&task.payload_json).context("decode translation task payload")?;
+        let work_item_id = payload
+            .get("work_item_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("translation task has no work_item_id"))?;
+        let ai = self
+            .ai
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI provider is not configured"))?;
+        let row = sqlx::query_as::<_, (String, String, String, String, String)>(
+            "SELECT id, source_blocks_json, target_slots_json, target_lang, model_profile FROM public.translation_work_items WHERE id = $1 AND status IN ('queued', 'running')",
+        )
+        .bind(work_item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load PostgreSQL translation work item")?
+        .ok_or_else(|| anyhow!("translation work item is missing or already finished"))?;
+        let prompt = format!(
+            "Translate the following source blocks into {} using the {} model profile. Return concise Markdown. Source blocks: {}. Target slots: {}",
+            row.3, row.4, row.1, row.2
+        );
+        let endpoint = ai
+            .base_url
+            .join("chat/completions")
+            .context("build AI chat completions endpoint")?;
+        let response = self
+            .http
+            .post(endpoint)
+            .bearer_auth(&ai.api_key)
+            .json(&json!({
+                "model": ai.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0
+            }))
+            .send()
+            .await
+            .context("call AI provider for PostgreSQL translation")?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .context("decode AI translation response")?;
+        if !status.is_success() {
+            bail!("AI translation provider returned {status}: {}", body);
+        }
+        let content = body
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("AI translation response has no content"))?;
+        let now = Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin translation finalize")?;
+        sqlx::query("UPDATE public.translation_work_items SET status = 'completed', result_status = 'ready', body_md = $1, finished_at = $2, updated_at = $2 WHERE id = $3")
+            .bind(content)
+            .bind(now)
+            .bind(&row.0)
+            .execute(&mut *tx)
+            .await
+            .context("persist PostgreSQL translation result")?;
+        sqlx::query("UPDATE public.translation_requests SET status = 'completed', result_status = 'ready', body_md = $1, finished_at = $2, updated_at = $2 WHERE work_item_id = $3")
+            .bind(content)
+            .bind(now)
+            .bind(&row.0)
+            .execute(&mut *tx)
+            .await
+            .context("persist PostgreSQL translation request result")?;
+        tx.commit().await.context("commit translation finalize")?;
+        Ok(json!({"work_item_id": row.0, "status": "completed"}).to_string())
     }
 }
 
