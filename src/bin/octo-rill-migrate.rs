@@ -459,7 +459,7 @@ async fn copy_table(
             let placeholders = (1..=columns.len())
                 .zip(target_types.iter())
                 .map(|(i, target_type)| {
-                    if target_type.as_deref() == Some("timestamp with time zone") {
+                    if is_timestamp_type(target_type.as_deref()) {
                         format!("${i}::timestamptz")
                     } else {
                         format!("${i}")
@@ -481,7 +481,7 @@ async fn copy_table(
                 .iter()
                 .zip(target_types.iter())
                 .map(|(cell, target_type)| -> Result<Box<dyn ToSql + Sync>> {
-                    if target_type.as_deref() == Some("timestamp with time zone") {
+                    if is_timestamp_type(target_type.as_deref()) {
                         Ok(to_pg_param(&cell_as_timestamp(cell)?))
                     } else {
                         Ok(to_pg_param(cell))
@@ -500,6 +500,10 @@ async fn copy_table(
         offset += batch_size as i64;
     }
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+fn is_timestamp_type(data_type: Option<&str>) -> bool {
+    data_type.is_some_and(|value| value.starts_with("timestamp"))
 }
 
 async fn target_column_types(
