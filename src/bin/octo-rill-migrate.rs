@@ -593,51 +593,50 @@ async fn copy_table_bulk(
     );
     let sink = pg.copy_in::<_, Bytes>(&copy_sql).await?;
     futures_util::pin_mut!(sink);
-    let mut offset = 0i64;
     let mut total = 0u64;
     let mut hasher = Sha256::new();
+    let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
+    let mut rows = sqlx::query(&query).fetch(sqlite);
+    let mut payload = Vec::new();
+    let mut batch_rows = 0usize;
     loop {
-        let query = format!(
-            "SELECT * FROM {} LIMIT ? OFFSET ?",
-            quote_sqlite_ident(table)
-        );
-        let rows = sqlx::query(&query)
-            .bind(batch_size as i64)
-            .bind(offset)
-            .fetch_all(sqlite)
-            .await?;
-        if rows.is_empty() {
+        let Some(row) = rows.try_next().await? else {
             break;
-        }
-        let mut payload = Vec::new();
-        for row in rows {
-            let cells = row_values(&row)?;
-            let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
-            hasher.update(&encoded);
-            for (index, (cell, target_type)) in cells.iter().zip(target_types.iter()).enumerate() {
-                if index > 0 {
-                    payload.push(b',');
-                }
-                let value = csv_cell(cell, target_type.as_deref());
-                match value {
-                    None => payload.extend_from_slice(b"\\N"),
-                    Some(value) => {
-                        payload.push(b'"');
-                        for byte in value.bytes() {
-                            if byte == b'"' {
-                                payload.push(b'"');
-                            }
-                            payload.push(byte);
+        };
+        let cells = row_values(&row)?;
+        let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
+        hasher.update(&encoded);
+        for (index, (cell, target_type)) in cells.iter().zip(target_types.iter()).enumerate() {
+            if index > 0 {
+                payload.push(b',');
+            }
+            let value = csv_cell(cell, target_type.as_deref());
+            match value {
+                None => payload.extend_from_slice(b"\\N"),
+                Some(value) => {
+                    payload.push(b'"');
+                    for byte in value.bytes() {
+                        if byte == b'"' {
+                            payload.push(b'"');
                         }
-                        payload.push(b'"');
+                        payload.push(byte);
                     }
+                    payload.push(b'"');
                 }
             }
-            payload.push(b'\n');
-            total += 1;
         }
+        payload.push(b'\n');
+        total += 1;
+        batch_rows += 1;
+        if batch_rows >= batch_size {
+            sink.as_mut()
+                .send(std::mem::take(&mut payload).into())
+                .await?;
+            batch_rows = 0;
+        }
+    }
+    if !payload.is_empty() {
         sink.as_mut().send(payload.into()).await?;
-        offset += batch_size as i64;
     }
     sink.as_mut().finish().await?;
     Ok((total, hex::encode(hasher.finalize())))
