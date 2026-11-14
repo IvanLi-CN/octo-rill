@@ -299,7 +299,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 
 async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'github_connections', 'job_tasks')",
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'github_connections', 'job_tasks', 'content_work_items', 'translation_work_items')",
     )
     .fetch_all(sqlite)
     .await
@@ -319,10 +319,16 @@ async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()>
 }
 
 fn missing_authoritative_tables(found: &HashSet<String>) -> Vec<&'static str> {
-    ["users", "github_connections", "job_tasks"]
-        .into_iter()
-        .filter(|name| !found.contains(*name))
-        .collect()
+    [
+        "users",
+        "github_connections",
+        "job_tasks",
+        "content_work_items",
+        "translation_work_items",
+    ]
+    .into_iter()
+    .filter(|name| !found.contains(*name))
+    .collect()
 }
 
 async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
@@ -782,7 +788,12 @@ mod tests {
         let found = HashSet::from(["users".to_owned()]);
         assert_eq!(
             missing_authoritative_tables(&found),
-            vec!["github_connections", "job_tasks"]
+            vec![
+                "github_connections",
+                "job_tasks",
+                "content_work_items",
+                "translation_work_items",
+            ]
         );
     }
 
