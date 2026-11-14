@@ -15,7 +15,7 @@ use axum::{
     http::Request,
     response::{IntoResponse, Response},
 };
-use sqlx::SqlitePool;
+use sqlx::{PgPool, SqlitePool};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 use tower::{Layer, Service};
@@ -25,7 +25,7 @@ use tower_sessions::{
     session::{Id, Record},
     session_store,
 };
-use tower_sessions_sqlx_store::SqliteStore;
+use tower_sessions_sqlx_store::{PostgresStore, SqliteStore};
 use tracing::{debug, warn};
 
 use crate::error::ApiError;
@@ -39,6 +39,19 @@ const SESSION_TABLE_NAME: &str = "tower_sessions";
 const SESSION_ACTIVITY_TOUCH_KEY: &str = "activity_touched_at";
 const SESSION_ACTIVITY_REFRESH_FAILURE_PREFIX: &str = "sqlite session activity refresh failed";
 const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
+
+/// Build the PostgreSQL-backed session store used by the PG runtime.
+///
+/// Keeping the schema and table contract here gives the eventual PG service
+/// path one construction point and prevents callers from silently falling
+/// back to the SQLite session table.
+pub fn postgres_session_store(pool: PgPool) -> anyhow::Result<PostgresStore> {
+    PostgresStore::new(pool)
+        .with_schema_name("octo_rill")
+        .map_err(|error| anyhow::anyhow!("configure PostgreSQL session schema: {error}"))?
+        .with_table_name(SESSION_TABLE_NAME)
+        .map_err(|error| anyhow::anyhow!("configure PostgreSQL session table: {error}"))
+}
 
 tokio::task_local! {
     static SESSION_BASELINE: RefCell<Option<Record>>;

@@ -77,6 +77,13 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
 ];
 
 pub async fn serve(config: AppConfig) -> Result<()> {
+    if config.database_backend()? == crate::config::DatabaseBackend::Postgres {
+        return crate::postgres_server::serve(config).await;
+    }
+    serve_sqlite(config).await
+}
+
+async fn serve_sqlite(config: AppConfig) -> Result<()> {
     observability::set_logging_thresholds(config.logging.clone());
     let metrics_config = crate::metrics::MetricsConfig::from_env()?;
     let metrics = crate::metrics::install_global(Arc::new(crate::metrics::Metrics::new()));
@@ -86,7 +93,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let connect_opts = build_sqlite_connect_options(&config.database_url)?;
 
-    let pool = build_sqlite_pool_options(config.sqlite_pool_max_connections)
+    let pool = build_sqlite_pool_options(config.database_pool_max_connections)
         .connect_with(connect_opts)
         .await
         .context("failed to open sqlite database")?;
@@ -126,7 +133,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         auto_vacuum = pragmas.auto_vacuum,
         busy_timeout_ms = pragmas.busy_timeout_ms,
         synchronous = pragmas.synchronous,
-        pool_max_connections = config.sqlite_pool_max_connections,
+        pool_max_connections = config.database_pool_max_connections,
         "sqlite runtime pragmas active"
     );
     warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
@@ -869,7 +876,7 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
     config: &AppConfig,
     runtime_settings: &admin_runtime::AdminRuntimeSettingsSnapshot,
 ) {
-    let pool = config.sqlite_pool_max_connections;
+    let pool = config.database_pool_max_connections;
     let translation_workers = runtime_settings.translation_general_worker_concurrency
         + runtime_settings.translation_dedicated_worker_concurrency;
     let logical_worker_concurrency = config.job_worker_concurrency
@@ -880,7 +887,7 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
         || logical_worker_concurrency > pool.saturating_mul(4)
     {
         warn!(
-            sqlite_pool_max_connections = pool,
+            database_pool_max_connections = pool,
             job_worker_concurrency = config.job_worker_concurrency,
             repo_release_worker_concurrency = runtime_settings.repo_release_worker_concurrency,
             translation_general_worker_concurrency =
@@ -1540,7 +1547,7 @@ mod tests {
             bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
             public_base_url: url::Url::parse(public_base_url).expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
-            sqlite_pool_max_connections: 8,
+            database_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
             job_worker_concurrency: 1,

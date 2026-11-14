@@ -19,6 +19,14 @@ mod metrics;
 mod observability;
 mod online_migrations;
 mod passkeys;
+mod postgres_database_migrations;
+mod postgres_jobs;
+mod postgres_runtime;
+mod postgres_runtime_owner;
+mod postgres_server;
+mod postgres_tasks;
+pub mod postgres_worker;
+mod postgres_write;
 mod public_metrics;
 mod release_links;
 mod runtime;
@@ -44,5 +52,39 @@ async fn main() -> Result<()> {
     observability::init_tracing();
 
     let config = config::AppConfig::from_env()?;
+    if std::env::var("OCTORILL_PG_BOOTSTRAP_ONLY").as_deref() == Ok("1") {
+        if config.database_backend()? != config::DatabaseBackend::Postgres {
+            anyhow::bail!("OCTORILL_PG_BOOTSTRAP_ONLY requires a postgres DATABASE_URL");
+        }
+        let runtime = postgres_runtime::connect_from_config(&config).await?;
+        if std::env::var("OCTORILL_PG_TASK_CLAIM_SMOKE").as_deref() == Ok("1") {
+            let owner_id = "bootstrap-smoke";
+            postgres_runtime_owner::register(&runtime.pool, owner_id, chrono::Utc::now()).await?;
+            let heartbeat =
+                postgres_runtime_owner::heartbeat(&runtime.pool, owner_id, chrono::Utc::now())
+                    .await?;
+            tracing::info!(heartbeat, "PostgreSQL runtime owner lease is ready");
+            if std::env::var("OCTORILL_PG_TASK_FINALIZE_SMOKE").as_deref() == Ok("1") {
+                let registry = postgres_worker::TaskExecutorRegistry::builder()
+                    .register("sync.releases", postgres_worker::BootstrapSmokeExecutor)
+                    .build();
+                let ran = runtime
+                    .run_registered_task_once(owner_id, &registry)
+                    .await?;
+                tracing::info!(ran, "PostgreSQL task execution lifecycle is ready");
+            } else {
+                let task = runtime
+                    .claim_next_queued_task(owner_id, chrono::Utc::now())
+                    .await?;
+                tracing::info!(
+                    claimed = task.is_some(),
+                    "PostgreSQL task claim contract is ready"
+                );
+            }
+        }
+        tracing::info!("PostgreSQL runtime baseline and session store are ready");
+        runtime.pool.close().await;
+        return Ok(());
+    }
     server::serve(config).await
 }

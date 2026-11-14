@@ -734,7 +734,7 @@ mod tests {
             bind_addr: "127.0.0.1:58090".parse::<SocketAddr>().unwrap(),
             public_base_url: Url::parse("http://127.0.0.1:58090").unwrap(),
             database_url: "sqlite::memory:".to_owned(),
-            sqlite_pool_max_connections: 4,
+            database_pool_max_connections: 4,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-search-test-logs"),
             job_worker_concurrency: 1,

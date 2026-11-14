@@ -95,11 +95,21 @@ impl ApiError {
         let is_background_admission = display_lower
             .contains("sqlite background writer admission denied")
             || error_chain_lower.contains("sqlite background writer admission denied");
+        let is_postgres_retryable =
+            crate::postgres_write::contains_retryable_sqlstate(&error_chain_lower);
         if is_write_deadline || is_write_busy || is_session_conflict || is_background_admission {
             return Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "sqlite_write_retryable",
                 "SQLite write capacity is busy; retry the request.",
+            )
+            .with_retry_after(1);
+        }
+        if is_postgres_retryable {
+            return Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "postgres_write_retryable",
+                "PostgreSQL transaction conflicted; retry the request.",
             )
             .with_retry_after(1);
         }
@@ -216,6 +226,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn postgres_serialization_failure_maps_to_retryable_service_unavailable() {
+        let response = ApiError::internal(anyhow::anyhow!(
+            "database error: SQLSTATE 40001 serialization failure"
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn postgres_deadlock_maps_to_retryable_service_unavailable() {
+        let error = ApiError::internal(anyhow::anyhow!(
+            "db error: SQLSTATE 40P01 deadlock detected"
+        ));
+
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

@@ -1,0 +1,67 @@
+# PostgreSQL 18 migration rehearsal contract.
+# The application service is intentionally gated on the one-shot importer.
+# Production cutover remains a separately authorised operation.
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-octo_rill}
+      POSTGRES_USER: ${POSTGRES_USER:-octo_rill}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  migration:
+    image: ${OCTORILL_IMAGE:-ghcr.io/ivanli-cn/octo-rill:latest}
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SQLITE_SOURCE: sqlite:/migration-source/octo-rill.db
+      POSTGRES_URL: postgres://${POSTGRES_USER:-octo_rill}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-octo_rill}
+      MIGRATION_MANIFEST: /migration-output/manifest.json
+      MIGRATION_SAFETY_BYTES: ${MIGRATION_SAFETY_BYTES:-1073741824}
+      MIGRATION_TARGET_PATH: /var/lib/postgresql
+    volumes:
+      - ${SQLITE_SOURCE_DIR:?set SQLITE_SOURCE_DIR}:/migration-source:ro
+      - migration-output:/migration-output
+      - pg-data:/var/lib/postgresql:ro
+    command: ["/app/octo-rill-migrate", "import"]
+
+  server:
+    image: ${OCTORILL_IMAGE:-ghcr.io/ivanli-cn/octo-rill:latest}
+    restart: unless-stopped
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-octo_rill}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-octo_rill}
+      OCTORILL_PG_WORKER_ENABLED: ${OCTORILL_PG_WORKER_ENABLED:-1}
+      OCTORILL_DB_POOL_MAX_CONNECTIONS: ${OCTORILL_DB_POOL_MAX_CONNECTIONS:-8}
+      OCTORILL_BIND_ADDR: 0.0.0.0:3000
+      OCTORILL_PUBLIC_BASE_URL: ${OCTORILL_PUBLIC_BASE_URL:?set OCTORILL_PUBLIC_BASE_URL}
+      OCTORILL_ENCRYPTION_KEY_BASE64: ${OCTORILL_ENCRYPTION_KEY_BASE64:?set OCTORILL_ENCRYPTION_KEY_BASE64}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:?set GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:?set GITHUB_CLIENT_SECRET}
+      GITHUB_OAUTH_REDIRECT_URL: ${GITHUB_OAUTH_REDIRECT_URL:?set GITHUB_OAUTH_REDIRECT_URL}
+      LINUXDO_CLIENT_ID: ${LINUXDO_CLIENT_ID:-}
+      LINUXDO_CLIENT_SECRET: ${LINUXDO_CLIENT_SECRET:-}
+      LINUXDO_OAUTH_REDIRECT_URL: ${LINUXDO_OAUTH_REDIRECT_URL:-}
+    ports:
+      - "${OCTORILL_PORT:-3000}:3000"
+    volumes:
+      - task-logs:/app/.data/task-logs
+
+volumes:
+  pg-data:
+  migration-output:
+  task-logs:
