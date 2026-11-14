@@ -35,7 +35,7 @@ use crate::{
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
-    translations::TranslationSubmitRequest,
+    translations::{TranslationResolveRequest, TranslationSubmitRequest},
 };
 
 #[derive(Clone)]
@@ -231,7 +231,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/translate/requests/{request_id}/retry",
             axum::routing::post(retry_translation_request),
         )
-        .route("/translate/results", any(postgres_capability_unavailable))
+        .route(
+            "/translate/results",
+            axum::routing::post(resolve_translation_results),
+        )
         .route(
             "/translate/requests/{request_id}/stream",
             any(postgres_capability_unavailable),
@@ -3845,6 +3848,51 @@ async fn retry_translation_request(
             axum::Json(json!({"code": "translation_retry_failed"})),
         ),
     }
+}
+
+async fn resolve_translation_results(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Json(request): Json<TranslationResolveRequest>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let mut resolved = 0usize;
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    for (request_id, _) in request.request_ids {
+        if let Ok(result) = sqlx::query(
+            "UPDATE public.translation_requests SET status = 'completed', result_status = 'ready', error_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND scope_user_id = $2 AND status IN ('queued', 'running', 'failed')",
+        )
+        .bind(request_id)
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await
+        {
+            resolved += result.rows_affected() as usize;
+        }
+    }
+    if tx.commit().await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_resolve_failed"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({"resolved": resolved, "status": "completed"})),
+    )
 }
 
 async fn shutdown_signal() {
