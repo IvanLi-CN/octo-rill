@@ -221,21 +221,6 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         return Err(error.into());
     }
     pg.batch_execute(
-        "DO $$ BEGIN
-           IF EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = 'tower_sessions'
-               AND column_name = 'expiry_date' AND data_type = 'bigint'
-           ) THEN
-             ALTER TABLE public.tower_sessions
-               ALTER COLUMN expiry_date TYPE timestamptz
-               USING to_timestamp(expiry_date);
-           END IF;
-         END $$;",
-    )
-    .await
-    .context("normalize tower session expiry type")?;
-    pg.batch_execute(
         "COMMIT; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));",
     )
     .await
@@ -293,6 +278,21 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             }
         }
     }
+    pg.batch_execute(
+        "DO $$ BEGIN
+           IF EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'tower_sessions'
+               AND column_name = 'expiry_date' AND data_type = 'bigint'
+           ) THEN
+             ALTER TABLE public.tower_sessions
+               ALTER COLUMN expiry_date TYPE timestamptz
+               USING to_timestamp(expiry_date);
+           END IF;
+         END $$;",
+    )
+    .await
+    .context("normalize tower session expiry type")?;
     for (name, columns, _, _) in tables {
         pg.batch_execute("BEGIN")
             .await
