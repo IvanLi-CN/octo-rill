@@ -29,6 +29,7 @@ ENV APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY migrations_pg ./migrations_pg
 COPY --from=web-builder /app/web/dist ./web/dist
 
 RUN cargo build --release --locked
@@ -40,6 +41,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=rust-builder /app/target/release/octo-rill /app/octo-rill
+COPY --from=rust-builder /app/target/release/octo-rill-migrate /app/octo-rill-migrate
 COPY --from=web-builder /app/web/dist /app/web/dist
 
 ENV OCTORILL_BIND_ADDR=0.0.0.0:3000

@@ -142,7 +142,7 @@ pub struct AppConfig {
     pub bind_addr: SocketAddr,
     pub public_base_url: Url,
     pub database_url: String,
-    pub sqlite_pool_max_connections: usize,
+    pub database_pool_max_connections: usize,
     pub static_dir: Option<PathBuf>,
     pub task_log_dir: PathBuf,
     pub job_worker_concurrency: usize,
@@ -154,6 +154,29 @@ pub struct AppConfig {
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
     pub app_default_time_zone: String,
     pub logging: LoggingThresholds,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+}
+
+impl DatabaseBackend {
+    pub fn from_url(database_url: &str) -> Result<Self> {
+        let scheme = database_url
+            .split_once(':')
+            .map(|(scheme, _)| scheme)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match scheme.as_str() {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            _ => anyhow::bail!(
+                "unsupported DATABASE_URL scheme '{scheme}' (expected sqlite or postgres)"
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -214,8 +237,8 @@ impl fmt::Debug for AppConfig {
             .field("public_base_url", &self.public_base_url)
             .field("database_url", &self.database_url)
             .field(
-                "sqlite_pool_max_connections",
-                &self.sqlite_pool_max_connections,
+                "database_pool_max_connections",
+                &self.database_pool_max_connections,
             )
             .field("static_dir", &self.static_dir)
             .field("task_log_dir", &self.task_log_dir)
@@ -233,6 +256,10 @@ impl fmt::Debug for AppConfig {
 }
 
 impl AppConfig {
+    pub fn database_backend(&self) -> Result<DatabaseBackend> {
+        DatabaseBackend::from_url(&self.database_url)
+    }
+
     pub fn from_env() -> Result<Self> {
         let bind_addr: SocketAddr = env::var("OCTORILL_BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:58090".to_owned())
@@ -251,8 +278,8 @@ impl AppConfig {
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./.data/octo-rill.db".to_owned());
-        let sqlite_pool_max_connections =
-            parse_bounded_positive_usize_env("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", false, 32)?
+        let database_pool_max_connections =
+            parse_bounded_positive_usize_env("OCTORILL_DB_POOL_MAX_CONNECTIONS", false, 32)?
                 .unwrap_or_else(|| {
                     if database_url == "sqlite::memory:" {
                         1
@@ -390,7 +417,7 @@ impl AppConfig {
             bind_addr,
             public_base_url,
             database_url,
-            sqlite_pool_max_connections,
+            database_pool_max_connections,
             static_dir,
             task_log_dir,
             job_worker_concurrency,
@@ -418,6 +445,23 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn database_backend_classifies_supported_urls() {
+        assert_eq!(
+            DatabaseBackend::from_url("sqlite:./data.db").unwrap(),
+            DatabaseBackend::Sqlite
+        );
+        assert_eq!(
+            DatabaseBackend::from_url("postgres://user@db/app").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            DatabaseBackend::from_url("postgresql://user@db/app").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert!(DatabaseBackend::from_url("mysql://user@db/app").is_err());
     }
 
     #[test]
@@ -467,7 +511,7 @@ mod tests {
             env::remove_var("APP_DEFAULT_TIME_ZONE");
             env::remove_var("DATABASE_URL");
             env::remove_var("OCTORILL_TASK_WORKERS");
-            env::remove_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS");
+            env::remove_var("OCTORILL_DB_POOL_MAX_CONNECTIONS");
             env::remove_var("OCTORILL_HTTP_SLOW_MS");
             env::remove_var("OCTORILL_UPSTREAM_SLOW_MS");
             env::remove_var("OCTORILL_SQLITE_WRITE_SLOW_MS");
@@ -489,17 +533,17 @@ mod tests {
     }
 
     #[test]
-    fn from_env_defaults_sqlite_pool_max_connections_to_eight() {
+    fn from_env_defaults_database_pool_max_connections_to_eight() {
         let _guard = env_lock().lock().expect("lock env");
         set_required_env();
 
         let config = AppConfig::from_env().expect("build config");
 
-        assert_eq!(config.sqlite_pool_max_connections, 8);
+        assert_eq!(config.database_pool_max_connections, 8);
     }
 
     #[test]
-    fn from_env_defaults_in_memory_sqlite_pool_max_connections_to_one() {
+    fn from_env_defaults_in_memory_database_pool_max_connections_to_one() {
         let _guard = env_lock().lock().expect("lock env");
         set_required_env();
         unsafe {
@@ -508,7 +552,7 @@ mod tests {
 
         let config = AppConfig::from_env().expect("build config");
 
-        assert_eq!(config.sqlite_pool_max_connections, 1);
+        assert_eq!(config.database_pool_max_connections, 1);
     }
 
     #[test]
@@ -541,39 +585,39 @@ mod tests {
     }
 
     #[test]
-    fn from_env_accepts_sqlite_pool_max_connections_override() {
+    fn from_env_accepts_database_pool_max_connections_override() {
         let _guard = env_lock().lock().expect("lock env");
         set_required_env();
         unsafe {
-            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "1");
+            env::set_var("OCTORILL_DB_POOL_MAX_CONNECTIONS", "1");
         }
 
         let config = AppConfig::from_env().expect("build config");
 
-        assert_eq!(config.sqlite_pool_max_connections, 1);
+        assert_eq!(config.database_pool_max_connections, 1);
 
         unsafe {
-            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "16");
+            env::set_var("OCTORILL_DB_POOL_MAX_CONNECTIONS", "16");
         }
 
         let config = AppConfig::from_env().expect("build config");
 
-        assert_eq!(config.sqlite_pool_max_connections, 16);
+        assert_eq!(config.database_pool_max_connections, 16);
     }
 
     #[test]
-    fn from_env_rejects_invalid_sqlite_pool_max_connections() {
+    fn from_env_rejects_invalid_database_pool_max_connections() {
         let _guard = env_lock().lock().expect("lock env");
         set_required_env();
         unsafe {
-            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "33");
+            env::set_var("OCTORILL_DB_POOL_MAX_CONNECTIONS", "33");
         }
 
         let err = AppConfig::from_env().expect_err("out-of-range sqlite pool should fail");
 
         assert!(
             err.to_string().contains(
-                "invalid OCTORILL_SQLITE_POOL_MAX_CONNECTIONS (expected positive integer <= 32)"
+                "invalid OCTORILL_DB_POOL_MAX_CONNECTIONS (expected positive integer <= 32)"
             ),
             "unexpected error: {err:?}"
         );
