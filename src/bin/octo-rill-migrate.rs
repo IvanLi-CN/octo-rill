@@ -483,6 +483,16 @@ async fn copy_table(
                 .map(|(cell, target_type)| -> Result<Box<dyn ToSql + Sync>> {
                     if is_timestamp_type(target_type.as_deref()) {
                         Ok(to_pg_param(&cell_as_timestamp(cell)?))
+                    } else if target_type.as_deref() == Some("boolean") {
+                        match cell {
+                            Cell::Integer(value) => Ok(Box::new(*value != 0)),
+                            Cell::Null => Ok(Box::new(None::<bool>)),
+                            Cell::Text(value) => Ok(Box::new(matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "1" | "true" | "t" | "yes"
+                            ))),
+                            other => Ok(to_pg_param(other)),
+                        }
                     } else {
                         Ok(to_pg_param(cell))
                     }
