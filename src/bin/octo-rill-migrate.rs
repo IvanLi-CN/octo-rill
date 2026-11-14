@@ -179,6 +179,20 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     )
     .await
     .context("acquire PostgreSQL migration lock")?;
+    // The PostgreSQL runtime migrations contain foreign keys to the legacy
+    // users table. Create that authoritative table from the snapshot before
+    // applying the runtime baseline; the full table pass below remains
+    // idempotent and will reuse this definition.
+    let users_ddl: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+            .fetch_one(sqlite)
+            .await
+            .context("read users table definition")?;
+    let users_ddl =
+        users_ddl.ok_or_else(|| anyhow::anyhow!("users table definition is missing"))?;
+    pg.batch_execute(&translate_ddl(&users_ddl, "users")?)
+        .await
+        .context("create PostgreSQL users prerequisite")?;
     let baseline_result = pg
         .batch_execute(concat!(
             include_str!("../../migrations_pg/0001_runtime.sql"),
