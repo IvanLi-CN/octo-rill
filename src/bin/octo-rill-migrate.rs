@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, TryStreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, TypeInfo, ValueRef, sqlite::SqlitePoolOptions};
@@ -448,9 +448,10 @@ async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
         "SELECT row_to_json(row)::text FROM (SELECT * FROM public.{} ORDER BY ctid) AS row",
         quote_ident(table)
     );
-    let rows = pg.query(&query, &[]).await?;
     let mut hasher = Sha256::new();
-    for row in rows {
+    let stream = pg.query_raw(&query, std::iter::empty::<&str>()).await?;
+    futures_util::pin_mut!(stream);
+    while let Some(row) = stream.try_next().await? {
         let value: String = row.get(0);
         hasher.update(value.as_bytes());
     }
