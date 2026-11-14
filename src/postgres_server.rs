@@ -31,7 +31,7 @@ use crate::{
     postgres_runtime_owner,
     postgres_tasks::{
         BriefExecutor, CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor,
-        StarredExecutor, WebhookExecutor,
+        StarredExecutor, TranslationExecutor, WebhookExecutor,
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
@@ -127,6 +127,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .register("brief.generate", BriefExecutor::new(runtime.pool.clone()))
         .register("brief.daily_slot", BriefExecutor::new(runtime.pool.clone()))
+        .register(
+            "translation.generate",
+            TranslationExecutor::new(runtime.pool.clone(), http.clone(), config.ai.clone()),
+        )
         .build();
     let state = PostgresServerState {
         runtime: runtime.clone(),
@@ -3724,7 +3728,7 @@ async fn submit_translation_request(
             );
         }
     };
-    let work_result = sqlx::query(
+    let work_result = sqlx::query_as::<_, (String,)>(
         "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default',$8,$9,$10,0,$11,'queued',$12,$12) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
     )
     .bind(&work_item_id)
@@ -3739,14 +3743,14 @@ async fn submit_translation_request(
     .bind(&target_slots_json)
     .bind(now + chrono::Duration::milliseconds(item.max_wait_ms.max(0)))
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await;
-    if work_result.is_err() {
+    let Ok((work_item_id,)) = work_result else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"code": "translation_enqueue_failed"})),
         );
-    }
+    };
     let request_result = sqlx::query(
         "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,$2,'postgres','user',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'queued',$14,$14)",
     )
@@ -3766,7 +3770,24 @@ async fn submit_translation_request(
     .bind(now)
     .execute(&mut *tx)
     .await;
-    if request_result.is_err() || tx.commit().await.is_err() {
+    if request_result.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    let task_id = local_id::generate_local_id();
+    let task_payload = json!({"work_item_id": work_item_id});
+    let task_result = sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', 'api.translate.requests', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(task_payload.to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if task_result.is_err() || tx.commit().await.is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"code": "translation_enqueue_failed"})),
@@ -3775,7 +3796,7 @@ async fn submit_translation_request(
     (
         StatusCode::ACCEPTED,
         axum::Json(
-            json!({"mode": "task_id", "request_id": request_id, "work_item_id": work_item_id, "status": "queued"}),
+            json!({"mode": "task_id", "task_id": task_id, "request_id": request_id, "work_item_id": work_item_id, "status": "queued"}),
         ),
     )
 }
@@ -3827,27 +3848,76 @@ async fn retry_translation_request(
             axum::Json(json!({"code": "unauthorized"})),
         );
     };
-    let result = sqlx::query(
-        "UPDATE public.translation_requests SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND scope_user_id = $2 AND status IN ('failed', 'completed')",
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    let work_item = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT work_item_id FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2 AND status IN ('failed', 'completed')",
     )
     .bind(&request_id)
     .bind(&user_id)
-    .execute(&state.runtime.pool)
+    .fetch_optional(&mut *tx)
     .await;
-    match result {
-        Ok(result) if result.rows_affected() == 1 => (
-            StatusCode::ACCEPTED,
-            axum::Json(json!({"request_id": request_id, "status": "queued"})),
-        ),
-        Ok(_) => (
+    let Some((Some(work_item_id),)) = (match work_item {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "translation_retry_failed"})),
+            );
+        }
+    }) else {
+        return (
             StatusCode::NOT_FOUND,
             axum::Json(json!({"code": "translation_request_not_retryable"})),
-        ),
-        Err(_) => (
+        );
+    };
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE public.translation_requests SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2 AND scope_user_id = $3 AND status IN ('failed', 'completed')",
+    )
+    .bind(now)
+    .bind(&request_id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await;
+    let work_updated = sqlx::query(
+        "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(&work_item_id)
+    .execute(&mut *tx)
+    .await;
+    let task_id = local_id::generate_local_id();
+    let task_result = sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', 'api.translate.retry', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(json!({"work_item_id": work_item_id}).to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if updated.is_err()
+        || work_updated.is_err()
+        || task_result.is_err()
+        || tx.commit().await.is_err()
+    {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"code": "translation_retry_failed"})),
-        ),
+        );
     }
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(json!({"request_id": request_id, "task_id": task_id, "status": "queued"})),
+    )
 }
 
 async fn resolve_translation_results(
