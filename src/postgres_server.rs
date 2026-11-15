@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::{
     config::AppConfig,
     crypto::EncryptedSecret,
-    local_id,
+    local_id, postgres_jobs,
     postgres_runtime::PostgresRuntime,
     postgres_runtime_owner,
     postgres_tasks::{
@@ -2524,18 +2524,31 @@ async fn cancel_task(
         )
             .into_response();
     };
-    match sqlx::query("UPDATE public.job_tasks SET cancel_requested = 1, updated_at = $1 WHERE id = $2 AND requested_by = $3 AND status IN ('queued', 'running')")
-        .bind(Utc::now())
-        .bind(&task_id)
-        .bind(&user_id)
-        .execute(&state.runtime.pool)
-        .await
+    match postgres_jobs::request_cancel_task(
+        &state.runtime.pool,
+        &task_id,
+        Some(&user_id),
+        Utc::now(),
+    )
+    .await
     {
-        Ok(result) if result.rows_affected() == 1 => (StatusCode::OK, axum::Json(json!({"task_id": task_id, "cancel_requested": true}))).into_response(),
-        Ok(_) => (StatusCode::NOT_FOUND, axum::Json(json!({"code": "not_found"}))).into_response(),
+        Ok(true) => (
+            StatusCode::OK,
+            axum::Json(json!({"task_id": task_id, "cancel_requested": true})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "not_found"})),
+        )
+            .into_response(),
         Err(error) => {
             warn!(%error, "PostgreSQL task cancellation failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"code": "database_error"}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "database_error"})),
+            )
+                .into_response()
         }
     }
 }
@@ -3052,20 +3065,14 @@ async fn admin_cancel_task(
     if let Err(status) = require_admin(&state, &session).await {
         return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
     }
-    match sqlx::query(
-        "UPDATE public.job_tasks SET cancel_requested = 1, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'running')",
-    )
-    .bind(Utc::now())
-    .bind(&task_id)
-    .execute(&state.runtime.pool)
-    .await
+    match postgres_jobs::request_cancel_task(&state.runtime.pool, &task_id, None, Utc::now()).await
     {
-        Ok(result) if result.rows_affected() == 1 => (
+        Ok(true) => (
             StatusCode::OK,
             axum::Json(json!({"task_id": task_id, "cancel_requested": true})),
         )
             .into_response(),
-        Ok(_) => (
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({"code": "task_not_found_or_terminal"})),
         )
@@ -3268,75 +3275,19 @@ async fn admin_retry_task(
     if let Err(status) = require_admin(&state, &session).await {
         return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
     }
-    let now = Utc::now();
-    let mut tx = match state.runtime.pool.begin().await {
-        Ok(tx) => tx,
-        Err(error) => {
-            warn!(%error, "PostgreSQL admin task retry transaction failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
-            )
-                .into_response();
-        }
-    };
-    let updated = sqlx::query(
-        "UPDATE public.job_tasks SET status = 'queued', cancel_requested = 0, result_json = NULL, error_message = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL, available_at = $1, started_at = NULL, finished_at = NULL, updated_at = $1 WHERE id = $2 AND status IN ('failed', 'cancelled')",
-    )
-    .bind(now)
-    .bind(&task_id)
-    .execute(&mut *tx)
-    .await;
-    match updated {
-        Ok(result) if result.rows_affected() == 1 => {
-            let payload = json!({"task_id": task_id, "status": "queued", "reason": "admin_retry"});
-            let event = sqlx::query(
-                "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) VALUES ($1, $2, 'task.retried', $3, $4)",
-            )
-            .bind(local_id::generate_local_id())
-            .bind(&task_id)
-            .bind(payload.to_string())
-            .bind(now)
-            .execute(&mut *tx)
-            .await;
-            match event {
-                Ok(_) => match tx.commit().await {
-                    Ok(()) => (
-                        StatusCode::ACCEPTED,
-                        axum::Json(json!({"task_id": task_id, "status": "queued"})),
-                    )
-                        .into_response(),
-                    Err(error) => {
-                        warn!(%error, task_id = %task_id, "PostgreSQL admin task retry commit failed");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            axum::Json(json!({"code": "database_error"})),
-                        )
-                            .into_response()
-                    }
-                },
-                Err(error) => {
-                    warn!(%error, task_id = %task_id, "PostgreSQL admin task retry event failed");
-                    let _ = tx.rollback().await;
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(json!({"code": "database_error"})),
-                    )
-                        .into_response()
-                }
-            }
-        }
-        Ok(_) => {
-            let _ = tx.rollback().await;
-            (
-                StatusCode::CONFLICT,
-                axum::Json(json!({"code": "task_not_retryable"})),
-            )
-                .into_response()
-        }
+    match postgres_jobs::retry_task(&state.runtime.pool, &task_id, Utc::now()).await {
+        Ok(true) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({"task_id": task_id, "status": "queued"})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"code": "task_not_retryable"})),
+        )
+            .into_response(),
         Err(error) => {
             warn!(%error, task_id = %task_id, "PostgreSQL admin task retry update failed");
-            let _ = tx.rollback().await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
