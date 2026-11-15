@@ -148,6 +148,7 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<Postgre
 }
 
 pub async fn connect_from_config(config: &AppConfig) -> Result<PostgresRuntime> {
+    config.require_postgres()?;
     connect(
         &config.database_url,
         config.database_pool_max_connections as u32,

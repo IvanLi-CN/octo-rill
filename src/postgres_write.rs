@@ -1,3 +1,17 @@
+use anyhow::{Context, Result};
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// Start the transaction used by PostgreSQL runtime writes.
+///
+/// Keeping transaction acquisition beside the PostgreSQL retry classifier
+/// gives runtime and migration code one explicit write boundary and prevents
+/// accidental fallback to the SQLite coordinator.
+pub async fn begin(pool: &PgPool) -> Result<Transaction<'_, Postgres>> {
+    pool.begin()
+        .await
+        .context("begin PostgreSQL write transaction")
+}
+
 /// Return whether an error description contains a PostgreSQL transaction state
 /// that is safe to retry as a whole transaction.
 pub fn contains_retryable_sqlstate(error: &str) -> bool {

@@ -98,11 +98,8 @@ enum Cell {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let sqlite = SqlitePoolOptions::new()
-        .max_connections(2)
-        .connect(&args.sqlite_source)
-        .await
-        .context("open SQLite source")?;
+    validate_sqlite_source(&args.sqlite_source)?;
+    validate_postgres_target(&args.postgres_url)?;
     let (mut pg, connection) = tokio_postgres::connect(&args.postgres_url, NoTls)
         .await
         .context("connect PostgreSQL target")?;
@@ -113,12 +110,51 @@ async fn main() -> Result<()> {
     });
 
     match args.command {
-        Command::Preflight => preflight(&sqlite, &pg, &args).await?,
-        Command::Import => import(&sqlite, &mut pg, &args).await?,
-        Command::Verify => verify(&sqlite, &mut pg, &args).await?,
+        Command::Preflight => {
+            let sqlite = open_sqlite_source(&args).await?;
+            preflight(&sqlite, &pg, &args).await?
+        }
+        Command::Import => {
+            let sqlite = open_sqlite_source(&args).await?;
+            import(&sqlite, &mut pg, &args).await?
+        }
+        Command::Verify => {
+            let sqlite = open_sqlite_source(&args).await?;
+            verify(&sqlite, &mut pg, &args).await?
+        }
         Command::Rebuild => rebuild(&mut pg).await?,
     }
     Ok(())
+}
+
+fn validate_sqlite_source(source: &str) -> Result<()> {
+    if source
+        .split_once(':')
+        .map(|(scheme, _)| scheme.eq_ignore_ascii_case("sqlite"))
+        != Some(true)
+    {
+        bail!("offline importer requires a SQLite source URL (got {source:?})");
+    }
+    Ok(())
+}
+
+fn validate_postgres_target(target: &str) -> Result<()> {
+    let scheme = target
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(scheme.as_str(), "postgres" | "postgresql") {
+        bail!("offline importer requires a PostgreSQL target URL (got {target:?})");
+    }
+    Ok(())
+}
+
+async fn open_sqlite_source(args: &Args) -> Result<SqlitePool> {
+    SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect(&args.sqlite_source)
+        .await
+        .context("open SQLite source")
 }
 
 async fn preflight(sqlite: &SqlitePool, pg: &Client, args: &Args) -> Result<()> {
@@ -1020,6 +1056,14 @@ mod tests {
     fn target_redaction_does_not_write_password() {
         let redacted = redact_target("postgres://user:secret@example.test:5432/db");
         assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn importer_boundaries_are_explicit() {
+        assert!(validate_sqlite_source("sqlite:./snapshot.db").is_ok());
+        assert!(validate_sqlite_source("postgres://db/app").is_err());
+        assert!(validate_postgres_target("postgresql://db/app").is_ok());
+        assert!(validate_postgres_target("sqlite:./snapshot.db").is_err());
     }
 
     #[test]

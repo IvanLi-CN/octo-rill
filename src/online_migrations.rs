@@ -1,3 +1,9 @@
+//! Online migrations for the legacy SQLite service boundary.
+//!
+//! PostgreSQL schema changes are versioned in `migrations_pg` and applied by
+//! `postgres_database_migrations`; this operator is not part of the
+//! PostgreSQL runtime and must not be spawned by it.
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
