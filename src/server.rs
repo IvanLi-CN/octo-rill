@@ -1003,7 +1003,7 @@ async fn version_no_store_cache(req: Request, next: Next) -> Response {
     response
 }
 
-fn attach_static_site_routes(app: Router, static_dir: PathBuf) -> Router {
+pub(crate) fn attach_static_site_routes(app: Router, static_dir: PathBuf) -> Router {
     let index = static_dir.join("index.html");
     let spa_static = Arc::new(SpaStaticPaths {
         static_dir,
