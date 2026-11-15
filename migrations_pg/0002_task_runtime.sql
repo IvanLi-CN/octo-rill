@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS public.job_tasks (
     lease_heartbeat_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE public.job_tasks ADD COLUMN IF NOT EXISTS log_file_path TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_job_tasks_pg_status_created_at
     ON public.job_tasks(status, created_at, id);
