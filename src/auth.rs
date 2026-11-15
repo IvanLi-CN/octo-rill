@@ -8,7 +8,7 @@ use axum::{
 };
 use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{Sqlite, Transaction};
+use sqlx::{PgPool, Postgres, Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
 use webauthn_rs::prelude::{
@@ -99,6 +99,144 @@ struct LinuxDoOwnerRow {
 #[derive(Debug, sqlx::FromRow)]
 struct UserLinuxDoBindingRow {
     linuxdo_user_id: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct PostgresAuthUser {
+    pub id: String,
+    pub is_admin: i64,
+    pub is_disabled: i64,
+    pub paused_at: Option<String>,
+}
+
+/// Persist a GitHub login in one PostgreSQL transaction.  This is the shared
+/// auth vertical used by the full PostgreSQL router: user upsert, connection
+/// token storage, and first-admin promotion commit together.
+pub async fn persist_github_login_postgres(
+    pool: &PgPool,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    scopes: &str,
+    encrypted: EncryptedSecret,
+    now: &str,
+) -> Result<String, ApiError> {
+    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query(
+        "INSERT INTO public.users
+         (id, github_user_id, login, name, avatar_url, email, created_at, updated_at, last_active_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$7)
+         ON CONFLICT (github_user_id) DO UPDATE SET
+           login=EXCLUDED.login, name=EXCLUDED.name, avatar_url=EXCLUDED.avatar_url,
+           email=EXCLUDED.email, updated_at=EXCLUDED.updated_at,
+           last_active_at=EXCLUDED.last_active_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let user_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.users WHERE github_user_id = $1 LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        "INSERT INTO public.github_connections
+         (id,user_id,github_user_id,login,name,avatar_url,email,access_token_ciphertext,access_token_nonce,scopes,linked_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
+         ON CONFLICT (github_user_id) DO UPDATE SET
+           user_id=EXCLUDED.user_id, login=EXCLUDED.login, name=EXCLUDED.name,
+           avatar_url=EXCLUDED.avatar_url, email=EXCLUDED.email,
+           access_token_ciphertext=EXCLUDED.access_token_ciphertext,
+           access_token_nonce=EXCLUDED.access_token_nonce, scopes=EXCLUDED.scopes,
+           updated_at=EXCLUDED.updated_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&user_id)
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(encrypted.ciphertext)
+    .bind(encrypted.nonce)
+    .bind(scopes)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    promote_first_admin_postgres(&mut tx, &user_id, now).await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(user_id)
+}
+
+pub async fn load_auth_user_postgres(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Option<PostgresAuthUser>, ApiError> {
+    sqlx::query_as::<_, PostgresAuthUser>(
+        "SELECT id, is_admin, is_disabled, paused_at
+         FROM public.users WHERE id = $1 LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+pub async fn update_account_paused_postgres(
+    pool: &PgPool,
+    user_id: &str,
+    paused_at: Option<&str>,
+    now: &str,
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    let updated = sqlx::query(
+        "UPDATE public.users SET paused_at = $1, last_active_at = $2, updated_at = $2
+         WHERE id = $3 AND is_disabled = 0",
+    )
+    .bind(paused_at)
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await.ok();
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "account_not_found",
+            "account not found",
+        ));
+    }
+    tx.commit().await.map_err(ApiError::internal)
+}
+
+async fn promote_first_admin_postgres(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    now: &str,
+) -> Result<bool, ApiError> {
+    let updated = sqlx::query(
+        "UPDATE public.users SET is_admin = 1, updated_at = $1
+         WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM public.users WHERE is_admin = 1)",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(updated.rows_affected() > 0)
 }
 
 async fn promote_first_admin(

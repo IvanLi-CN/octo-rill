@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sqlx::{PgPool, Postgres, Transaction};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LinuxDoUser {
@@ -47,6 +48,47 @@ pub fn resolve_avatar_url(template: &str, size: u16) -> String {
     }
 
     format!("https://linux.do/{trimmed}")
+}
+
+/// Persist a LinuxDo connection in the PostgreSQL account store.  The
+/// caller owns the surrounding transaction so binding and any pending
+/// passkey/account updates can commit atomically.
+pub async fn upsert_connection_postgres(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    user: &LinuxDoUser,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO public.linuxdo_connections
+         (user_id, linuxdo_user_id, username, name, avatar_url, trust_level, active, silenced, linked_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+         ON CONFLICT (user_id) DO UPDATE SET
+           linuxdo_user_id=EXCLUDED.linuxdo_user_id, username=EXCLUDED.username,
+           name=EXCLUDED.name, avatar_url=EXCLUDED.avatar_url,
+           trust_level=EXCLUDED.trust_level, active=EXCLUDED.active,
+           silenced=EXCLUDED.silenced, updated_at=EXCLUDED.updated_at",
+    )
+    .bind(user_id)
+    .bind(user.id)
+    .bind(&user.username)
+    .bind(normalize_display_name(user.name.as_deref()))
+    .bind(resolve_avatar_url(&user.avatar_template, 96))
+    .bind(user.trust_level)
+    .bind(user.active)
+    .bind(user.silenced)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+}
+
+pub async fn delete_connection_postgres(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM public.linuxdo_connections WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 #[cfg(test)]
