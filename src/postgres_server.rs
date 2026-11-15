@@ -300,6 +300,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
         .with_state(state);
+    let app = if let Some(static_dir) = config.static_dir.clone() {
+        crate::server::attach_static_site_routes(app, static_dir)
+    } else {
+        app
+    };
     let session_layer =
         crate::session_store::CoordinatedSessionLayer::new(runtime.sessions.clone())
             .with_name("octo_rill_sid")
