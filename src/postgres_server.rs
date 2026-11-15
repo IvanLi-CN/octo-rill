@@ -16,7 +16,7 @@ use futures_util::stream;
 use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::{FromRow, Postgres, QueryBuilder};
+use sqlx::FromRow;
 use std::convert::Infallible;
 use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
@@ -3429,19 +3429,6 @@ struct SearchQuery {
     q: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
-struct PgSearchRow {
-    id: String,
-    resource_type: String,
-    title: Option<String>,
-    body: Option<String>,
-    repo_full_name: Option<String>,
-    source_time: Option<String>,
-    unread: Option<i64>,
-    target_path: Option<String>,
-    target_url: Option<String>,
-}
-
 async fn search(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -3463,35 +3450,7 @@ async fn search(
             );
         }
     };
-    let mut query = QueryBuilder::<Postgres>::new(
-        "SELECT id, resource_type, title, body, repo_full_name, source_time, unread, target_path, target_url \
-         FROM public.search_documents WHERE (user_id IS NULL OR user_id = ",
-    );
-    query.push_bind(&user_id).push(")");
-    if !parsed.terms.is_empty() {
-        query
-            .push(" AND search_vector @@ websearch_to_tsquery('octo_rill_simple', ")
-            .push_bind(parsed.terms.join(" "))
-            .push(")");
-    }
-    if let Some(resource_type) = parsed.resource_type {
-        query.push(" AND resource_type = ").push_bind(resource_type);
-    }
-    if let Some(owner) = parsed.owner {
-        query.push(" AND owner_login = ").push_bind(owner);
-    }
-    if let Some(repo) = parsed.repo {
-        query.push(" AND repo_full_name = ").push_bind(repo);
-    }
-    if parsed.unread {
-        query.push(" AND unread <> 0");
-    }
-    query.push(" ORDER BY source_time DESC NULLS LAST, id DESC LIMIT 20");
-    let rows = match query
-        .build_query_as::<PgSearchRow>()
-        .fetch_all(&state.runtime.pool)
-        .await
-    {
+    let rows = match crate::search::query_postgres(&state.runtime.pool, &user_id, &parsed).await {
         Ok(rows) => rows,
         Err(error) => {
             warn!(%error, "PostgreSQL search query failed");
@@ -3501,34 +3460,10 @@ async fn search(
             );
         }
     };
-    let items = rows
-        .into_iter()
-        .map(|row| {
-            let repository = row.repo_full_name.as_ref().and_then(|full_name| {
-                full_name
-                    .split_once('/')
-                    .map(|(owner, name)| json!({"owner": owner, "name": name, "full_name": full_name}))
-            });
-            json!({
-                "id": row.id,
-                "type": row.resource_type,
-                "title": row.title.unwrap_or_default(),
-                "excerpt": row.body.map(|body| body.chars().take(240).collect::<String>()),
-                "repository": repository,
-                "updated_at": row.source_time,
-                "source_time": row.source_time,
-                "unread": row.unread.unwrap_or_default() != 0,
-                "is_following": null,
-                "matched_lane": "canonical",
-                "matched_lanes": ["canonical"],
-                "target": row.target_path.or(row.target_url).map(|href| json!({"href": href, "lane": null})),
-            })
-        })
-        .collect::<Vec<_>>();
     (
         StatusCode::OK,
         axum::Json(json!({
-            "items": items,
+            "items": rows,
             "remaining_requests": crate::search::SEARCH_RATE_LIMIT - 1,
             "reset_at": (chrono::Utc::now() + chrono::Duration::seconds(crate::search::SEARCH_RATE_WINDOW_SECONDS)).to_rfc3339(),
             "index_status": "ready"
