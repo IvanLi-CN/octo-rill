@@ -53,5 +53,15 @@ mod tests {
             .find(|migration| migration.version == 9)
             .expect("brief migration");
         assert!(brief.sql.contains("briefs"));
+        let baseline = MIGRATOR.iter().next().expect("runtime baseline");
+        for table in [
+            "public.users",
+            "public.github_connections",
+            "public.linuxdo_connections",
+            "public.user_passkeys",
+            "public.user_api_keys",
+        ] {
+            assert!(baseline.sql.contains(table), "baseline missing {table}");
+        }
     }
 }
