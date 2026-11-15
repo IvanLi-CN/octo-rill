@@ -14,6 +14,8 @@ use tokio::{
     time::{Duration, MissedTickBehavior, interval},
 };
 
+const TASK_LEASE_TIMEOUT: chrono::Duration = chrono::Duration::seconds(90);
+
 use crate::postgres_jobs::ClaimedTask;
 
 #[async_trait]
@@ -117,7 +119,7 @@ pub async fn run_once<E: TaskExecutor + ?Sized>(
         return Ok(true);
     }
 
-    match executor.execute(&task).await {
+    match execute_with_heartbeat(pool, runtime_owner_id, executor, &task).await {
         Ok(result_json) => {
             crate::postgres_jobs::finalize_task(
                 pool,
@@ -188,7 +190,7 @@ async fn finish_claimed_task<E: TaskExecutor + ?Sized>(
         .context("finalize cancelled PostgreSQL task")?;
         return Ok(true);
     }
-    match executor.execute(&task).await {
+    match execute_with_heartbeat(pool, runtime_owner_id, executor, &task).await {
         Ok(result_json) => {
             crate::postgres_jobs::finalize_task(
                 pool,
@@ -220,6 +222,37 @@ async fn finish_claimed_task<E: TaskExecutor + ?Sized>(
     Ok(true)
 }
 
+async fn execute_with_heartbeat<E: TaskExecutor + ?Sized>(
+    pool: &PgPool,
+    runtime_owner_id: &str,
+    executor: &E,
+    task: &ClaimedTask,
+) -> Result<String> {
+    let heartbeat_pool = pool.clone();
+    let heartbeat_owner = runtime_owner_id.to_owned();
+    let heartbeat_task = task.id.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = crate::postgres_jobs::heartbeat_task(
+                &heartbeat_pool,
+                &heartbeat_task,
+                &heartbeat_owner,
+                Utc::now(),
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id = %heartbeat_task, "PostgreSQL task lease heartbeat failed");
+            }
+        }
+    });
+    let result = executor.execute(task).await;
+    heartbeat.abort();
+    result
+}
+
 /// Keep polling the PostgreSQL queue until the caller signals shutdown.
 ///
 /// The loop intentionally delegates every state transition to `run_once`, so
@@ -233,7 +266,9 @@ pub async fn run_until_shutdown<E: TaskExecutor + ?Sized>(
     poll_interval: Duration,
 ) -> Result<()> {
     let mut ticker = interval(poll_interval.max(Duration::from_millis(25)));
+    let mut recovery_ticker = interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    recovery_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -241,6 +276,13 @@ pub async fn run_until_shutdown<E: TaskExecutor + ?Sized>(
                 if *shutdown.borrow() {
                     return Ok(());
                 }
+            }
+            _ = recovery_ticker.tick() => {
+                crate::postgres_jobs::recover_expired_tasks(
+                    pool,
+                    TASK_LEASE_TIMEOUT,
+                    Utc::now(),
+                ).await?;
             }
             _ = ticker.tick() => {
                 run_once(pool, runtime_owner_id, executor).await?;
@@ -257,7 +299,9 @@ pub async fn run_registered_until_shutdown(
     poll_interval: Duration,
 ) -> Result<()> {
     let mut ticker = interval(poll_interval.max(Duration::from_millis(25)));
+    let mut recovery_ticker = interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    recovery_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -265,6 +309,13 @@ pub async fn run_registered_until_shutdown(
                 if *shutdown.borrow() {
                     return Ok(());
                 }
+            }
+            _ = recovery_ticker.tick() => {
+                crate::postgres_jobs::recover_expired_tasks(
+                    pool,
+                    TASK_LEASE_TIMEOUT,
+                    Utc::now(),
+                ).await?;
             }
             _ = ticker.tick() => {
                 run_registered_once(pool, runtime_owner_id, registry).await?;
@@ -293,6 +344,8 @@ mod tests {
         assert!(source.contains("cancel_requested"));
         assert!(source.contains("finalize_task"));
         assert!(source.contains("TaskExecutor"));
+        assert!(source.contains("heartbeat_task"));
+        assert!(source.contains("recover_expired_tasks"));
     }
 
     #[test]
