@@ -3,13 +3,13 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{Json, Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse,
         sse::{Event, Sse},
     },
-    routing::get,
+    routing::{any, get},
 };
 use chrono::Utc;
 use futures_util::stream;
@@ -31,10 +31,11 @@ use crate::{
     postgres_runtime_owner,
     postgres_tasks::{
         BriefExecutor, CompositeSyncExecutor, NotificationsExecutor, ReleasesExecutor,
-        StarredExecutor, WebhookExecutor,
+        StarredExecutor, TranslationExecutor, WebhookExecutor,
     },
     postgres_worker::TaskExecutorRegistry,
     state::GitHubOAuthClient,
+    translations::{TranslationResolveRequest, TranslationSubmitRequest},
 };
 
 #[derive(Clone)]
@@ -126,6 +127,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .register("brief.generate", BriefExecutor::new(runtime.pool.clone()))
         .register("brief.daily_slot", BriefExecutor::new(runtime.pool.clone()))
+        .register(
+            "translation.generate",
+            TranslationExecutor::new(runtime.pool.clone(), http.clone(), config.ai.clone()),
+        )
         .build();
     let state = PostgresServerState {
         runtime: runtime.clone(),
@@ -218,6 +223,67 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
+        .route(
+            "/translate/requests",
+            axum::routing::post(submit_translation_request),
+        )
+        .route(
+            "/translate/requests/{request_id}",
+            get(get_translation_request),
+        )
+        .route(
+            "/translate/requests/{request_id}/retry",
+            axum::routing::post(retry_translation_request),
+        )
+        .route(
+            "/translate/results",
+            axum::routing::post(resolve_translation_results),
+        )
+        .route(
+            "/translate/requests/{request_id}/stream",
+            get(stream_translation_request),
+        )
+        .route(
+            "/translate/releases/batch",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/translate/releases/batch/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route("/translate/release", any(postgres_capability_unavailable))
+        .route(
+            "/translate/release/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/status",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/requests",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/requests/{request_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/attempt-events",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/batches",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/admin/jobs/translations/batches/{batch_id}",
+            any(postgres_capability_unavailable),
+        )
         .route("/api/feed", get(feed))
         .route("/api/dashboard/feed", get(dashboard_feed))
         .route("/api/briefs", get(list_briefs))
@@ -3595,6 +3661,347 @@ async fn version() -> axum::Json<serde_json::Value> {
         "version": info.version,
         "source": info.source,
     }))
+}
+
+async fn postgres_capability_unavailable() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(json!({
+            "code": "postgres_capability_unavailable",
+            "message": "this capability is not yet available on the PostgreSQL runtime"
+        })),
+    )
+}
+
+async fn submit_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Json(request): Json<TranslationSubmitRequest>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let Some(item) = request
+        .item
+        .or_else(|| request.items.and_then(|mut items| items.pop()))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "translation_item_required"})),
+        );
+    };
+    let now = Utc::now();
+    let work_item_id = local_id::generate_local_id();
+    let request_id = local_id::generate_local_id();
+    let source_blocks_json = match serde_json::to_string(&item.source_blocks) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": "invalid_source_blocks"})),
+            );
+        }
+    };
+    let target_slots_json = match serde_json::to_string(&item.target_slots) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"code": "invalid_target_slots"})),
+            );
+        }
+    };
+    let source_hash = crate::ai::sha256_hex(&format!("{source_blocks_json}\n{target_slots_json}"));
+    let dedupe_key = format!(
+        "{}:{}:{}:{}:{}:{}",
+        user_id, item.kind, item.entity_id, item.variant, item.target_lang, source_hash
+    );
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    let work_result = sqlx::query_as::<_, (String,)>(
+        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default',$8,$9,$10,0,$11,'queued',$12,$12) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
+    )
+    .bind(&work_item_id)
+    .bind(&dedupe_key)
+    .bind(&user_id)
+    .bind(&item.kind)
+    .bind(&item.variant)
+    .bind(&item.entity_id)
+    .bind(&item.target_lang)
+    .bind(&source_hash)
+    .bind(&source_blocks_json)
+    .bind(&target_slots_json)
+    .bind(now + chrono::Duration::milliseconds(item.max_wait_ms.max(0)))
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await;
+    let Ok((work_item_id,)) = work_result else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    };
+    let request_result = sqlx::query(
+        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,$2,'postgres','user',$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'queued',$14,$14)",
+    )
+    .bind(&request_id)
+    .bind(&request.mode)
+    .bind(&user_id)
+    .bind(&item.producer_ref)
+    .bind(&item.kind)
+    .bind(&item.variant)
+    .bind(&item.entity_id)
+    .bind(&item.target_lang)
+    .bind(item.max_wait_ms.max(0))
+    .bind(&source_hash)
+    .bind(&source_blocks_json)
+    .bind(&target_slots_json)
+    .bind(&work_item_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if request_result.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    let task_id = local_id::generate_local_id();
+    let task_payload = json!({"work_item_id": work_item_id});
+    let task_result = sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', 'api.translate.requests', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(task_payload.to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if task_result.is_err() || tx.commit().await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(
+            json!({"mode": "task_id", "task_id": task_id, "request_id": request_id, "work_item_id": work_item_id, "status": "queued"}),
+        ),
+    )
+}
+
+async fn get_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, mode, status, kind, variant, entity_id, title_zh, summary_md, body_md FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match row {
+        Ok(Some((id, mode, status, kind, variant, entity_id, title_zh, summary_md, body_md))) => (
+            StatusCode::OK,
+            axum::Json(
+                json!({"id": id, "request_id": id, "mode": mode, "status": status, "kind": kind, "variant": variant, "entity_id": entity_id, "result": {"title_zh": title_zh, "summary_md": summary_md, "body_md": body_md}}),
+            ),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "translation_request_not_found"})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_request_failed"})),
+        ),
+    }
+}
+
+async fn retry_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    let work_item = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT work_item_id FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2 AND status IN ('failed', 'completed')",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await;
+    let Some((Some(work_item_id),)) = (match work_item {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "translation_retry_failed"})),
+            );
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "translation_request_not_retryable"})),
+        );
+    };
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE public.translation_requests SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2 AND scope_user_id = $3 AND status IN ('failed', 'completed')",
+    )
+    .bind(now)
+    .bind(&request_id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await;
+    let work_updated = sqlx::query(
+        "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(&work_item_id)
+    .execute(&mut *tx)
+    .await;
+    let task_id = local_id::generate_local_id();
+    let task_result = sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', 'api.translate.retry', $2, $3, $4, $4)",
+    )
+    .bind(&task_id)
+    .bind(&user_id)
+    .bind(json!({"work_item_id": work_item_id}).to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if updated.is_err()
+        || work_updated.is_err()
+        || task_result.is_err()
+        || tx.commit().await.is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_retry_failed"})),
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(json!({"request_id": request_id, "task_id": task_id, "status": "queued"})),
+    )
+}
+
+async fn resolve_translation_results(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Json(request): Json<TranslationResolveRequest>,
+) -> impl IntoResponse {
+    let Some(user_id) = session.get::<String>("user_id").await.ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"code": "unauthorized"})),
+        );
+    };
+    let mut resolved = 0usize;
+    let mut tx = match state.runtime.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"code": "postgres_unavailable"})),
+            );
+        }
+    };
+    for (request_id, _) in request.request_ids {
+        if let Ok(result) = sqlx::query(
+            "UPDATE public.translation_requests SET status = 'completed', result_status = 'ready', error_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND scope_user_id = $2 AND status IN ('queued', 'running', 'failed')",
+        )
+        .bind(request_id)
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await
+        {
+            resolved += result.rows_affected() as usize;
+        }
+    }
+    if tx.commit().await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_resolve_failed"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({"resolved": resolved, "status": "completed"})),
+    )
+}
+
+async fn stream_translation_request(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let Some(user_id) = session
+        .get::<String>("user_id")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let row = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, status, result_status, title_zh, summary_md, body_md FROM public.translation_requests WHERE id = $1 AND scope_user_id = $2",
+    )
+    .bind(&request_id)
+    .bind(&user_id)
+    .fetch_optional(&state.runtime.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let payload = json!({
+        "request_id": row.0,
+        "status": row.1,
+        "result_status": row.2,
+        "title_zh": row.3,
+        "summary_md": row.4,
+        "body_md": row.5,
+    });
+    let event = Event::default()
+        .event("translation.status")
+        .data(payload.to_string());
+    Ok(Sse::new(stream::iter([Ok(event)])).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn shutdown_signal() {
