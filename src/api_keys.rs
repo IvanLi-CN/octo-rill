@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, SqlitePool};
+use sqlx::SqlitePool;
 
 use crate::{error::ApiError, sqlite_write::SqliteWriteCoordinator, state::AppState};
 
@@ -258,66 +258,6 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
         state.pool.clone(),
         state.sqlite_writer.clone(),
     );
-
-    Ok(row.user_id)
-}
-
-/// Authenticate an API key against the PostgreSQL runtime store.
-///
-/// This deliberately returns only the owning user id.  The encrypted key
-/// material and the plaintext token never leave the request boundary.
-pub async fn authenticate_api_key_postgres(
-    pool: &PgPool,
-    api_key: &str,
-) -> Result<String, ApiError> {
-    let hash = hash_api_key(api_key);
-    let row = sqlx::query_as::<_, ApiKeyAuthRow>(
-        "SELECT id, user_id, is_disabled, paused_at
-         FROM public.user_api_keys k
-         JOIN public.users u ON u.id = k.user_id
-         WHERE k.key_hash = $1
-           AND k.revoked_at IS NULL
-         LIMIT 1",
-    )
-    .bind(hash)
-    .fetch_optional(pool)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "invalid api key",
-        )
-    })?;
-
-    if row.is_disabled != 0 {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "account_disabled",
-            "account disabled",
-        ));
-    }
-    if row.paused_at.is_some() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "account_paused",
-            "account paused",
-        ));
-    }
-
-    let used_at = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "UPDATE public.user_api_keys
-         SET last_used_at = $1
-         WHERE id = $2
-           AND (last_used_at IS NULL OR last_used_at < $1)",
-    )
-    .bind(&used_at)
-    .bind(&row.id)
-    .execute(pool)
-    .await
-    .map_err(ApiError::internal)?;
 
     Ok(row.user_id)
 }
