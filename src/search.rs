@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use axum::http::StatusCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Row, Sqlite};
 
 use crate::{error::ApiError, sqlite_write::SqliteWritePriority, state::AppState};
 
@@ -78,6 +78,21 @@ struct SearchDocumentRow {
     source_time: Option<String>,
     unread: Option<i64>,
     is_following: Option<i64>,
+    target_path: Option<String>,
+    target_url: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct PostgresSearchDocumentRow {
+    id: String,
+    resource_type: String,
+    title: Option<String>,
+    body: Option<String>,
+    repo_full_name: Option<String>,
+    translated_text: Option<String>,
+    smart_text: Option<String>,
+    source_time: Option<String>,
+    unread: Option<i64>,
     target_path: Option<String>,
     target_url: Option<String>,
 }
@@ -448,6 +463,121 @@ pub async fn query(
     Ok(rows
         .into_iter()
         .map(|row| to_result(row, &parsed.terms))
+        .collect())
+}
+
+/// Query the PostgreSQL search projection while preserving the SQLite search
+/// parser and response semantics. The projection is intentionally treated as
+/// rebuildable: global rows (`user_id IS NULL`) are visible to every user and
+/// user-lane rows are visible only to their owner.
+pub async fn query_postgres(
+    pool: &PgPool,
+    user_id: &str,
+    parsed: &ParsedSearchQuery,
+) -> Result<Vec<SearchResult>, sqlx::Error> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT d.id, d.resource_type, d.title, d.body, d.repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.unread, d.target_path, d.target_url FROM public.search_documents d LEFT JOIN public.search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(" WHERE (d.user_id IS NULL OR d.user_id = ");
+    builder.push_bind(user_id);
+    builder.push(")");
+
+    if let Some(resource_type) = &parsed.resource_type {
+        builder
+            .push(" AND d.resource_type = ")
+            .push_bind(resource_type);
+    }
+    if let Some(owner) = &parsed.owner {
+        builder
+            .push(" AND lower(d.owner_login) = lower(")
+            .push_bind(owner)
+            .push(")");
+    }
+    if let Some(repo) = &parsed.repo {
+        builder
+            .push(" AND (lower(d.repo_full_name) = lower(")
+            .push_bind(repo)
+            .push(") OR lower(d.repo_full_name) LIKE '%/' || lower(")
+            .push_bind(escape_like(repo))
+            .push("))");
+    }
+    if let Some(after) = &parsed.after {
+        builder
+            .push(" AND COALESCE(d.source_time, '') >= ")
+            .push_bind(after);
+    }
+    if let Some(before) = &parsed.before {
+        builder
+            .push(" AND COALESCE(d.source_time, '') <= ")
+            .push_bind(before);
+    }
+    if parsed.unread {
+        builder.push(" AND COALESCE(d.unread, 0) <> 0");
+    }
+    if !parsed.terms.is_empty() {
+        let fts_query = parsed
+            .terms
+            .iter()
+            .filter(|term| term.chars().count() >= 3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !fts_query.is_empty() {
+            builder.push(" AND (d.search_vector @@ websearch_to_tsquery('octo_rill_simple', ");
+            builder.push_bind(fts_query.clone());
+            builder.push(") OR ul.search_vector @@ websearch_to_tsquery('octo_rill_simple', ");
+            builder.push_bind(fts_query);
+            builder.push(")");
+        }
+        for term in &parsed.terms {
+            let pattern = format!("%{}%", escape_like(term));
+            builder.push(" AND (lower(COALESCE(d.title, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder.push(" ) ESCAPE CHR(92) OR lower(COALESCE(d.body, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder.push(" ) ESCAPE CHR(92) OR lower(COALESCE(d.repo_full_name, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder.push(" ) ESCAPE CHR(92) OR lower(COALESCE(d.translated_text, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder.push(" ) ESCAPE CHR(92) OR lower(COALESCE(d.smart_text, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder
+                .push(" ) ESCAPE CHR(92) OR lower(COALESCE(ul.translated_text, '')) LIKE lower(");
+            builder.push_bind(pattern.clone());
+            builder.push(" ) ESCAPE CHR(92) OR lower(COALESCE(ul.smart_text, '')) LIKE lower(");
+            builder.push_bind(pattern);
+            builder.push(" ) ESCAPE CHR(92))");
+        }
+    }
+    builder.push(" ORDER BY d.source_time DESC NULLS LAST, d.id DESC LIMIT ");
+    builder.push_bind(SEARCH_LIMIT);
+
+    let rows = builder
+        .build_query_as::<PostgresSearchDocumentRow>()
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            to_result(
+                SearchDocumentRow {
+                    id: row.id,
+                    resource_type: row.resource_type,
+                    title: row.title,
+                    body: row.body,
+                    repo_full_name: row.repo_full_name,
+                    translated_text: row.translated_text,
+                    smart_text: row.smart_text,
+                    source_time: row.source_time,
+                    unread: row.unread,
+                    is_following: None,
+                    target_path: row.target_path,
+                    target_url: row.target_url,
+                },
+                &parsed.terms,
+            )
+        })
         .collect())
 }
 

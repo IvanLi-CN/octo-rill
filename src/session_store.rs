@@ -1,3 +1,10 @@
+//! Session storage adapters.
+//!
+//! `postgres_session_store` is the only store exposed to the PostgreSQL
+//! runtime. `CoordinatedSqliteSessionStore` remains for the legacy SQLite
+//! server and test fixtures; it is deliberately a separate type so a runtime
+//! pool cannot be silently routed through the SQLite write coordinator.
+
 use std::{
     borrow::Cow,
     cell::RefCell,
