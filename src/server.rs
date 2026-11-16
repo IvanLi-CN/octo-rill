@@ -78,7 +78,7 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     if config.database_backend()? == crate::config::DatabaseBackend::Postgres {
-        return crate::postgres_server::serve(config).await;
+        return crate::postgres_server::serve_postgres(config).await;
     }
     serve_sqlite(config).await
 }
@@ -1003,7 +1003,10 @@ async fn version_no_store_cache(req: Request, next: Next) -> Response {
     response
 }
 
-fn attach_static_site_routes(app: Router, static_dir: PathBuf) -> Router {
+pub(crate) fn attach_static_site_routes<S>(app: Router<S>, static_dir: PathBuf) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let index = static_dir.join("index.html");
     let spa_static = Arc::new(SpaStaticPaths {
         static_dir,
