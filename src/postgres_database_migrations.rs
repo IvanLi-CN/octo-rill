@@ -6,7 +6,9 @@ use sqlx::{PgPool, migrate::Migrator};
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg");
 
 pub async fn run(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin PostgreSQL migrations")?;
+    let mut tx = crate::postgres_write::begin(pool)
+        .await
+        .context("begin PostgreSQL migrations")?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('octo-rill:runtime-baseline', 0))")
         .execute(&mut *tx)
         .await
@@ -51,5 +53,15 @@ mod tests {
             .find(|migration| migration.version == 9)
             .expect("brief migration");
         assert!(brief.sql.contains("briefs"));
+        let baseline = MIGRATOR.iter().next().expect("runtime baseline");
+        for table in [
+            "public.users",
+            "public.github_connections",
+            "public.linuxdo_connections",
+            "public.user_passkeys",
+            "public.user_api_keys",
+        ] {
+            assert!(baseline.sql.contains(table), "baseline missing {table}");
+        }
     }
 }

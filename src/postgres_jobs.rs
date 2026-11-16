@@ -109,6 +109,149 @@ pub async fn finalize_task(
     Err(anyhow!("PostgreSQL task finalize retry loop exhausted"))
 }
 
+/// Request cancellation for a queued or running task and append an audit event.
+/// When `requested_by` is supplied, the update is scoped to that requester.
+pub async fn request_cancel_task(
+    pool: &PgPool,
+    task_id: &str,
+    requested_by: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin PostgreSQL task cancellation")?;
+    let updated = sqlx::query(
+        "UPDATE public.job_tasks SET cancel_requested = 1, updated_at = $1 WHERE id = $2 AND status IN ('queued', 'running') AND ($3::text IS NULL OR requested_by = $3)",
+    )
+    .bind(now)
+    .bind(task_id)
+    .bind(requested_by)
+    .execute(&mut *tx)
+    .await
+    .context("request PostgreSQL task cancellation")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback()
+            .await
+            .context("rollback missing PostgreSQL task cancellation")?;
+        return Ok(false);
+    }
+    append_event(
+        &mut tx,
+        task_id,
+        "task.cancel_requested",
+        serde_json::json!({"requested_by": requested_by}),
+        now,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit PostgreSQL task cancellation")?;
+    Ok(true)
+}
+
+/// Requeue a terminal task for an explicit retry while preserving an audit trail.
+pub async fn retry_task(pool: &PgPool, task_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    let mut tx = pool.begin().await.context("begin PostgreSQL task retry")?;
+    let updated = sqlx::query(
+        "UPDATE public.job_tasks SET status = 'queued', cancel_requested = 0, result_json = NULL, error_message = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL, available_at = $1, started_at = NULL, finished_at = NULL, updated_at = $1 WHERE id = $2 AND status IN ('failed', 'cancelled')",
+    )
+    .bind(now)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await
+    .context("retry PostgreSQL task")?;
+    if updated.rows_affected() == 0 {
+        tx.rollback()
+            .await
+            .context("rollback non-retryable PostgreSQL task")?;
+        return Ok(false);
+    }
+    append_event(
+        &mut tx,
+        task_id,
+        "task.retried",
+        serde_json::json!({"status": "queued"}),
+        now,
+    )
+    .await?;
+    tx.commit().await.context("commit PostgreSQL task retry")?;
+    Ok(true)
+}
+
+/// Refresh a worker-owned task lease. A stale owner cannot extend another worker's lease.
+pub async fn heartbeat_task(
+    pool: &PgPool,
+    task_id: &str,
+    runtime_owner_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE public.job_tasks SET lease_heartbeat_at = $1, updated_at = $1 WHERE id = $2 AND status = 'running' AND runtime_owner_id = $3",
+    )
+    .bind(now)
+    .bind(task_id)
+    .bind(runtime_owner_id)
+    .execute(pool)
+    .await
+    .context("heartbeat PostgreSQL task lease")?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// Return tasks whose worker lease expired to the queue.
+pub async fn recover_expired_tasks(
+    pool: &PgPool,
+    lease_timeout: chrono::Duration,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let cutoff = now - lease_timeout.max(chrono::Duration::seconds(1));
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin PostgreSQL expired task recovery")?;
+    let rows = sqlx::query_as::<Postgres, (String,)>(
+        "UPDATE public.job_tasks SET status = 'queued', runtime_owner_id = NULL, lease_heartbeat_at = NULL, available_at = $1, error_message = 'runtime lease expired', updated_at = $1 WHERE status = 'running' AND lease_heartbeat_at IS NOT NULL AND lease_heartbeat_at < $2 RETURNING id",
+    )
+    .bind(now)
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
+    .await
+    .context("recover expired PostgreSQL task leases")?;
+    for (task_id,) in &rows {
+        append_event(
+            &mut tx,
+            task_id,
+            "task.lease_expired",
+            serde_json::json!({"status": "queued"}),
+            now,
+        )
+        .await?;
+    }
+    tx.commit()
+        .await
+        .context("commit expired PostgreSQL task recovery")?;
+    Ok(rows.len() as u64)
+}
+
+async fn append_event(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    task_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query("INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) VALUES ($1, $2, $3, $4, $5)")
+        .bind(crate::local_id::generate_local_id())
+        .bind(task_id)
+        .bind(event_type)
+        .bind(serde_json::to_string(&payload).context("serialize PostgreSQL task event")?)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .context("record PostgreSQL task event")?;
+    Ok(())
+}
+
 async fn finalize_once(
     pool: &PgPool,
     task_id: &str,
@@ -261,5 +404,8 @@ mod tests {
         assert!(source.contains("runtime_owner_id = $6"));
         assert!(source.contains("task.completed"));
         assert!(source.contains("task_type = ANY($2)"));
+        assert!(source.contains("request_cancel_task"));
+        assert!(source.contains("recover_expired_tasks"));
+        assert!(source.contains("task.lease_expired"));
     }
 }

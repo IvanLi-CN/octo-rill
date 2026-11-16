@@ -1,3 +1,10 @@
+//! Legacy SQLite schema migrations.
+//!
+//! This module is intentionally limited to the SQLite application and test
+//! harness. PostgreSQL runtime startup must call
+//! [`crate::postgres_database_migrations`] instead; separate entry points keep
+//! the SQLite `_sqlx_migrations` history out of PostgreSQL.
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};

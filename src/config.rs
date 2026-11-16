@@ -177,6 +177,17 @@ impl DatabaseBackend {
             ),
         }
     }
+
+    /// Validate the database URL used by the long-lived application runtime.
+    /// SQLite remains available to the offline importer and test fixtures.
+    pub fn require_postgres(database_url: &str) -> Result<()> {
+        match Self::from_url(database_url)? {
+            Self::Postgres => Ok(()),
+            Self::Sqlite => anyhow::bail!(
+                "application runtime requires a PostgreSQL DATABASE_URL; SQLite is only supported by the offline importer and test fixtures"
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -258,6 +269,10 @@ impl fmt::Debug for AppConfig {
 impl AppConfig {
     pub fn database_backend(&self) -> Result<DatabaseBackend> {
         DatabaseBackend::from_url(&self.database_url)
+    }
+
+    pub fn require_postgres(&self) -> Result<()> {
+        DatabaseBackend::require_postgres(&self.database_url)
     }
 
     pub fn from_env() -> Result<Self> {
@@ -462,6 +477,14 @@ mod tests {
             DatabaseBackend::Postgres
         );
         assert!(DatabaseBackend::from_url("mysql://user@db/app").is_err());
+    }
+
+    #[test]
+    fn runtime_storage_contract_rejects_sqlite() {
+        assert!(DatabaseBackend::require_postgres("postgres://user@db/app").is_ok());
+        let error = DatabaseBackend::require_postgres("sqlite:./data.db")
+            .expect_err("SQLite must not be accepted by the application runtime");
+        assert!(error.to_string().contains("offline importer"));
     }
 
     #[test]
