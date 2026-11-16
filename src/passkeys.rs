@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 use uuid::Uuid;
 use webauthn_rs::prelude::{AuthenticationResult, Passkey, PasskeyRegistration};
 
@@ -148,23 +148,6 @@ pub async fn load_passkey_summaries(
     .map_err(ApiError::internal)
 }
 
-/// PostgreSQL-native passkey summary lookup used by the production runtime.
-pub async fn load_passkey_summaries_postgres(
-    pool: &PgPool,
-    user_id: &str,
-) -> Result<Vec<PasskeySummary>, ApiError> {
-    sqlx::query_as::<_, PasskeySummary>(
-        "SELECT id, label, created_at, last_used_at
-         FROM public.user_passkeys
-         WHERE user_id = $1
-         ORDER BY created_at ASC, id ASC",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(ApiError::internal)
-}
-
 pub async fn load_passkeys(
     state: &AppState,
     user_id: &str,
@@ -188,25 +171,6 @@ pub async fn load_passkeys(
     .await
     .map_err(ApiError::internal)?;
 
-    rows.into_iter().map(stored_passkey_from_row).collect()
-}
-
-/// Load passkey credentials from PostgreSQL without exposing the serialized
-/// credential outside this module's authentication boundary.
-pub async fn load_passkeys_postgres(
-    pool: &PgPool,
-    user_id: &str,
-) -> Result<Vec<StoredPasskey>, ApiError> {
-    let rows = sqlx::query_as::<_, StoredPasskeyRow>(
-        "SELECT id, credential_id, label, passkey_json, created_at, last_used_at
-         FROM public.user_passkeys
-         WHERE user_id = $1
-         ORDER BY created_at ASC, id ASC",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(ApiError::internal)?;
     rows.into_iter().map(stored_passkey_from_row).collect()
 }
 
@@ -301,93 +265,6 @@ pub async fn attach_pending_passkey_to_user(
     Ok(AttachPendingPasskeyOutcome::Attached)
 }
 
-/// Atomically bind a pending passkey to a PostgreSQL account.  The user
-/// handle is initialized under the same transaction, preventing concurrent
-/// onboarding flows from attaching a credential to the wrong account.
-pub async fn attach_pending_passkey_to_user_postgres(
-    tx: &mut Transaction<'_, Postgres>,
-    user_id: &str,
-    pending: &PendingPasskeyCredentialSession,
-) -> Result<AttachPendingPasskeyOutcome, ApiError> {
-    if !ensure_passkey_user_handle_postgres(tx, user_id, pending.user_handle_uuid.as_str()).await? {
-        return Ok(AttachPendingPasskeyOutcome::RetryRequired);
-    }
-
-    let credential_id = passkey_credential_id(&pending.passkey);
-    if let Some(owner_user_id) = sqlx::query_scalar::<_, String>(
-        "SELECT user_id FROM public.user_passkeys WHERE credential_id = $1 LIMIT 1",
-    )
-    .bind(&credential_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?
-    {
-        return Ok(if owner_user_id == user_id {
-            AttachPendingPasskeyOutcome::AlreadyExists
-        } else {
-            AttachPendingPasskeyOutcome::AlreadyBound
-        });
-    }
-
-    let passkey_json = serde_json::to_string(&pending.passkey).map_err(ApiError::internal)?;
-    sqlx::query(
-        "INSERT INTO public.user_passkeys
-         (id, user_id, credential_id, label, passkey_json, created_at, last_used_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(user_id)
-    .bind(&credential_id)
-    .bind(&pending.label)
-    .bind(passkey_json)
-    .bind(&pending.created_at)
-    .bind(Option::<String>::None)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(AttachPendingPasskeyOutcome::Attached)
-}
-
-async fn ensure_passkey_user_handle_postgres(
-    tx: &mut Transaction<'_, Postgres>,
-    user_id: &str,
-    pending_user_handle_uuid: &str,
-) -> Result<bool, ApiError> {
-    let existing = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT passkey_user_handle_uuid FROM public.users WHERE id = $1 LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    if let Some(existing) = existing.as_deref() {
-        return Ok(existing == pending_user_handle_uuid);
-    }
-    let result = sqlx::query(
-        "UPDATE public.users SET passkey_user_handle_uuid = $1
-         WHERE id = $2 AND passkey_user_handle_uuid IS NULL",
-    )
-    .bind(pending_user_handle_uuid)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    if result.rows_affected() > 0 {
-        return Ok(true);
-    }
-    let refreshed = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT passkey_user_handle_uuid FROM public.users WHERE id = $1 LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    match refreshed.as_deref() {
-        Some(value) => Ok(value == pending_user_handle_uuid),
-        None => Err(ApiError::internal("failed to persist passkey user handle")),
-    }
-}
-
 async fn ensure_passkey_user_handle(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -473,34 +350,6 @@ pub async fn mark_passkey_authentication_used(
     .bind(passkey_json)
     .bind(used_at)
     .bind(stored_passkey.summary.id.as_str())
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    stored_passkey.summary.last_used_at = Some(used_at.to_owned());
-    Ok(())
-}
-
-pub async fn mark_passkey_authentication_used_postgres(
-    tx: &mut Transaction<'_, Postgres>,
-    stored_passkey: &mut StoredPasskey,
-    result: &AuthenticationResult,
-    used_at: &str,
-) -> Result<(), ApiError> {
-    let Some(_) = stored_passkey.passkey.update_credential(result) else {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "passkey_mismatch",
-            "passkey does not match the authenticated credential",
-        ));
-    };
-    let passkey_json =
-        serde_json::to_string(&stored_passkey.passkey).map_err(ApiError::internal)?;
-    sqlx::query(
-        "UPDATE public.user_passkeys SET passkey_json = $1, last_used_at = $2 WHERE id = $3",
-    )
-    .bind(passkey_json)
-    .bind(used_at)
-    .bind(&stored_passkey.summary.id)
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
