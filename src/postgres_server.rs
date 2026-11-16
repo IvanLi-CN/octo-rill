@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::{Json, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
+    middleware,
     response::{
         IntoResponse,
         sse::{Event, Sse},
@@ -20,6 +21,8 @@ use sqlx::FromRow;
 use std::convert::Infallible;
 use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
+use tower::ServiceBuilder;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tower_sessions::{Expiry, Session, cookie::SameSite, session_store::ExpiredDeletion};
 use tracing::{info, warn};
 
@@ -49,13 +52,13 @@ struct PostgresServerState {
     task_registry: TaskExecutorRegistry,
 }
 
-/// PostgreSQL-native service boundary.
+/// PostgreSQL production application entry.
 ///
-/// This entry point deliberately owns the PG pool and owner lease instead of
-/// passing a PostgreSQL connection into the SQLite `AppState`. The router is
-/// intentionally small until each business vertical has a native PG query
-/// implementation; unsupported routes therefore fail closed at the boundary.
-pub async fn serve(config: AppConfig) -> Result<()> {
+/// This entry point owns the PG pool and owner lease while preserving the
+/// complete application boundary: route inventory, sessions, static assets,
+/// CORS, observability, workers, and graceful shutdown. A route without a
+/// native PG implementation remains registered and fails closed explicitly.
+pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     let runtime = crate::postgres_runtime::connect_from_config(&config).await?;
     crate::postgres_runtime::verify_application_schema(&runtime.pool).await?;
     let owner_id: Arc<str> = local_id::generate_local_id().into();
@@ -149,6 +152,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .route("/api/health", get(health))
+        .route("/api/version", get(version))
         .route("/api/me", get(me))
         .route("/api/me/resume", axum::routing::post(me_resume))
         .route("/api/me/personal-repos", get(personal_repos))
@@ -189,6 +194,42 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/repos/{owner}/{repo}/following",
             axum::routing::put(follow_repo).delete(unfollow_repo),
         )
+        .route(
+            "/api/repos/{owner}/{repo}/releases/tag/{tag}/detail",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/repos/{owner}/{repo}/discussions/{number}/detail",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/repos/{owner}/{repo}/public-release",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/public/repos/{owner}/{repo}/releases",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/public/repos/{owner}/{repo}/releases/tag/{tag}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/public/repos/{owner}/{repo}/releases/content",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/webhooks/github/releases",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/dashboard/updates",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/dashboard/feed/sections/{section_id}/items",
+            any(postgres_capability_unavailable),
+        )
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/api/tasks/{task_id}", get(task_status))
         .route(
@@ -200,6 +241,27 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/api/admin/jobs/events", get(admin_job_events))
         .route("/api/admin/users", get(admin_users))
         .route(
+            "/api/admin/repos/overview",
+            any(postgres_capability_unavailable),
+        )
+        .route("/api/admin/repos", any(postgres_capability_unavailable))
+        .route(
+            "/api/admin/public-release-repos",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/public-release-repos/{usage_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/release-reading/backfill",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/webhook-push/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
             "/api/admin/jobs/realtime/{task_id}/cancel",
             axum::routing::post(admin_cancel_task),
         )
@@ -208,10 +270,94 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/api/admin/jobs/realtime/{task_id}/retry",
             axum::routing::post(admin_retry_task),
         )
+        .route(
+            "/api/admin/jobs/realtime/{task_id}/release-freshness",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/realtime/{task_id}/log",
+            any(postgres_capability_unavailable),
+        )
         .route("/api/admin/jobs/scheduled", get(admin_scheduled_slots))
         .route(
             "/api/admin/jobs/scheduled/{hour_utc}",
             axum::routing::patch(admin_patch_scheduled_slot),
+        )
+        .route(
+            "/api/admin/jobs/sync/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/status",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/activity",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/calls",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/calls/{call_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/llm/calls/{call_id}/diagnostic-access",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/ai-records/{record_kind}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/ai-records/{record_kind}/activity",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/ai-records/{record_kind}/{record_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/migrations",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/migrations/{migration_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/migrations/{migration_id}/pause",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/migrations/{migration_id}/resume",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/content-processing/cutover",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/content-processing/freeze",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/content-processing/identity-upgrade",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/search-index",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/search-index/resume",
+            any(postgres_capability_unavailable),
         )
         .route(
             "/api/admin/users/{user_id}",
@@ -219,10 +365,39 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route(
             "/api/admin/users/{user_id}/profile",
-            get(admin_user_profile),
+            get(admin_user_profile).patch(postgres_capability_unavailable),
         )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
+        .route(
+            "/api/reaction-token/status",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/reaction-token/check",
+            any(postgres_capability_unavailable),
+        )
+        .route("/api/reaction-token", any(postgres_capability_unavailable))
+        .route(
+            "/api/release/reactions/toggle",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/auth/passkeys/register/options",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/auth/passkeys/register/verify",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/auth/passkeys/authenticate/options",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/auth/passkeys/authenticate/verify",
+            any(postgres_capability_unavailable),
+        )
         .route(
             "/translate/requests",
             axum::routing::post(submit_translation_request),
@@ -241,6 +416,26 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route(
             "/translate/requests/{request_id}/stream",
+            get(stream_translation_request),
+        )
+        .route(
+            "/api/translate/requests",
+            axum::routing::post(submit_translation_request),
+        )
+        .route(
+            "/api/translate/requests/{request_id}",
+            get(get_translation_request),
+        )
+        .route(
+            "/api/translate/requests/{request_id}/retry",
+            axum::routing::post(retry_translation_request),
+        )
+        .route(
+            "/api/translate/results",
+            axum::routing::post(resolve_translation_results),
+        )
+        .route(
+            "/api/translate/requests/{request_id}/stream",
             get(stream_translation_request),
         )
         .route(
@@ -284,7 +479,67 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/jobs/translations/batches/{batch_id}",
             any(postgres_capability_unavailable),
         )
-        .route("/api/feed", get(feed))
+        .route(
+            "/api/translate/releases/batch",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/releases/batch/stream",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/release",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/release/detail/batch",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/release/detail",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/notifications/batch",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/translate/notification",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/status",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/runtime-config",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/requests",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/requests/{request_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/attempt-events",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/batches",
+            any(postgres_capability_unavailable),
+        )
+        .route(
+            "/api/admin/jobs/translations/batches/{batch_id}",
+            any(postgres_capability_unavailable),
+        )
+        .route("/api/feed", get(feed).head(postgres_capability_unavailable))
+        .route(
+            "/api/feed/reactions/refresh",
+            any(postgres_capability_unavailable),
+        )
         .route("/api/dashboard/feed", get(dashboard_feed))
         .route("/api/briefs", get(list_briefs))
         .route("/api/briefs/{brief_id}", get(get_brief))
@@ -297,7 +552,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::post(sync_notifications),
         )
         .route("/auth/github/login", get(github_login))
+        .route("/auth/github/connect", any(postgres_capability_unavailable))
         .route("/auth/github/callback", get(github_callback))
+        .route("/auth/linuxdo/login", any(postgres_capability_unavailable))
+        .route(
+            "/auth/linuxdo/callback",
+            any(postgres_capability_unavailable),
+        )
         .route("/auth/logout", get(logout))
         .with_state(state);
     let session_layer =
@@ -306,7 +567,46 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             .with_secure(config.public_base_url.scheme() == "https")
             .with_same_site(SameSite::Lax)
             .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
-    let app = app.layer(session_layer);
+    let mut app = app.layer(session_layer);
+    if let Some(static_dir) = config.static_dir.clone() {
+        app = crate::server::attach_static_site_routes(app, static_dir);
+    }
+
+    let cors_origin = crate::state::normalize_origin(&config.public_base_url)?;
+    let cors_origin: HeaderValue = cors_origin
+        .as_str()
+        .parse()
+        .context("invalid cors origin")?;
+    let cors = CorsLayer::new()
+        .allow_origin(cors_origin)
+        .allow_credentials(true)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
+    let (set_request_id, propagate_request_id) = crate::observability::request_id_layers();
+    let access_log = middleware::from_fn(crate::observability::access_log_middleware);
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::extract::Request| {
+            crate::observability::request_trace_span(request)
+        })
+        .on_request(())
+        .on_response(())
+        .on_failure(());
+    let app = app.layer(cors).layer(
+        ServiceBuilder::new()
+            .layer(set_request_id)
+            .layer(trace_layer)
+            .layer(access_log)
+            .layer(propagate_request_id),
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -341,9 +641,6 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let worker_pool = runtime.pool.clone();
     let worker_owner = owner_id.clone();
     let worker = tokio::spawn(async move {
-        if std::env::var("OCTORILL_PG_WORKER_ENABLED").as_deref() != Ok("1") {
-            return Ok::<(), anyhow::Error>(());
-        }
         crate::postgres_worker::run_registered_until_shutdown(
             &worker_pool,
             &worker_owner,
