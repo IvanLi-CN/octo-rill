@@ -540,26 +540,47 @@ def main():
             assert failed_watcher == "failed", failed_watcher
 
             # The persisted backoff window must be honoured: a delivery that
-            # arrives during it is acknowledged without another upstream call.
+            # arrives during it waits in the queue instead of being dropped.
             STUB["fail_status"] = 0
             requests_before = len(STUB["requests"])
             code, body = post(release_payload(), base, delivery="delivery-backed-off")
             assert code == 200 and body["queued"] is True, (code, body)
-            backed_off_state = delivery_state("delivery-backed-off")
-            assert backed_off_state[0] == "queued" and backed_off_state[1], backed_off_state
-            backed_off_task_id = backed_off_state[1]
+            backed_off_task = sql(
+                "SELECT status || '|' || COALESCE(available_at::text, '') FROM public.job_tasks"
+                " WHERE task_type = 'sync.repo_release'"
+                " AND payload_json LIKE '%delivery-backed-off%'",
+                database_url,
+            ).split("|")
+            assert backed_off_task[0] == "queued", backed_off_task
+            assert backed_off_task[1] != "", backed_off_task
+            time.sleep(1.5)
+            assert len(STUB["requests"]) == requests_before, STUB["requests"][requests_before:]
+            still_queued = sql(
+                "SELECT status FROM public.job_tasks"
+                " WHERE payload_json LIKE '%delivery-backed-off%'",
+                database_url,
+            )
+            assert still_queued == "queued", still_queued
+            # Once the window elapses the deferred delivery is executed.
+            sql(
+                "UPDATE public.job_tasks SET available_at = now()"
+                " WHERE payload_json LIKE '%delivery-backed-off%'",
+                database_url,
+            )
+            backed_off_task_id = sql(
+                "SELECT id FROM public.job_tasks"
+                " WHERE payload_json LIKE '%delivery-backed-off%'",
+                database_url,
+            )
             status, error_message = wait_for_task(backed_off_task_id)
             assert status == "succeeded", (status, error_message)
-            backed_off = json.loads(
-                sql(
-                    "SELECT COALESCE(result_json, '{}') FROM public.job_tasks"
-                    f" WHERE id = '{backed_off_task_id}'",
-                    database_url,
-                )
+            deferred_release = sql(
+                f"SELECT COALESCE(result_json, '{{}}') FROM public.job_tasks"
+                f" WHERE id = '{backed_off_task_id}'",
+                database_url,
             )
-            assert backed_off["stopped_reason"] == "backoff", backed_off
-            assert backed_off["backoff_until"], backed_off
-            assert len(STUB["requests"]) == requests_before, STUB["requests"][requests_before:]
+            assert json.loads(deferred_release).get("repo_id") == REPO_ID, deferred_release
+            assert len(STUB["requests"]) > requests_before, "deferred refresh must reach GitHub"
 
             # A completed manage pass must acknowledge its reconcile demand;
             # otherwise the scheduler re-enqueues it on every tick forever.

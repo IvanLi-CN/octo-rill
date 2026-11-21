@@ -205,40 +205,6 @@ impl TaskExecutor for RepoReleaseRefreshExecutor {
             bail!("repo release executor received {}", task.task_type);
         }
         let payload = RepoReleaseTaskPayload::from_task(task)?;
-        // `repo_release_sync_state.backoff_until` is the durable retry signal a
-        // throttled or failed refresh writes. Honour it before claiming the
-        // work item so a webhook burst cannot bypass the backoff window.
-        let backoff_until = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT backoff_until FROM public.repo_release_sync_state WHERE repo_id = $1",
-        )
-        .bind(payload.repo_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("load repo release backoff state")?
-        .flatten();
-        if let Some(until) = backoff_until
-            && until.as_str() > Utc::now().to_rfc3339().as_str()
-        {
-            info!(
-                event = "worker.repo_release",
-                task_id = task.id,
-                repo_id = payload.repo_id,
-                repo = payload.repo_full_name,
-                backoff_until = until,
-                "repository release refresh deferred by backoff"
-            );
-            return Ok(json!({
-                "task": TASK_TYPE,
-                "user_id": payload.user_id,
-                "repo_id": payload.repo_id,
-                "repo_full_name": payload.repo_full_name,
-                "reason": payload.reason,
-                "delivery_id": payload.delivery_id,
-                "stopped_reason": "backoff",
-                "backoff_until": until,
-            })
-            .to_string());
-        }
         let claim = self
             .begin_work_item(task, &payload)
             .await

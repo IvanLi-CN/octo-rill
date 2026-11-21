@@ -398,12 +398,27 @@ async fn enqueue_repo_release_refresh(
         "reason": "webhook_release",
         "delivery_id": delivery_id,
     });
+    // A throttled repository leaves a durable backoff window; queue the refresh
+    // behind it instead of dropping the delivery's work.
+    let backoff_until: Option<String> = sqlx::query_scalar(
+        "SELECT backoff_until FROM public.repo_release_sync_state WHERE repo_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("load repo release backoff for enqueue")?
+    .flatten();
+    let available_at = backoff_until
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .filter(|until| *until > now);
     let inserted = sqlx::query_scalar::<_, String>(
         r#"
         INSERT INTO public.job_tasks (
-          id, task_type, status, source, requested_by, payload_json, created_at, updated_at
+          id, task_type, status, source, requested_by, payload_json, created_at, updated_at,
+          available_at
         )
-        SELECT $1, 'sync.repo_release', 'queued', $2, $3, $4, $5, $5
+        SELECT $1, 'sync.repo_release', 'queued', $2, $3, $4, $5, $5, $7
         WHERE NOT EXISTS (
           SELECT 1
           FROM public.job_tasks pending
@@ -425,6 +440,7 @@ async fn enqueue_repo_release_refresh(
     .bind(payload.to_string())
     .bind(now)
     .bind(&repo_id_key)
+    .bind(available_at)
     .fetch_optional(&mut *transaction)
     .await
     .context("enqueue repo release refresh task")?;
