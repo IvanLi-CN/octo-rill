@@ -336,15 +336,18 @@ jobs:
         run: |
           set -euo pipefail
           tmp_dir="$(mktemp -d)"
-          cleanup() { status=$?; docker rm -f ci-smoke >/dev/null 2>&1 || true; rm -rf "$tmp_dir"; exit "$status"; }
+          cleanup() { status=$?; docker rm -f ci-smoke >/dev/null 2>&1 || true; docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$tmp_dir"; exit "$status"; }
           trap cleanup EXIT
           docker run -d --rm --name ci-smoke -p 127.0.0.1::3000 \
             -e OCTORILL_ENCRYPTION_KEY_BASE64=synthetic \
-            -e DATABASE_URL=sqlite::memory: \
+            -e DATABASE_URL=postgres://octo:octo@${postgres_container}:5432/octo_rill \
             -e GITHUB_CLIENT_ID=ci-client \
             -e GITHUB_CLIENT_SECRET=ci-secret \
             -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/callback \
             "${CI_SMOKE_IMAGE}"
+          docker run -d --rm --name "$postgres_container" postgres:18
+          pg_isready -h "$postgres_container" -U octo -d octo_rill
+          if docker run --rm -e DATABASE_URL=sqlite::memory: "${CI_SMOKE_IMAGE}"; then exit 1; fi
           curl -fsS http://127.0.0.1:3000/api/health > "$tmp_dir/health.json"
           jq -e --arg version "${CI_SMOKE_VERSION}" '.ok == true and .version == $version' "$tmp_dir/health.json"
 

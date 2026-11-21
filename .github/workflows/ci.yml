@@ -582,19 +582,43 @@ jobs:
             status=$?
             if [ "$status" -ne 0 ]; then
               docker logs "$container" || true
+              docker logs "${container}-pg" || true
             fi
             docker rm -f "$container" >/dev/null 2>&1 || true
+            docker rm -f "${container}-pg" >/dev/null 2>&1 || true
+            docker network rm "octo-rill-ci-smoke-net-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >/dev/null 2>&1 || true
             rm -rf "$tmp_dir"
             exit "$status"
           }
           trap cleanup EXIT
 
           smoke_key="$(openssl rand -base64 32 | tr -d '\n')"
+          network="octo-rill-ci-smoke-net-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          postgres_container="${container}-pg"
+          docker network create "$network" >/dev/null
+          docker run -d --rm \
+            --name "$postgres_container" \
+            --network "$network" \
+            -e POSTGRES_USER=octo \
+            -e POSTGRES_PASSWORD=octo \
+            -e POSTGRES_DB=octo_rill \
+            postgres:18 >/dev/null
+          pg_ready=""
+          for _ in $(seq 1 60); do
+            if docker exec "$postgres_container" pg_isready -U octo -d octo_rill >/dev/null 2>&1; then
+              pg_ready="yes"
+              break
+            fi
+            sleep 1
+          done
+          [ -n "$pg_ready" ] || { echo "PostgreSQL smoke container was not ready" >&2; exit 1; }
+
           docker run -d --rm \
             --name "$container" \
+            --network "$network" \
             -p 127.0.0.1::3000 \
             -e OCTORILL_ENCRYPTION_KEY_BASE64="$smoke_key" \
-            -e DATABASE_URL=sqlite::memory: \
+            -e DATABASE_URL="postgres://octo:octo@${postgres_container}:5432/octo_rill" \
             -e GITHUB_CLIENT_ID=ci-smoke-client \
             -e GITHUB_CLIENT_SECRET=ci-smoke-secret \
             -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/auth/github/callback \
@@ -626,3 +650,16 @@ jobs:
           grep -q 'id="root"' "$index_file"
 
           docker stop --time 10 "$container" >/dev/null
+
+          # The runtime refuses SQLite now. Prove it in the same image instead of
+          # leaving the old smoke contract untested.
+          if timeout 60 docker run --rm \
+            -e OCTORILL_ENCRYPTION_KEY_BASE64="$smoke_key" \
+            -e DATABASE_URL=sqlite::memory: \
+            -e GITHUB_CLIENT_ID=ci-smoke-client \
+            -e GITHUB_CLIENT_SECRET=ci-smoke-secret \
+            -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/auth/github/callback \
+            "$CI_SMOKE_IMAGE" >/dev/null 2>&1; then
+            echo "runtime accepted a SQLite DATABASE_URL" >&2
+            exit 1
+          fi

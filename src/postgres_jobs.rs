@@ -327,6 +327,23 @@ async fn claim_once(
             )
           )
           AND ($2::text[] IS NULL OR candidate.task_type = ANY($2))
+          -- A repository inside its durable backoff window must not be claimed,
+          -- whatever queued the task or when the window was written.
+          AND (
+            candidate.task_type IS DISTINCT FROM 'sync.repo_release'
+            OR NOT EXISTS (
+              SELECT 1
+              FROM public.repo_release_sync_state AS backoff
+              WHERE backoff.repo_id = CASE
+                      WHEN pg_input_is_valid(candidate.payload_json, 'jsonb')
+                        AND (candidate.payload_json::jsonb ->> 'repo_id') ~ '^[0-9]{1,18}$'
+                      THEN (candidate.payload_json::jsonb ->> 'repo_id')::bigint
+                    END
+                AND backoff.backoff_until IS NOT NULL
+                AND pg_input_is_valid(backoff.backoff_until, 'timestamptz')
+                AND backoff.backoff_until::timestamptz > $1
+            )
+          )
         ORDER BY candidate.created_at ASC, candidate.id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1

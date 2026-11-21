@@ -49,3 +49,7 @@ web/*.tsbuildinfo
 .impeccable/
 .serena/
 .serena
+
+# Python caches from validation scripts
+__pycache__/
+*.pyc

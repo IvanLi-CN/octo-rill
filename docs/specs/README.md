@@ -121,3 +121,4 @@
 | 公开指标 API | active | [IMPLEMENTATION.md](./public-metrics-api/IMPLEMENTATION.md) / [HISTORY.md](./public-metrics-api/HISTORY.md) | [SPEC.md](./public-metrics-api/SPEC.md) | - | 实施中；公开治理统计 API + 真实可用的部分小时趋势 |
 | 核心性能监控 | active | [IMPLEMENTATION.md](./monitoring-dashboard/IMPLEMENTATION.md) / [HISTORY.md](./monitoring-dashboard/HISTORY.md) | [SPEC.md](./monitoring-dashboard/SPEC.md) | - | 应用 metrics + Grafana/Prometheus 资产 + 固定只读诊断 CLI；隔离运行验收与 PR 收敛进行中 |
 | Release 阅读内容与变更依据 | active | [IMPLEMENTATION.md](./release-reading-content/IMPLEMENTATION.md) / [HISTORY.md](./release-reading-content/HISTORY.md) | [SPEC.md](./release-reading-content/SPEC.md) | - | 内容规则已确认；统一正文、差异分析、机器材料边界与日报消费尚待实现 |
+| PostgreSQL 运行时持久化 | active | [IMPLEMENTATION.md](./postgresql-runtime/IMPLEMENTATION.md) / [HISTORY.md](./postgresql-runtime/HISTORY.md) | [SPEC.md](./postgresql-runtime/SPEC.md) | - | 已实现；运行时固定 PostgreSQL 18，离线导入 + 独立 runtime schema、七通道调度、共享 Release 刷新判定与全局内容读投影 |

@@ -10,7 +10,7 @@ use axum::{
         IntoResponse,
         sse::{Event, Sse},
     },
-    routing::{any, get},
+    routing::get,
 };
 use chrono::Utc;
 use futures_util::stream;
@@ -28,8 +28,8 @@ use tracing::{info, warn};
 
 use crate::{
     config::AppConfig,
-    crypto::EncryptedSecret,
     local_id, postgres_jobs,
+    postgres_repo_release_worker::RepoReleaseRefreshExecutor,
     postgres_runtime::PostgresRuntime,
     postgres_runtime_owner,
     postgres_tasks::{
@@ -42,14 +42,17 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct PostgresServerState {
-    runtime: PostgresRuntime,
-    owner_id: Arc<str>,
-    linuxdo_available: bool,
-    github_oauth: GitHubOAuthClient,
-    http: reqwest::Client,
-    encryption_key: crate::crypto::EncryptionKey,
-    task_registry: TaskExecutorRegistry,
+pub(super) struct PostgresServerState {
+    pub(super) runtime: PostgresRuntime,
+    pub(super) owner_id: Arc<str>,
+    pub(super) linuxdo_available: bool,
+    pub(super) github_oauth: GitHubOAuthClient,
+    pub(super) auth_ext: crate::postgres_auth_ext::AuthExtState,
+    pub(super) http: reqwest::Client,
+    pub(super) encryption_key: crate::crypto::EncryptionKey,
+    pub(super) task_registry: TaskExecutorRegistry,
+    pub(super) ai_model: Option<String>,
+    pub(super) ai: Option<crate::config::AiConfig>,
 }
 
 /// PostgreSQL production application entry.
@@ -81,6 +84,14 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         .register(
             "sync.releases",
             ReleasesExecutor::new(
+                runtime.pool.clone(),
+                http.clone(),
+                config.encryption_key.clone(),
+            ),
+        )
+        .register(
+            "sync.repo_release",
+            RepoReleaseRefreshExecutor::new(
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
@@ -140,14 +151,21 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         owner_id: owner_id.clone(),
         linuxdo_available: config.linuxdo.is_some(),
         github_oauth: crate::state::build_oauth_client(&config)?,
+        auth_ext: crate::postgres_auth_ext::AuthExtState::new(&config)?,
         http,
         encryption_key: config.encryption_key.clone(),
         task_registry,
+        ai_model: config.ai.as_ref().map(|ai| ai.model.clone()),
+        ai: config.ai.clone(),
     };
     info!(
         task_types = ?state.task_registry.registered_task_types(),
         "PostgreSQL task executors registered"
     );
+    let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
+    // Periodic lanes only enqueue work; the worker performs it. They share the
+    // same shutdown signal so a drain stops new dispatches immediately.
+    crate::postgres_scheduler::spawn(state.clone(), worker_shutdown.subscribe());
     let worker_registry = state.task_registry.clone();
     let app = Router::new()
         .route("/health", get(health))
@@ -196,39 +214,41 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route(
             "/api/repos/{owner}/{repo}/releases/tag/{tag}/detail",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::get_release_detail_by_repo_tag),
         )
         .route(
             "/api/repos/{owner}/{repo}/discussions/{number}/detail",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::get_announcement_detail),
         )
         .route(
             "/api/repos/{owner}/{repo}/public-release",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::get_repo_public_release_status)
+                .post(crate::postgres_repo_releases::publish_repo_public_release)
+                .delete(crate::postgres_repo_releases::unpublish_repo_public_release),
         )
         .route(
             "/api/public/repos/{owner}/{repo}/releases",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::public_list_repo_releases_http),
         )
         .route(
             "/api/public/repos/{owner}/{repo}/releases/tag/{tag}",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::public_get_repo_release_detail),
         )
         .route(
             "/api/public/repos/{owner}/{repo}/releases/content",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_repo_releases::public_get_repo_release_content),
         )
         .route(
             "/api/webhooks/github/releases",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_webhook::receive),
         )
         .route(
             "/api/dashboard/updates",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_dashboard::dashboard_updates),
         )
         .route(
             "/api/dashboard/feed/sections/{section_id}/items",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_dashboard::dashboard_readable_section_items),
         )
         .route("/api/tasks/{task_id}/events", get(task_events))
         .route("/api/tasks/{task_id}", get(task_status))
@@ -242,24 +262,26 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         .route("/api/admin/users", get(admin_users))
         .route(
             "/api/admin/repos/overview",
-            any(postgres_capability_unavailable),
+            get(admin_repo_governance_overview),
         )
-        .route("/api/admin/repos", any(postgres_capability_unavailable))
+        .route("/api/admin/repos", get(admin_repo_governance))
         .route(
             "/api/admin/public-release-repos",
-            any(postgres_capability_unavailable),
+            get(admin_public_release_repos),
         )
         .route(
             "/api/admin/public-release-repos/{usage_id}",
-            any(postgres_capability_unavailable),
+            axum::routing::delete(crate::postgres_admin_actions::admin_delete_public_release_repo),
         )
         .route(
             "/api/admin/jobs/release-reading/backfill",
-            any(postgres_capability_unavailable),
+            axum::routing::post(
+                crate::postgres_admin_actions::admin_enqueue_release_reading_backfill,
+            ),
         )
         .route(
             "/api/admin/jobs/webhook-push/runtime-config",
-            any(postgres_capability_unavailable),
+            get(admin_webhook_runtime_config),
         )
         .route(
             "/api/admin/jobs/realtime/{task_id}/cancel",
@@ -272,11 +294,11 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route(
             "/api/admin/jobs/realtime/{task_id}/release-freshness",
-            any(postgres_capability_unavailable),
+            get(admin_release_freshness),
         )
         .route(
             "/api/admin/jobs/realtime/{task_id}/log",
-            any(postgres_capability_unavailable),
+            get(admin_task_log),
         )
         .route("/api/admin/jobs/scheduled", get(admin_scheduled_slots))
         .route(
@@ -285,79 +307,77 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route(
             "/api/admin/jobs/sync/runtime-config",
-            any(postgres_capability_unavailable),
+            get(admin_sync_runtime_config),
         )
         .route(
             "/api/admin/jobs/llm/status",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_llm::status),
         )
         .route(
             "/api/admin/jobs/llm/activity",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_llm::activity),
         )
         .route(
             "/api/admin/jobs/llm/runtime-config",
-            any(postgres_capability_unavailable),
+            axum::routing::patch(crate::postgres_admin_actions::admin_patch_llm_runtime_config),
         )
         .route(
             "/api/admin/jobs/llm/calls",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_llm::calls),
         )
         .route(
             "/api/admin/jobs/llm/calls/{call_id}",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_llm::detail),
         )
         .route(
             "/api/admin/jobs/llm/calls/{call_id}/diagnostic-access",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_audit_llm_diagnostic_access),
         )
         .route(
             "/api/admin/jobs/ai-records/{record_kind}",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_ai_records::admin_list_collection_records),
         )
         .route(
             "/api/admin/jobs/ai-records/{record_kind}/activity",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_ai_records::admin_get_collection_activity),
         )
         .route(
             "/api/admin/jobs/ai-records/{record_kind}/{record_id}",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_admin_ai_records::admin_get_collection_record_detail),
         )
-        .route(
-            "/api/admin/jobs/migrations",
-            any(postgres_capability_unavailable),
-        )
+        .route("/api/admin/jobs/migrations", get(admin_migrations))
         .route(
             "/api/admin/jobs/migrations/{migration_id}",
-            any(postgres_capability_unavailable),
+            get(admin_migration_detail),
         )
         .route(
             "/api/admin/jobs/migrations/{migration_id}/pause",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_pause_online_migration),
         )
         .route(
             "/api/admin/jobs/migrations/{migration_id}/resume",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_resume_online_migration),
         )
         .route(
             "/api/admin/jobs/content-processing/cutover",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_content_processing_cutover),
         )
         .route(
             "/api/admin/jobs/content-processing/freeze",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_content_processing_freeze),
         )
         .route(
             "/api/admin/jobs/content-processing/identity-upgrade",
-            any(postgres_capability_unavailable),
+            get(admin_identity_upgrade_status)
+                .post(crate::postgres_admin_actions::admin_content_identity_upgrade_control),
         )
         .route(
             "/api/admin/jobs/search-index",
-            any(postgres_capability_unavailable),
+            get(admin_search_index_status),
         )
         .route(
             "/api/admin/jobs/search-index/resume",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_admin_actions::admin_resume_search_index),
         )
         .route(
             "/api/admin/users/{user_id}",
@@ -365,38 +385,38 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route(
             "/api/admin/users/{user_id}/profile",
-            get(admin_user_profile).patch(postgres_capability_unavailable),
+            get(admin_user_profile).patch(crate::postgres_admin_actions::admin_patch_user_profile),
         )
         .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
-        .route(
-            "/api/reaction-token/status",
-            any(postgres_capability_unavailable),
-        )
+        .route("/api/reaction-token/status", get(reaction_token_status))
         .route(
             "/api/reaction-token/check",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_reactions::check_reaction_token),
         )
-        .route("/api/reaction-token", any(postgres_capability_unavailable))
+        .route(
+            "/api/reaction-token",
+            axum::routing::put(crate::postgres_reactions::upsert_reaction_token),
+        )
         .route(
             "/api/release/reactions/toggle",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_reactions::toggle_release_reaction),
         )
         .route(
             "/api/auth/passkeys/register/options",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_auth_ext::passkey_register_options),
         )
         .route(
             "/api/auth/passkeys/register/verify",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_auth_ext::passkey_register_verify),
         )
         .route(
             "/api/auth/passkeys/authenticate/options",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_auth_ext::passkey_authenticate_options),
         )
         .route(
             "/api/auth/passkeys/authenticate/verify",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_auth_ext::passkey_authenticate_verify),
         )
         .route(
             "/translate/requests",
@@ -440,107 +460,120 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route(
             "/translate/releases/batch",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_releases_batch),
         )
         .route(
             "/translate/releases/batch/stream",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_releases_batch_stream),
         )
-        .route("/translate/release", any(postgres_capability_unavailable))
+        .route(
+            "/translate/release",
+            axum::routing::post(crate::postgres_translate::translate_release),
+        )
         .route(
             "/translate/release/stream",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_release_stream),
         )
         .route(
             "/admin/jobs/translations/status",
-            any(postgres_capability_unavailable),
+            get(admin_translation_status),
         )
         .route(
             "/admin/jobs/translations/runtime-config",
-            any(postgres_capability_unavailable),
+            axum::routing::patch(
+                crate::postgres_admin_actions::admin_patch_translation_runtime_config,
+            ),
         )
         .route(
             "/admin/jobs/translations/requests",
-            any(postgres_capability_unavailable),
+            get(admin_translation_requests),
         )
         .route(
             "/admin/jobs/translations/requests/{request_id}",
-            any(postgres_capability_unavailable),
+            get(admin_translation_request_detail),
         )
         .route(
             "/admin/jobs/translations/attempt-events",
-            any(postgres_capability_unavailable),
+            get(admin_translation_attempt_events),
         )
         .route(
             "/admin/jobs/translations/batches",
-            any(postgres_capability_unavailable),
+            get(admin_translation_batches),
         )
         .route(
             "/admin/jobs/translations/batches/{batch_id}",
-            any(postgres_capability_unavailable),
+            get(admin_translation_batch_detail),
         )
         .route(
             "/api/translate/releases/batch",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_releases_batch),
         )
         .route(
             "/api/translate/releases/batch/stream",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_releases_batch_stream),
         )
         .route(
             "/api/translate/release",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_release),
         )
         .route(
             "/api/translate/release/detail/batch",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_release_detail_batch),
         )
         .route(
             "/api/translate/release/detail",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_release_detail),
         )
         .route(
             "/api/translate/notifications/batch",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_notifications_batch),
         )
         .route(
             "/api/translate/notification",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_translate::translate_notification),
         )
         .route(
             "/api/admin/jobs/translations/status",
-            any(postgres_capability_unavailable),
+            get(admin_translation_status),
         )
         .route(
             "/api/admin/jobs/translations/runtime-config",
-            any(postgres_capability_unavailable),
+            axum::routing::patch(
+                crate::postgres_admin_actions::admin_patch_translation_runtime_config,
+            ),
         )
         .route(
             "/api/admin/jobs/translations/requests",
-            any(postgres_capability_unavailable),
+            get(admin_translation_requests),
         )
         .route(
             "/api/admin/jobs/translations/requests/{request_id}",
-            any(postgres_capability_unavailable),
+            get(admin_translation_request_detail),
         )
         .route(
             "/api/admin/jobs/translations/attempt-events",
-            any(postgres_capability_unavailable),
+            get(admin_translation_attempt_events),
         )
         .route(
             "/api/admin/jobs/translations/batches",
-            any(postgres_capability_unavailable),
+            get(admin_translation_batches),
         )
         .route(
             "/api/admin/jobs/translations/batches/{batch_id}",
-            any(postgres_capability_unavailable),
+            get(admin_translation_batch_detail),
         )
-        .route("/api/feed", get(feed).head(postgres_capability_unavailable))
+        .route(
+            "/api/feed",
+            get(crate::postgres_dashboard::feed).head(crate::postgres_dashboard::head_feed),
+        )
         .route(
             "/api/feed/reactions/refresh",
-            any(postgres_capability_unavailable),
+            axum::routing::post(crate::postgres_reactions::refresh_feed_reactions),
         )
-        .route("/api/dashboard/feed", get(dashboard_feed))
+        .route(
+            "/api/dashboard/feed",
+            get(crate::postgres_dashboard::dashboard_feed),
+        )
         .route("/api/briefs", get(list_briefs))
         .route("/api/briefs/{brief_id}", get(get_brief))
         .route("/api/briefs/generate", axum::routing::post(generate_brief))
@@ -552,12 +585,18 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             axum::routing::post(sync_notifications),
         )
         .route("/auth/github/login", get(github_login))
-        .route("/auth/github/connect", any(postgres_capability_unavailable))
+        .route(
+            "/auth/github/connect",
+            get(crate::postgres_auth_ext::github_connect),
+        )
         .route("/auth/github/callback", get(github_callback))
-        .route("/auth/linuxdo/login", any(postgres_capability_unavailable))
+        .route(
+            "/auth/linuxdo/login",
+            get(crate::postgres_auth_ext::linuxdo_login),
+        )
         .route(
             "/auth/linuxdo/callback",
-            any(postgres_capability_unavailable),
+            get(crate::postgres_auth_ext::linuxdo_callback),
         )
         .route("/auth/logout", get(logout))
         .with_state(state);
@@ -637,18 +676,22 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             .clone()
             .continuously_delete_expired(Duration::from_secs(60)),
     );
-    let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
     let worker_pool = runtime.pool.clone();
     let worker_owner = owner_id.clone();
     let worker = tokio::spawn(async move {
-        crate::postgres_worker::run_registered_until_shutdown(
-            &worker_pool,
-            &worker_owner,
-            &worker_registry,
-            worker_shutdown_rx,
-            Duration::from_millis(250),
-        )
-        .await
+        if postgres_worker_enabled() {
+            crate::postgres_worker::run_registered_until_shutdown(
+                &worker_pool,
+                &worker_owner,
+                &worker_registry,
+                worker_shutdown_rx,
+                Duration::from_millis(250),
+            )
+            .await
+        } else {
+            info!("PostgreSQL task worker disabled by OCTORILL_PG_WORKER_ENABLED");
+            Ok(())
+        }
     });
 
     let serve_result = axum::serve(listener, app)
@@ -664,6 +707,10 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     postgres_runtime_owner::unregister(&runtime.pool, &owner_id).await?;
     runtime.pool.close().await;
     serve_result
+}
+
+fn postgres_worker_enabled() -> bool {
+    std::env::var("OCTORILL_PG_WORKER_ENABLED").as_deref() != Ok("0")
 }
 
 async fn logout(session: Session) -> impl IntoResponse {
@@ -698,6 +745,13 @@ async fn github_login(
         .insert(SESSION_KEY_OAUTH_STATE, csrf_token.secret())
         .await
         .is_err()
+        || session
+            .insert(
+                crate::postgres_auth_ext::SESSION_KEY_GITHUB_OAUTH_MODE,
+                crate::postgres_auth_ext::GITHUB_OAUTH_MODE_LOGIN,
+            )
+            .await
+            .is_err()
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -718,36 +772,44 @@ async fn github_callback(
     State(state): State<PostgresServerState>,
     session: Session,
     Query(query): Query<GitHubCallbackQuery>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    match github_callback_inner(state, session, query).await {
+        Ok(redirect) => redirect.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn github_callback_inner(
+    state: PostgresServerState,
+    session: Session,
+    query: GitHubCallbackQuery,
+) -> Result<axum::response::Redirect, crate::error::ApiError> {
     let expected = session
         .get::<String>(SESSION_KEY_OAUTH_STATE)
         .await
-        .ok()
-        .flatten();
-    let _ = session.remove::<String>(SESSION_KEY_OAUTH_STATE).await;
+        .map_err(crate::error::ApiError::internal)?;
     if expected.as_deref() != Some(query.state.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({"code": "invalid_oauth_state"})),
-        )
-            .into_response();
+        return Err(crate::error::ApiError::bad_request("invalid oauth state"));
     }
-    let token = match state
+    let requested_mode = session
+        .get::<String>(crate::postgres_auth_ext::SESSION_KEY_GITHUB_OAUTH_MODE)
+        .await
+        .map_err(crate::error::ApiError::internal)?;
+    session
+        .remove::<String>(SESSION_KEY_OAUTH_STATE)
+        .await
+        .map_err(crate::error::ApiError::internal)?;
+    let _ = session
+        .remove::<String>(crate::postgres_auth_ext::SESSION_KEY_GITHUB_OAUTH_MODE)
+        .await;
+
+    let token = state
         .github_oauth
         .exchange_code(AuthorizationCode::new(query.code))
         .request_async(&state.http)
         .await
-    {
-        Ok(token) => token,
-        Err(error) => {
-            warn!(%error, "PostgreSQL GitHub token exchange failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                axum::Json(json!({"code": "github_token_exchange_failed"})),
-            )
-                .into_response();
-        }
-    };
+        .context("github oauth token exchange failed")
+        .map_err(crate::error::ApiError::internal)?;
     let access_token = token.access_token().secret().to_owned();
     let scopes = token
         .scopes()
@@ -759,17 +821,10 @@ async fn github_callback(
                 .join(" ")
         })
         .unwrap_or_default();
-    let user = match crate::github::fetch_user(&state.http, &access_token).await {
-        Ok(user) => user,
-        Err(error) => {
-            warn!(%error, "PostgreSQL GitHub user lookup failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                axum::Json(json!({"code": "github_user_lookup_failed"})),
-            )
-                .into_response();
-        }
-    };
+    let user = crate::github::fetch_user(&state.http, &access_token)
+        .await
+        .context("failed to fetch github user")
+        .map_err(crate::error::ApiError::internal)?;
     let email = if user.email.is_some() {
         user.email.clone()
     } else {
@@ -778,89 +833,16 @@ async fn github_callback(
             .ok()
             .flatten()
     };
-    let encrypted = match state.encryption_key.encrypt_str(&access_token) {
-        Ok(encrypted) => encrypted,
-        Err(error) => {
-            warn!(%error, "PostgreSQL GitHub token encryption failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "token_encryption_failed"})),
-            )
-                .into_response();
-        }
-    };
-    match persist_github_login(&state, &user, email.as_deref(), &scopes, encrypted).await {
-        Ok(user_id) => match session.insert(SESSION_KEY_USER_ID, user_id).await {
-            Ok(()) => axum::response::Redirect::to("/").into_response(),
-            Err(error) => {
-                warn!(%error, "PostgreSQL login session save failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(json!({"code": "session_save_failed"})),
-                )
-                    .into_response()
-            }
-        },
-        Err(error) => {
-            warn!(%error, "PostgreSQL GitHub login persistence failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "login_persistence_failed"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn persist_github_login(
-    state: &PostgresServerState,
-    user: &crate::github::GitHubUser,
-    email: Option<&str>,
-    scopes: &str,
-    encrypted: EncryptedSecret,
-) -> Result<String, sqlx::Error> {
-    let now = Utc::now().to_rfc3339();
-    let mut tx = state.runtime.pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO public.users (id, github_user_id, login, name, avatar_url, email, created_at, updated_at, last_active_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$7) \
-         ON CONFLICT (github_user_id) DO UPDATE SET login=EXCLUDED.login, name=EXCLUDED.name, avatar_url=EXCLUDED.avatar_url, email=EXCLUDED.email, updated_at=EXCLUDED.updated_at, last_active_at=EXCLUDED.last_active_at",
+    crate::postgres_auth_ext::finalize_github_auth(
+        &state,
+        &session,
+        &user,
+        email.as_deref(),
+        access_token.as_str(),
+        scopes.as_str(),
+        requested_mode,
     )
-    .bind(local_id::generate_local_id())
-    .bind(user.id)
-    .bind(&user.login)
-    .bind(user.name.as_deref())
-    .bind(user.avatar_url.as_deref())
-    .bind(email)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    let user_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM public.users WHERE github_user_id = $1 LIMIT 1",
-    )
-    .bind(user.id)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO public.github_connections (id,user_id,github_user_id,login,name,avatar_url,email,access_token_ciphertext,access_token_nonce,scopes,linked_at,updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) \
-         ON CONFLICT (github_user_id) DO UPDATE SET user_id=EXCLUDED.user_id,login=EXCLUDED.login,name=EXCLUDED.name,avatar_url=EXCLUDED.avatar_url,email=EXCLUDED.email,access_token_ciphertext=EXCLUDED.access_token_ciphertext,access_token_nonce=EXCLUDED.access_token_nonce,scopes=EXCLUDED.scopes,updated_at=EXCLUDED.updated_at",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(&user_id)
-    .bind(user.id)
-    .bind(&user.login)
-    .bind(user.name.as_deref())
-    .bind(user.avatar_url.as_deref())
-    .bind(email)
-    .bind(encrypted.ciphertext)
-    .bind(encrypted.nonce)
-    .bind(scopes)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(user_id)
+    .await
 }
 
 #[derive(sqlx::FromRow)]
@@ -1790,7 +1772,7 @@ async fn me_profile(
             .into_response();
     };
     match sqlx::query_as::<_, PgProfileRow>(
-        "SELECT daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at FROM public.users WHERE id = $1 AND is_disabled = 0 AND paused_at IS NULL",
+        "SELECT COALESCE((SELECT daily_brief_schedule_local_time FROM public.admin_runtime_settings WHERE id=1), '06:00') AS daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at FROM public.users WHERE id = $1 AND is_disabled = 0 AND paused_at IS NULL",
     )
     .bind(&user_id)
     .fetch_optional(&state.runtime.pool)
@@ -2102,6 +2084,235 @@ async fn list_releases(
     }
 }
 
+/// Translation payloads for the release-detail endpoint.
+///
+/// Global content processing is authoritative when enabled; otherwise the
+/// legacy per-user `ai_translations` cache is served. Both modes return the
+/// same item shape so clients keep one contract.
+#[allow(clippy::too_many_arguments)]
+async fn release_detail_processing_items(
+    state: &PostgresServerState,
+    user_id: &str,
+    release_id: i64,
+    repo_id: i64,
+    html_url: &str,
+    tag_name: &str,
+    name: Option<&str>,
+    body: Option<&str>,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let overlay = crate::postgres_content_overlay::OverlayState::load(&state.runtime.pool).await;
+    if overlay.is_global() {
+        // Projection identities are keyed by the writer's repository identity,
+        // which is derived from the release URL (and falls back to
+        // `unknown/<repo_id>` for tags containing `/`). The visible-repository
+        // name is not that identity, so it cannot be used here.
+        let repo_identity =
+            crate::postgres_content_overlay::release_repo_identity(html_url, repo_id);
+        let source = crate::postgres_content_overlay::ReleaseSource {
+            release_id,
+            repo_full_name: repo_identity.as_str(),
+            repo_identity: repo_identity.as_str(),
+            tag_name,
+            name,
+            body,
+            previous_tag_name: None,
+        };
+        let audience = crate::postgres_content_overlay::release_audience(
+            &state.runtime.pool,
+            user_id,
+            repo_id,
+        )
+        .await
+        .unwrap_or(crate::postgres_content_overlay::ReleaseAudience::Authorized);
+        let release_key = release_id.to_string();
+        let translation_request_id =
+            crate::postgres_content_overlay::latest_translation_request_id(
+                &state.runtime.pool,
+                release_key.as_str(),
+                &crate::postgres_content_overlay::RELEASE_TRANSLATION_REQUEST_KINDS,
+                None,
+            )
+            .await
+            .unwrap_or_default();
+        let smart_request_id = crate::postgres_content_overlay::latest_translation_request_id(
+            &state.runtime.pool,
+            release_key.as_str(),
+            &crate::postgres_content_overlay::RELEASE_SMART_REQUEST_KINDS,
+            None,
+        )
+        .await
+        .unwrap_or_default();
+        return match crate::postgres_content_overlay::release_detail_processing(
+            &state.runtime.pool,
+            overlay,
+            &source,
+            audience,
+        )
+        .await
+        {
+            Ok(processing) => (
+                processing.translation.map(|projection| {
+                    translation_projection_item(&projection, false, translation_request_id)
+                }),
+                processing.smart.map(|projection| {
+                    translation_projection_item(&projection, true, smart_request_id)
+                }),
+            ),
+            Err(error) => {
+                warn!(%error, release_id, "PostgreSQL global release overlay failed");
+                (None, None)
+            }
+        };
+    }
+    detail_translation_items(&state.runtime.pool, user_id, release_id).await
+}
+
+fn translation_projection_item(
+    projection: &crate::postgres_content_overlay::ContentProjection,
+    smart: bool,
+    request_id: Option<String>,
+) -> serde_json::Value {
+    let title = projection.title();
+    let summary = if smart {
+        projection.smart_summary()
+    } else {
+        projection.translation_summary()
+    };
+    let error = if projection.status == "ready" {
+        None
+    } else {
+        projection
+            .payload
+            .get("error_text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut item = json!({
+        "lang": "zh-CN",
+        "status": projection.status,
+        "title": title,
+        "summary": summary,
+        "error_code": error.as_deref(),
+        "error_summary": error.as_deref(),
+        "error_detail": null
+    });
+    crate::postgres_repo_releases::apply_translation_request_metadata(
+        &mut item,
+        request_id,
+        crate::postgres_content_overlay::is_active_work_status(projection.status.as_str()),
+    );
+    item
+}
+
+/// Legacy-mode translation cache for one release.
+async fn detail_translation_items(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    release_id: i64,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        entity_type: String,
+        lang: String,
+        status: String,
+        title: Option<String>,
+        summary: Option<String>,
+        error_text: Option<String>,
+        work_status: Option<String>,
+    }
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT t.entity_type, t.lang, t.status, t.title, t.summary, t.error_text, \
+                w.status AS work_status \
+         FROM public.ai_translations t \
+         LEFT JOIN public.translation_work_items w ON w.id = t.active_work_item_id \
+         WHERE t.user_id = $1 AND t.entity_id = $2 \
+           AND t.entity_type IN ('release_detail', 'release_smart')",
+    )
+    .bind(user_id)
+    .bind(release_id.to_string())
+    .fetch_all(pool)
+    .await;
+    let Ok(rows) = rows else {
+        return (None, None);
+    };
+    let mut translated = None;
+    let mut smart = None;
+    let mut translated_in_flight = false;
+    let mut smart_in_flight = false;
+    for row in rows {
+        let in_flight = matches!(row.status.as_str(), "queued" | "running")
+            || matches!(
+                row.work_status.as_deref(),
+                Some("queued" | "batched" | "running")
+            );
+        let mut item = if row.status == "ready" {
+            crate::postgres_repo_releases::translated_item_json(
+                "ready",
+                row.title,
+                row.summary,
+                None,
+                None,
+                None,
+            )
+        } else if in_flight {
+            crate::postgres_repo_releases::translated_item_json(
+                "missing",
+                None,
+                None,
+                None,
+                row.error_text.as_deref(),
+                None,
+            )
+        } else {
+            continue;
+        };
+        item["lang"] = serde_json::json!(row.lang);
+        match row.entity_type.as_str() {
+            "release_detail" => {
+                translated_in_flight |= in_flight;
+                translated = Some(item);
+            }
+            "release_smart" => {
+                smart_in_flight |= in_flight;
+                smart = Some(item);
+            }
+            _ => {}
+        }
+    }
+    let release_key = release_id.to_string();
+    let translation_request_id = crate::postgres_content_overlay::latest_translation_request_id(
+        pool,
+        release_key.as_str(),
+        &crate::postgres_content_overlay::RELEASE_TRANSLATION_REQUEST_KINDS,
+        Some(user_id),
+    )
+    .await
+    .unwrap_or_default();
+    let smart_request_id = crate::postgres_content_overlay::latest_translation_request_id(
+        pool,
+        release_key.as_str(),
+        &crate::postgres_content_overlay::RELEASE_SMART_REQUEST_KINDS,
+        Some(user_id),
+    )
+    .await
+    .unwrap_or_default();
+    if let Some(item) = translated.as_mut() {
+        crate::postgres_repo_releases::apply_translation_request_metadata(
+            item,
+            translation_request_id,
+            translated_in_flight,
+        );
+    }
+    if let Some(item) = smart.as_mut() {
+        crate::postgres_repo_releases::apply_translation_request_metadata(
+            item,
+            smart_request_id,
+            smart_in_flight,
+        );
+    }
+    (translated, smart)
+}
+
 async fn release_detail(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -2129,20 +2340,37 @@ async fn release_detail(
     match row {
         Ok(Some(row)) => {
             use sqlx::Row;
+            let release_id_value = row.get::<i64, _>("release_id");
+            let repo_id = row.get::<i64, _>("repo_id");
+            let full_name = row.get::<String, _>("full_name");
+            let tag_name = row.get::<String, _>("tag_name");
+            let name = row.get::<Option<String>, _>("name");
+            let body = row.get::<Option<String>, _>("body");
+            let (translated, smart) = release_detail_processing_items(
+                &state,
+                &user_id,
+                release_id_value,
+                repo_id,
+                row.get::<String, _>("html_url").as_str(),
+                tag_name.as_str(),
+                name.as_deref(),
+                body.as_deref(),
+            )
+            .await;
             (
                 StatusCode::OK,
                 axum::Json(json!({
-                    "release_id": row.get::<i64, _>("release_id").to_string(),
-                    "repo_full_name": row.get::<String, _>("full_name"),
-                    "tag_name": row.get::<String, _>("tag_name"),
-                    "name": row.get::<Option<String>, _>("name"),
-                    "body": row.get::<Option<String>, _>("body"),
+                    "release_id": release_id_value.to_string(),
+                    "repo_full_name": full_name,
+                    "tag_name": tag_name,
+                    "name": name,
+                    "body": body,
                     "html_url": row.get::<String, _>("html_url"),
                     "published_at": row.get::<Option<String>, _>("published_at"),
                     "is_prerelease": row.get::<i64, _>("is_prerelease") != 0,
                     "is_draft": row.get::<i64, _>("is_draft") != 0,
-                    "translated": null,
-                    "smart": null
+                    "translated": translated,
+                    "smart": smart
                 })),
             )
                 .into_response()
@@ -2257,7 +2485,7 @@ async fn personal_repos(
         }
     };
     let rows = match sqlx::query_as::<_, PgPersonalRepoRow>(
-        "SELECT ob.repo_id, ob.repo_full_name AS full_name, split_part(ob.repo_full_name, '/', 1) AS owner_login, split_part(ob.repo_full_name, '/', 2) AS name, 'https://github.com/' || ob.repo_full_name AS html_url, ob.updated_at, (SELECT COUNT(*) FROM public.repo_releases r WHERE r.repo_id = ob.repo_id AND COALESCE(r.is_draft, 0) = 0) AS release_count, ob.owner_avatar_url, ob.open_graph_image_url, ob.uses_custom_open_graph_image FROM public.owned_repo_star_baselines ob WHERE ob.user_id = $1 AND position('/' in ob.repo_full_name) > 1 AND lower(split_part(ob.repo_full_name, '/', 1)) = lower($2) ORDER BY lower(ob.repo_full_name) ASC",
+        "SELECT ob.repo_id, ob.repo_full_name AS full_name, split_part(ob.repo_full_name, '/', 1) AS owner_login, split_part(ob.repo_full_name, '/', 2) AS name, 'https://github.com/' || ob.repo_full_name AS html_url, ob.updated_at, COALESCE(rc.release_count, 0) AS release_count, ob.owner_avatar_url, ob.open_graph_image_url, ob.uses_custom_open_graph_image FROM public.owned_repo_star_baselines ob LEFT JOIN (SELECT repo_id, COUNT(*) AS release_count FROM public.repo_releases WHERE COALESCE(is_draft, 0)=0 GROUP BY repo_id) rc ON rc.repo_id=ob.repo_id WHERE ob.user_id = $1 AND position('/' in ob.repo_full_name) > 1 AND lower(split_part(ob.repo_full_name, '/', 1)) = lower($2) ORDER BY lower(ob.repo_full_name) ASC",
     )
     .bind(&user_id)
     .bind(&owner_login)
@@ -2403,127 +2631,6 @@ async fn public_metrics(State(state): State<PostgresServerState>) -> impl IntoRe
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(json!({"error": "metrics_unavailable"})),
-            )
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct PgFeedQuery {
-    limit: Option<i64>,
-}
-
-async fn load_feed_items(
-    state: &PostgresServerState,
-    user_id: &str,
-    limit: i64,
-) -> Result<Vec<serde_json::Value>, sqlx::Error> {
-    #[derive(Debug, FromRow)]
-    struct Row {
-        id: String,
-        resource_type: String,
-        title: Option<String>,
-        body: Option<String>,
-        repo_full_name: Option<String>,
-        source_time: Option<String>,
-        unread: Option<i64>,
-        target_url: Option<String>,
-    }
-    let rows = sqlx::query_as::<_, Row>(
-        "SELECT id, resource_type, title, body, repo_full_name, source_time, unread, target_url FROM public.search_documents WHERE (user_id IS NULL OR user_id = $1) ORDER BY source_time DESC NULLS LAST, id DESC LIMIT $2",
-    )
-    .bind(user_id)
-    .bind(limit.clamp(1, 100))
-    .fetch_all(&state.runtime.pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            json!({
-                "kind": row.resource_type,
-                "ts": row.source_time.clone().unwrap_or_default(),
-                "id": row.id,
-                "repo_full_name": row.repo_full_name,
-                "title": row.title,
-                "body": row.body,
-                "body_truncated": false,
-                "subtitle": null,
-                "reason": null,
-                "subject_type": null,
-                "html_url": row.target_url,
-                "unread": row.unread,
-                "repo_visual": null,
-                "actor": null,
-                "translated": null,
-                "smart": null,
-                "reactions": null
-            })
-        })
-        .collect())
-}
-
-async fn feed(
-    State(state): State<PostgresServerState>,
-    session: Session,
-    Query(query): Query<PgFeedQuery>,
-) -> impl IntoResponse {
-    let Some(user_id) = session
-        .get::<String>(SESSION_KEY_USER_ID)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
-        );
-    };
-    match load_feed_items(&state, &user_id, query.limit.unwrap_or(30)).await {
-        Ok(items) => (
-            StatusCode::OK,
-            axum::Json(json!({"items": items, "next_cursor": null})),
-        ),
-        Err(error) => {
-            warn!(%error, "PostgreSQL feed query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
-            )
-        }
-    }
-}
-
-async fn dashboard_feed(
-    State(state): State<PostgresServerState>,
-    session: Session,
-    Query(query): Query<PgFeedQuery>,
-) -> impl IntoResponse {
-    let Some(user_id) = session
-        .get::<String>(SESSION_KEY_USER_ID)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"code": "unauthorized", "message": "login required"})),
-        );
-    };
-    match load_feed_items(&state, &user_id, query.limit.unwrap_or(30)).await {
-        Ok(items) => {
-            let count = items.len();
-            (
-                StatusCode::OK,
-                axum::Json(
-                    json!({"sections": [{"id": "pg-canonical", "display_date": null, "kind": "raw", "window_start": null, "window_end": null, "brief": null, "items": items, "supplemental_items": [], "supplemental_next_cursor": null, "items_next_cursor": null, "item_count": count, "activity_count": count, "can_generate_brief": false}], "next_cursor": null}),
-                ),
-            )
-        }
-        Err(error) => {
-            warn!(%error, "PostgreSQL dashboard feed query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
             )
         }
     }
@@ -2850,7 +2957,7 @@ async fn cancel_task(
     }
 }
 
-async fn require_admin(
+pub(super) async fn require_admin(
     state: &PostgresServerState,
     session: &Session,
 ) -> Result<String, StatusCode> {
@@ -3263,7 +3370,7 @@ async fn admin_patch_user(
     }
 }
 
-async fn admin_user_profile(
+pub(crate) async fn admin_user_profile(
     State(state): State<PostgresServerState>,
     session: Session,
     Path(user_id): Path<String>,
@@ -3272,7 +3379,7 @@ async fn admin_user_profile(
         return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
     }
     match sqlx::query(
-        "SELECT id, daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at, webhook_push_enabled, webhook_push_desired_state \
+        "SELECT id, COALESCE((SELECT daily_brief_schedule_local_time FROM public.admin_runtime_settings WHERE id=1), '06:00') AS daily_brief_schedule_local_time, daily_brief_time_zone, include_own_releases, last_active_at, webhook_push_enabled, webhook_push_desired_state \
          FROM public.users WHERE id = $1",
     )
     .bind(&user_id)
@@ -3826,7 +3933,15 @@ async fn health(State(state): State<PostgresServerState>) -> impl IntoResponse {
         .fetch_one(&state.runtime.pool)
         .await
     {
-        Ok(_) => (StatusCode::OK, axum::Json(json!({"ok": true}))),
+        Ok(_) => {
+            // The release smoke asserts the effective version here, matching
+            // the legacy `/api/health` payload.
+            let info = crate::version::resolve_effective_version();
+            (
+                StatusCode::OK,
+                axum::Json(json!({"ok": true, "version": info.version})),
+            )
+        }
         Err(error) => {
             warn!(%error, owner_id = %state.owner_id, "PostgreSQL health probe failed");
             (
@@ -3846,14 +3961,947 @@ async fn version() -> axum::Json<serde_json::Value> {
     }))
 }
 
-async fn postgres_capability_unavailable() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        axum::Json(json!({
-            "code": "postgres_capability_unavailable",
-            "message": "this capability is not yet available on the PostgreSQL runtime"
-        })),
+async fn reaction_token_status(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    use sqlx::Row;
+    let Some(user_id) = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code":"unauthorized"})),
+        )
+            .into_response();
+    };
+    let active = sqlx::query_scalar::<_, i64>("SELECT is_disabled FROM public.users WHERE id=$1")
+        .bind(&user_id)
+        .fetch_optional(&state.runtime.pool)
+        .await;
+    match active {
+        Ok(Some(0)) => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"code":"account_disabled"})),
+            )
+                .into_response();
+        }
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"code":"unauthorized"})),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            warn!(%error, "PostgreSQL reaction token user check failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response();
+        }
+    }
+    match sqlx::query("SELECT masked_token,last_check_state,last_check_message,last_checked_at,owner_github_connection_id,owner_github_user_id,owner_login FROM public.reaction_pat_tokens WHERE user_id=$1")
+        .bind(&user_id).fetch_optional(&state.runtime.pool).await {
+        Ok(None) => Json(json!({"configured":false,"masked_token":null,"check":{"state":"idle","message":null,"checked_at":null},"owner":null})).into_response(),
+        Ok(Some(row)) => {
+            let status: String = row.get("last_check_state");
+            let status = if matches!(status.as_str(), "valid"|"invalid"|"error") {status.as_str()} else {"idle"};
+            let owner = match (row.get::<Option<String>,_>("owner_github_connection_id"),row.get::<Option<i64>,_>("owner_github_user_id"),row.get::<Option<String>,_>("owner_login")) {
+                (Some(connection),Some(id),Some(login)) => json!({"github_connection_id":connection,"github_user_id":id,"login":login}),
+                _ => serde_json::Value::Null,
+            };
+            Json(json!({"configured":true,"masked_token":row.get::<String,_>("masked_token"),"check":{"state":status,"message":row.get::<Option<String>,_>("last_check_message"),"checked_at":row.get::<Option<String>,_>("last_checked_at")},"owner":owner})).into_response()
+        },
+        Err(error) => {
+            warn!(%error, "PostgreSQL reaction token status query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"code":"database_error"}))).into_response()
+        }
+    }
+}
+
+fn postgres_translation_request_select() -> String {
+    let mut base = crate::translations::request_row_select_sql().to_owned();
+    for field in ["created_at", "started_at", "finished_at", "updated_at"] {
+        base = base.replace(
+            &format!("r.{field},"),
+            &format!("r.{field}::text AS {field},"),
+        );
+    }
+    base = base.replace("r.max_wait_ms,", "r.max_wait_ms::bigint AS max_wait_ms,");
+    base = base.replace("SELECT MAX(created_at)", "SELECT MAX(created_at)::text");
+    for table in [
+        "translation_work_items",
+        "translation_requests",
+        "translation_attempt_events",
+    ] {
+        base = base.replace(&format!("FROM {table} "), &format!("FROM public.{table} "));
+    }
+    base
+}
+
+async fn admin_translation_requests(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<crate::translations::AdminTranslationListQuery>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let status = query.status.unwrap_or_else(|| "all".to_owned());
+    let group = query.task_group.unwrap_or_else(|| "all".to_owned());
+    if !matches!(group.as_str(), "all" | "translation" | "polish") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code":"bad_request","message":"invalid task_group filter"})),
+        )
+            .into_response();
+    }
+    let parse_time =
+        |value: Option<String>| -> Result<Option<chrono::DateTime<Utc>>, chrono::ParseError> {
+            value
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    chrono::DateTime::parse_from_rfc3339(v.trim()).map(|t| t.with_timezone(&Utc))
+                })
+                .transpose()
+        };
+    let (from, before) = match (
+        parse_time(query.discovered_from),
+        parse_time(query.discovered_before),
+    ) {
+        (Ok(from), Ok(before)) => (from, before),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"code":"bad_request","message":"invalid timestamp filter"})),
+            )
+                .into_response();
+        }
+    };
+    let base = postgres_translation_request_select();
+    let filter = " WHERE ($1='all' OR CASE WHEN status='queued' AND work_item_status IN ('running','batched') THEN 'running' ELSE status END=$1) AND ($2='all' OR ($2='translation' AND kind!='release_smart') OR ($2='polish' AND kind='release_smart')) AND ($3::timestamptz IS NULL OR created_at::timestamptz >= $3) AND ($4::timestamptz IS NULL OR created_at::timestamptz < $4)";
+    let count_sql = format!("SELECT COUNT(*) FROM ({base}) request_rows {filter}");
+    let items_sql = format!(
+        "SELECT * FROM ({base}) request_rows {filter} ORDER BY CASE WHEN status IN ('queued','running') THEN 0 ELSE 1 END, created_at DESC,id DESC LIMIT $5 OFFSET $6"
+    );
+    let result = async {
+        let total = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(&status)
+            .bind(&group)
+            .bind(from)
+            .bind(before)
+            .fetch_one(&state.runtime.pool)
+            .await?;
+        let rows = sqlx::query_as::<_, crate::translations::RequestRow>(&items_sql)
+            .bind(&status)
+            .bind(&group)
+            .bind(from)
+            .bind(before)
+            .bind(page_size)
+            .bind(page.saturating_sub(1).saturating_mul(page_size))
+            .fetch_all(&state.runtime.pool)
+            .await?;
+        Ok::<_, sqlx::Error>(crate::translations::AdminTranslationRequestsResponse {
+            items: rows
+                .iter()
+                .map(|r| r.to_admin_request_list_item())
+                .collect(),
+            page,
+            page_size,
+            total,
+        })
+    }
+    .await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL admin translation requests failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_translation_batches(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<crate::translations::AdminTranslationListQuery>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let status = query.status.unwrap_or_else(|| "all".to_owned());
+    let result = async {
+        let total = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public.translation_batches WHERE ($1='all' OR status=$1)",
+        ).bind(&status).fetch_one(&state.runtime.pool).await?;
+        let rows = sqlx::query_as::<_, crate::translations::AdminTranslationBatchRow>(
+            "SELECT id,status,trigger_reason,worker_slot::bigint AS worker_slot,request_count::bigint AS request_count,item_count::bigint AS item_count,estimated_input_tokens::bigint AS estimated_input_tokens,error_text,created_at::text AS created_at,started_at::text AS started_at,finished_at::text AS finished_at,updated_at::text AS updated_at FROM public.translation_batches WHERE ($1='all' OR status=$1) ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3",
+        ).bind(&status).bind(page_size).bind(page.saturating_sub(1).saturating_mul(page_size))
+            .fetch_all(&state.runtime.pool).await?;
+        let batch_ids = rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let summaries = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT bi.batch_id, CASE WHEN bi.result_status IS NOT NULL AND bi.result_status!='' THEN bi.result_status WHEN w.result_status IS NOT NULL AND w.result_status!='' THEN w.result_status WHEN w.status='queued' OR w.status IS NULL THEN 'queued' ELSE 'running' END AS result_status,COUNT(*) FROM public.translation_batch_items bi JOIN public.translation_work_items w ON w.id=bi.work_item_id WHERE bi.batch_id=ANY($1) GROUP BY bi.batch_id,2",
+        ).bind(&batch_ids).fetch_all(&state.runtime.pool).await?;
+        let mut by_id = std::collections::HashMap::<String, crate::translations::AdminTranslationBatchResultSummary>::new();
+        for (id, status, count) in summaries {
+            let entry = by_id.entry(id).or_default();
+            match status.as_str() {
+                "ready" => entry.ready=count,
+                "error" => entry.error=count,
+                "missing" => entry.missing=count,
+                "disabled" => entry.disabled=count,
+                "queued" => entry.queued=count,
+                "running" => entry.running=count,
+                _ => {}
+            }
+        }
+        Ok::<_, sqlx::Error>((total, rows, by_id))
+    }.await;
+    match result {
+        Ok((total, rows, mut summaries)) => {
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    let summary = summaries.remove(&row.id).unwrap_or_default();
+                    row.into_list_item(summary)
+                })
+                .collect::<Vec<_>>();
+            Json(crate::translations::AdminTranslationBatchesResponse {
+                items,
+                page,
+                page_size,
+                total,
+            })
+            .into_response()
+        }
+        Err(error) => {
+            warn!(%error,"PostgreSQL admin translation batches failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn load_pg_translation_attempts(
+    state: &PostgresServerState,
+    work_item_id: &str,
+) -> Result<Vec<crate::translations::AdminTranslationAttemptEvent>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT to_jsonb(e) AS data FROM public.translation_attempt_events e WHERE work_item_id=$1 ORDER BY created_at,id")
+        .bind(work_item_id).fetch_all(&state.runtime.pool).await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let mut data: serde_json::Value = row.try_get("data")?;
+        let text = |key: &str| {
+            data.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let ids =
+            serde_json::from_str::<Vec<String>>(&text("llm_call_ids_json")).unwrap_or_default();
+        let attempt = data.get("attempt_no").and_then(|v| v.as_i64()).unwrap_or(0);
+        let links = sqlx::query("SELECT llm_call_id,stage,relation_role,evidence_availability FROM public.translation_attempt_llm_calls WHERE work_item_id=$1 AND attempt_no=$2")
+            .bind(work_item_id).bind(attempt).fetch_all(&state.runtime.pool).await?;
+        let calls = sqlx::query_as::<_,crate::translations::AdminTranslationLinkedLlmCall>("SELECT id,status,source,model,scheduler_wait_ms,duration_ms,created_at::text AS created_at FROM public.llm_calls WHERE id=ANY($1)")
+            .bind(&ids).fetch_all(&state.runtime.pool).await?;
+        let mut hydrated = Vec::new();
+        for id in &ids {
+            let link = links
+                .iter()
+                .find(|l| l.get::<String, _>("llm_call_id") == *id);
+            let call = calls.iter().find(|c| c.id == *id).cloned().or_else(|| {
+                link.map(|l| crate::translations::AdminTranslationLinkedLlmCall {
+                    id: id.clone(),
+                    status: "expired".to_owned(),
+                    source: "诊断载荷已过期".to_owned(),
+                    model: "unknown".to_owned(),
+                    scheduler_wait_ms: 0,
+                    duration_ms: None,
+                    stage: Some(l.get("stage")),
+                    relation_role: Some(l.get("relation_role")),
+                    evidence_availability: Some(l.get("evidence_availability")),
+                    created_at: String::new(),
+                })
+            });
+            if let Some(mut call) = call {
+                if let Some(link) = link {
+                    call.stage = Some(link.get("stage"));
+                    call.relation_role = Some(link.get("relation_role"));
+                    call.evidence_availability = Some(link.get("evidence_availability"));
+                } else {
+                    call.relation_role = Some("legacy_unverified".to_owned());
+                    call.evidence_availability = Some("not_captured".to_owned());
+                }
+                hydrated.push(call);
+            }
+        }
+        if let Some(id) = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            data["id"] = json!(id);
+        }
+        if let Some(value) = data.get("retry_eligible").and_then(|v| v.as_i64()) {
+            data["retry_eligible"] = json!(value != 0);
+        }
+        data["llm_call_ids"] = json!(ids);
+        data["llm_calls"] = json!(hydrated);
+        let event = serde_json::from_value(data).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        result.push(event);
+    }
+    Ok(result)
+}
+
+async fn admin_translation_request_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(request_id): Path<String>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let query = format!(
+        "{} WHERE r.id=$1 LIMIT 1",
+        postgres_translation_request_select()
+    );
+    let result = async {
+        let row = sqlx::query_as::<_, crate::translations::RequestRow>(&query)
+            .bind(&request_id)
+            .fetch_optional(&state.runtime.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok::<_, sqlx::Error>(None);
+        };
+        let item = row.to_result();
+        let attempts = if let Some(id) = item.work_item_id.as_deref() {
+            load_pg_translation_attempts(&state, id).await?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(
+            crate::translations::AdminTranslationRequestDetailResponse {
+                request: row.to_admin_request_list_item(),
+                result: crate::translations::admin_translation_result_item(item),
+                attempts,
+            },
+        ))
+    }
+    .await;
+    match result {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"code":"not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL translation request detail failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_translation_attempt_events(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<crate::translations::AdminTranslationAttemptListQuery>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let entity = query.entity_id.unwrap_or_default().trim().to_owned();
+    let request = query.request_id.unwrap_or_default().trim().to_owned();
+    let work = query.work_item_id.unwrap_or_default().trim().to_owned();
+    let kind = query.kind.unwrap_or_default().trim().to_owned();
+    let variant = query.variant.unwrap_or_default().trim().to_owned();
+    if entity.is_empty() && request.is_empty() && work.is_empty() {
+        return (StatusCode::BAD_REQUEST,Json(json!({"code":"bad_request","message":"entity_id, request_id, or work_item_id is required"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+    let result=async {
+        let filter=" WHERE ($1='' OR entity_id=$1) AND ($2='' OR request_id=$2) AND ($3='' OR work_item_id=$3) AND ($4='' OR kind=$4) AND ($5='' OR variant=$5)";
+        let total=sqlx::query_scalar::<_,i64>(&format!("SELECT COUNT(*) FROM public.translation_attempt_events {filter}")).bind(&entity).bind(&request).bind(&work).bind(&kind).bind(&variant).fetch_one(&state.runtime.pool).await?;
+        let query=format!("SELECT id::text,work_item_id FROM public.translation_attempt_events {filter} ORDER BY created_at,id LIMIT $6 OFFSET $7");
+        let rows=sqlx::query_as::<_,(String,String)>(&query).bind(&entity).bind(&request).bind(&work).bind(&kind).bind(&variant).bind(page_size).bind(page.saturating_sub(1).saturating_mul(page_size)).fetch_all(&state.runtime.pool).await?;
+        let ids=rows.iter().map(|r|r.0.clone()).collect::<std::collections::HashSet<_>>();
+        let works=rows.into_iter().map(|r|r.1).collect::<std::collections::HashSet<_>>();
+        let mut items=Vec::new();
+        for work in works {items.extend(load_pg_translation_attempts(&state,&work).await?.into_iter().filter(|e|ids.contains(&e.id.to_string())));}
+        items.sort_by(|a,b|a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok::<_,sqlx::Error>(crate::translations::AdminTranslationAttemptEventsResponse{items,page,page_size,total})
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL translation attempt list failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(crate) async fn admin_translation_status(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async {
+        let counts=sqlx::query("SELECT (SELECT COUNT(*) FROM public.translation_requests WHERE status='queued') AS queued_requests,(SELECT COUNT(*) FROM public.translation_work_items WHERE status='queued') AS queued_work_items,(SELECT COUNT(*) FROM public.translation_batches WHERE status='running') AS running_batches,(SELECT COUNT(*) FROM public.translation_requests WHERE created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()) AS requests_24h,(SELECT MAX(finished_at)::text FROM public.translation_batches) AS last_batch_finished_at").fetch_one(&state.runtime.pool).await?;
+        let batches=sqlx::query("SELECT id,status,item_count,error_text FROM public.translation_batches WHERE created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()").fetch_all(&state.runtime.pool).await?;
+        let mut completed=0_i64;let mut clean=0_i64;let mut issues=0_i64;let mut failed=0_i64;
+        let mut errors=0_i64;let mut missing=0_i64;
+        for batch in batches {
+            let id:String=batch.try_get("id")?;
+            let rows=sqlx::query_as::<_,(String,i64)>("SELECT CASE WHEN bi.result_status IS NOT NULL AND bi.result_status!='' THEN bi.result_status WHEN w.result_status IS NOT NULL AND w.result_status!='' THEN w.result_status WHEN w.status='queued' OR w.status IS NULL THEN 'queued' ELSE 'running' END AS result_status,COUNT(*) FROM public.translation_batch_items bi JOIN public.translation_work_items w ON w.id=bi.work_item_id WHERE bi.batch_id=$1 GROUP BY 1").bind(id).fetch_all(&state.runtime.pool).await?;
+            let mut summary=crate::translations::AdminTranslationBatchResultSummary::default();
+            for (status,n) in rows {match status.as_str(){"ready"=>summary.ready=n,"error"=>summary.error=n,"missing"=>summary.missing=n,"disabled"=>summary.disabled=n,"queued"=>summary.queued=n,"running"=>summary.running=n,_=>{}}}
+            errors+=summary.error;missing+=summary.missing;
+            let status:String=batch.try_get("status")?;
+            if status=="completed" {completed+=1;let outcome=crate::translations::translation_batch_business_outcome(&status,&summary,batch.try_get("item_count")?,batch.try_get::<Option<String>,_>("error_text")?.as_deref());if matches!(outcome.code.as_str(),"ok"|"disabled"){clean+=1}else{issues+=1}}
+            if status=="failed" {failed+=1}
+        }
+        let avg=sqlx::query_scalar::<_,Option<f64>>("SELECT AVG(EXTRACT(EPOCH FROM (deadline_at::timestamptz-created_at::timestamptz))*1000)::float8 FROM public.translation_work_items WHERE finished_at IS NOT NULL AND created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()").fetch_one(&state.runtime.pool).await?;
+        let context=sqlx::query_scalar::<_,Option<i64>>("SELECT ai_model_context_limit FROM public.admin_runtime_settings WHERE id=1").fetch_optional(&state.runtime.pool).await?.flatten();
+        let (limit,source)=context.map(|v|(v.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(state.ai_model.as_deref().unwrap_or_default()));
+        // The PG registry is a single sequential worker; it has no separate
+        // batching scheduler or dedicated workers. Report that actual state.
+        let enabled=postgres_worker_enabled();
+        let running=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM public.job_tasks WHERE task_type='translation.generate' AND status='running' AND runtime_owner_id=$1").bind(state.owner_id.as_ref()).fetch_one(&state.runtime.pool).await?;
+        let workers=if enabled {vec![crate::translations::AdminTranslationWorkerStatus{worker_id:state.owner_id.to_string(),worker_slot:1,worker_kind:"general".to_owned(),status:if running>0{"running"}else{"idle"}.to_owned(),current_batch_id:None,request_count:running,work_item_count:running,trigger_reason:None,updated_at:Utc::now().to_rfc3339(),error_text:None,error_code:None,error_summary:None,error_detail:None}]}else{Vec::new()};
+        let concurrency=i64::from(enabled);
+        Ok::<_,sqlx::Error>(crate::translations::AdminTranslationStatusResponse{scheduler_enabled:enabled,llm_enabled:state.ai_model.is_some(),scan_interval_ms:250,batch_token_threshold:i64::from(limit.saturating_sub(1800).saturating_sub(((f64::from(limit)*0.05).ceil() as u32).max(512)).clamp(1,1800)),ai_model_context_limit:context,effective_model_input_limit:i64::from(limit),effective_model_input_limit_source:source.to_owned(),general_worker_concurrency:concurrency,dedicated_worker_concurrency:0,worker_concurrency:concurrency,target_general_worker_concurrency:concurrency,target_dedicated_worker_concurrency:0,target_worker_concurrency:concurrency,idle_workers:if enabled&&running==0{1}else{0},busy_workers:running.min(concurrency),workers,queued_requests:counts.try_get("queued_requests")?,queued_work_items:counts.try_get("queued_work_items")?,running_batches:counts.try_get("running_batches")?,requests_24h:counts.try_get("requests_24h")?,completed_batches_24h:completed,clean_completed_batches_24h:clean,completed_with_issues_batches_24h:issues,failed_batches_24h:failed,error_work_items_24h:errors,missing_work_items_24h:missing,avg_wait_ms_24h:avg.map(|v|v.round() as i64),last_batch_finished_at:counts.try_get("last_batch_finished_at")?})
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL translation status failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(crate) async fn admin_migrations(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async {
+        let run=sqlx::query_scalar::<_,serde_json::Value>("SELECT to_jsonb(r)-'last_error' || jsonb_build_object('last_error',CASE WHEN last_error IS NULL THEN NULL ELSE 'migration failed; consult protected service logs' END,'pause_requested',pause_requested<>0) FROM public.online_migration_runs r WHERE migration_id='content-processing-online-v2'").fetch_optional(&state.runtime.pool).await?;
+        let operations=sqlx::query_scalar::<_,serde_json::Value>("SELECT to_jsonb(o)-'last_error' || jsonb_build_object('last_error',CASE WHEN last_error IS NULL THEN NULL ELSE 'migration failed; consult protected service logs' END) FROM public.online_migration_operations o WHERE migration_id='content-processing-online-v2' ORDER BY operation_order").fetch_all(&state.runtime.pool).await?;
+        Ok::<_,sqlx::Error>(json!({"run":run,"operations":operations}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL online migration read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(crate) async fn admin_migration_detail(
+    state: State<PostgresServerState>,
+    session: Session,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if id != "content-processing-online-v2" {
+        return (StatusCode::NOT_FOUND, Json(json!({"code":"not_found"}))).into_response();
+    }
+    admin_migrations(state, session).await
+}
+
+async fn admin_webhook_runtime_config(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    match sqlx::query_as::<_,(i64,Option<String>)>("SELECT webhook_push_audit_interval_days,webhook_push_audit_last_started_at FROM public.admin_runtime_settings WHERE id=1").fetch_one(&state.runtime.pool).await {
+        Ok((days,last))=>{
+            let next=last.as_deref().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).map(|t|(t+chrono::Duration::days(days)).to_rfc3339());
+            Json(json!({"audit_interval_days":days,"last_started_at":last,"next_started_at":next})).into_response()
+        },
+        Err(error)=>{warn!(%error,"PostgreSQL webhook runtime config read failed");(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"code":"database_error"}))).into_response()}
+    }
+}
+
+#[derive(Deserialize)]
+struct PgAdminPublicRepoQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    query: Option<String>,
+}
+
+async fn admin_public_release_repos(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<PgAdminPublicRepoQuery>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1);
+    if page < 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code":"bad_request","message":"page must be >= 1"})),
+        )
+            .into_response();
+    }
+    let size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let text = query.query.unwrap_or_default().trim().to_lowercase();
+    match public_release_repos_body(&state, page, size, &text).await {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL admin public repositories failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Load one public-repo governance page. Shared by the list handler and the
+/// admin deletion handler, which returns the refreshed page with its cleanup
+/// summary attached.
+pub(crate) async fn public_release_repos_body(
+    state: &PostgresServerState,
+    page: i64,
+    size: i64,
+    text: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let pattern = format!("%{text}%");
+    async {
+        let total=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM public.public_repo_release_usage WHERE $1='' OR full_name_lower LIKE $2").bind(text).bind(&pattern).fetch_one(&state.runtime.pool).await?;
+        let rows=sqlx::query_scalar::<_,serde_json::Value>(r#"SELECT to_jsonb(item) FROM (
+            SELECT pu.id,pu.repo_id,pu.full_name,pu.first_registered_at,pu.last_requested_at,pu.last_list_requested_at,pu.last_detail_requested_at,pu.api_list_requests,pu.api_detail_requests,pu.page_list_requests,pu.page_detail_requests,pu.last_sync_status,pu.last_sync_error,COUNT(DISTINCT r.release_id) AS release_count,
+            COUNT(DISTINCT CASE WHEN td.status='ready' THEN r.release_id END) AS translated_ready_count,
+            COUNT(DISTINCT CASE WHEN COALESCE(td.status,'missing')!='ready' THEN r.release_id END) AS translated_missing_count,
+            COUNT(DISTINCT CASE WHEN sm.status='ready' THEN r.release_id END) AS polished_ready_count,
+            COUNT(DISTINCT CASE WHEN COALESCE(sm.status,'missing')!='ready' THEN r.release_id END) AS polished_missing_count,pu.created_at,pu.updated_at
+            FROM (SELECT * FROM public.public_repo_release_usage WHERE $1='' OR full_name_lower LIKE $2 ORDER BY last_requested_at DESC,full_name LIMIT $3 OFFSET $4) pu
+            LEFT JOIN public.repo_releases r ON r.repo_id=pu.repo_id
+            LEFT JOIN LATERAL(SELECT status FROM public.ai_translations WHERE entity_type='release_detail' AND entity_id=r.release_id::text AND lang='zh-CN' ORDER BY CASE WHEN status='ready' THEN 0 ELSE 1 END,updated_at DESC LIMIT 1) td ON true
+            LEFT JOIN LATERAL(SELECT status FROM public.ai_translations WHERE entity_type='release_smart' AND entity_id=r.release_id::text AND lang='zh-CN' ORDER BY CASE WHEN status='ready' THEN 0 ELSE 1 END,updated_at DESC LIMIT 1) sm ON true
+            GROUP BY pu.id,pu.repo_id,pu.full_name,pu.first_registered_at,pu.last_requested_at,pu.last_list_requested_at,pu.last_detail_requested_at,pu.api_list_requests,pu.api_detail_requests,pu.page_list_requests,pu.page_detail_requests,pu.last_sync_status,pu.last_sync_error,pu.created_at,pu.updated_at
+            ORDER BY pu.last_requested_at DESC,pu.full_name) item"#).bind(text).bind(&pattern).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
+        Ok::<_,sqlx::Error>(json!({"items":rows,"page":page,"page_size":size,"total":total}))
+    }.await
+}
+
+pub(crate) async fn admin_search_index_status(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async {
+        let row=sqlx::query("SELECT phase,cursor,status,last_error,updated_at FROM public.search_projection_backfill_state WHERE id=1").fetch_one(&state.runtime.pool).await?;
+        let metadata=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM public.search_metadata_backfill_queue)").fetch_one(&state.runtime.pool).await?;
+        let pending=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM public.search_projection_outbox)").fetch_one(&state.runtime.pool).await?;
+        let failure=sqlx::query_scalar::<_,Option<String>>("SELECT last_error FROM public.search_projection_outbox_failed ORDER BY failed_at DESC,projection_key DESC LIMIT 1").fetch_optional(&state.runtime.pool).await?.flatten();
+        let persisted:String=row.try_get("status")?;
+        let status=if failure.is_some(){"failed"}else if persisted=="ready"&&(metadata||pending){"building"}else{persisted.as_str()};
+        let error=row.try_get::<Option<String>,_>("last_error")?.or(failure);
+        let mut body=json!({"phase":row.try_get::<String,_>("phase")?,"cursor":row.try_get::<i64,_>("cursor")?,"status":status,"updated_at":row.try_get::<String,_>("updated_at")?,"metadata_pending":metadata});
+        if error.is_some(){body["last_error"]=json!("search projection failed; consult protected service logs");}
+        Ok::<_,sqlx::Error>(body)
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL search index status failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(crate) async fn admin_identity_upgrade_status(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async {
+        let row=sqlx::query("SELECT generation,status,phase,cursor,last_error_code,started_at,completed_at,updated_at FROM public.content_identity_upgrade_control WHERE id=1").fetch_one(&state.runtime.pool).await?;
+        let raw:Option<String>=row.try_get("cursor")?;
+        let cursor:serde_json::Value=raw.map(|v|serde_json::from_str(&v)).transpose().map_err(|e|sqlx::Error::Decode(Box::new(e)))?.unwrap_or(json!({}));
+        let progress=|name:&str| {let p=&cursor[name];json!({"processed":p["processed"].as_i64().unwrap_or(0),"total":p.get("total"),"completed_at":p.get("completed_at"),"requeued":p["requeued"].as_i64().unwrap_or(0)})};
+        let waiting=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM (SELECT canonical_resource_type,canonical_resource_id,pipeline,variant,target_lang,source_hash,protocol_version FROM public.content_work_items WHERE status='blocked_config' GROUP BY canonical_resource_type,canonical_resource_id,pipeline,variant,target_lang,source_hash,protocol_version) blocked WHERE NOT EXISTS(SELECT 1 FROM public.content_work_identities i JOIN public.content_current_result_projections p ON p.identity_id=i.id WHERE i.canonical_resource_type=blocked.canonical_resource_type AND i.canonical_resource_id=blocked.canonical_resource_id AND i.pipeline=blocked.pipeline AND i.variant=blocked.variant AND i.target_lang=blocked.target_lang AND i.source_hash=blocked.source_hash AND i.protocol_version=blocked.protocol_version)").fetch_one(&state.runtime.pool).await?;
+        Ok::<_,sqlx::Error>(json!({"generation":row.try_get::<i64,_>("generation")?,"status":row.try_get::<String,_>("status")?,"phase":row.try_get::<String,_>("phase")?,"last_error_code":row.try_get::<Option<String>,_>("last_error_code")?,"started_at":row.try_get::<Option<String>,_>("started_at")?,"completed_at":row.try_get::<Option<String>,_>("completed_at")?,"updated_at":row.try_get::<String,_>("updated_at")?,"search_index_refresh_pending":cursor["search_index_refresh_pending"].as_bool().unwrap_or(false),"work_identity_backfill":progress("work_identity_backfill"),"projection_backfill":progress("projection_backfill"),"blocked_config_recovery":progress("blocked_config_recovery"),"waiting_blocked_config_identities":waiting}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL identity upgrade status failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn pg_sync_runtime_config(
+    state: &PostgresServerState,
+) -> Result<serde_json::Value, sqlx::Error> {
+    use sqlx::Row;
+    let settings=sqlx::query_scalar::<_,serde_json::Value>("SELECT jsonb_build_object('sync_auto_fetch_interval_minutes',sync_auto_fetch_interval_minutes,'sync_auto_fetch_effective_at',sync_auto_fetch_effective_at,'star_sync_delta_interval_minutes',star_sync_delta_interval_minutes,'star_sync_full_sweep_interval_minutes',star_sync_full_sweep_interval_minutes,'retry_recent_failures_interval_minutes',retry_recent_failures_interval_minutes,'repo_release_worker_concurrency',repo_release_worker_concurrency,'repo_refresh_system_budget_per_window',repo_refresh_system_budget_per_window,'dashboard_release_freshness_profile',dashboard_release_freshness_profile,'daily_brief_schedule_local_time',daily_brief_schedule_local_time) FROM public.admin_runtime_settings WHERE id=1").fetch_one(&state.runtime.pool).await?;
+    let delta=sqlx::query_scalar::<_,Option<String>>("SELECT MAX(finished_at)::text FROM public.job_tasks WHERE task_type='sync.starred.delta' AND status='succeeded'").fetch_one(&state.runtime.pool).await?;
+    let full = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(completed_at)::text FROM public.star_sync_epochs WHERE status='succeeded'",
     )
+    .fetch_one(&state.runtime.pool)
+    .await?;
+    let epochs=sqlx::query("SELECT github_connection_id,processed_pages,processed_items,total_count_at_start,next_slice_not_before FROM public.star_sync_epochs WHERE status IN ('queued','running') ORDER BY created_at,id").fetch_all(&state.runtime.pool).await?;
+    let epochs=epochs.into_iter().map(|r|{let items=r.get::<i64,_>("processed_items").max(0);let total=r.get::<Option<i64>,_>("total_count_at_start");json!({"github_connection_id":r.get::<String,_>("github_connection_id"),"processed_pages":r.get::<i64,_>("processed_pages").max(0),"processed_items":items,"total_count_at_start":total,"completion_percent":total.filter(|v|*v>0).map(|v|(items as f64/v as f64*100.0).min(100.0)),"next_slice_not_before":r.get::<Option<String>,_>("next_slice_not_before")})}).collect::<Vec<_>>();
+    let tasks=sqlx::query_scalar::<_,serde_json::Value>(r#"WITH roots AS(SELECT id,status,source,created_at,started_at,finished_at FROM public.job_tasks WHERE task_type='sync.subscriptions' AND CASE WHEN pg_input_is_valid(result_json,'jsonb') THEN COALESCE((result_json::jsonb->>'skipped'),'false') NOT IN ('true','1') ELSE true END ORDER BY created_at DESC,id DESC LIMIT 3),chain AS(SELECT id AS root_id,finished_at FROM roots UNION ALL SELECT t.parent_task_id,t.finished_at FROM public.job_tasks t JOIN roots r ON r.id=t.parent_task_id WHERE t.task_type IN ('translate.release.batch','summarize.release.smart.batch')),rollup AS(SELECT root_id,MAX(finished_at) AS finished_at,COUNT(*) FILTER(WHERE finished_at IS NULL) AS unfinished FROM chain GROUP BY root_id) SELECT jsonb_build_object('id',r.id,'status',r.status,'source',r.source,'skipped',false,'duration_ms',CASE WHEN c.unfinished=0 THEN (EXTRACT(EPOCH FROM(c.finished_at-r.created_at))*1000)::bigint ELSE NULL END,'created_at',r.created_at::text,'started_at',r.started_at::text,'finished_at',CASE WHEN c.unfinished=0 THEN c.finished_at::text ELSE NULL END) FROM roots r JOIN rollup c ON c.root_id=r.id ORDER BY r.created_at DESC,r.id DESC"#).fetch_all(&state.runtime.pool).await?;
+    let mut body = settings;
+    body["star_sync"] = json!({"last_delta_completed_at":delta,"last_full_sweep_completed_at":full,"active_epochs":epochs});
+    body["recent_sync_tasks"] = json!(tasks);
+    Ok(body)
+}
+
+async fn admin_sync_runtime_config(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    match pg_sync_runtime_config(&state).await {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL sync runtime read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PgGovernanceQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    query: Option<String>,
+    aging: Option<String>,
+    target_windows: Option<String>,
+    urgency_min: Option<f64>,
+    urgency_max: Option<f64>,
+}
+async fn admin_repo_governance(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<PgGovernanceQuery>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let size = query.page_size.unwrap_or(100).clamp(1, 500);
+    let text = query.query.unwrap_or_default().trim().to_lowercase();
+    let aging = query.aging.unwrap_or_else(|| "all".to_owned());
+    let windows = query
+        .target_windows
+        .unwrap_or_default()
+        .split(',')
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>();
+    let valid = query.urgency_min.is_none_or(|v| v.is_finite() && v >= 0.0)
+        && query.urgency_max.is_none_or(|v| v.is_finite() && v >= 0.0)
+        && !matches!((query.urgency_min,query.urgency_max),(Some(a),Some(b)) if a>b);
+    let windows = match windows {
+        Ok(w)
+            if w.iter().all(|v| *v > 0)
+                && valid
+                && matches!(aging.as_str(), "all" | "stale" | "missing") =>
+        {
+            w
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"code":"bad_request","message":"invalid governance filter"})),
+            )
+                .into_response();
+        }
+    };
+    let result=async{
+        let filter=" WHERE ($1='' OR lower(repo_full_name) LIKE $2) AND ($3='all' OR ($3='stale' AND actual_last_success_at::timestamptz <= now()-interval '1 day') OR ($3='missing' AND actual_last_success_at IS NULL)) AND (cardinality($4::bigint[])=0 OR target_window=ANY($4)) AND ($5::float8 IS NULL OR urgency_score >= $5) AND ($6::float8 IS NULL OR urgency_score <= $6)";
+        let count=format!("SELECT COUNT(*) FROM public.repo_refresh_governance_snapshots {filter}");let pattern=format!("%{text}%");
+        let total=sqlx::query_scalar::<_,i64>(&count).bind(&text).bind(&pattern).bind(&aging).bind(&windows).bind(query.urgency_min).bind(query.urgency_max).fetch_one(&state.runtime.pool).await?;
+        let sql=format!("SELECT to_jsonb(item) FROM (SELECT repo_id,repo_full_name,watcher_user_count,watcher_repo_total_sum,cached_stargazer_count,priority_rank,target_window,target_interval_minutes,urgency_score,urgency_bucket,system_last_selected_at,system_last_success_at,system_last_attempt_at,system_last_attempt_status,system_last_attempt_error,actual_last_success_at,actual_last_success_source FROM public.repo_refresh_governance_snapshots {filter} ORDER BY urgency_score DESC,priority_rank,repo_id LIMIT $7 OFFSET $8) item");
+        let items=sqlx::query_scalar::<_,serde_json::Value>(&sql).bind(&text).bind(&pattern).bind(&aging).bind(&windows).bind(query.urgency_min).bind(query.urgency_max).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
+        let options=sqlx::query_scalar::<_,serde_json::Value>("SELECT jsonb_build_object('target_window',target_window,'repo_count',COUNT(*)) FROM public.repo_refresh_governance_snapshots GROUP BY target_window ORDER BY target_window").fetch_all(&state.runtime.pool).await?;
+        Ok::<_,sqlx::Error>(json!({"items":items,"page":page,"page_size":size,"total":total,"target_window_options":options}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL governance list failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_repo_governance_overview(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async{
+        let settings=pg_sync_runtime_config(&state).await?;
+        let budget=settings["repo_refresh_system_budget_per_window"].as_i64().unwrap_or(1).max(1);
+        let count=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM public.repo_refresh_governance_snapshots").fetch_one(&state.runtime.pool).await?;
+        let pressure=sqlx::query_scalar::<_,f64>("SELECT COALESCE(SUM(GREATEST(0.0,LEAST(COALESCE(urgency_score,1),4.0)-1.0))/$1::float8,0) FROM public.repo_refresh_governance_snapshots").bind(budget as f64).fetch_one(&state.runtime.pool).await?;
+        let last=sqlx::query_scalar::<_,Option<String>>("SELECT completed_at FROM public.repo_refresh_governance_cycles WHERE status='completed' ORDER BY completed_at DESC,updated_at DESC LIMIT 1").fetch_optional(&state.runtime.pool).await?.flatten();
+        let cycle=sqlx::query_scalar::<_,serde_json::Value>("SELECT jsonb_build_object('active_cycle_id',id,'active_cycle_started_at',started_at,'active_cycle_repo_count',frozen_repo_count,'active_cycle_completed_count',completed_repo_count,'active_cycle_window_minutes',window_minutes,'active_cycle_window_budget',window_budget,'active_cycle_last_selection_window_index',last_selection_window_index) FROM public.repo_refresh_governance_cycles WHERE status='active' ORDER BY started_at DESC LIMIT 1").fetch_optional(&state.runtime.pool).await?.unwrap_or(json!({"active_cycle_id":null,"active_cycle_started_at":null,"active_cycle_repo_count":0,"active_cycle_completed_count":0,"active_cycle_window_minutes":null,"active_cycle_window_budget":null,"active_cycle_last_selection_window_index":null}));
+        let rows=sqlx::query("SELECT repo_id,actual_last_success_at,target_window,target_interval_minutes,urgency_score,system_last_attempt_status FROM public.repo_refresh_governance_snapshots ORDER BY priority_rank,repo_id").fetch_all(&state.runtime.pool).await?;
+        let cells=rows.into_iter().map(|r|{
+            let last:Option<String>=r.get("actual_last_success_at");let age=last.as_deref().and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).map(|t|Utc::now().signed_duration_since(t.with_timezone(&Utc)).num_minutes());
+            let bucket=match age{Some(v) if v<=30=>"fresh",Some(v) if v<=360=>"warm",Some(v) if v<=1440=>"aging",Some(_)=>"stale",None=>"unknown"};
+            json!({"repo_id":r.get::<i64,_>("repo_id"),"age_bucket":bucket,"band_label":format!("W{} · {} 分钟",r.get::<i64,_>("target_window"),r.get::<i64,_>("target_interval_minutes")),"urgency_score":r.get::<f64,_>("urgency_score"),"system_attempt_status":r.get::<Option<String>,_>("system_last_attempt_status")})
+        }).collect::<Vec<_>>();
+        Ok::<_,sqlx::Error>(json!({"summary":{"dedup_repo_count":count,"pressure_windows":pressure,"last_full_cycle_completed_at":last},"cycle":cycle,"settings":settings,"grid_cells":cells}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL governance overview failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_translation_batch_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(batch_id): Path<String>,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result=async{
+        let batch=sqlx::query_as::<_,crate::translations::AdminTranslationBatchRow>("SELECT id,status,trigger_reason,worker_slot::bigint AS worker_slot,request_count::bigint AS request_count,item_count::bigint AS item_count,estimated_input_tokens::bigint AS estimated_input_tokens,error_text,created_at::text AS created_at,started_at::text AS started_at,finished_at::text AS finished_at,updated_at::text AS updated_at FROM public.translation_batches WHERE id=$1").bind(&batch_id).fetch_optional(&state.runtime.pool).await?;
+        let Some(batch)=batch else{return Ok::<_,sqlx::Error>(None)};
+        let rows=sqlx::query("SELECT w.id AS work_item_id,b.entity_id,b.kind,b.variant,CASE WHEN b.result_status IS NOT NULL AND b.result_status!='' THEN b.result_status WHEN w.result_status IS NOT NULL AND w.result_status!='' THEN w.result_status WHEN w.status='queued' OR w.status IS NULL THEN 'queued' ELSE 'running' END AS result_status,w.title_zh,w.summary_md,w.body_md,COALESCE(b.error_text,w.error_text) AS error_text,(SELECT MIN(r.producer_ref) FROM public.translation_requests r WHERE r.work_item_id=w.id) AS producer_ref FROM public.translation_batch_items b JOIN public.translation_work_items w ON w.id=b.work_item_id WHERE b.batch_id=$1 ORDER BY b.item_index,w.id").bind(&batch_id).fetch_all(&state.runtime.pool).await?;
+        let mut summary=crate::translations::AdminTranslationBatchResultSummary::default();
+        let mut items=Vec::new();
+        for row in rows{
+            let status:String=row.try_get("result_status")?;match status.as_str(){"ready"=>summary.ready+=1,"error"=>summary.error+=1,"missing"=>summary.missing+=1,"disabled"=>summary.disabled+=1,"queued"=>summary.queued+=1,"running"=>summary.running+=1,_=>{}}
+            let item=crate::translations::TranslationResultItem{producer_ref:row.try_get::<Option<String>,_>("producer_ref")?.unwrap_or_else(||"(shared)".to_owned()),entity_id:row.try_get("entity_id")?,kind:row.try_get("kind")?,variant:row.try_get("variant")?,status,title_zh:row.try_get("title_zh")?,summary_md:row.try_get("summary_md")?,body_md:row.try_get("body_md")?,reading:None,error:row.try_get("error_text")?,work_item_id:Some(row.try_get("work_item_id")?),batch_id:Some(batch_id.clone())};
+            items.push(crate::translations::admin_translation_result_item(item));
+        }
+        let calls=sqlx::query_as::<_,crate::translations::AdminTranslationLinkedLlmCall>("SELECT id,status,source,model,scheduler_wait_ms,duration_ms,created_at::text AS created_at FROM public.llm_calls WHERE parent_translation_batch_id=$1 ORDER BY created_at DESC,id DESC").bind(&batch_id).fetch_all(&state.runtime.pool).await?;
+        Ok(Some(json!({"batch":batch.into_list_item(summary),"items":items,"llm_calls":calls})))
+    }.await;
+    match result {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"code":"not_found"}))).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL translation batch detail failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn admin_task_log(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> axum::response::Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let result = async {
+        let path = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT log_file_path FROM public.job_tasks WHERE id=$1",
+        )
+        .bind(&task_id)
+        .fetch_optional(&state.runtime.pool)
+        .await?
+        .flatten();
+        Ok::<_, sqlx::Error>(path)
+    }
+    .await;
+    match result {
+        Ok(Some(path)) => match tokio::fs::File::open(path).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncReadExt;
+                let stream = async_stream::stream! {let mut buffer=[0_u8;16384];loop{match file.read(&mut buffer).await{Ok(0)=>break,Ok(n)=>yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::copy_from_slice(&buffer[..n])),Err(e)=>{yield Err(e);break}}}};
+                let mut response =
+                    axum::response::Response::new(axum::body::Body::from_stream(stream));
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-ndjson"),
+                );
+                if task_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && let Ok(value) =
+                        HeaderValue::from_str(&format!("attachment; filename=\"{task_id}.ndjson\""))
+                {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CONTENT_DISPOSITION, value);
+                }
+                response
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"code":"not_found","message":"task log not found"})),
+            )
+                .into_response(),
+            Err(error) => {
+                warn!(%error,"PostgreSQL task log open failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"code":"log_read_failed"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code":"not_found","message":"task log not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL task log lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PgFreshnessQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    decision: Option<String>,
+    reason: Option<String>,
+}
+async fn admin_release_freshness(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Path(task_id): Path<String>,
+    Query(query): Query<PgFreshnessQuery>,
+) -> axum::response::Response {
+    use sqlx::Row;
+    if let Err(status) = require_admin(&state, &session).await {
+        return (status, Json(json!({"code":"admin_required"}))).into_response();
+    }
+    let kind =
+        sqlx::query_scalar::<_, String>("SELECT task_type FROM public.job_tasks WHERE id=$1")
+            .bind(&task_id)
+            .fetch_optional(&state.runtime.pool)
+            .await;
+    match kind{Ok(Some(kind)) if kind=="sync.access_refresh"=>{},Ok(Some(_))=>return(StatusCode::BAD_REQUEST,Json(json!({"code":"bad_request","message":"release freshness audit is only available for sync.access_refresh tasks"}))).into_response(),Ok(None)=>return(StatusCode::NOT_FOUND,Json(json!({"code":"not_found"}))).into_response(),Err(error)=>{warn!(%error,"PostgreSQL freshness task lookup failed");return(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"code":"database_error"}))).into_response();}}
+    let decision = query.decision.unwrap_or_default().trim().to_owned();
+    let reason = query.reason.unwrap_or_default().trim().to_owned();
+    if !matches!(
+        decision.as_str(),
+        "" | "fetch" | "reused_fresh" | "reused_running"
+    ) || reason.len() > 64
+        || !reason
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"code":"bad_request"}))).into_response();
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let result=async{
+        let filter=" WHERE rw.task_id=$1 AND ($2='' OR rw.freshness_decision=$2) AND ($3='' OR CASE WHEN pg_input_is_valid(rw.freshness_assessment_json,'jsonb') THEN (rw.freshness_assessment_json::jsonb->'reason_codes') ? $3 ELSE false END)";
+        let total=sqlx::query_scalar::<_,i64>(&format!("SELECT COUNT(*) FROM public.repo_release_watchers rw {filter}")).bind(&task_id).bind(&decision).bind(&reason).fetch_one(&state.runtime.pool).await?;
+        let sql=format!("SELECT wi.repo_id,wi.repo_full_name,rw.status,rw.reused_fresh,rw.freshness_window_minutes,rw.freshness_decision,rw.freshness_assessment_json,wi.last_success_at,rw.error_text FROM public.repo_release_watchers rw JOIN public.repo_release_work_items wi ON wi.id=rw.work_item_id {filter} ORDER BY wi.repo_id,rw.id LIMIT $4 OFFSET $5");
+        let rows=sqlx::query(&sql).bind(&task_id).bind(&decision).bind(&reason).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
+        let items=rows.into_iter().map(|r|{let raw:Option<String>=r.get("freshness_assessment_json");let assessment=raw.and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok());let last=assessment.as_ref().and_then(|a|a["last_success_at"].as_str()).map(str::to_owned).or(r.get::<Option<String>,_>("last_success_at"));json!({"repo_id":r.get::<i64,_>("repo_id"),"repo_full_name":r.get::<String,_>("repo_full_name"),"status":r.get::<String,_>("status"),"reused_fresh":r.get::<i64,_>("reused_fresh")!=0,"freshness_window_minutes":r.get::<Option<i64>,_>("freshness_window_minutes"),"freshness_decision":r.get::<Option<String>,_>("freshness_decision"),"assessment":assessment,"last_success_at":last,"error_text":r.get::<Option<String>,_>("error_text")})}).collect::<Vec<_>>();
+        Ok::<_,sqlx::Error>(json!({"items":items,"page":page,"page_size":size,"total":total}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => {
+            warn!(%error,"PostgreSQL freshness audit failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code":"database_error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn submit_translation_request(

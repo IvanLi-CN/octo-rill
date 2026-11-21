@@ -3,7 +3,7 @@ use sqlx::{PgPool, migrate::Migrator};
 
 /// PostgreSQL keeps an independent SQLx migration history. The SQLite
 /// `_sqlx_migrations` table is deliberately never read or reused here.
-static MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg");
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg/");
 
 pub async fn run(pool: &PgPool) -> Result<()> {
     let mut tx = crate::postgres_write::begin(pool)
@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 9);
+        assert_eq!(MIGRATOR.iter().count(), 17);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -53,6 +53,18 @@ mod tests {
             .find(|migration| migration.version == 9)
             .expect("brief migration");
         assert!(brief.sql.contains("briefs"));
+        let application = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 15)
+            .expect("application schema migration");
+        assert!(application.sql.contains("public.repo_releases"));
+        assert!(application.sql.contains("public.user_repo_associations"));
+        assert!(
+            application
+                .sql
+                .contains("CREATE OR REPLACE VIEW public.user_release_visible_repos")
+        );
+        assert!(!application.sql.contains("OWNER TO"));
         let baseline = MIGRATOR.iter().next().expect("runtime baseline");
         for table in [
             "public.users",

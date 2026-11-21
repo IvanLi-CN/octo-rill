@@ -1,45 +1,94 @@
+// The runtime serves PostgreSQL only. These modules keep the legacy SQLite
+// implementation and its operators readable until the deletion backlog
+// (仓库外运维记录) removes them; nothing in them
+// is reachable from `main`, so their absence of callers is expected rather
+// than dead code to delete in the persistence cutover.
+#[allow(dead_code)]
 mod admin_ai_records;
+#[allow(dead_code)]
 mod admin_runtime;
+#[allow(dead_code)]
 mod ai;
+#[allow(dead_code)]
 mod api;
+#[allow(dead_code)]
 mod api_keys;
+#[allow(dead_code)]
 mod auth;
+#[allow(dead_code)]
 mod briefs;
 mod config;
+#[allow(dead_code)]
 mod content_identity_upgrade;
+#[allow(dead_code)]
 mod content_processing;
 mod crypto;
+#[allow(dead_code)]
 mod database_migrations;
+#[allow(dead_code)]
 mod error;
+#[allow(dead_code)]
 mod github;
+mod github_api;
+#[allow(dead_code)]
 mod jobs;
+#[allow(dead_code)]
 mod linuxdo;
 mod local_id;
+#[allow(dead_code)]
 mod metrics;
 mod observability;
+#[allow(dead_code)]
 mod online_migrations;
+#[allow(dead_code)]
 mod passkeys;
+mod postgres_admin_actions;
+mod postgres_admin_ai_records;
+mod postgres_admin_llm;
+mod postgres_auth_ext;
+mod postgres_content_overlay;
+mod postgres_dashboard;
 mod postgres_database_migrations;
 mod postgres_jobs;
+mod postgres_reactions;
+mod postgres_repo_release_fetch;
+mod postgres_repo_release_worker;
+mod postgres_repo_releases;
 mod postgres_runtime;
 mod postgres_runtime_owner;
+mod postgres_scheduler;
 mod postgres_server;
+mod postgres_star_epochs;
 mod postgres_tasks;
+mod postgres_translate;
+mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
+#[allow(dead_code)]
 mod public_metrics;
+#[allow(dead_code)]
 mod release_links;
+#[allow(dead_code)]
 mod runtime;
 mod search;
+#[allow(dead_code)]
 mod search_index;
+#[allow(dead_code)]
 mod server;
+#[allow(dead_code)]
 mod session_store;
+#[allow(dead_code)]
 mod sqlite_write;
+#[allow(dead_code)]
 mod state;
+#[allow(dead_code)]
 mod sync;
+#[allow(dead_code)]
 mod translations;
 mod version;
+#[allow(dead_code)]
 mod webhook_push;
+#[allow(dead_code)]
 mod worker_backoff;
 
 use anyhow::Result;
@@ -82,9 +131,26 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        if let Ok(lane) = std::env::var("OCTORILL_PG_SCHEDULER_TICK") {
+            let now = match std::env::var("OCTORILL_PG_SCHEDULER_NOW") {
+                Ok(raw) => {
+                    chrono::DateTime::parse_from_rfc3339(raw.trim())?.with_timezone(&chrono::Utc)
+                }
+                Err(_) => chrono::Utc::now(),
+            };
+            let defaults = postgres_scheduler::SchedulerDefaults::from_config(&config);
+            let enqueued =
+                postgres_scheduler::run_lane_once(&runtime.pool, lane.trim(), &defaults, now)
+                    .await?;
+            tracing::info!(lane = %lane, enqueued, "PostgreSQL scheduler lane tick applied");
+        }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
         return Ok(());
     }
-    server::serve(config).await
+    // PostgreSQL is the only production runtime. The SQLite modules remain
+    // compiled for the offline importer and its regression suites, but a
+    // SQLite DATABASE_URL must fail closed instead of serving traffic.
+    config.require_postgres()?;
+    postgres_server::serve_postgres(config).await
 }
