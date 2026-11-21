@@ -3933,7 +3933,15 @@ async fn health(State(state): State<PostgresServerState>) -> impl IntoResponse {
         .fetch_one(&state.runtime.pool)
         .await
     {
-        Ok(_) => (StatusCode::OK, axum::Json(json!({"ok": true}))),
+        Ok(_) => {
+            // The release smoke asserts the effective version here, matching
+            // the legacy `/api/health` payload.
+            let info = crate::version::resolve_effective_version();
+            (
+                StatusCode::OK,
+                axum::Json(json!({"ok": true, "version": info.version})),
+            )
+        }
         Err(error) => {
             warn!(%error, owner_id = %state.owner_id, "PostgreSQL health probe failed");
             (
