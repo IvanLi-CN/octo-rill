@@ -505,11 +505,14 @@ impl TaskExecutor for WebhookExecutor {
         // records the check time; without this the demand stays outstanding and
         // every scheduler tick enqueues another manage task for the same user.
         let completed_at = Utc::now().to_rfc3339();
+        // Only an account-wide pass advances the completion timestamp; a
+        // repo-scoped or pause/delete pass never checked the whole account.
+        let account_wide = payload.get("repo_id").is_none_or(Value::is_null);
         acknowledge_reconcile_generation(
             &self.pool,
             &user_id,
             payload.get("demand_generation").and_then(Value::as_i64),
-            &completed_at,
+            account_wide.then_some(completed_at.as_str()),
         )
         .await?;
         Ok(json!({"user_id": user_id, "desired_state": desired_state, "registered": registered, "removed": removed}).to_string())
@@ -522,7 +525,7 @@ async fn acknowledge_reconcile_generation(
     pool: &PgPool,
     user_id: &str,
     generation: Option<i64>,
-    completed_at: &str,
+    account_check_at: Option<&str>,
 ) -> Result<()> {
     let mut transaction = pool
         .begin()
@@ -536,17 +539,21 @@ async fn acknowledge_reconcile_generation(
         )
         .bind(user_id)
         .bind(generation)
-        .bind(completed_at)
+        .bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction)
         .await
         .context("acknowledge PostgreSQL webhook reconcile generation")?;
     }
-    sqlx::query("UPDATE public.users SET webhook_push_last_completed_check_at = $2 WHERE id = $1")
+    if let Some(checked_at) = account_check_at {
+        sqlx::query(
+            "UPDATE public.users SET webhook_push_last_completed_check_at = $2 WHERE id = $1",
+        )
         .bind(user_id)
-        .bind(completed_at)
+        .bind(checked_at)
         .execute(&mut *transaction)
         .await
         .context("record PostgreSQL webhook completion time")?;
+    }
     transaction
         .commit()
         .await

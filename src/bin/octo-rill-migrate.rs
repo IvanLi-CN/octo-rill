@@ -269,6 +269,13 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     pg.batch_execute("COMMIT")
         .await
         .context("commit PostgreSQL runtime baseline")?;
+    // A re-run against the same source may see a shrunken table; the previous
+    // manifest is the only durable record of its earlier size.
+    let previous_manifest: Option<Manifest> = tokio::fs::read(&args.manifest)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+        .filter(|previous| previous.source == args.sqlite_source);
     let mut manifest = Manifest {
         source: args.sqlite_source.clone(),
         target: redact_target(&args.postgres_url),
@@ -387,22 +394,39 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         };
         // A resumed copy only inserts what is missing. If the target still holds
         // rows the source no longer has, this is a source-side delete and the
-        // database must be rebuilt rather than silently diverging.
-        if name != "job_task_events" {
-            let settled: i64 = pg
-                .query_one(
-                    &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
-                    &[],
-                )
-                .await?
-                .get(0);
-            if settled as u64 != rows {
-                let _ = pg.batch_execute("ROLLBACK").await;
-                bail!(
-                    "table {name}: target keeps {settled} rows but source now has {rows}; \
-                     the source deleted rows, so import into a fresh database instead of reusing this one"
-                );
-            }
+        // database must be rebuilt rather than silently diverging. The
+        // append-only event log may legitimately hold more rows than the
+        // snapshot, so only a shrinking source fails there.
+        if let Some(previous) = &previous_manifest
+            && let Some(previous_table) = previous.tables.get(&name)
+            && !previous_table.skipped
+            && source_rows < previous_table.rows as i64
+        {
+            let _ = pg.batch_execute("ROLLBACK").await;
+            bail!(
+                "table {name}: source now has {source_rows} rows but the previous import recorded {}; \
+                 the source deleted rows, so import into a fresh database instead of reusing this one",
+                previous_table.rows
+            );
+        }
+        let settled: i64 = pg
+            .query_one(
+                &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
+                &[],
+            )
+            .await?
+            .get(0);
+        let settled_matches = if name == "job_task_events" {
+            settled >= source_rows
+        } else {
+            settled == source_rows
+        };
+        if !settled_matches {
+            let _ = pg.batch_execute("ROLLBACK").await;
+            bail!(
+                "table {name}: target keeps {settled} rows but source now has {source_rows}; \
+                 the source deleted rows, so import into a fresh database instead of reusing this one"
+            );
         }
         eprintln!(
             "copied table {name}: {rows} rows in {:.1}s",
@@ -580,6 +604,15 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         ) {
             bail!(
                 "verification failed for {name}: source rows {source_rows}, target rows {target_rows}, manifest rows {}",
+                table.rows
+            );
+        }
+        // A source that lost rows fails closed even for the append-only log:
+        // only rows added after the snapshot are tolerated.
+        if source_rows < table.rows as i64 {
+            bail!(
+                "verification failed for {name}: source now has {source_rows} rows but the manifest recorded {}; \
+                 the source deleted rows",
                 table.rows
             );
         }
