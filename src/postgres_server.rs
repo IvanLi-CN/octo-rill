@@ -67,9 +67,12 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     let owner_id: Arc<str> = local_id::generate_local_id().into();
     postgres_runtime_owner::register(&runtime.pool, &owner_id, Utc::now()).await?;
 
+    // GitHub answers 301 for renamed repositories and organisations. The
+    // legacy client followed those redirects; refusing them turned every
+    // renamed repository into a permanent `github_http_error`.
     let http = reqwest::Client::builder()
         .user_agent("OctoRill")
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .context("build PostgreSQL service HTTP client")?;
     let task_registry = TaskExecutorRegistry::builder()
