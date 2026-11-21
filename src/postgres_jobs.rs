@@ -336,7 +336,8 @@ async fn claim_once(
               FROM public.repo_release_sync_state AS backoff
               WHERE backoff.repo_id = CASE
                       WHEN pg_input_is_valid(candidate.payload_json, 'jsonb')
-                      THEN NULLIF(candidate.payload_json::jsonb ->> 'repo_id', '')::bigint
+                        AND (candidate.payload_json::jsonb ->> 'repo_id') ~ '^[0-9]{1,18}$'
+                      THEN (candidate.payload_json::jsonb ->> 'repo_id')::bigint
                     END
                 AND backoff.backoff_until IS NOT NULL
                 AND pg_input_is_valid(backoff.backoff_until, 'timestamptz')

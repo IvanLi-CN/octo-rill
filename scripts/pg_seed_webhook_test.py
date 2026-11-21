@@ -664,6 +664,38 @@ def main():
             )
             assert completed_at != "", completed_at
 
+            # A pause sweep carries no `repo_id` either; it must not advance the
+            # account completion time.
+            sql(
+                "INSERT INTO public.users(id, github_user_id, login, created_at, updated_at,"
+                " is_admin, include_own_releases, webhook_push_enabled, webhook_push_desired_state,"
+                " webhook_push_secret_ciphertext, webhook_push_secret_nonce,"
+                " webhook_push_callback_key)"
+                " VALUES ('seed-pause', 503, 'pause-owner', '2026-01-01T00:00:00Z',"
+                " '2026-01-01T00:00:00Z', 0, 1, 1, 'paused',"
+                f" decode('{ciphertext.hex()}', 'hex'), decode('{nonce.hex()}', 'hex'),"
+                " 'synthetic-pause-key');"
+                "INSERT INTO public.reaction_pat_tokens(user_id, token_ciphertext, token_nonce,"
+                " masked_token, updated_at, owner_github_user_id, owner_login,"
+                " webhook_push_allows_private_repos)"
+                f" VALUES ('seed-pause', decode('{token_ciphertext.hex()}', 'hex'),"
+                f" decode('{nonce.hex()}', 'hex'), 'masked', '2026-01-01T00:00:00Z', 503, 'pause-owner', 1);"
+                "INSERT INTO public.job_tasks(id, task_type, status, source, requested_by,"
+                " payload_json, cancel_requested, created_at, updated_at)"
+                " VALUES ('task-pause-pass', 'webhook.push.manage', 'queued', 'validation',"
+                " 'seed-pause', '{\"user_id\":\"seed-pause\",\"operation\":\"reconcile\","
+                "\"desired_state\":\"paused\"}', 0, now(), now());",
+                database_url,
+            )
+            status, error_message = wait_for_task("task-pause-pass")
+            assert status == "succeeded", (status, error_message)
+            pause_stamp = sql(
+                "SELECT COALESCE(webhook_push_last_completed_check_at, '')"
+                " FROM public.users WHERE id = 'seed-pause'",
+                database_url,
+            )
+            assert pause_stamp == "", pause_stamp
+
             print(
                 json.dumps(
                     {
