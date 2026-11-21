@@ -505,9 +505,11 @@ impl TaskExecutor for WebhookExecutor {
         // records the check time; without this the demand stays outstanding and
         // every scheduler tick enqueues another manage task for the same user.
         let completed_at = Utc::now().to_rfc3339();
-        // Only an account-wide pass advances the completion timestamp; a
-        // repo-scoped or pause/delete pass never checked the whole account.
-        let account_wide = payload.get("repo_id").is_none_or(Value::is_null);
+        // Only an account-wide reconcile advances the completion timestamp: a
+        // repo-scoped pass never checked the account, and a pause/delete sweep
+        // carries `desired_state` but no `repo_id`.
+        let account_wide = payload.get("repo_id").is_none_or(Value::is_null)
+            && payload.get("desired_state").is_none();
         acknowledge_reconcile_generation(
             &self.pool,
             &user_id,

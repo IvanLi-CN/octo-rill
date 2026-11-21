@@ -12,6 +12,7 @@ The suite runs in two phases against one database:
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -561,8 +562,11 @@ def main():
                 database_url,
             )
             assert still_queued == "queued", still_queued
-            # Once the window elapses the deferred delivery is executed.
+            # Once the window elapses both the durable window and the task's
+            # own schedule are released; the deferred delivery then runs.
             sql(
+                "UPDATE public.repo_release_sync_state SET backoff_until = NULL"
+                " WHERE repo_id = 4242;"
                 "UPDATE public.job_tasks SET available_at = now()"
                 " WHERE payload_json LIKE '%delivery-backed-off%'",
                 database_url,
@@ -581,6 +585,42 @@ def main():
             )
             assert json.loads(deferred_release).get("repo_id") == REPO_ID, deferred_release
             assert len(STUB["requests"]) > requests_before, "deferred refresh must reach GitHub"
+
+            # A task that was already queued when the window was written must
+            # wait for the window too; the claim guard owns that decision.
+            future_window = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(minutes=10)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            sql(
+                "UPDATE public.repo_release_sync_state"
+                f" SET backoff_until = '{future_window}' WHERE repo_id = 4242",
+                database_url,
+            )
+            sql(
+                "INSERT INTO public.job_tasks(id, task_type, status, source, requested_by,"
+                " payload_json, cancel_requested, created_at, updated_at)"
+                " VALUES ('task-preexisting-backoff', 'sync.repo_release', 'queued',"
+                " 'validation', 'seed-hook',"
+                ' \'{"user_id":"seed-hook","repo_id":4242,'
+                '"repo_full_name":"owner/repo","reason":"webhook_release",'
+                '"delivery_id":"delivery-preexisting"}\', 0, now(), now())',
+                database_url,
+            )
+            requests_before_preexisting = len(STUB["requests"])
+            time.sleep(1.5)
+            preexisting = sql(
+                "SELECT status FROM public.job_tasks WHERE id = 'task-preexisting-backoff'",
+                database_url,
+            )
+            assert preexisting == "queued", preexisting
+            assert len(STUB["requests"]) == requests_before_preexisting, "backoff must block the claim"
+            sql(
+                "UPDATE public.repo_release_sync_state SET backoff_until = NULL WHERE repo_id = 4242",
+                database_url,
+            )
+            status, error_message = wait_for_task("task-preexisting-backoff")
+            assert status == "succeeded", (status, error_message)
 
             # A completed manage pass must acknowledge its reconcile demand;
             # otherwise the scheduler re-enqueues it on every tick forever.
