@@ -64,7 +64,7 @@ MIGRATION_MANIFEST=/path/manifest.json \
 
 ### T3 切换
 
-1. 新库上以 `OCTORILL_PG_BOOTSTRAP_ONLY=1` 启动一次，确认运行时迁移 0010–0015 已应用。
+1. 新库上以 `OCTORILL_PG_BOOTSTRAP_ONLY=1` 启动一次，确认运行时迁移 0010–0017 已应用。
 2. 部署新镜像/配置：`DATABASE_URL=postgres://...`、`OCTORILL_PG_WORKER_ENABLED=0`、`OCTORILL_PG_SCHEDULER_ENABLED=1`；生产加密密钥与 OAuth 凭据沿用现有 secret。
 3. 启动服务，等待 `/health` 与 `/version`。
 4. 冒烟通过后再单独打开 worker（见 T3.5），避免带存量 14,616 条 `repo_release_work_items` 与七个 lane 同时冲 GitHub。

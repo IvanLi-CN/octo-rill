@@ -229,7 +229,6 @@ pub(crate) async fn fetch_releases(
 
     let mut first_failure: Option<RefreshFailure> = None;
     let mut upstream_failure: Option<RefreshFailure> = None;
-    let mut credentials_exhausted = true;
     for candidate in &candidates {
         match fetch_for_user(
             pool,
@@ -275,15 +274,17 @@ pub(crate) async fn fetch_releases(
                 first_failure.get_or_insert(failure);
                 if !rotates {
                     // Not a credential problem: another candidate token would
-                    // hit the same upstream condition.
-                    credentials_exhausted = false;
+                    // hit the same upstream condition. The anonymous read can
+                    // still succeed, so stop rotating but keep the fallback.
                     break;
                 }
             }
         }
     }
 
-    if public_usage.needs_public_fallback && credentials_exhausted {
+    // Legacy attempted the anonymous read after any candidate failure, so a
+    // rate-limited or throttled token does not hide a public repository.
+    if public_usage.needs_public_fallback {
         match fetch_public(http, request, sync_state.as_ref()).await {
             Ok(fetch) => {
                 return Ok(ReleaseFetchOutcome {
@@ -339,6 +340,14 @@ async fn load_candidate_user_ids(
               FROM public.starred_repos st
               WHERE st.user_id = u.id
                 AND st.repo_id = $1
+                -- An association row is the user's explicit follow state:
+                -- a residual star must not nominate an unfollowed user.
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM public.user_repo_associations ura
+                  WHERE ura.user_id = u.id
+                    AND ura.repo_full_name_lower = lower(st.full_name)
+                )
             )
             OR EXISTS (
               SELECT 1

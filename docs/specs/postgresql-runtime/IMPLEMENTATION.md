@@ -12,7 +12,7 @@
 
 - `REQ-PGR-001`: `src/main.rs` 固定 `postgres_server::serve_postgres`，SQLite URL 失败关闭。
 - `REQ-PGR-002`: `src/bin/octo-rill-migrate.rs`（`preflight`/`import`/`verify`/`rebuild`），逐表行数与摘要校验，删除/内容变化失败关闭。
-- `REQ-PGR-003`: `migrations_pg/0010`–`0016`；`0015_application_tables.sql` 提供 59 表 + 3 视图，`0016_normalize_flag_columns.sql` 归一导入库的布尔列。
+- `REQ-PGR-003`: `migrations_pg/0010`–`0017`；`0015_application_tables.sql` 提供 59 表 + 3 视图，`0016_normalize_flag_columns.sql` 归一导入库的布尔列。
 - `REQ-PGR-004`: `src/postgres_jobs.rs`、`src/postgres_worker.rs`、`src/postgres_scheduler.rs`、`src/postgres_runtime_owner.rs`。
 - `REQ-PGR-005`: `src/postgres_repo_release_fetch.rs`（共享判定）、`src/postgres_repo_release_worker.rs`（单仓任务）、`src/postgres_tasks.rs::ReleasesExecutor`（账号级有界并发）。
 - `REQ-PGR-006`: `src/postgres_content_overlay.rs`。

@@ -539,9 +539,74 @@ def main():
             )
             assert failed_watcher == "failed", failed_watcher
 
+            # The persisted backoff window must be honoured: a delivery that
+            # arrives during it is acknowledged without another upstream call.
+            STUB["fail_status"] = 0
+            requests_before = len(STUB["requests"])
+            code, body = post(release_payload(), base, delivery="delivery-backed-off")
+            assert code == 200 and body["queued"] is True, (code, body)
+            backed_off_state = delivery_state("delivery-backed-off")
+            assert backed_off_state[0] == "queued" and backed_off_state[1], backed_off_state
+            backed_off_task_id = backed_off_state[1]
+            status, error_message = wait_for_task(backed_off_task_id)
+            assert status == "succeeded", (status, error_message)
+            backed_off = json.loads(
+                sql(
+                    "SELECT COALESCE(result_json, '{}') FROM public.job_tasks"
+                    f" WHERE id = '{backed_off_task_id}'",
+                    database_url,
+                )
+            )
+            assert backed_off["stopped_reason"] == "backoff", backed_off
+            assert backed_off["backoff_until"], backed_off
+            assert len(STUB["requests"]) == requests_before, STUB["requests"][requests_before:]
+
+            # A completed manage pass must acknowledge its reconcile demand;
+            # otherwise the scheduler re-enqueues it on every tick forever.
+            sql(
+                "INSERT INTO public.users(id, github_user_id, login, created_at, updated_at,"
+                " is_admin, include_own_releases, webhook_push_enabled, webhook_push_desired_state,"
+                " webhook_push_secret_ciphertext, webhook_push_secret_nonce,"
+                " webhook_push_callback_key)"
+                " VALUES ('seed-ack', 502, 'ack-owner', '2026-01-01T00:00:00Z',"
+                " '2026-01-01T00:00:00Z', 0, 1, 1, 'enabled',"
+                f" decode('{ciphertext.hex()}', 'hex'), decode('{nonce.hex()}', 'hex'),"
+                " 'synthetic-ack-key');"
+                "INSERT INTO public.reaction_pat_tokens(user_id, token_ciphertext, token_nonce,"
+                " masked_token, updated_at, owner_github_user_id, owner_login,"
+                " webhook_push_allows_private_repos)"
+                f" VALUES ('seed-ack', decode('{token_ciphertext.hex()}', 'hex'),"
+                f" decode('{nonce.hex()}', 'hex'), 'masked', '2026-01-01T00:00:00Z', 502, 'ack-owner', 1);"
+                "INSERT INTO public.webhook_push_reconcile_demands(user_id,"
+                " requested_generation, completed_generation, requested_at, updated_at)"
+                " VALUES ('seed-ack', 3, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+                "INSERT INTO public.job_tasks(id, task_type, status, source, requested_by,"
+                " payload_json, cancel_requested, created_at, updated_at)"
+                " VALUES ('task-reconcile-ack', 'webhook.push.manage', 'queued', 'validation',"
+                " 'seed-ack', '{\"user_id\":\"seed-ack\",\"operation\":\"reconcile\","
+                "\"repo_id\":null,\"demand_generation\":3,\"retry_repo_ids\":[],"
+                "\"scheduled\":false,\"retry_count\":0}', 0, now(), now());",
+                database_url,
+            )
+            status, error_message = wait_for_task("task-reconcile-ack")
+            assert status == "succeeded", (status, error_message)
+            demand = sql(
+                "SELECT requested_generation || '|' || completed_generation"
+                " FROM public.webhook_push_reconcile_demands WHERE user_id = 'seed-ack'",
+                database_url,
+            )
+            assert demand == "3|3", demand
+            completed_at = sql(
+                "SELECT COALESCE(webhook_push_last_completed_check_at, '')"
+                " FROM public.users WHERE id = 'seed-ack'",
+                database_url,
+            )
+            assert completed_at != "", completed_at
+
             print(
                 json.dumps(
                     {
+                        "reconcile_generation_acknowledged": "pass",
                         "signature_verification": "pass",
                         "unknown_key_acknowledged": "pass",
                         "payload_validation": "pass",
@@ -552,6 +617,7 @@ def main():
                         "repo_release_worker_persistence": "pass",
                         "repo_release_conditional_refresh": "pass",
                         "repo_release_failure_classification": "pass",
+                        "repo_release_backoff_honoured": "pass",
                     }
                 )
             )

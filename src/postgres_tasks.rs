@@ -501,8 +501,57 @@ impl TaskExecutor for WebhookExecutor {
                 .await?;
             }
         }
+        // Completing the pass acknowledges the generation that requested it and
+        // records the check time; without this the demand stays outstanding and
+        // every scheduler tick enqueues another manage task for the same user.
+        let completed_at = Utc::now().to_rfc3339();
+        acknowledge_reconcile_generation(
+            &self.pool,
+            &user_id,
+            payload.get("demand_generation").and_then(Value::as_i64),
+            &completed_at,
+        )
+        .await?;
         Ok(json!({"user_id": user_id, "desired_state": desired_state, "registered": registered, "removed": removed}).to_string())
     }
+}
+
+/// Mark the reconcile demand generation as completed and advance the user's
+/// last completed check time in one transaction.
+async fn acknowledge_reconcile_generation(
+    pool: &PgPool,
+    user_id: &str,
+    generation: Option<i64>,
+    completed_at: &str,
+) -> Result<()> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("begin webhook reconcile acknowledgement")?;
+    if let Some(generation) = generation {
+        sqlx::query(
+            "UPDATE public.webhook_push_reconcile_demands
+             SET completed_generation = GREATEST(completed_generation, $2), updated_at = $3
+             WHERE user_id = $1 AND requested_generation >= $2",
+        )
+        .bind(user_id)
+        .bind(generation)
+        .bind(completed_at)
+        .execute(&mut *transaction)
+        .await
+        .context("acknowledge PostgreSQL webhook reconcile generation")?;
+    }
+    sqlx::query("UPDATE public.users SET webhook_push_last_completed_check_at = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(completed_at)
+        .execute(&mut *transaction)
+        .await
+        .context("record PostgreSQL webhook completion time")?;
+    transaction
+        .commit()
+        .await
+        .context("commit webhook reconcile acknowledgement")?;
+    Ok(())
 }
 
 async fn ensure_github_hook(

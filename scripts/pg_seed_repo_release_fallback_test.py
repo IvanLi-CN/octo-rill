@@ -49,6 +49,8 @@ GAMMA_REPO = 4444
 GAMMA_FULL_NAME = "private/gamma"
 DELTA_REPO = 4545
 DELTA_FULL_NAME = "private/delta"
+EPSILON_REPO = 4646
+EPSILON_FULL_NAME = "public/epsilon"
 
 ETAG = '"stub-releases-v1"'
 
@@ -64,6 +66,9 @@ STUB = {
     "requests": [],
     # Concurrency probe: every `/pace` read sleeps so overlapping requests show
     # up as `max_in_flight`.
+    # Repositories whose authenticated read is throttled; the anonymous read
+    # must still be attempted.
+    "rate_limited": set(),
     "delay_seconds": 0.25,
     "in_flight": 0,
     "max_in_flight": 0,
@@ -109,6 +114,14 @@ class StubGithubHandler(BaseHTTPRequestHandler):
                 "if_none_match": self.headers.get("If-None-Match"),
             }
         )
+        if full_name in STUB["rate_limited"] and authorization:
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("X-RateLimit-Remaining", "0")
+            self.send_header("X-RateLimit-Reset", "9999999999")
+            self.end_headers()
+            self.wfile.write(b'{"message":"API rate limit exceeded"}')
+            return
         with STUB["lock"]:
             STUB["in_flight"] += 1
             STUB["max_in_flight"] = max(STUB["max_in_flight"], STUB["in_flight"])
@@ -317,6 +330,18 @@ def main():
                 association(PACE_USER, repo_id, full_name)
                 for repo_id, full_name in PACE_REPOS
             ),
+            association(PAYLOAD_USER, EPSILON_REPO, EPSILON_FULL_NAME),
+            usage(EPSILON_REPO, EPSILON_FULL_NAME, "github_public", status="ready"),
+            task(
+                "task-epsilon",
+                "sync.repo_release",
+                {
+                    "user_id": PAYLOAD_USER,
+                    "repo_id": EPSILON_REPO,
+                    "repo_full_name": EPSILON_FULL_NAME,
+                    "reason": "fallback_probe",
+                },
+            ),
             task("task-account", "sync.releases", {"user_id": ACCOUNT_USER}),
             task("task-pace", "sync.releases", {"user_id": PACE_USER}),
         ]
@@ -336,6 +361,12 @@ def main():
                 github_release(DELTA_FULL_NAME, "v4.0.0", 9004, "2026-11-18T00:00:00Z")
             ],
         }
+        STUB["rate_limited"].add(EPSILON_FULL_NAME)
+        STUB["public"].add(EPSILON_FULL_NAME)
+        STUB["tokens"][EPSILON_FULL_NAME] = set()
+        STUB["releases"][EPSILON_FULL_NAME] = [
+            github_release(EPSILON_FULL_NAME, "v5.0.0", 9005, "2026-11-18T00:00:00Z")
+        ]
         for pace_repo_id, pace_full_name in PACE_REPOS:
             STUB["public"].add(pace_full_name)
             STUB["tokens"][pace_full_name] = set()
@@ -513,6 +544,16 @@ def main():
             assert set(failed) == {GAMMA_FULL_NAME}, account
             assert failed[GAMMA_FULL_NAME]["reason_code"] == "repo_inaccessible", account
 
+            # --- a throttled token still reaches the public fallback ---------
+            status, error_message, result_json = wait_for("task-epsilon")
+            assert status == "succeeded", (status, error_message, result_json)
+            epsilon = json.loads(result_json)
+            assert epsilon["via"] == "public", epsilon
+            assert "candidate_user_id" not in epsilon, epsilon
+            epsilon_auth = [r["authorization"] for r in requests_for(EPSILON_FULL_NAME)]
+            assert epsilon_auth[:2] == [f"Bearer {PAYLOAD_TOKEN}", None], epsilon_auth
+            assert usage_status(EPSILON_REPO).split("|")[0] == "ready", usage_status(EPSILON_REPO)
+
             # --- account lane is bounded, not serial ------------------------
             status, error_message, result_json = wait_for("task-pace")
             assert status == "succeeded", (status, error_message, result_json)
@@ -549,6 +590,7 @@ def main():
                         "usage_status_transitions": "pass",
                         "account_lane_resilience": "pass",
                         "account_lane_concurrency": "pass",
+                        "throttled_token_public_fallback": "pass",
                     }
                 )
             )

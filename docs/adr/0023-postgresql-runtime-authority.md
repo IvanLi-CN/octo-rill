@@ -12,7 +12,7 @@ OctoRill 的运行时持久化长期只有 SQLite 单写入调度层。`docs/pos
 
 - 生产运行时的持久化权威是 PostgreSQL。`DATABASE_URL` 指向 SQLite 时进程启动即失败关闭，不存在“可回退的双写运行态”。
 - 迁移输入是 SQLite 快照，不是运行中的数据库；导入只允许写入**新建**的 PostgreSQL 库。导入器按表校验行数与确定性摘要，源侧删除与内容变更一律失败关闭并提示导入新库；中断后的重入仍使用同一目标库补齐。
-- SQLite 的 `_sqlx_migrations` 历史不参与 PostgreSQL。运行时迁移由 `migrations_pg/` 独立维护，已发布迁移不可修改；导入库与空库通过 `0010`–`0016` 收敛到同一可启动 schema，SQLite 翻译出的类型差异在读路径或 forward migration 中归一，不改写已发布迁移。
+- SQLite 的 `_sqlx_migrations` 历史不参与 PostgreSQL。运行时迁移由 `migrations_pg/` 独立维护，已发布迁移不可修改；导入库与空库通过 `0010`–`0017` 收敛到同一可启动 schema，SQLite 翻译出的类型差异在读路径或 forward migration 中归一，不改写已发布迁移。
 - 任务与调度语义由 PostgreSQL 承担：`FOR UPDATE SKIP LOCKED` 认领、租约心跳、`40P01/40001` 重试、按 `(task_type, payload scope)` 的单飞去重，以及日报、订阅、Star、失败重试、webhook 推送、账号暂停、管理端汇总七个通道。
 - 单仓 Release 刷新有一个共享判定模块：候选用户轮换、公共仓库匿名 fallback、站点级并发上限来自 `admin_runtime_settings.repo_release_worker_concurrency`。账号级与单仓任务不得各自实现一套抓取与限流语义。
 - 全局内容处理的读投影与写入身份必须一致：投影以 `html_url` 解析出的 `owner/repo` 与 repo 标识重建，解析失败才回退 `unknown/{repo_id}`；不为 legacy 不存在的“宽松投影”增加分支。

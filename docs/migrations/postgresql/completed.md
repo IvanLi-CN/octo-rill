@@ -21,6 +21,7 @@
 | B18 | 通过（Seed PG18） | 异步翻译写入 `llm_calls`/`llm_call_events`/`translation_attempt_llm_calls`：`pg_seed_translate_test.py` 11/11，含 `task_id_llm_audit`、`task_id_persisted_prompt` |
 | B19 | 通过（Seed PG18） | 新增 `src/postgres_repo_release_fetch.rs`：候选用户轮换 + 公共仓库匿名 fallback，`ReleasesExecutor` 与单仓 worker 共用；`pg_seed_repo_release_fallback_test.py` 6/6。生产影响已量化：84 个 `github_public` 仓库中 11 个没有任何用户 token 可读 |
 | B23 | 通过（Seed PG18） | 账户级刷新按 `admin_runtime_settings.repo_release_worker_concurrency` 并发（凭据缓存改为可共享），替代串行遍历；生产最大单账户 9,040 仓，串行会把一轮刷新拖到 45 分钟以上，超过 10 分钟周期。套件断言在途请求上界 4、观测值 2–4 |
+| B24 | 通过（Seed PG18） | 评审修复：webhook reconcile demand 完成后确认 generation 并推进 `webhook_push_last_completed_check_at`；refresh 遵守 `backoff_until`；候选查询排除已取关用户；非凭据类失败后仍尝试匿名 fallback；空库补翻译重试列与日报唯一键；导入 `verify` 先比行数再比摘要以保留 append-only 语义 |
 | B20 | 通过（Seed PG18） | star 通道新增 due-epoch 探测（`load_due_epoch_user_ids` + 单飞去重），`pg_seed_scheduler_test.py` 覆盖到期/未到期/已有排队任务/暂停用户 |
 | B21 | 通过（Seed + 生产副本） | 译文载荷补齐 `request_id` / `auto_translate`（legacy `TranslatedItem` 语义），global 与 legacy 两套套件断言 |
 | B22 | 通过（Seed PG18） | 异步翻译 prompt 改用持久化 `source_snapshot_json` 块（缺失时回退实时内容并告警一次） |
@@ -76,6 +77,9 @@
 5. 迁移速度：移除逐行 JSON 哈希与重复源扫描后，生产副本导入由约 25 分钟降至 7 分 41 秒。
 6. 标志位列在新库为 `boolean`、导入库为 `bigint` → 新增 `0016` 统一为 `bigint`（并同步翻译写入绑定），避免 LLM 运行配置读写 500。
 7. `0015` 在已导入库上因主键/唯一索引同名冲突失败 → 约束补齐块增加 `invalid_table_definition` 与 `duplicate_table` 保护，导入库与空库均可启动。
+8. 空库缺少 `translation_work_items` 的重试/状态列（只在导入库存在）→ `0011` 补齐 `attempt_count`、`error_code`、`failure_class`、`next_retry_at`、`retry_expires_at`、`next_attempt_trigger`、`processing_stage`、`provider_status`、`output_contract_status`、`retry_disposition`；fresh 套件断言列存在且 AI 记录列表返回 200。
+9. `0015` 在缺少 `legacy_source_hash` 的旧形态观察表上失败 → 约束改为按列存在守卫。
+10. 每日日报 upsert 依赖 `(user_id, date)` 唯一键，而 fresh 与导入库都只有 partial window 索引 → `0017` 新增唯一索引（生产快照 0 重复）。
 
 ## 旧实现缺陷（已登记 issue，不属于迁移工作）
 
