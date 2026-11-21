@@ -742,7 +742,10 @@ pub(crate) async fn enqueue_recent_failures_retry_if_due(
           AND b.window_end_utc IS NOT NULL
           AND b.effective_time_zone IS NOT NULL
           AND b.effective_local_boundary IS NOT NULL
-          AND b.updated_at >= $1
+          -- Imported databases carry `briefs.updated_at` as text while a fresh
+          -- schema uses timestamptz; normalise through text, then compare.
+          AND pg_input_is_valid(b.updated_at::text, 'timestamptz')
+          AND b.updated_at::text::timestamptz >= $1
         ORDER BY b.updated_at DESC, b.created_at DESC, b.id DESC
         LIMIT $2
         "#,

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a synthetic source from SQLite schema; import into a disposable PG database."""
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -58,6 +59,26 @@ def main():
             assert rerun.returncode != 0, 'same-count corruption must fail import re-entry'
             sql("UPDATE public.users SET login='seed' WHERE id='seed-user'", url)
             assert sql("SELECT count(*) FROM public.user_release_visible_repos WHERE user_id='seed-user'", url) == '1'
+            # Imported `briefs.updated_at` is text; the retry lane must compare it
+            # chronologically instead of against a timestamp.
+            recent = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            sql("INSERT INTO public.briefs (id, user_id, date, window_start_utc, window_end_utc, "
+                "effective_time_zone, effective_local_boundary, generation_source, content_markdown, "
+                "created_at, updated_at) VALUES ('seed-brief','seed-user','2026-01-01',"
+                "'2026-01-01T00:00:00Z','2026-01-02T00:00:00Z','UTC','00:00',"
+                f"'content_refresh_failed','# failed','{recent}','{recent}')", url)
+            retry_rows = sql(
+                "SELECT b.id FROM public.briefs b JOIN public.users u ON u.id = b.user_id"
+                " WHERE u.is_disabled = 0 AND u.paused_at IS NULL"
+                " AND b.generation_source = 'content_refresh_failed'"
+                " AND b.window_start_utc IS NOT NULL AND b.window_end_utc IS NOT NULL"
+                " AND b.effective_time_zone IS NOT NULL AND b.effective_local_boundary IS NOT NULL"
+                " AND pg_input_is_valid(b.updated_at::text, 'timestamptz')"
+                " AND b.updated_at::text::timestamptz >= (now() - interval '8 hours')"
+                " ORDER BY b.updated_at DESC, b.created_at DESC, b.id DESC LIMIT 20",
+                url,
+            )
+            assert retry_rows.strip() == 'seed-brief', retry_rows
             assert sql("SELECT count(*) FROM public.user_following_repos WHERE user_id='seed-user'", url) == '1'
             sql("DELETE FROM public.starred_repos WHERE user_id='seed-user'", url)
             assert sql("SELECT count(*) FROM public.user_release_visible_repos WHERE user_id='seed-user'", url) == '0'
