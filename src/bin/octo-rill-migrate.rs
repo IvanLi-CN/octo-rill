@@ -48,6 +48,9 @@ struct Args {
     /// is not visible in the migration container.
     #[arg(long, env = "MIGRATION_TARGET_PATH")]
     target_path: Option<PathBuf>,
+    /// Restrict verification to one table for bounded, resumable validation.
+    #[arg(long, env = "MIGRATION_VERIFY_TABLE")]
+    verify_table: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -89,7 +92,6 @@ struct TableManifest {
 enum Cell {
     Null,
     Text(String),
-    Timestamp(Option<DateTime<Utc>>),
     Integer(i64),
     Real(f64),
     Blob(Vec<u8>),
@@ -217,6 +219,14 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     )
     .await
     .context("acquire PostgreSQL migration lock")?;
+    // Import throughput settings for this session only: the target is a fresh
+    // validation database whose durability is re-established by ``verify`` and
+    // by the production switch, so per-commit fsync is pure overhead here.
+    pg.batch_execute(
+        "SET synchronous_commit = off;\n         SET client_min_messages = warning;\n         SET maintenance_work_mem = '1GB';\n         SET jit = off;",
+    )
+    .await
+    .context("apply PostgreSQL import session settings")?;
     // The PostgreSQL runtime migrations contain foreign keys to the legacy
     // users table. Create that authoritative table from the snapshot before
     // applying the runtime baseline; the full table pass below remains
@@ -256,11 +266,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         let _ = pg.batch_execute("ROLLBACK; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));").await;
         return Err(error.into());
     }
-    pg.batch_execute(
-        "COMMIT; SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));",
-    )
-    .await
-    .context("commit PostgreSQL runtime baseline")?;
+    pg.batch_execute("COMMIT")
+        .await
+        .context("commit PostgreSQL runtime baseline")?;
     let mut manifest = Manifest {
         source: args.sqlite_source.clone(),
         target: redact_target(&args.postgres_url),
@@ -279,7 +287,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     for table in table_rows {
         let name: String = table.try_get("name")?;
         let ddl: Option<String> = table.try_get("sql")?;
-        if fts_names.contains(&name) {
+        if let Some(reason) = skipped_source_table_reason(&name, &fts_names) {
             manifest.tables.insert(
                 name,
                 TableManifest {
@@ -287,7 +295,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                     sha256: String::new(),
                     target_sha256: String::new(),
                     skipped: true,
-                    reason: Some("SQLite FTS5 is a rebuildable projection".into()),
+                    reason: Some(reason.into()),
                 },
             );
             continue;
@@ -333,6 +341,13 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         pg.batch_execute("BEGIN")
             .await
             .with_context(|| format!("begin copy transaction for {name}"))?;
+        let table_started = std::time::Instant::now();
+        // Runtime defaults must not replace the source scheduler configuration,
+        // including an intentionally empty source table or disabled hour slots.
+        if name == "daily_brief_hour_slots" {
+            pg.batch_execute("DELETE FROM public.daily_brief_hour_slots")
+                .await?;
+        }
         let source_rows: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM {}",
             quote_sqlite_ident(&name)
@@ -349,30 +364,53 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             .with_context(|| format!("count target table {name}"))?
             .get(0);
         let copy_result = if target_rows > 0 && target_rows == source_rows {
-            Ok((source_rows as u64, String::new()))
+            if canonical_source_checksum(sqlite, pg, &name, &columns)
+                .await?
+                .1
+                != canonical_target_checksum(pg, &name, &columns).await?
+            {
+                pg.batch_execute("ROLLBACK").await?;
+                bail!("existing target content differs from source for {name}");
+            }
+            Ok(source_rows as u64)
         } else if target_rows == 0 {
             copy_table_bulk(sqlite, pg, &name, &columns, args.batch_size).await
         } else {
             copy_table(sqlite, pg, &name, &columns, args.batch_size).await
         };
-        let (rows, sha) = match copy_result {
+        let rows = match copy_result {
             Ok(result) => result,
             Err(error) => {
                 let _ = pg.batch_execute("ROLLBACK").await;
                 return Err(error).with_context(|| format!("copy table {name}"));
             }
         };
-        let target_sha = if sha.is_empty() {
-            String::new()
-        } else {
-            match checksum_postgres(pg, &name).await {
-                Ok(checksum) => checksum,
-                Err(error) => {
-                    let _ = pg.batch_execute("ROLLBACK").await;
-                    return Err(error).with_context(|| format!("checksum target table {name}"));
-                }
+        // A resumed copy only inserts what is missing. If the target still holds
+        // rows the source no longer has, this is a source-side delete and the
+        // database must be rebuilt rather than silently diverging.
+        if name != "job_task_events" {
+            let settled: i64 = pg
+                .query_one(
+                    &format!("SELECT count(*) FROM public.{}", quote_ident(&name)),
+                    &[],
+                )
+                .await?
+                .get(0);
+            if settled as u64 != rows {
+                let _ = pg.batch_execute("ROLLBACK").await;
+                bail!(
+                    "table {name}: target keeps {settled} rows but source now has {rows}; \
+                     the source deleted rows, so import into a fresh database instead of reusing this one"
+                );
             }
-        };
+        }
+        eprintln!(
+            "copied table {name}: {rows} rows in {:.1}s",
+            table_started.elapsed().as_secs_f64()
+        );
+        // Cross-engine canonical verification owns integrity: ``verify``
+        // rescans normalized values on both engines. Hashing every source row
+        // during the copy would scan and serialize the same data twice.
         pg.batch_execute("COMMIT")
             .await
             .with_context(|| format!("commit copy transaction for {name}"))?;
@@ -380,13 +418,17 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             name,
             TableManifest {
                 rows,
-                sha256: sha,
-                target_sha256: target_sha,
+                sha256: String::new(),
+                target_sha256: String::new(),
                 skipped: false,
                 reason: None,
             },
         );
     }
+    import_application_views(sqlite, pg).await?;
+    // Keep the runtime store's schema aligned with imported login sessions.
+    pg.batch_execute("INSERT INTO octo_rill.tower_sessions(id,data,expiry_date) SELECT id,data,expiry_date FROM public.tower_sessions ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,expiry_date=EXCLUDED.expiry_date;")
+        .await.context("migrate persisted login sessions to runtime store")?;
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(sqlite)
         .await?;
@@ -411,8 +453,57 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
     )
     .await
     .context("persist migration manifest")?;
+    pg.batch_execute("SELECT pg_advisory_unlock(hashtextextended('octo-rill:pg18-import', 0));")
+        .await?;
     println!("import complete: {}", args.manifest.display());
     Ok(())
+}
+
+/// Source tables that must never be copied into the PostgreSQL target.
+///
+/// The SQLite SQLx history describes migrations that have no PostgreSQL
+/// equivalent; copying it makes the PostgreSQL migrator treat foreign versions
+/// as applied and abort. The source version is preserved in the migration
+/// manifest and `octo_rill.migration_manifests` instead.
+fn skipped_source_table_reason(name: &str, fts_names: &HashSet<String>) -> Option<&'static str> {
+    if fts_names.contains(name) {
+        return Some("SQLite FTS5 is a rebuildable projection");
+    }
+    if name == "_sqlx_migrations" {
+        return Some("SQLite migration history is recorded in the migration manifest");
+    }
+    None
+}
+
+async fn import_application_views(sqlite: &SqlitePool, pg: &Client) -> Result<()> {
+    // Visibility is live relational state. Importing a view's current rows would
+    // silently lose follow/unfollow and access-control changes after cutover.
+    for name in [
+        "user_following_repos",
+        "user_release_visible_repos",
+        "search_release_metadata",
+    ] {
+        let ddl: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?")
+                .bind(name)
+                .fetch_optional(sqlite)
+                .await?;
+        if let Some(ddl) = ddl {
+            pg.batch_execute(&translate_view_ddl(&ddl))
+                .await
+                .with_context(|| format!("create PostgreSQL application view {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn translate_view_ddl(ddl: &str) -> String {
+    let sql = ddl
+        .replace("CREATE VIEW IF NOT EXISTS", "CREATE OR REPLACE VIEW")
+        .replace("CREATE VIEW ", "CREATE OR REPLACE VIEW ")
+        .replace("instr(", "strpos(")
+        .replace(" AS INTEGER)", " AS BIGINT)");
+    format!("SET search_path TO public, octo_rill; {sql};")
 }
 
 async fn validate_authoritative_source_tables(sqlite: &SqlitePool) -> Result<()> {
@@ -451,9 +542,28 @@ fn missing_authoritative_tables(found: &HashSet<String>) -> Vec<&'static str> {
 
 async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
     let expected: Manifest = serde_json::from_slice(&tokio::fs::read(&args.manifest).await?)?;
-    for (name, table) in expected.tables.iter().filter(|(_, t)| !t.skipped) {
+    if let Some(name) = &args.verify_table {
+        if !expected.tables.get(name).is_some_and(|t| !t.skipped) {
+            bail!("unknown or skipped verification table {name}");
+        }
+    }
+    for (name, table) in expected.tables.iter().filter(|(name, t)| {
+        !t.skipped
+            && args
+                .verify_table
+                .as_ref()
+                .is_none_or(|selected| selected == *name)
+    }) {
         let columns = column_names(sqlite, name).await?;
-        let (source_rows, source_sha) = checksum_sqlite(sqlite, name, &columns).await?;
+
+        let verify_started = std::time::Instant::now();
+        eprintln!("verifying table {name}");
+        let (source_rows, source_content) =
+            canonical_source_checksum(sqlite, pg, name, &columns).await?;
+        let target_content = canonical_target_checksum(pg, name, &columns).await?;
+        if source_content != target_content {
+            bail!("source/target content mismatch for {name}");
+        }
         let target_rows: i64 = pg
             .query_one(
                 &format!("SELECT count(*) FROM public.{}", quote_ident(name)),
@@ -461,26 +571,158 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             )
             .await?
             .get(0);
-        let target_sha = checksum_postgres(pg, name).await?;
         let append_only_event_log = name == "job_task_events";
-        if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64)
-            || (!table.sha256.is_empty() && source_sha != table.sha256)
-            || (!append_only_event_log
-                && !table.target_sha256.is_empty()
-                && target_sha != table.target_sha256)
-        {
+        if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64) {
             bail!(
-                "verification failed for {name}: source rows/hash {source_rows}/{source_sha}, target rows/hash {target_rows}/{target_sha}, manifest source/target {}/{}",
-                table.sha256,
-                table.target_sha256
+                "verification failed for {name}: source rows {source_rows}, target rows {target_rows}, manifest rows {}",
+                table.rows
             );
         }
+        // Manifests written by older importers also carried a raw source hash;
+        // keep validating it when present so older manifests stay meaningful.
+        if !table.sha256.is_empty() {
+            let (_, source_sha) = checksum_sqlite(sqlite, name, &columns).await?;
+            if source_sha != table.sha256 {
+                bail!("source content changed since import for {name}");
+            }
+        }
+        eprintln!(
+            "verified table {name}: {source_rows} rows in {:.1}s",
+            verify_started.elapsed().as_secs_f64()
+        );
     }
     println!(
         "verification passed for {} tables",
-        expected.tables.values().filter(|t| !t.skipped).count()
+        expected
+            .tables
+            .iter()
+            .filter(|(name, t)| !t.skipped
+                && args
+                    .verify_table
+                    .as_ref()
+                    .is_none_or(|selected| selected == *name))
+            .count()
     );
     Ok(())
+}
+
+// Compare the same normalized values on both databases, independently of
+// physical row order. Sorting fixed-size row digests bounds memory by rows,
+// rather than retaining potentially large source documents.
+fn canonical_value(value: Option<String>, kind: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value else { return Ok(None) };
+    Ok(Some(if is_timestamp_type(kind) {
+        let normalized = if value.ends_with("+00") {
+            format!("{value}:00")
+        } else {
+            value.clone()
+        };
+        let parsed = DateTime::parse_from_rfc3339(&normalized)
+            .or_else(|_| DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%#z"))
+            .or_else(|_| DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%:z"))
+            .or_else(|_| {
+                NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f")
+                    .map(|v| v.and_utc().fixed_offset())
+            })
+            .with_context(|| format!("normalize timestamp {value:?}"))?;
+        // PostgreSQL rounds nanoseconds to microseconds on timestamp input.
+        // PostgreSQL parses the fractional seconds through float8 before
+        // rint; decimal half-microseconds can sit on either side of a tie.
+        let fractional = value.split_once('.').map(|(_, tail)| {
+            tail.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        });
+        let rounded = fractional
+            .map(|digits| {
+                format!("0.{digits}")
+                    .parse::<f64>()
+                    .map(|v| (v * 1_000_000.0).round_ties_even() as u32)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let micros = parsed
+            .timestamp()
+            .checked_mul(1_000_000)
+            .and_then(|v| v.checked_add(i64::from(rounded)))
+            .context("timestamp microsecond overflow")?;
+        DateTime::<Utc>::from_timestamp_micros(micros)
+            .context("timestamp outside PostgreSQL verification range")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    } else if matches!(kind, Some("double precision" | "real")) {
+        value.parse::<f64>()?.to_string()
+    } else {
+        value
+    }))
+}
+
+fn finish_canonical_checksum(mut hashes: Vec<[u8; 32]>) -> String {
+    hashes.sort_unstable();
+    let mut digest = Sha256::new();
+    for hash in hashes {
+        digest.update(hash);
+    }
+    hex::encode(digest.finalize())
+}
+
+async fn canonical_source_checksum(
+    sqlite: &SqlitePool,
+    pg: &Client,
+    table: &str,
+    columns: &[String],
+) -> Result<(u64, String)> {
+    let types = target_column_types(pg, table, columns).await?;
+    let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
+    let mut rows = sqlx::query(&query).fetch(sqlite);
+    let mut hashes = Vec::new();
+    while let Some(row) = rows.try_next().await? {
+        let values = row_values(&row)?
+            .iter()
+            .zip(&types)
+            .map(|(cell, kind)| canonical_value(csv_cell(cell, kind.as_deref()), kind.as_deref()))
+            .collect::<Result<Vec<_>>>()?;
+        hashes.push(Sha256::digest(serde_json::to_vec(&values)?).into());
+    }
+    let rows = hashes.len() as u64;
+    Ok((rows, finish_canonical_checksum(hashes)))
+}
+
+async fn canonical_target_checksum(pg: &Client, table: &str, columns: &[String]) -> Result<String> {
+    let types = target_column_types(pg, table, columns).await?;
+    let selection = columns
+        .iter()
+        .map(|name| format!("{}::text", quote_ident(name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!("SELECT {selection} FROM public.{}", quote_ident(table));
+    let rows = pg.query_raw(&query, std::iter::empty::<&str>()).await?;
+    futures_util::pin_mut!(rows);
+    let mut hashes = Vec::new();
+    while let Some(row) = rows.try_next().await? {
+        let values = types
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let value: Option<String> = row.try_get(index)?;
+                let value = if kind.as_deref() == Some("boolean") {
+                    value.map(|v| {
+                        if v == "t" {
+                            "true".to_owned()
+                        } else if v == "f" {
+                            "false".to_owned()
+                        } else {
+                            v
+                        }
+                    })
+                } else {
+                    value
+                };
+                canonical_value(value, kind.as_deref())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        hashes.push(Sha256::digest(serde_json::to_vec(&values)?).into());
+    }
+    Ok(finish_canonical_checksum(hashes))
 }
 
 fn verification_counts_match(
@@ -493,21 +735,6 @@ fn verification_counts_match(
     } else {
         source_rows == target_rows
     }
-}
-
-async fn checksum_postgres(pg: &Client, table: &str) -> Result<String> {
-    let query = format!(
-        "SELECT row_to_json(row)::text FROM (SELECT * FROM public.{} ORDER BY ctid) AS row",
-        quote_ident(table)
-    );
-    let mut hasher = Sha256::new();
-    let stream = pg.query_raw(&query, std::iter::empty::<&str>()).await?;
-    futures_util::pin_mut!(stream);
-    while let Some(row) = stream.try_next().await? {
-        let value: String = row.get(0);
-        hasher.update(value.as_bytes());
-    }
-    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn rebuild(pg: &mut Client) -> Result<()> {
@@ -532,11 +759,10 @@ async fn copy_table(
     table: &str,
     columns: &[String],
     batch_size: usize,
-) -> Result<(u64, String)> {
+) -> Result<u64> {
     let target_types = target_column_types(pg, table, columns).await?;
     let mut offset = 0i64;
     let mut total = 0u64;
-    let mut hasher = Sha256::new();
     loop {
         let query = format!(
             "SELECT * FROM {} LIMIT ? OFFSET ?",
@@ -552,17 +778,12 @@ async fn copy_table(
         }
         for row in rows {
             let cells = row_values(&row)?;
-            let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
-            hasher.update(&encoded);
+            // Re-entry happens after a partial copy, so values must be coerced
+            // exactly like the bulk path: SQLite cells are dynamically typed and
+            // binding a Text cell to a bigint parameter aborts the import.
             let placeholders = (1..=columns.len())
                 .zip(target_types.iter())
-                .map(|(i, target_type)| {
-                    if is_timestamp_type(target_type.as_deref()) {
-                        format!("${i}::timestamptz")
-                    } else {
-                        format!("${i}")
-                    }
-                })
+                .map(|(index, target_type)| bind_placeholder(index, target_type.as_deref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
@@ -570,7 +791,7 @@ async fn copy_table(
                 quote_ident(table),
                 columns
                     .iter()
-                    .map(|c| quote_ident(c))
+                    .map(|column| quote_ident(column))
                     .collect::<Vec<_>>()
                     .join(","),
                 placeholders
@@ -578,27 +799,11 @@ async fn copy_table(
             let params = cells
                 .iter()
                 .zip(target_types.iter())
-                .map(|(cell, target_type)| -> Result<Box<dyn ToSql + Sync>> {
-                    if is_timestamp_type(target_type.as_deref()) {
-                        Ok(to_pg_param(&cell_as_timestamp(cell)?))
-                    } else if target_type.as_deref() == Some("boolean") {
-                        match cell {
-                            Cell::Integer(value) => Ok(Box::new(*value != 0)),
-                            Cell::Null => Ok(Box::new(None::<bool>)),
-                            Cell::Text(value) => Ok(Box::new(matches!(
-                                value.to_ascii_lowercase().as_str(),
-                                "1" | "true" | "t" | "yes"
-                            ))),
-                            other => Ok(to_pg_param(other)),
-                        }
-                    } else {
-                        Ok(to_pg_param(cell))
-                    }
-                })
+                .map(|(cell, target_type)| bind_value(cell, target_type.as_deref()))
                 .collect::<Result<Vec<_>>>()?;
             let refs = params
                 .iter()
-                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                .map(|value| value.as_ref() as &(dyn ToSql + Sync))
                 .collect::<Vec<_>>();
             execute_with_retry(pg, &sql, &refs)
                 .await
@@ -607,7 +812,40 @@ async fn copy_table(
         }
         offset += batch_size as i64;
     }
-    Ok((total, hex::encode(hasher.finalize())))
+    Ok(total)
+}
+
+/// Placeholder for a target column.
+///
+/// The parameter itself is always bound as text (`$n::text`), and the server
+/// performs the conversion to the column type. Binding directly as the column
+/// type would make the client serialize with that type, which fails for
+/// SQLite's dynamically typed cells (a Text cell in a bigint column).
+fn bind_placeholder(index: usize, target_type: Option<&str>) -> String {
+    match target_type {
+        Some("bytea") => format!("decode(${index}, 'hex')"),
+        Some(data_type) if needs_text_cast(data_type) => {
+            format!("${index}::text::{data_type}")
+        }
+        _ => format!("${index}"),
+    }
+}
+
+fn needs_text_cast(data_type: &str) -> bool {
+    !matches!(
+        data_type,
+        "text" | "character varying" | "character" | "citext" | "name"
+    )
+}
+
+/// Bind a source cell as text so the placeholder cast decides the target type.
+fn bind_value(cell: &Cell, target_type: Option<&str>) -> Result<Box<dyn ToSql + Sync>> {
+    let value = csv_cell(cell, target_type);
+    let value = match (target_type, value) {
+        (Some("bytea"), Some(value)) => Some(value.trim_start_matches("\\x").to_owned()),
+        (_, value) => value,
+    };
+    Ok(Box::new(value))
 }
 
 async fn copy_table_bulk(
@@ -616,7 +854,7 @@ async fn copy_table_bulk(
     table: &str,
     columns: &[String],
     batch_size: usize,
-) -> Result<(u64, String)> {
+) -> Result<u64> {
     let target_types = target_column_types(pg, table, columns).await?;
     let copy_sql = format!(
         "COPY public.{} ({}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
@@ -630,7 +868,6 @@ async fn copy_table_bulk(
     let sink = pg.copy_in::<_, Bytes>(&copy_sql).await?;
     futures_util::pin_mut!(sink);
     let mut total = 0u64;
-    let mut hasher = Sha256::new();
     let query = format!("SELECT * FROM {}", quote_sqlite_ident(table));
     let mut rows = sqlx::query(&query).fetch(sqlite);
     let mut payload = Vec::new();
@@ -640,8 +877,6 @@ async fn copy_table_bulk(
             break;
         };
         let cells = row_values(&row)?;
-        let encoded = serde_json::to_vec(&cells.iter().map(cell_debug).collect::<Vec<_>>())?;
-        hasher.update(&encoded);
         for (index, (cell, target_type)) in cells.iter().zip(target_types.iter()).enumerate() {
             if index > 0 {
                 payload.push(b',');
@@ -675,7 +910,7 @@ async fn copy_table_bulk(
         sink.as_mut().send(payload.into()).await?;
     }
     sink.as_mut().finish().await?;
-    Ok((total, hex::encode(hasher.finalize())))
+    Ok(total)
 }
 
 fn csv_cell(cell: &Cell, target_type: Option<&str>) -> Option<String> {
@@ -705,7 +940,6 @@ fn csv_cell(cell: &Cell, target_type: Option<&str>) -> Option<String> {
         }
         Cell::Real(value) => Some(value.to_string()),
         Cell::Blob(value) => Some(format!("\\x{}", hex::encode(value))),
-        Cell::Timestamp(value) => value.map(|value| value.to_rfc3339()),
     }
 }
 
@@ -822,38 +1056,9 @@ fn cell_debug(cell: &Cell) -> serde_json::Value {
     match cell {
         Cell::Null => serde_json::Value::Null,
         Cell::Text(v) => serde_json::json!({"t":v}),
-        Cell::Timestamp(v) => serde_json::json!({"t":v.map(|value| value.to_rfc3339())}),
         Cell::Integer(v) => serde_json::json!({"i":v}),
         Cell::Real(v) => serde_json::json!({"r":v}),
         Cell::Blob(v) => serde_json::json!({"b":hex::encode(v)}),
-    }
-}
-
-fn cell_as_timestamp(cell: &Cell) -> Result<Cell> {
-    match cell {
-        Cell::Null => Ok(Cell::Timestamp(None)),
-        Cell::Text(value) => {
-            let timestamp = DateTime::parse_from_rfc3339(value)
-                .map(|value| value.with_timezone(&Utc))
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
-                        .map(|value| value.and_utc())
-                })
-                .with_context(|| format!("parse UTC timestamp {value:?}"))?;
-            Ok(Cell::Timestamp(Some(timestamp)))
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-fn to_pg_param(cell: &Cell) -> Box<dyn ToSql + Sync> {
-    match cell {
-        Cell::Null => Box::new(None::<String>),
-        Cell::Text(v) => Box::new(v.clone()),
-        Cell::Timestamp(v) => Box::new(*v),
-        Cell::Integer(v) => Box::new(*v),
-        Cell::Real(v) => Box::new(*v),
-        Cell::Blob(v) => Box::new(v.clone()),
     }
 }
 
@@ -1029,6 +1234,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timestamp_checksum_matches_postgres_microsecond_rounding() {
+        let kind = Some("timestamp with time zone");
+        assert_eq!(
+            canonical_value(Some("2026-12-01T05:32:37.829795988Z".into()), kind).unwrap(),
+            canonical_value(Some("2026-12-01 05:32:37.829796+00".into()), kind).unwrap()
+        );
+    }
+
+    #[test]
+    fn timestamp_ties_round_to_even_microseconds() {
+        let kind = Some("timestamp with time zone");
+        assert_eq!(
+            canonical_value(Some("2026-05-19T09:14:47.195090500Z".into()), kind).unwrap(),
+            canonical_value(Some("2026-05-19T09:14:47.195090Z".into()), kind).unwrap()
+        );
+    }
+
+    #[test]
     fn sqlite_ddl_is_translated_without_sqlite_only_tokens() {
         let ddl = translate_ddl(
             "CREATE TABLE IF NOT EXISTS sample (id INTEGER PRIMARY KEY AUTOINCREMENT, body BLOB, label TEXT COLLATE NOCASE)",
@@ -1040,6 +1263,22 @@ mod tests {
         assert!(!ddl.contains("AUTOINCREMENT"));
         assert!(!ddl.contains("COLLATE NOCASE"));
         assert!(ddl.contains("SET search_path TO public, octo_rill"));
+    }
+
+    #[test]
+    fn sqlite_migration_history_is_never_copied() {
+        let fts = HashSet::new();
+        assert_eq!(
+            skipped_source_table_reason("_sqlx_migrations", &fts),
+            Some("SQLite migration history is recorded in the migration manifest")
+        );
+        assert_eq!(skipped_source_table_reason("users", &fts), None);
+        let mut shadow = HashSet::new();
+        shadow.insert("search_documents".to_owned());
+        assert_eq!(
+            skipped_source_table_reason("search_documents", &shadow),
+            Some("SQLite FTS5 is a rebuildable projection")
+        );
     }
 
     #[test]
