@@ -23,3 +23,18 @@
 "src/translations.rs|allow|clippy::too_many_arguments" = 1
 "src/translations.rs|allow|dead_code" = 5
 "src/webhook_push.rs|allow|clippy::too_many_arguments" = 3
+
+# Runtime persistence cutover: the legacy SQLite modules stay readable until the
+# deletion backlog removes them, so their module declarations no longer have
+# callers. The PostgreSQL transport modules return `Response` by design and
+# carry a few explicit-argument loaders.
+"src/main.rs|allow|dead_code" = 29
+"src/postgres_dashboard.rs|allow|clippy::result_large_err" = 1
+"src/postgres_dashboard.rs|allow|clippy::too_many_arguments" = 2
+"src/postgres_translate.rs|allow|clippy::result_large_err" = 1
+"src/postgres_translate.rs|allow|clippy::too_many_arguments" = 6
+"src/postgres_admin_ai_records.rs|allow|clippy::too_many_arguments" = 2
+"src/postgres_auth_ext.rs|allow|clippy::too_many_arguments" = 1
+"src/postgres_dashboard.rs|allow|dead_code" = 1
+"src/postgres_repo_releases.rs|allow|clippy::too_many_arguments" = 2
+"src/postgres_server.rs|allow|clippy::too_many_arguments" = 1

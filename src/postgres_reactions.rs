@@ -21,9 +21,6 @@ use tower_sessions::Session;
 use crate::{error::ApiError, postgres_server::PostgresServerState};
 
 const SESSION_KEY_USER_ID: &str = "user_id";
-/// Upstream GitHub REST/GraphQL base. The legacy runtime exposes this as a
-/// programmatic state field so tests can point at a local upstream; the
-/// PostgreSQL state has no such field, so the same seam is honoured through
 
 fn invalid_api_key() -> ApiError {
     ApiError::new(

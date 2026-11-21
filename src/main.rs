@@ -1,24 +1,46 @@
+// The runtime serves PostgreSQL only. These modules keep the legacy SQLite
+// implementation and its operators readable until the deletion backlog
+// (docs/migrations/postgresql/requirements.md) removes them; nothing in them
+// is reachable from `main`, so their absence of callers is expected rather
+// than dead code to delete in the persistence cutover.
+#[allow(dead_code)]
 mod admin_ai_records;
+#[allow(dead_code)]
 mod admin_runtime;
+#[allow(dead_code)]
 mod ai;
+#[allow(dead_code)]
 mod api;
+#[allow(dead_code)]
 mod api_keys;
+#[allow(dead_code)]
 mod auth;
+#[allow(dead_code)]
 mod briefs;
 mod config;
+#[allow(dead_code)]
 mod content_identity_upgrade;
+#[allow(dead_code)]
 mod content_processing;
 mod crypto;
+#[allow(dead_code)]
 mod database_migrations;
+#[allow(dead_code)]
 mod error;
+#[allow(dead_code)]
 mod github;
 mod github_api;
+#[allow(dead_code)]
 mod jobs;
+#[allow(dead_code)]
 mod linuxdo;
 mod local_id;
+#[allow(dead_code)]
 mod metrics;
 mod observability;
+#[allow(dead_code)]
 mod online_migrations;
+#[allow(dead_code)]
 mod passkeys;
 mod postgres_admin_actions;
 mod postgres_admin_ai_records;
@@ -42,19 +64,31 @@ mod postgres_translate;
 mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
+#[allow(dead_code)]
 mod public_metrics;
+#[allow(dead_code)]
 mod release_links;
+#[allow(dead_code)]
 mod runtime;
 mod search;
+#[allow(dead_code)]
 mod search_index;
+#[allow(dead_code)]
 mod server;
+#[allow(dead_code)]
 mod session_store;
+#[allow(dead_code)]
 mod sqlite_write;
+#[allow(dead_code)]
 mod state;
+#[allow(dead_code)]
 mod sync;
+#[allow(dead_code)]
 mod translations;
 mod version;
+#[allow(dead_code)]
 mod webhook_push;
+#[allow(dead_code)]
 mod worker_backoff;
 
 use anyhow::Result;

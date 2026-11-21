@@ -542,10 +542,10 @@ fn missing_authoritative_tables(found: &HashSet<String>) -> Vec<&'static str> {
 
 async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()> {
     let expected: Manifest = serde_json::from_slice(&tokio::fs::read(&args.manifest).await?)?;
-    if let Some(name) = &args.verify_table {
-        if !expected.tables.get(name).is_some_and(|t| !t.skipped) {
-            bail!("unknown or skipped verification table {name}");
-        }
+    if let Some(name) = &args.verify_table
+        && expected.tables.get(name).is_none_or(|table| table.skipped)
+    {
+        bail!("unknown or skipped verification table {name}");
     }
     for (name, table) in expected.tables.iter().filter(|(name, t)| {
         !t.skipped

@@ -11,6 +11,10 @@
 //! [`postgres_content_overlay`] replaces the per-row translation/smart fields
 //! with the content-processing projections before the feed assembly runs.
 
+// These handlers return `Response` as their error type so a failure keeps its
+// status and body; boxing it would only add an allocation on the error path.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{HashMap, HashSet};
 
 use axum::{
@@ -603,6 +607,7 @@ struct FeedRow {
     smart_work_status: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_feed_items(
     pool: &PgPool,
     user_id: &str,
@@ -2024,12 +2029,12 @@ async fn upsert_public_release_usage(
     .await
     .map_err(|error| database_error("read public release usage", error))?;
 
-    if row.repo_id.is_none() && row.last_sync_status != "inaccessible" {
-        if let Some(resolved) =
+    if row.repo_id.is_none()
+        && row.last_sync_status != "inaccessible"
+        && let Some(resolved) =
             resolve_public_release_usage_from_local_metadata(state, &full_name_lower).await?
-        {
-            return Ok(resolved);
-        }
+    {
+        return Ok(resolved);
     }
     Ok(row)
 }
@@ -2373,6 +2378,7 @@ fn normalize_timestamp_opt(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn brief_row_is_visible(
     date: &str,
     window_start_utc: Option<&str>,

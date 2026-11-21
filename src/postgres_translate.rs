@@ -11,6 +11,10 @@
 //! framing, disabled-AI payloads, and failure classification mirror the legacy
 //! SQLite implementation.
 
+// These handlers return `Response` as their error type so a failure keeps its
+// status and body; boxing it would only add an allocation on the error path.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -2766,6 +2770,7 @@ fn classify_upstream_failure(status: u16, detail: &str) -> crate::ai::LlmFailure
     crate::ai::LlmFailureClass::Transient
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_call(
     pool: &PgPool,
     call_id: &str,

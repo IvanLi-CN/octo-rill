@@ -4503,7 +4503,7 @@ pub(crate) async fn public_release_repos_body(
     text: &str,
 ) -> Result<serde_json::Value, sqlx::Error> {
     let pattern = format!("%{text}%");
-    let result=async {
+    async {
         let total=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM public.public_repo_release_usage WHERE $1='' OR full_name_lower LIKE $2").bind(text).bind(&pattern).fetch_one(&state.runtime.pool).await?;
         let rows=sqlx::query_scalar::<_,serde_json::Value>(r#"SELECT to_jsonb(item) FROM (
             SELECT pu.id,pu.repo_id,pu.full_name,pu.first_registered_at,pu.last_requested_at,pu.last_list_requested_at,pu.last_detail_requested_at,pu.api_list_requests,pu.api_detail_requests,pu.page_list_requests,pu.page_detail_requests,pu.last_sync_status,pu.last_sync_error,COUNT(DISTINCT r.release_id) AS release_count,
@@ -4518,8 +4518,7 @@ pub(crate) async fn public_release_repos_body(
             GROUP BY pu.id,pu.repo_id,pu.full_name,pu.first_registered_at,pu.last_requested_at,pu.last_list_requested_at,pu.last_detail_requested_at,pu.api_list_requests,pu.api_detail_requests,pu.page_list_requests,pu.page_detail_requests,pu.last_sync_status,pu.last_sync_error,pu.created_at,pu.updated_at
             ORDER BY pu.last_requested_at DESC,pu.full_name) item"#).bind(text).bind(&pattern).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
         Ok::<_,sqlx::Error>(json!({"items":rows,"page":page,"page_size":size,"total":total}))
-    }.await;
-    result
+    }.await
 }
 
 pub(crate) async fn admin_search_index_status(
@@ -4800,14 +4799,12 @@ async fn admin_task_log(
                 if task_id
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    if let Ok(value) =
+                    && let Ok(value) =
                         HeaderValue::from_str(&format!("attachment; filename=\"{task_id}.ndjson\""))
-                    {
-                        response
-                            .headers_mut()
-                            .insert(axum::http::header::CONTENT_DISPOSITION, value);
-                    }
+                {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CONTENT_DISPOSITION, value);
                 }
                 response
             }

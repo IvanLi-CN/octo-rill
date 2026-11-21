@@ -2350,7 +2350,6 @@ async fn execute_collection_scalar_in_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn list_collection_page_in_connection(
     connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
@@ -2633,8 +2632,7 @@ pub async fn admin_get_collection_activity(
     let read = async move {
         let global_mode = current_mode(&read_state.pool)
             .await
-            .map_err(ApiError::internal)?
-            == true;
+            .map_err(ApiError::internal)?;
         let rows = load_activity_rows(
             &read_state.pool,
             kind,
@@ -3246,8 +3244,7 @@ pub async fn admin_get_collection_record_detail(
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
     let global_mode = current_mode(&state.pool)
         .await
-        .map_err(ApiError::internal)?
-        == true;
+        .map_err(ApiError::internal)?;
     let task_summaries =
         load_task_summaries(state.as_ref(), kind, &ids, &coverage, global_mode).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
