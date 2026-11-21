@@ -1011,7 +1011,6 @@ BEGIN
         'ALTER TABLE public.content_attempt_provider_admissions ADD CONSTRAINT content_attempt_provider_admi_attempt_event_id_call_ordinal_key UNIQUE (attempt_event_id, call_ordinal)',
         'ALTER TABLE public.content_identity_upgrade_control ADD CONSTRAINT content_identity_upgrade_control_pkey PRIMARY KEY (id)',
         'ALTER TABLE public.content_legacy_observations ADD CONSTRAINT content_legacy_observations_pkey PRIMARY KEY (id)',
-        'ALTER TABLE public.content_legacy_observations ADD CONSTRAINT content_legacy_observations_legacy_table_legacy_primary_key_key UNIQUE (legacy_table, legacy_primary_key, legacy_source_hash)',
         'ALTER TABLE public.content_request_links ADD CONSTRAINT content_request_links_pkey PRIMARY KEY (id)',
         'ALTER TABLE public.content_request_links ADD CONSTRAINT content_request_links_request_id_key UNIQUE (request_id)',
         'ALTER TABLE public.content_work_admission_events ADD CONSTRAINT content_work_admission_events_pkey PRIMARY KEY (id)',
@@ -1098,6 +1097,31 @@ BEGIN
             WHEN duplicate_table THEN NULL;
         END;
     END LOOP;
+END
+$$;
+
+-- The observation identity includes the source hash, which the earliest
+-- imported shape predates. Guard the constraint on the column so a pre-hash
+-- database still starts instead of failing on an unknown column.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'content_legacy_observations'
+          AND column_name = 'legacy_source_hash'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.content_legacy_observations
+                ADD CONSTRAINT content_legacy_observations_legacy_table_legacy_primary_key_key
+                UNIQUE (legacy_table, legacy_primary_key, legacy_source_hash);
+        EXCEPTION
+            WHEN duplicate_object THEN NULL;
+            WHEN invalid_table_definition THEN NULL;
+            WHEN duplicate_table THEN NULL;
+        END;
+    END IF;
 END
 $$;
 

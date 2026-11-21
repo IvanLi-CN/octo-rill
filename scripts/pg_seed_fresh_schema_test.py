@@ -239,6 +239,45 @@ def main():
             assert body['counts'] is not None, body
             checks['admin_jobs_overview'] = 'pass'
 
+            # The imported shape carries the translation retry columns; a fresh
+            # database must expose them too or the AI-records reads 500.
+            columns = set(sql(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'public' AND table_name = 'translation_work_items'",
+                url,
+            ).splitlines())
+            for column in ('attempt_count', 'retry_disposition', 'next_attempt_trigger',
+                           'error_code', 'failure_class', 'provider_status'):
+                assert column in columns, (column, sorted(columns))
+            checks['translation_work_columns'] = 'pass'
+
+            code, body = request('/api/admin/jobs/ai-records/release')
+            assert code == 200, (code, body)
+            checks['admin_ai_records'] = 'pass'
+
+            # The daily-brief executor upserts on (user_id, date); the fresh
+            # schema must carry the matching arbiter.
+            brief_upsert = (
+                "INSERT INTO public.briefs (id, user_id, date, window_start_utc,"
+                " window_end_utc, effective_time_zone, effective_local_boundary,"
+                " generation_source, content_markdown, created_at, updated_at)"
+                " VALUES ('{brief_id}', 'fresh-user', '2026-11-20', '2026-11-20T00:00:00Z',"
+                " '2026-11-21T00:00:00Z', 'UTC', '00:00', 'postgres_deterministic',"
+                " '{content}', '{now}', '{now}')"
+                " ON CONFLICT (user_id, date) DO UPDATE SET"
+                " content_markdown = EXCLUDED.content_markdown,"
+                " generation_source = EXCLUDED.generation_source, updated_at = EXCLUDED.updated_at"
+            )
+            sql(brief_upsert.format(brief_id='fresh-user:2026-11-20', content='first', now=now), url)
+            sql(brief_upsert.format(brief_id='fresh-user:2026-11-20', content='second', now=now), url)
+            briefs = sql(
+                "SELECT count(*) || '|' || max(content_markdown) FROM public.briefs"
+                " WHERE user_id = 'fresh-user' AND date = '2026-11-20'",
+                url,
+            )
+            assert briefs == '1|second', briefs
+            checks['brief_upsert_arbiter'] = 'pass'
+
             print(json.dumps(checks))
     finally:
         if process is not None:

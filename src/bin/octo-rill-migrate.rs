@@ -558,12 +558,13 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 
         let verify_started = std::time::Instant::now();
         eprintln!("verifying table {name}");
-        let (source_rows, source_content) =
-            canonical_source_checksum(sqlite, pg, name, &columns).await?;
-        let target_content = canonical_target_checksum(pg, name, &columns).await?;
-        if source_content != target_content {
-            bail!("source/target content mismatch for {name}");
-        }
+        let source_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {}",
+            quote_sqlite_ident(name)
+        ))
+        .fetch_one(sqlite)
+        .await
+        .with_context(|| format!("count SQLite rows for {name}"))?;
         let target_rows: i64 = pg
             .query_one(
                 &format!("SELECT count(*) FROM public.{}", quote_ident(name)),
@@ -572,11 +573,28 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
             .await?
             .get(0);
         let append_only_event_log = name == "job_task_events";
-        if !verification_counts_match(append_only_event_log, source_rows, target_rows as u64) {
+        if !verification_counts_match(
+            append_only_event_log,
+            source_rows as u64,
+            target_rows as u64,
+        ) {
             bail!(
                 "verification failed for {name}: source rows {source_rows}, target rows {target_rows}, manifest rows {}",
                 table.rows
             );
+        }
+        // The event log may gain runtime rows after the snapshot; their digest
+        // can only match while the target still holds exactly the source rows.
+        if append_only_event_log && target_rows > source_rows {
+            eprintln!(
+                "verifying table {name}: {target_rows} runtime rows appended after the snapshot"
+            );
+        } else {
+            let (_, source_content) = canonical_source_checksum(sqlite, pg, name, &columns).await?;
+            let target_content = canonical_target_checksum(pg, name, &columns).await?;
+            if source_content != target_content {
+                bail!("source/target content mismatch for {name}");
+            }
         }
         // Manifests written by older importers also carried a raw source hash;
         // keep validating it when present so older manifests stay meaningful.
