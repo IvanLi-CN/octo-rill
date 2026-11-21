@@ -333,7 +333,7 @@ workflow_cases = (
     (
         "runtime-cleanup",
         lambda text: text.replace('            docker rm -f "$container"', '            docker rm "$container"', 1),
-        "ci.yml: Docker runtime smoke must contain 'docker rm -f'",
+        "ci.yml: Docker runtime smoke must contain 'docker rm -f \"$container\"'",
     ),
     (
         "e2e-summary-always",

@@ -45,7 +45,7 @@
 
 - 单仓 Release 刷新 MUST 共用一套判定：候选用户轮换仅在凭据/权限类失败时发生，公共仓库可在凭据耗尽后匿名读取，并发上限取自 `repo_release_worker_concurrency`；账号级任务 MUST NOT 因单仓不可读而整体失败。
 - Inputs: 仓库、请求用户、连接凭据、usage 登记。
-- Outputs: Release 快照、`via`/`candidate_user_id` 记录、usage 状态与失败分类。
+- Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态与失败分类。
 
 ### REQ-PGR-006
 

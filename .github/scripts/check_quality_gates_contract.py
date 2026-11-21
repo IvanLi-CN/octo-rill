@@ -720,7 +720,9 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         "mktemp -d",
         "trap cleanup EXIT",
         "docker run -d --rm",
-        "DATABASE_URL=sqlite::memory:",
+        'DATABASE_URL="postgres://octo:octo@${postgres_container}:5432/octo_rill"',
+        "postgres:18",
+        "pg_isready",
         "OCTORILL_ENCRYPTION_KEY_BASE64",
         "/api/health",
         "/api/version",
@@ -729,7 +731,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         ".ok == true and .version == $version",
         ".source != null",
         "docker stop --time 10",
-        "docker rm -f",
+        'docker rm -f "$container"',
         "rm -rf",
     ):
         require(required_fragment in smoke_run, f"ci.yml: Docker runtime smoke must contain {required_fragment!r}")
