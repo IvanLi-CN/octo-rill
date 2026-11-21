@@ -479,9 +479,11 @@ pub async fn query_postgres(
         "SELECT d.id, d.resource_type, d.title, d.body, d.repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.unread, d.target_path, d.target_url FROM public.search_documents d LEFT JOIN public.search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
     );
     builder.push_bind(user_id);
-    builder.push(" WHERE (d.user_id IS NULL OR d.user_id = ");
+    builder.push(" WHERE ((d.resource_type IN ('release','announcement') AND EXISTS (SELECT 1 FROM public.user_release_visible_repos vr WHERE vr.user_id = ");
     builder.push_bind(user_id);
-    builder.push(")");
+    builder.push(" AND vr.repo_id=d.repo_id)) OR (d.resource_type NOT IN ('release','announcement') AND d.user_id = ");
+    builder.push_bind(user_id);
+    builder.push("))");
 
     if let Some(resource_type) = &parsed.resource_type {
         builder
@@ -524,11 +526,13 @@ pub async fn query_postgres(
             .collect::<Vec<_>>()
             .join(" ");
         if !fts_query.is_empty() {
-            builder.push(" AND (d.search_vector @@ websearch_to_tsquery('octo_rill_simple', ");
+            builder
+                .push(" AND (d.search_vector @@ websearch_to_tsquery('public.octo_rill_simple', ");
             builder.push_bind(fts_query.clone());
-            builder.push(") OR ul.search_vector @@ websearch_to_tsquery('octo_rill_simple', ");
+            builder
+                .push(") OR ul.search_vector @@ websearch_to_tsquery('public.octo_rill_simple', ");
             builder.push_bind(fts_query);
-            builder.push(")");
+            builder.push("))");
         }
         for term in &parsed.terms {
             let pattern = format!("%{}%", escape_like(term));

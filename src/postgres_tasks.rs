@@ -5,13 +5,24 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use tracing::warn;
 
 use crate::{
-    config::AiConfig, crypto::EncryptionKey, postgres_jobs::ClaimedTask,
+    config::AiConfig,
+    crypto::EncryptionKey,
+    local_id,
+    postgres_jobs::ClaimedTask,
+    postgres_repo_release_fetch::{
+        RefreshFailure, ReleaseCredentialCache, ReleaseFetchRequest, fetch_releases,
+        mark_public_usage_failed, mark_public_usage_ready,
+    },
+    postgres_star_epochs::{self, StarEpochProgress, StarEpochRow, StarSlicePage},
     postgres_worker::TaskExecutor,
 };
 
@@ -145,73 +156,31 @@ impl TaskExecutor for TranslationExecutor {
             .get("work_item_id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("translation task has no work_item_id"))?;
+        let request_id = payload.get("request_id").and_then(Value::as_str);
         let ai = self
             .ai
             .as_ref()
             .ok_or_else(|| anyhow!("AI provider is not configured"))?;
-        let row = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, source_blocks_json, target_slots_json, target_lang, model_profile FROM public.translation_work_items WHERE id = $1 AND status IN ('queued', 'running')",
+        let outcome = crate::postgres_translate::translate_work_item_for_task(
+            &self.pool,
+            &self.http,
+            ai,
+            &task.id,
+            &task.task_type,
+            work_item_id,
+            request_id,
+            &task.source,
         )
-        .bind(work_item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("load PostgreSQL translation work item")?
-        .ok_or_else(|| anyhow!("translation work item is missing or already finished"))?;
-        let prompt = format!(
-            "Translate the following source blocks into {} using the {} model profile. Return concise Markdown. Source blocks: {}. Target slots: {}",
-            row.3, row.4, row.1, row.2
-        );
-        let endpoint = ai
-            .base_url
-            .join("chat/completions")
-            .context("build AI chat completions endpoint")?;
-        let response = self
-            .http
-            .post(endpoint)
-            .bearer_auth(&ai.api_key)
-            .json(&json!({
-                "model": ai.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0
-            }))
-            .send()
-            .await
-            .context("call AI provider for PostgreSQL translation")?;
-        let status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .context("decode AI translation response")?;
-        if !status.is_success() {
-            bail!("AI translation provider returned {status}: {}", body);
+        .await?;
+        if outcome.status != "ready" {
+            bail!(
+                "{}",
+                outcome
+                    .error
+                    .unwrap_or_else(|| "translation failed".to_owned())
+            );
         }
-        let content = body
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("AI translation response has no content"))?;
-        let now = Utc::now();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("begin translation finalize")?;
-        sqlx::query("UPDATE public.translation_work_items SET status = 'completed', result_status = 'ready', body_md = $1, finished_at = $2, updated_at = $2 WHERE id = $3")
-            .bind(content)
-            .bind(now)
-            .bind(&row.0)
-            .execute(&mut *tx)
-            .await
-            .context("persist PostgreSQL translation result")?;
-        sqlx::query("UPDATE public.translation_requests SET status = 'completed', result_status = 'ready', body_md = $1, finished_at = $2, updated_at = $2 WHERE work_item_id = $3")
-            .bind(content)
-            .bind(now)
-            .bind(&row.0)
-            .execute(&mut *tx)
-            .await
-            .context("persist PostgreSQL translation request result")?;
-        tx.commit().await.context("commit translation finalize")?;
-        Ok(json!({"work_item_id": row.0, "status": "completed"}).to_string())
+        Ok(json!({"work_item_id": work_item_id, "status": "completed"}).to_string())
     }
 }
 
@@ -231,8 +200,102 @@ struct StarredRepoRow {
 #[derive(Debug, FromRow)]
 struct GithubConnectionRow {
     id: String,
+    github_user_id: i64,
+    login: String,
+    avatar_url: Option<String>,
     access_token_ciphertext: Vec<u8>,
     access_token_nonce: Vec<u8>,
+}
+
+#[derive(Debug, FromRow)]
+struct StarMembershipSnapshot {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    description: Option<String>,
+    html_url: String,
+    stargazed_at: Option<String>,
+    is_private: i64,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: i64,
+    repo_stargazer_count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredGraphQlResponse {
+    data: Option<StarredGraphQlData>,
+    errors: Option<Vec<StarredGraphQlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredGraphQlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredGraphQlData {
+    viewer: StarredViewer,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredViewer {
+    #[serde(rename = "starredRepositories")]
+    starred_repositories: StarredConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredConnection {
+    #[serde(rename = "totalCount")]
+    total_count: i64,
+    #[serde(rename = "isOverLimit")]
+    is_over_limit: bool,
+    #[serde(rename = "pageInfo")]
+    page_info: StarredPageInfo,
+    edges: Vec<StarredEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredPageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredEdge {
+    #[serde(rename = "starredAt")]
+    starred_at: Option<String>,
+    node: StarredNode,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredNode {
+    #[serde(rename = "databaseId")]
+    database_id: Option<i64>,
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+    name: String,
+    description: Option<String>,
+    url: String,
+    #[serde(rename = "isPrivate")]
+    is_private: bool,
+    #[serde(rename = "stargazerCount")]
+    stargazer_count: Option<i64>,
+    #[serde(rename = "openGraphImageUrl")]
+    open_graph_image_url: Option<String>,
+    #[serde(rename = "usesCustomOpenGraphImage")]
+    uses_custom_open_graph_image: bool,
+    owner: StarredOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarredOwner {
+    login: String,
+    #[serde(rename = "avatarUrl")]
+    avatar_url: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -550,6 +613,12 @@ async fn mark_webhook_repo(
 
 #[async_trait]
 impl TaskExecutor for StarredExecutor {
+    /// Advance at most one Star reconciliation slice per execution.
+    ///
+    /// Every GitHub connection owns a durable epoch row; the executor picks the
+    /// first connection whose epoch is due, claims exactly one page slice and
+    /// returns `queued` while the sweep has more pages. Only the last page
+    /// finalizes the epoch and unlocks membership pruning.
     async fn execute(&self, task: &ClaimedTask) -> Result<String> {
         if task.task_type != "sync.starred" {
             bail!("starred executor received {}", task.task_type);
@@ -559,7 +628,7 @@ impl TaskExecutor for StarredExecutor {
         let user_id = task_user_id(&payload, task)
             .ok_or_else(|| anyhow!("sync.starred task has no user_id"))?;
         let connections = sqlx::query_as::<_, GithubConnectionRow>(
-            "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
+            "SELECT id, github_user_id, login, avatar_url, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
         )
         .bind(&user_id)
         .fetch_all(&self.pool)
@@ -569,47 +638,271 @@ impl TaskExecutor for StarredExecutor {
             bail!("sync.starred has no GitHub connection for user {user_id}");
         }
 
-        let now = Utc::now().to_rfc3339();
-        let mut total = 0usize;
-        for connection in connections {
-            let token = self
-                .encryption_key
-                .decrypt_str(
-                    &connection.access_token_ciphertext,
-                    &connection.access_token_nonce,
-                )
-                .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
-            for page in 1..=20 {
-                let response = self
-                    .http
-                    .get(format!(
-                        "{GITHUB_API}/user/starred?per_page=100&page={page}"
-                    ))
-                    .bearer_auth(&token)
-                    .header(reqwest::header::USER_AGENT, "OctoRill")
-                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .send()
-                    .await
-                    .context("fetch GitHub starred repositories")?;
-                let status = response.status();
-                if !status.is_success() {
-                    bail!("GitHub starred repositories returned HTTP {status}");
-                }
-                let repos = response
-                    .json::<Vec<Value>>()
-                    .await
-                    .context("decode GitHub starred repositories")?;
-                for repo in &repos {
-                    upsert_starred_repo(&self.pool, &user_id, repo, &now).await?;
-                }
-                total += repos.len();
-                if repos.len() < 100 {
-                    break;
-                }
+        let now = Utc::now();
+        let full_sweep_interval_minutes =
+            postgres_star_epochs::load_full_sweep_interval_minutes(&self.pool).await?;
+        let mut due = Vec::with_capacity(connections.len());
+        for connection in &connections {
+            if let Some(dispatch) = postgres_star_epochs::ensure_epoch_due(
+                &self.pool,
+                &user_id,
+                connection.id.as_str(),
+                full_sweep_interval_minutes,
+                now,
+            )
+            .await?
+            {
+                due.push((dispatch, connection));
             }
         }
-        Ok(json!({"repositories": total, "user_id": user_id}).to_string())
+        // Advance the most overdue connection first so users with several
+        // GitHub connections rotate instead of always serving the first one.
+        due.sort_by(|(left, left_connection), (right, right_connection)| {
+            left.due_at
+                .cmp(&right.due_at)
+                .then_with(|| left_connection.id.cmp(&right_connection.id))
+        });
+        let mut not_due = connections.len() - due.len();
+        for (dispatch, connection) in due {
+            let Some(epoch) = postgres_star_epochs::claim_epoch_slice(
+                &self.pool,
+                dispatch.epoch_id.as_str(),
+                task.id.as_str(),
+                now,
+            )
+            .await?
+            else {
+                not_due += 1;
+                continue;
+            };
+            let progress = self
+                .execute_epoch_slice(
+                    &user_id,
+                    connection,
+                    &epoch,
+                    full_sweep_interval_minutes,
+                    task.id.as_str(),
+                    now,
+                )
+                .await?;
+            let repositories: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.starred_repos WHERE user_id = $1")
+                    .bind(&user_id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .context("count PostgreSQL starred repositories")?;
+            return Ok(json!({
+                "status": progress.status,
+                "user_id": user_id,
+                "schedule_key": dispatch.schedule_key,
+                "epoch_id": progress.epoch_id,
+                "github_connection_id": progress.github_connection_id,
+                "processed_pages": progress.processed_pages,
+                "processed_items": progress.processed_items,
+                "total_count_at_start": progress.total_count_at_start,
+                "has_next_page": progress.has_next_page,
+                "next_slice_not_before": progress.next_slice_not_before,
+                "membership_removed": progress.membership_removed,
+                "repositories": repositories,
+            })
+            .to_string());
+        }
+        Ok(json!({
+            "status": "skipped",
+            "user_id": user_id,
+            "reason": "star_epoch_not_due",
+            "not_due_connections": not_due,
+        })
+        .to_string())
+    }
+}
+
+impl StarredExecutor {
+    /// Execute one claimed slice: fetch a single page, persist the membership
+    /// diff, then either schedule the next slice or finalize the epoch.
+    async fn execute_epoch_slice(
+        &self,
+        user_id: &str,
+        connection: &GithubConnectionRow,
+        epoch: &StarEpochRow,
+        full_sweep_interval_minutes: i64,
+        lease_owner_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<StarEpochProgress> {
+        let token = match self.encryption_key.decrypt_str(
+            &connection.access_token_ciphertext,
+            &connection.access_token_nonce,
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                let reason = format!("credentials_invalid: {error:#}");
+                postgres_star_epochs::fail_epoch(&self.pool, epoch.id.as_str(), &reason, now)
+                    .await?;
+                return Err(error.context(format!("decrypt GitHub connection {}", connection.id)));
+            }
+        };
+        let page = match fetch_starred_page(
+            &self.http,
+            token.as_str(),
+            epoch.next_cursor.as_deref(),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                if error.downcast_ref::<StarredFetchTerminal>().is_some() {
+                    postgres_star_epochs::fail_epoch(
+                        &self.pool,
+                        epoch.id.as_str(),
+                        format!("{error:#}").as_str(),
+                        now,
+                    )
+                    .await?;
+                } else {
+                    postgres_star_epochs::defer_epoch_after_failure(
+                        &self.pool,
+                        epoch.id.as_str(),
+                        format!("{error:#}").as_str(),
+                        now,
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+        };
+        if page.is_over_limit {
+            postgres_star_epochs::fail_epoch(
+                &self.pool,
+                epoch.id.as_str(),
+                "github_is_over_limit",
+                now,
+            )
+            .await?;
+            bail!("star reconciliation refused to prune an over-limit GitHub connection");
+        }
+        if let Err(error) = self
+            .apply_epoch_page(user_id, connection, epoch, &page.repos, now)
+            .await
+        {
+            postgres_star_epochs::defer_epoch_after_failure(
+                &self.pool,
+                epoch.id.as_str(),
+                format!("{error:#}").as_str(),
+                now,
+            )
+            .await?;
+            return Err(error);
+        }
+        let slice = StarSlicePage {
+            repo_count: i64::try_from(page.repos.len()).unwrap_or(i64::MAX),
+            total_count: page.total_count,
+            end_cursor: page.end_cursor,
+        };
+        if page.has_next_page {
+            postgres_star_epochs::schedule_next_slice(
+                &self.pool,
+                epoch,
+                &slice,
+                full_sweep_interval_minutes,
+                lease_owner_id,
+                now,
+            )
+            .await
+        } else {
+            self.finalize_epoch_slice(epoch, connection, &slice, lease_owner_id, now)
+                .await
+        }
+    }
+
+    /// Persist one page of connection memberships and the aggregate Star rows
+    /// they imply in a single transaction.
+    async fn apply_epoch_page(
+        &self,
+        user_id: &str,
+        connection: &GithubConnectionRow,
+        epoch: &StarEpochRow,
+        repos: &[StarredRepoSnapshot],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let now_rfc3339 = now.to_rfc3339();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin PostgreSQL star membership page transaction")?;
+        for repo in repos {
+            upsert_connection_star_membership(
+                &mut tx,
+                user_id,
+                connection.id.as_str(),
+                epoch.id.as_str(),
+                repo,
+                now_rfc3339.as_str(),
+            )
+            .await?;
+            rebuild_user_starred_repo_from_memberships(
+                &mut tx,
+                user_id,
+                repo.repo_id,
+                now_rfc3339.as_str(),
+            )
+            .await?;
+            upsert_epoch_star_member(&mut tx, user_id, connection, repo, now_rfc3339.as_str())
+                .await?;
+        }
+        tx.commit()
+            .await
+            .context("commit PostgreSQL star membership page transaction")?;
+        Ok(())
+    }
+
+    /// Finalize the epoch: prune memberships the sweep never saw, rebuild their
+    /// aggregates and mark the epoch succeeded, all in one transaction.
+    async fn finalize_epoch_slice(
+        &self,
+        epoch: &StarEpochRow,
+        connection: &GithubConnectionRow,
+        slice: &StarSlicePage,
+        lease_owner_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<StarEpochProgress> {
+        let now_rfc3339 = now.to_rfc3339();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin PostgreSQL star reconciliation finalize transaction")?;
+        let stale =
+            postgres_star_epochs::finalize_epoch_in_tx(&mut tx, epoch, slice, lease_owner_id, now)
+                .await?;
+        for membership in &stale {
+            rebuild_user_starred_repo_from_memberships(
+                &mut tx,
+                epoch.user_id.as_str(),
+                membership.repo_id,
+                now_rfc3339.as_str(),
+            )
+            .await?;
+        }
+        prune_epoch_star_members(&mut tx, epoch.user_id.as_str(), connection.github_user_id)
+            .await?;
+        tx.commit()
+            .await
+            .context("commit PostgreSQL star reconciliation finalize transaction")?;
+        Ok(StarEpochProgress {
+            epoch_id: epoch.id.clone(),
+            github_connection_id: epoch.github_connection_id.clone(),
+            processed_pages: epoch.processed_pages + 1,
+            processed_items: epoch.processed_items + slice.repo_count,
+            total_count_at_start: epoch
+                .total_count_at_start
+                .unwrap_or(slice.total_count)
+                .max(0),
+            has_next_page: false,
+            next_slice_not_before: None,
+            status: "succeeded",
+            membership_removed: stale.len(),
+        })
     }
 }
 
@@ -710,6 +1003,11 @@ impl TaskExecutor for NotificationsExecutor {
                 if notifications.len() < 50 {
                     break;
                 }
+                if page == 20 {
+                    bail!(
+                        "notification sync exceeds the bounded page budget; continuation is required"
+                    );
+                }
             }
         }
         Ok(json!({"notifications": total, "user_id": user_id}).to_string())
@@ -727,73 +1025,172 @@ impl TaskExecutor for ReleasesExecutor {
         let user_id = task_user_id(&payload, task)
             .ok_or_else(|| anyhow!("sync.releases task has no user_id"))?;
         let repos = sqlx::query_as::<_, StarredRepoRow>(
-            "SELECT repo_id, full_name FROM public.starred_repos WHERE user_id = $1 ORDER BY repo_id",
+            "SELECT DISTINCT repo_id, full_name FROM public.user_release_visible_repos WHERE user_id = $1 ORDER BY repo_id",
         )
         .bind(&user_id)
         .fetch_all(&self.pool)
         .await
         .context("load PostgreSQL starred repositories")?;
-        let connections = sqlx::query_as::<_, GithubTokenRow>(
-            "SELECT id, access_token_ciphertext, access_token_nonce FROM public.github_connections WHERE user_id = $1 ORDER BY linked_at ASC, id ASC",
-        )
-        .bind(&user_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("load PostgreSQL GitHub release connections")?;
         if repos.is_empty() {
             return Ok(json!({"releases": 0, "repositories": 0, "user_id": user_id}).to_string());
         }
-        if connections.is_empty() {
-            bail!("sync.releases has no GitHub connection for user {user_id}");
-        }
         let now = Utc::now().to_rfc3339();
-        let mut total = 0usize;
-        for connection in connections {
-            let token = self
-                .encryption_key
-                .decrypt_str(
-                    &connection.access_token_ciphertext,
-                    &connection.access_token_nonce,
-                )
-                .with_context(|| format!("decrypt GitHub connection {}", connection.id))?;
-            for repo in &repos {
-                for page in 1..=20 {
-                    let response = self
-                        .http
-                        .get(format!(
-                            "{GITHUB_API}/repos/{}/releases?per_page=50&page={page}",
-                            repo.full_name
-                        ))
-                        .bearer_auth(&token)
-                        .header(reqwest::header::USER_AGENT, "OctoRill")
-                        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                        .header("X-GitHub-Api-Version", "2022-11-28")
-                        .send()
-                        .await
-                        .context("fetch GitHub releases")?;
-                    let status = response.status();
-                    if !status.is_success() {
-                        bail!(
-                            "GitHub releases returned HTTP {status} for {}",
-                            repo.full_name
-                        );
-                    }
-                    let releases = response
-                        .json::<Vec<Value>>()
-                        .await
-                        .context("decode GitHub releases")?;
-                    for release in &releases {
-                        upsert_release(&self.pool, &user_id, repo, release, &now).await?;
-                    }
-                    total += releases.len();
-                    if releases.len() < 50 {
-                        break;
-                    }
-                }
-            }
+        let credentials = ReleaseCredentialCache::default();
+        // The legacy lane refreshed up to `repo_release_worker_concurrency`
+        // repositories in parallel across its work-item pool. One account task
+        // now owns that whole list, so the same setting bounds the in-flight
+        // requests here; without it a 9k-repository account would serialize a
+        // full cycle past the 10-minute refresh interval.
+        let concurrency = load_repo_release_concurrency(&self.pool).await;
+        let mut pending = Vec::with_capacity(repos.len());
+        for repo in &repos {
+            let credentials = &credentials;
+            let now = now.as_str();
+            let user_id = user_id.as_str();
+            pending.push(async move {
+                fetch_one_account_repo(self, user_id, repo, now, credentials)
+                    .await
+                    .map(|fetched| AccountRepoOutcome {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        fetched,
+                        failure: None,
+                    })
+                    .unwrap_or_else(|failure| AccountRepoOutcome {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        fetched: 0,
+                        failure: Some(failure),
+                    })
+            });
         }
-        Ok(json!({"releases": total, "repositories": repos.len(), "user_id": user_id}).to_string())
+        let mut outcomes = stream::iter(pending)
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        // Deterministic reporting: completion order follows network latency.
+        outcomes.sort_by_key(|outcome| outcome.repo_id);
+        let mut total = 0usize;
+        let mut repositories = 0usize;
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            if let Some(failure) = outcome.failure {
+                failed.push(json!({
+                    "repo_id": outcome.repo_id,
+                    "repo_full_name": outcome.repo_full_name,
+                    "reason_code": failure.reason_code,
+                }));
+                continue;
+            }
+            repositories += 1;
+            total += outcome.fetched;
+        }
+        Ok(json!({
+            "releases": total,
+            "repositories": repositories,
+            "user_id": user_id,
+            "failed_repositories": failed,
+        })
+        .to_string())
     }
+}
+
+struct AccountRepoOutcome {
+    repo_id: i64,
+    repo_full_name: String,
+    fetched: usize,
+    failure: Option<RefreshFailure>,
+}
+
+/// Fetch and persist one repository of an account-wide sync. A repository this
+/// account cannot read must not fail the whole sync: the shared decision
+/// rotates to another candidate user and, for a public repository, to an
+/// unauthenticated read.
+async fn fetch_one_account_repo(
+    executor: &ReleasesExecutor,
+    user_id: &str,
+    repo: &StarredRepoRow,
+    now: &str,
+    credentials: &ReleaseCredentialCache,
+) -> std::result::Result<usize, RefreshFailure> {
+    let outcome = match fetch_releases(
+        &executor.pool,
+        &executor.http,
+        &executor.encryption_key,
+        &ReleaseFetchRequest {
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.as_str(),
+            requested_by_user_id: user_id,
+        },
+        credentials,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            warn!(
+                event = "upstream.call",
+                operation = "sync.releases",
+                repo = repo.full_name,
+                user_id,
+                error_kind = failure.reason_code,
+                error_chain = failure.message,
+                "repository releases could not be read for this account"
+            );
+            if let Err(error) =
+                mark_public_usage_failed(&executor.pool, repo.repo_id, &failure, now).await
+            {
+                warn!(
+                    event = "upstream.call",
+                    operation = "sync.releases",
+                    repo = repo.full_name,
+                    error = %error,
+                    "failed to record public release usage failure"
+                );
+            }
+            return Err(failure);
+        }
+    };
+    if outcome.public_usage.exists
+        && let Err(error) = mark_public_usage_ready(&executor.pool, repo.repo_id, now).await
+    {
+        warn!(
+            event = "upstream.call",
+            operation = "sync.releases",
+            repo = repo.full_name,
+            error = %error,
+            "failed to record public release usage success"
+        );
+    }
+    if outcome.fetch.not_modified {
+        return Ok(0);
+    }
+    for release in &outcome.fetch.releases {
+        upsert_release(&executor.pool, user_id, repo, release, now)
+            .await
+            .map_err(RefreshFailure::local)?;
+    }
+    Ok(outcome.fetch.releases.len())
+}
+
+async fn load_repo_release_concurrency(pool: &PgPool) -> usize {
+    let configured = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT repo_release_worker_concurrency FROM public.admin_runtime_settings LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    configured
+        .map(|value| {
+            value.clamp(
+                1,
+                i64::try_from(crate::admin_runtime::MAX_REPO_RELEASE_WORKER_CONCURRENCY)
+                    .unwrap_or(32),
+            ) as usize
+        })
+        .unwrap_or(crate::admin_runtime::DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY)
 }
 
 async fn upsert_release(
@@ -807,26 +1204,55 @@ async fn upsert_release(
         .get("id")
         .and_then(Value::as_i64)
         .ok_or_else(|| anyhow!("GitHub release has no numeric id"))?;
+    let revision = release
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .or_else(|| release.get("published_at").and_then(Value::as_str))
+        .or_else(|| release.get("created_at").and_then(Value::as_str))
+        .unwrap_or(now);
+    // Foreground release reads use this shared cache. Keep the source revision
+    // separate from first detection, and never overwrite a newer webhook row.
     sqlx::query(
-        "INSERT INTO public.releases (id, user_id, repo_id, release_id, tag_name, name, body, html_url, published_at, created_at, is_prerelease, is_draft, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (user_id, release_id) DO UPDATE SET repo_id = EXCLUDED.repo_id, tag_name = EXCLUDED.tag_name, name = EXCLUDED.name, body = EXCLUDED.body, html_url = EXCLUDED.html_url, published_at = EXCLUDED.published_at, created_at = EXCLUDED.created_at, is_prerelease = EXCLUDED.is_prerelease, is_draft = EXCLUDED.is_draft, updated_at = EXCLUDED.updated_at",
+        r#"INSERT INTO public.repo_releases
+        (id,repo_id,release_id,node_id,tag_name,name,body,html_url,published_at,created_at,is_prerelease,is_draft,updated_at,detected_at,react_plus1,react_laugh,react_heart,react_hooray,react_rocket,react_eyes)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        ON CONFLICT(release_id) DO UPDATE SET
+        repo_id=EXCLUDED.repo_id,node_id=EXCLUDED.node_id,tag_name=EXCLUDED.tag_name,name=EXCLUDED.name,body=EXCLUDED.body,html_url=EXCLUDED.html_url,published_at=EXCLUDED.published_at,created_at=EXCLUDED.created_at,is_prerelease=EXCLUDED.is_prerelease,is_draft=EXCLUDED.is_draft,updated_at=EXCLUDED.updated_at,
+        react_plus1=EXCLUDED.react_plus1,react_laugh=EXCLUDED.react_laugh,react_heart=EXCLUDED.react_heart,react_hooray=EXCLUDED.react_hooray,react_rocket=EXCLUDED.react_rocket,react_eyes=EXCLUDED.react_eyes
+        WHERE repo_releases.updated_at=repo_releases.detected_at OR EXCLUDED.updated_at >= repo_releases.updated_at"#,
     )
-    .bind(format!("{user_id}:{release_id}"))
-    .bind(user_id)
+    .bind(local_id::generate_local_id())
     .bind(repo.repo_id)
     .bind(release_id)
+    .bind(release.get("node_id").and_then(Value::as_str))
     .bind(release.get("tag_name").and_then(Value::as_str).unwrap_or_default())
     .bind(release.get("name").and_then(Value::as_str))
     .bind(release.get("body").and_then(Value::as_str))
     .bind(release.get("html_url").and_then(Value::as_str).unwrap_or_default())
     .bind(release.get("published_at").and_then(Value::as_str))
     .bind(release.get("created_at").and_then(Value::as_str))
-    .bind(if release.get("prerelease").and_then(Value::as_bool).unwrap_or(false) { 1_i64 } else { 0_i64 })
-    .bind(if release.get("draft").and_then(Value::as_bool).unwrap_or(false) { 1_i64 } else { 0_i64 })
+    .bind(i64::from(release.get("prerelease").and_then(Value::as_bool).unwrap_or(false)))
+    .bind(i64::from(release.get("draft").and_then(Value::as_bool).unwrap_or(false)))
+    .bind(revision)
     .bind(now)
-    .execute(pool)
-    .await
-    .context("upsert PostgreSQL release")?;
+    .bind(reaction_count(release, "+1"))
+    .bind(reaction_count(release, "laugh"))
+    .bind(reaction_count(release, "heart"))
+    .bind(reaction_count(release, "hooray"))
+    .bind(reaction_count(release, "rocket"))
+    .bind(reaction_count(release, "eyes"))
+    .execute(pool).await.context("upsert PostgreSQL shared release")?;
+    let _ = user_id; // User visibility is represented by repository associations.
+
     Ok(())
+}
+
+fn reaction_count(release: &Value, key: &str) -> i64 {
+    release
+        .get("reactions")
+        .and_then(|v| v.get(key))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
 }
 
 async fn upsert_notification(pool: &PgPool, user_id: &str, notification: &Value) -> Result<()> {
@@ -844,7 +1270,7 @@ async fn upsert_notification(pool: &PgPool, user_id: &str, notification: &Value)
     sqlx::query(
         "INSERT INTO public.notifications (id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, url, html_url, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, NULL) ON CONFLICT (user_id, thread_id) DO UPDATE SET repo_full_name = EXCLUDED.repo_full_name, subject_title = EXCLUDED.subject_title, subject_type = EXCLUDED.subject_type, reason = EXCLUDED.reason, updated_at = EXCLUDED.updated_at, unread = EXCLUDED.unread, url = EXCLUDED.url, html_url = EXCLUDED.html_url",
     )
-    .bind(thread_id.clone())
+    .bind(local_id::generate_local_id())
     .bind(user_id)
     .bind(thread_id)
     .bind(repository.get("full_name").and_then(Value::as_str))
@@ -860,47 +1286,336 @@ async fn upsert_notification(pool: &PgPool, user_id: &str, notification: &Value)
     Ok(())
 }
 
-async fn upsert_starred_repo(pool: &PgPool, user_id: &str, repo: &Value, now: &str) -> Result<()> {
-    let repo_id = repo
-        .get("id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow!("GitHub starred repository has no numeric id"))?;
-    let full_name = repo
-        .get("full_name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let owner_login = repo
-        .get("owner")
-        .and_then(|owner| owner.get("login"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+/// One GraphQL Star page: the slices of a connection epoch.
+#[derive(Debug)]
+struct StarredPage {
+    repos: Vec<StarredRepoSnapshot>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+    total_count: i64,
+    is_over_limit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StarredRepoSnapshot {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    description: Option<String>,
+    html_url: String,
+    stargazed_at: Option<String>,
+    is_private: bool,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
+    repo_stargazer_count: Option<i64>,
+}
+
+/// A Star page failure that must not be retried: the connection itself is
+/// unusable (expired or under-scoped token), so the epoch has to end.
+#[derive(Debug)]
+struct StarredFetchTerminal {
+    message: String,
+}
+
+impl std::fmt::Display for StarredFetchTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for StarredFetchTerminal {}
+
+async fn fetch_starred_page(
+    http: &Client,
+    token: &str,
+    after: Option<&str>,
+) -> Result<StarredPage> {
+    let query = r#"
+      query($after: String, $first: Int!) {
+        viewer {
+          starredRepositories(first: $first, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
+            totalCount
+            isOverLimit
+            pageInfo { hasNextPage endCursor }
+            edges {
+              starredAt
+              node {
+                databaseId
+                nameWithOwner
+                name
+                description
+                url
+                isPrivate
+                stargazerCount
+                openGraphImageUrl
+                usesCustomOpenGraphImage
+                owner {
+                  login
+                  avatarUrl(size: 80)
+                }
+              }
+            }
+          }
+        }
+      }
+    "#;
+    let response = http
+        .post(crate::github_api::graphql_url())
+        .bearer_auth(token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&json!({
+            "query": query,
+            "variables": {
+                "after": after,
+                "first": postgres_star_epochs::STAR_SYNC_FULL_PAGE_SIZE,
+            },
+        }))
+        .send()
+        .await
+        .context("fetch GitHub starred repositories")?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = format!("GitHub starred repositories returned HTTP {status}");
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
+        ) {
+            return Err(anyhow::Error::new(StarredFetchTerminal { message }));
+        }
+        bail!("{message}");
+    }
+    let body = response
+        .text()
+        .await
+        .context("read GitHub starred repository page")?;
+    let parsed = serde_json::from_str::<StarredGraphQlResponse>(&body)
+        .context("decode GitHub starred repositories")?;
+    if let Some(errors) = parsed.errors.as_ref().filter(|errors| !errors.is_empty()) {
+        let message = errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("GitHub starred page returned errors: {message}");
+    }
+    let page = parsed
+        .data
+        .ok_or_else(|| anyhow!("GitHub starred page has no data"))?
+        .viewer
+        .starred_repositories;
+    let repos = page
+        .edges
+        .into_iter()
+        .filter_map(|edge| {
+            let repo_id = edge.node.database_id?;
+            Some(StarredRepoSnapshot {
+                repo_id,
+                full_name: edge.node.name_with_owner,
+                owner_login: edge.node.owner.login,
+                name: edge.node.name,
+                description: edge.node.description,
+                html_url: edge.node.url,
+                stargazed_at: edge.starred_at,
+                is_private: edge.node.is_private,
+                owner_avatar_url: edge.node.owner.avatar_url,
+                open_graph_image_url: edge.node.open_graph_image_url,
+                uses_custom_open_graph_image: edge.node.uses_custom_open_graph_image,
+                repo_stargazer_count: edge.node.stargazer_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(StarredPage {
+        repos,
+        has_next_page: page.page_info.has_next_page,
+        end_cursor: page.page_info.end_cursor,
+        total_count: page.total_count.max(0),
+        is_over_limit: page.is_over_limit,
+    })
+}
+
+/// Upsert one connection membership and stamp it with the current epoch.
+async fn upsert_connection_star_membership(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    github_connection_id: &str,
+    epoch_id: &str,
+    repo: &StarredRepoSnapshot,
+    now: &str,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO public.starred_repos (id, user_id, repo_id, full_name, owner_login, name, description, html_url, stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT (user_id, repo_id) DO UPDATE SET full_name = EXCLUDED.full_name, owner_login = EXCLUDED.owner_login, name = EXCLUDED.name, description = EXCLUDED.description, html_url = EXCLUDED.html_url, is_private = EXCLUDED.is_private, updated_at = EXCLUDED.updated_at, owner_avatar_url = EXCLUDED.owner_avatar_url, open_graph_image_url = EXCLUDED.open_graph_image_url, uses_custom_open_graph_image = EXCLUDED.uses_custom_open_graph_image, repo_stargazer_count = EXCLUDED.repo_stargazer_count, repo_stargazer_count_updated_at = EXCLUDED.repo_stargazer_count_updated_at",
+        "INSERT INTO public.starred_repo_connection_memberships (\
+           id, user_id, github_connection_id, repo_id, full_name, owner_login, name, description, \
+           html_url, stargazed_at, is_private, owner_avatar_url, open_graph_image_url, \
+           uses_custom_open_graph_image, repo_stargazer_count, last_seen_epoch_id, \
+           last_delta_seen_at, created_at, updated_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NULL, $17, $17) \
+         ON CONFLICT (user_id, github_connection_id, repo_id) DO UPDATE SET \
+           full_name = EXCLUDED.full_name, owner_login = EXCLUDED.owner_login, \
+           name = EXCLUDED.name, description = EXCLUDED.description, \
+           html_url = EXCLUDED.html_url, stargazed_at = EXCLUDED.stargazed_at, \
+           is_private = EXCLUDED.is_private, owner_avatar_url = EXCLUDED.owner_avatar_url, \
+           open_graph_image_url = EXCLUDED.open_graph_image_url, \
+           uses_custom_open_graph_image = EXCLUDED.uses_custom_open_graph_image, \
+           repo_stargazer_count = EXCLUDED.repo_stargazer_count, \
+           last_seen_epoch_id = COALESCE(\
+             EXCLUDED.last_seen_epoch_id, \
+             public.starred_repo_connection_memberships.last_seen_epoch_id\
+           ), \
+           updated_at = EXCLUDED.updated_at",
     )
-    .bind(format!("{user_id}:{repo_id}"))
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(github_connection_id)
+    .bind(repo.repo_id)
+    .bind(repo.full_name.as_str())
+    .bind(repo.owner_login.as_str())
+    .bind(repo.name.as_str())
+    .bind(repo.description.as_deref())
+    .bind(repo.html_url.as_str())
+    .bind(repo.stargazed_at.as_deref())
+    .bind(i64::from(repo.is_private))
+    .bind(repo.owner_avatar_url.as_deref())
+    .bind(repo.open_graph_image_url.as_deref())
+    .bind(i64::from(repo.uses_custom_open_graph_image))
+    .bind(repo.repo_stargazer_count)
+    .bind(epoch_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("upsert PostgreSQL star membership {}", repo.full_name))?;
+    Ok(())
+}
+
+/// Rebuild one aggregate `starred_repos` row from the connection memberships.
+async fn rebuild_user_starred_repo_from_memberships(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    repo_id: i64,
+    now: &str,
+) -> Result<()> {
+    let membership = sqlx::query_as::<_, StarMembershipSnapshot>(
+        "SELECT repo_id, full_name, owner_login, name, description, html_url, stargazed_at, \
+                is_private, owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image, \
+                repo_stargazer_count \
+         FROM public.starred_repo_connection_memberships \
+         WHERE user_id = $1 AND repo_id = $2 \
+         ORDER BY stargazed_at DESC, updated_at DESC, id ASC LIMIT 1",
+    )
     .bind(user_id)
     .bind(repo_id)
-    .bind(full_name)
-    .bind(owner_login)
-    .bind(repo.get("name").and_then(Value::as_str).unwrap_or_default())
-    .bind(repo.get("description").and_then(Value::as_str))
-    .bind(repo.get("html_url").and_then(Value::as_str).unwrap_or_default())
-    .bind(
-        repo.get("created_at")
-            .and_then(Value::as_str)
-            .or_else(|| repo.get("updated_at").and_then(Value::as_str))
-            .unwrap_or(now),
-    )
-    .bind(if repo.get("private").and_then(Value::as_bool).unwrap_or(false) { 1_i64 } else { 0_i64 })
-    .bind(now)
-    .bind(repo.get("owner").and_then(|owner| owner.get("avatar_url")).and_then(Value::as_str))
-    .bind(repo.get("open_graph_image_url").and_then(Value::as_str))
-    .bind(0_i64)
-    .bind(repo.get("stargazers_count").and_then(Value::as_i64))
-    .bind(now)
-    .execute(pool)
+    .fetch_optional(&mut **tx)
     .await
-    .context("upsert PostgreSQL starred repository")?;
+    .context("load aggregate PostgreSQL star membership")?;
+    let Some(membership) = membership else {
+        sqlx::query("DELETE FROM public.starred_repos WHERE user_id = $1 AND repo_id = $2")
+            .bind(user_id)
+            .bind(repo_id)
+            .execute(&mut **tx)
+            .await
+            .context("delete aggregate PostgreSQL starred repo")?;
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO public.starred_repos (\
+           id, user_id, repo_id, full_name, owner_login, name, description, html_url, \
+           stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url, \
+           uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+         ON CONFLICT (user_id, repo_id) DO UPDATE SET \
+           full_name = EXCLUDED.full_name, owner_login = EXCLUDED.owner_login, \
+           name = EXCLUDED.name, description = EXCLUDED.description, \
+           html_url = EXCLUDED.html_url, stargazed_at = EXCLUDED.stargazed_at, \
+           is_private = EXCLUDED.is_private, updated_at = EXCLUDED.updated_at, \
+           owner_avatar_url = EXCLUDED.owner_avatar_url, \
+           open_graph_image_url = EXCLUDED.open_graph_image_url, \
+           uses_custom_open_graph_image = EXCLUDED.uses_custom_open_graph_image, \
+           repo_stargazer_count = EXCLUDED.repo_stargazer_count, \
+           repo_stargazer_count_updated_at = EXCLUDED.repo_stargazer_count_updated_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(membership.repo_id)
+    .bind(membership.full_name.as_str())
+    .bind(membership.owner_login.as_str())
+    .bind(membership.name.as_str())
+    .bind(membership.description.as_deref())
+    .bind(membership.html_url.as_str())
+    .bind(membership.stargazed_at.as_deref())
+    .bind(membership.is_private)
+    .bind(now)
+    .bind(membership.owner_avatar_url.as_deref())
+    .bind(membership.open_graph_image_url.as_deref())
+    .bind(membership.uses_custom_open_graph_image)
+    .bind(membership.repo_stargazer_count)
+    .bind(membership.repo_stargazer_count.map(|_| now))
+    .execute(&mut **tx)
+    .await
+    .context("upsert aggregate PostgreSQL starred repo")?;
+    Ok(())
+}
+
+/// Record the observing account as the current stargazer membership of a repo.
+async fn upsert_epoch_star_member(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    connection: &GithubConnectionRow,
+    repo: &StarredRepoSnapshot,
+    now: &str,
+) -> Result<()> {
+    let actor_html_url = format!("https://github.com/{}", connection.login);
+    sqlx::query(
+        "INSERT INTO public.repo_star_current_members (\
+           id, user_id, repo_id, repo_full_name, actor_github_user_id, actor_login, \
+           actor_avatar_url, actor_html_url, starred_at, created_at, updated_at\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) \
+         ON CONFLICT (user_id, repo_id, actor_github_user_id) DO UPDATE SET \
+           repo_full_name = EXCLUDED.repo_full_name, actor_login = EXCLUDED.actor_login, \
+           actor_avatar_url = EXCLUDED.actor_avatar_url, \
+           actor_html_url = EXCLUDED.actor_html_url, starred_at = EXCLUDED.starred_at, \
+           updated_at = EXCLUDED.updated_at",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(repo.repo_id)
+    .bind(repo.full_name.as_str())
+    .bind(connection.github_user_id)
+    .bind(connection.login.as_str())
+    .bind(connection.avatar_url.as_deref())
+    .bind(actor_html_url.as_str())
+    .bind(repo.stargazed_at.as_deref())
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .context("upsert PostgreSQL repo star current member")?;
+    Ok(())
+}
+
+/// Drop current-member rows whose repository is no longer starred through any
+/// connection of the user.
+async fn prune_epoch_star_members(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    actor_github_user_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM public.repo_star_current_members member \
+         WHERE member.user_id = $1 AND member.actor_github_user_id = $2 \
+           AND NOT EXISTS (\
+             SELECT 1 FROM public.starred_repo_connection_memberships membership \
+             WHERE membership.user_id = $1 AND membership.repo_id = member.repo_id\
+           )",
+    )
+    .bind(user_id)
+    .bind(actor_github_user_id)
+    .execute(&mut **tx)
+    .await
+    .context("prune PostgreSQL repo star current members")?;
     Ok(())
 }
 
@@ -927,6 +1642,66 @@ mod tests {
     use super::{ClaimedTask, task_user_id};
     use serde_json::json;
 
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_seed_upserts_keep_shared_releases_and_user_notification_identity()
+    -> anyhow::Result<()> {
+        use super::*;
+        let admin_url = std::env::var("TEST_PG_TASKS_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("tasks_seed_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result=async {
+            sqlx::raw_sql(r#"
+                CREATE TABLE repo_releases(id text PRIMARY KEY,repo_id bigint,release_id bigint UNIQUE,node_id text,tag_name text,name text,body text,html_url text,published_at text,created_at text,is_prerelease bigint,is_draft bigint,updated_at text,detected_at text,react_plus1 bigint,react_laugh bigint,react_heart bigint,react_hooray bigint,react_rocket bigint,react_eyes bigint);
+                CREATE TABLE notifications(id text PRIMARY KEY,user_id text,thread_id text,repo_full_name text,subject_title text,subject_type text,reason text,updated_at text,unread bigint,url text,html_url text,last_seen_at text,UNIQUE(user_id,thread_id));
+            "#).execute(&pool).await?;
+            sqlx::raw_sql("CREATE TABLE starred_repos(id text PRIMARY KEY,user_id text,repo_id bigint,full_name text,owner_login text,name text,description text,html_url text,stargazed_at text,is_private bigint,updated_at text,owner_avatar_url text,open_graph_image_url text,uses_custom_open_graph_image bigint,repo_stargazer_count bigint,repo_stargazer_count_updated_at text,UNIQUE(user_id,repo_id))").execute(&pool).await?;
+            sqlx::raw_sql(r#"
+                CREATE TABLE starred_repo_connection_memberships(id text PRIMARY KEY,user_id text,github_connection_id text,repo_id bigint,full_name text,owner_login text,name text,description text,html_url text,stargazed_at text,is_private bigint,owner_avatar_url text,open_graph_image_url text,uses_custom_open_graph_image bigint,repo_stargazer_count bigint,last_seen_epoch_id text,last_delta_seen_at text,created_at text,updated_at text,UNIQUE(user_id,github_connection_id,repo_id));
+                CREATE TABLE repo_star_current_members(id text PRIMARY KEY,user_id text,repo_id bigint,repo_full_name text,actor_github_user_id bigint,actor_login text,actor_avatar_url text,actor_html_url text,starred_at text,created_at text,updated_at text,UNIQUE(user_id,repo_id,actor_github_user_id));
+            "#).execute(&pool).await?;
+            let starred=StarredRepoSnapshot{repo_id:42,full_name:"seed/repo".to_owned(),owner_login:"seed".to_owned(),name:"repo".to_owned(),description:None,html_url:"https://github.com/seed/repo".to_owned(),stargazed_at:Some("2026-10-01T00:00:00Z".to_owned()),is_private:false,owner_avatar_url:None,open_graph_image_url:None,uses_custom_open_graph_image:false,repo_stargazer_count:None};
+            let connection=GithubConnectionRow{id:"seed-connection".to_owned(),github_user_id:501,login:"seed".to_owned(),avatar_url:None,access_token_ciphertext:Vec::new(),access_token_nonce:Vec::new()};
+            let mut tx=pool.begin().await?;
+            upsert_connection_star_membership(&mut tx,"user-a","seed-connection","seed-epoch",&starred,"2026-11-21T00:00:00Z").await?;
+            rebuild_user_starred_repo_from_memberships(&mut tx,"user-a",42,"2026-11-21T00:00:00Z").await?;
+            upsert_epoch_star_member(&mut tx,"user-a",&connection,&starred,"2026-11-21T00:00:00Z").await?;
+            tx.commit().await?;
+            let star:(String,String)=sqlx::query_as("SELECT id,stargazed_at FROM starred_repos").fetch_one(&pool).await?;
+            assert!(local_id::is_local_id(&star.0));assert_eq!(star.1,"2026-10-01T00:00:00Z");
+            let members:i64=sqlx::query_scalar("SELECT COUNT(*) FROM repo_star_current_members WHERE user_id='user-a'").fetch_one(&pool).await?;
+            assert_eq!(members,1);
+            let repo=StarredRepoRow{repo_id:42,full_name:"seed/repo".to_owned()};
+            let release=json!({"id":99,"tag_name":"v1","body":"current","html_url":"https://example.invalid/v1","updated_at":"2026-11-20T00:00:00Z","reactions":{"+1":2}});
+            upsert_release(&pool,"user-a",&repo,&release,"2026-11-21T00:00:00Z").await?;
+            let initial:(String,String,String,i64)=sqlx::query_as("SELECT id,body,detected_at,react_plus1 FROM repo_releases WHERE release_id=99").fetch_one(&pool).await?;
+            assert!(local_id::is_local_id(&initial.0));assert_eq!(initial.1,"current");assert_eq!(initial.3,2);
+            let stale=json!({"id":99,"tag_name":"old","body":"stale","updated_at":"2026-11-19T00:00:00Z"});
+            upsert_release(&pool,"user-b",&repo,&stale,"2026-11-22T00:00:00Z").await?;
+            let latest:(String,String,String)=sqlx::query_as("SELECT id,body,detected_at FROM repo_releases WHERE release_id=99").fetch_one(&pool).await?;
+            assert_eq!((latest.0,latest.1,latest.2),(initial.0,"current".to_owned(),initial.2));
+            let notification=json!({"id":"thread-1","unread":true,"repository":{"full_name":"seed/repo"},"subject":{"title":"hello","type":"Issue"},"url":"https://example.invalid/thread"});
+            upsert_notification(&pool,"user-a",&notification).await?;
+            upsert_notification(&pool,"user-b",&notification).await?;
+            upsert_notification(&pool,"user-a",&notification).await?;
+            let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM notifications ORDER BY user_id").fetch_all(&pool).await?;
+            assert_eq!(ids.len(),2);assert_ne!(ids[0],ids[1]);assert!(ids.iter().all(|id|local_id::is_local_id(id)));
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
     #[test]
     fn notification_executor_rejects_other_task_types() {
         let source = include_str!("postgres_tasks.rs");
@@ -935,14 +1710,16 @@ mod tests {
         assert!(source.contains("sync.starred"));
         assert!(source.contains("sync.all"));
         assert!(source.contains("sync.access_refresh"));
-        assert!(source.contains("/user/starred?per_page=100&page="));
+        assert!(source.contains("starredRepositories(first: $first, after: $after"));
+        assert!(source.contains("postgres_star_epochs::STAR_SYNC_FULL_PAGE_SIZE"));
+        assert!(source.contains("star_sync_epochs"));
         assert!(source.contains("webhook.push.manage"));
         assert!(source.contains("webhook.push.reconcile"));
         assert!(source.contains("/hooks"));
         assert!(source.contains("brief.generate"));
         assert!(source.contains("postgres_deterministic"));
         assert!(source.contains("ON CONFLICT (user_id, thread_id)"));
-        assert!(source.contains("ON CONFLICT (user_id, release_id)"));
+        assert!(source.contains("ON CONFLICT(release_id)"));
         assert!(source.contains("ON CONFLICT (user_id, repo_id)"));
         assert!(source.contains("decrypt_str"));
         assert!(source.contains("requested_by"));

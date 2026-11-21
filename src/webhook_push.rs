@@ -35,7 +35,7 @@ const OP_CHECK: &str = "check";
 const OP_PAUSE: &str = "pause";
 const OP_DELETE: &str = "delete";
 const OP_RECONCILE: &str = "reconcile";
-const DESIRED_ENABLED: &str = "enabled";
+pub(crate) const DESIRED_ENABLED: &str = "enabled";
 const DESIRED_PAUSED: &str = "paused";
 const DESIRED_DELETED: &str = "deleted";
 const STATUS_REGISTERED: &str = "registered";
@@ -211,22 +211,22 @@ pub struct ReceiverQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleasePayload {
-    action: Option<String>,
-    release: Option<ReleasePayloadItem>,
-    repository: Option<ReleasePayloadRepo>,
+pub(crate) struct ReleasePayload {
+    pub(crate) action: Option<String>,
+    pub(crate) release: Option<ReleasePayloadItem>,
+    pub(crate) repository: Option<ReleasePayloadRepo>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleasePayloadItem {
-    id: i64,
-    draft: bool,
+pub(crate) struct ReleasePayloadItem {
+    pub(crate) id: i64,
+    pub(crate) draft: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleasePayloadRepo {
-    id: i64,
-    full_name: String,
+pub(crate) struct ReleasePayloadRepo {
+    pub(crate) id: i64,
+    pub(crate) full_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3313,7 +3313,7 @@ pub async fn admin_patch_runtime_config(
     Ok(Json(runtime_config(state.as_ref()).await?))
 }
 
-fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
+pub(crate) fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
     let Some(hex_signature) = signature.strip_prefix("sha256=") else {
         return false;
     };
@@ -3327,7 +3327,7 @@ fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
-fn has_valid_signature_format(signature: &str) -> bool {
+pub(crate) fn has_valid_signature_format(signature: &str) -> bool {
     signature.strip_prefix("sha256=").is_some_and(|value| {
         value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
@@ -3343,7 +3343,7 @@ fn decode_hex(value: &str) -> std::result::Result<Vec<u8>, ()> {
         .collect()
 }
 
-fn should_enqueue_release(
+pub(crate) fn should_enqueue_release(
     include_own_releases: bool,
     enabled: bool,
     event: &str,
@@ -3364,7 +3364,10 @@ fn should_enqueue_release(
         && repo_status == STATUS_REGISTERED
 }
 
-fn private_repo_scope_allows(is_private: Option<i64>, allows_private: Option<i64>) -> bool {
+pub(crate) fn private_repo_scope_allows(
+    is_private: Option<i64>,
+    allows_private: Option<i64>,
+) -> bool {
     !(is_private == Some(1) && allows_private == Some(0))
 }
 

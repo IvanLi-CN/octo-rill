@@ -12,6 +12,7 @@ mod crypto;
 mod database_migrations;
 mod error;
 mod github;
+mod github_api;
 mod jobs;
 mod linuxdo;
 mod local_id;
@@ -19,12 +20,26 @@ mod metrics;
 mod observability;
 mod online_migrations;
 mod passkeys;
+mod postgres_admin_actions;
+mod postgres_admin_ai_records;
+mod postgres_admin_llm;
+mod postgres_auth_ext;
+mod postgres_content_overlay;
+mod postgres_dashboard;
 mod postgres_database_migrations;
 mod postgres_jobs;
+mod postgres_reactions;
+mod postgres_repo_release_fetch;
+mod postgres_repo_release_worker;
+mod postgres_repo_releases;
 mod postgres_runtime;
 mod postgres_runtime_owner;
+mod postgres_scheduler;
 mod postgres_server;
+mod postgres_star_epochs;
 mod postgres_tasks;
+mod postgres_translate;
+mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
 mod public_metrics;
@@ -82,9 +97,26 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        if let Ok(lane) = std::env::var("OCTORILL_PG_SCHEDULER_TICK") {
+            let now = match std::env::var("OCTORILL_PG_SCHEDULER_NOW") {
+                Ok(raw) => {
+                    chrono::DateTime::parse_from_rfc3339(raw.trim())?.with_timezone(&chrono::Utc)
+                }
+                Err(_) => chrono::Utc::now(),
+            };
+            let defaults = postgres_scheduler::SchedulerDefaults::from_config(&config);
+            let enqueued =
+                postgres_scheduler::run_lane_once(&runtime.pool, lane.trim(), &defaults, now)
+                    .await?;
+            tracing::info!(lane = %lane, enqueued, "PostgreSQL scheduler lane tick applied");
+        }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
         runtime.pool.close().await;
         return Ok(());
     }
-    server::serve(config).await
+    // PostgreSQL is the only production runtime. The SQLite modules remain
+    // compiled for the offline importer and its regression suites, but a
+    // SQLite DATABASE_URL must fail closed instead of serving traffic.
+    config.require_postgres()?;
+    postgres_server::serve_postgres(config).await
 }

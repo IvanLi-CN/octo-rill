@@ -457,7 +457,9 @@ fn translation_retry_disposition(contract_recovered: bool, retry_scheduled: bool
     }
 }
 
-fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslationRequestResultItem {
+pub(crate) fn admin_translation_result_item(
+    item: TranslationResultItem,
+) -> AdminTranslationRequestResultItem {
     let classified = (item.status == "error")
         .then(|| classify_translation_error(item.error.as_deref()))
         .flatten();
@@ -629,7 +631,7 @@ pub struct AdminTranslationRequestsResponse {
     pub total: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminTranslationAttemptEvent {
     pub id: i64,
     pub work_item_id: String,
@@ -708,7 +710,7 @@ pub struct AdminTranslationBatchesResponse {
     pub total: i64,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, Deserialize)]
 pub struct AdminTranslationLinkedLlmCall {
     pub id: String,
     pub status: String,
@@ -733,8 +735,8 @@ pub struct AdminTranslationBatchDetailResponse {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct AdminTranslationBatchRow {
-    id: String,
+pub(crate) struct AdminTranslationBatchRow {
+    pub(crate) id: String,
     status: String,
     trigger_reason: String,
     worker_slot: i64,
@@ -1134,7 +1136,7 @@ struct ClaimCandidateRow {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct RequestRow {
+pub(crate) struct RequestRow {
     id: String,
     mode: String,
     source: String,
@@ -1175,7 +1177,7 @@ impl RequestRow {
         }
     }
 
-    fn to_admin_request_list_item(&self) -> AdminTranslationRequestListItem {
+    pub(crate) fn to_admin_request_list_item(&self) -> AdminTranslationRequestListItem {
         AdminTranslationRequestListItem {
             id: self.id.clone(),
             status: self.effective_status().to_owned(),
@@ -1197,7 +1199,7 @@ impl RequestRow {
         }
     }
 
-    fn to_result(&self) -> TranslationResultItem {
+    pub(crate) fn to_result(&self) -> TranslationResultItem {
         TranslationResultItem {
             producer_ref: self.producer_ref.clone(),
             entity_id: self.entity_id.clone(),
@@ -1422,7 +1424,7 @@ fn translation_batch_result_summary_total(summary: &AdminTranslationBatchResultS
         + summary.running
 }
 
-fn translation_batch_business_outcome(
+pub(crate) fn translation_batch_business_outcome(
     status: &str,
     summary: &AdminTranslationBatchResultSummary,
     expected_total: i64,
@@ -1487,7 +1489,7 @@ fn translation_batch_business_outcome(
 }
 
 impl AdminTranslationBatchRow {
-    fn into_list_item(
+    pub(crate) fn into_list_item(
         self,
         result_summary: AdminTranslationBatchResultSummary,
     ) -> AdminTranslationBatchListItem {
@@ -2315,7 +2317,7 @@ fn claim_origin_case_sql() -> &'static str {
     "#
 }
 
-fn request_row_select_sql() -> &'static str {
+pub(crate) fn request_row_select_sql() -> &'static str {
     r#"
     SELECT r.id, r.mode, r.source, r.request_origin, r.requested_by, r.scope_user_id,
            r.producer_ref, r.kind, r.variant, r.entity_id, r.target_lang, r.max_wait_ms,
