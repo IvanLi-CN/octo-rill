@@ -413,7 +413,9 @@ def main():
             assert status == "succeeded", (status, error_message, result_json)
             result = json.loads(result_json)
             assert result["via"] == "candidate", result
-            assert result["candidate_user_id"] == FOLLOWER_USER, result
+            # Which account's connection served the read is service-side:
+            # the requesting user must not learn the rotated account id.
+            assert "candidate_user_id" not in result, result
             # The account lane may have cached the release first; what matters
             # is that this refresh really read the repository through the
             # follower's token.
@@ -442,7 +444,7 @@ def main():
             assert status == "succeeded", (status, error_message, result_json)
             result = json.loads(result_json)
             assert result["via"] == "public", result
-            assert result["candidate_user_id"] is None, result
+            assert "candidate_user_id" not in result, result
             beta_requests = requests_for(BETA_FULL_NAME)
             assert beta_requests, "the public repository must still be read once"
             assert all(r["authorization"] is None for r in beta_requests), beta_requests

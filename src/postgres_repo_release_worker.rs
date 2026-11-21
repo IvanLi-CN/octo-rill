@@ -193,7 +193,6 @@ impl RefreshStats {
             "new_release_ids": self.new_release_ids,
             "content_pending": content_pending,
             "via": self.via.map(FetchVia::as_str),
-            "candidate_user_id": self.candidate_user_id,
         })
         .to_string()
     }
@@ -1069,7 +1068,9 @@ mod tests {
         assert_eq!(result["content_pending"], true);
         assert_eq!(result["new_release_ids"], json!([9001]));
         assert_eq!(result["via"], "candidate");
-        assert_eq!(result["candidate_user_id"], "user-b");
+        // The rotated account is a service-side fact: the requester may not
+        // learn which other account's connection was used.
+        assert!(result.get("candidate_user_id").is_none(), "{result}");
     }
 
     #[test]
