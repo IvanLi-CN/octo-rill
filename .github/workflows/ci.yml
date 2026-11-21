@@ -650,3 +650,16 @@ jobs:
           grep -q 'id="root"' "$index_file"
 
           docker stop --time 10 "$container" >/dev/null
+
+          # The runtime refuses SQLite now. Prove it in the same image instead of
+          # leaving the old smoke contract untested.
+          if timeout 60 docker run --rm \
+            -e OCTORILL_ENCRYPTION_KEY_BASE64="$smoke_key" \
+            -e DATABASE_URL=sqlite::memory: \
+            -e GITHUB_CLIENT_ID=ci-smoke-client \
+            -e GITHUB_CLIENT_SECRET=ci-smoke-secret \
+            -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/auth/github/callback \
+            "$CI_SMOKE_IMAGE" >/dev/null 2>&1; then
+            echo "runtime accepted a SQLite DATABASE_URL" >&2
+            exit 1
+          fi

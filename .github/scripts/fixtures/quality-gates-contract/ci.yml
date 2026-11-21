@@ -347,6 +347,7 @@ jobs:
             "${CI_SMOKE_IMAGE}"
           docker run -d --rm --name "$postgres_container" postgres:18
           pg_isready -h "$postgres_container" -U octo -d octo_rill
+          if docker run --rm -e DATABASE_URL=sqlite::memory: "${CI_SMOKE_IMAGE}"; then exit 1; fi
           curl -fsS http://127.0.0.1:3000/api/health > "$tmp_dir/health.json"
           jq -e --arg version "${CI_SMOKE_VERSION}" '.ok == true and .version == $version' "$tmp_dir/health.json"
 
