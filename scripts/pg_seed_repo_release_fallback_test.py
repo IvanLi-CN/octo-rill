@@ -51,6 +51,9 @@ DELTA_REPO = 4545
 DELTA_FULL_NAME = "private/delta"
 EPSILON_REPO = 4646
 EPSILON_FULL_NAME = "public/epsilon"
+MOVED_REPO = 4747
+MOVED_OLD_NAME = "legacy/renamed"
+MOVED_NEW_NAME = "renamed/repo"
 
 ETAG = '"stub-releases-v1"'
 
@@ -69,6 +72,9 @@ STUB = {
     # Repositories whose authenticated read is throttled; the anonymous read
     # must still be attempted.
     "rate_limited": set(),
+    # Repositories renamed upstream: GitHub answers 301 and the client must follow.
+    "redirects": {},
+    "base": "",
     "delay_seconds": 0.25,
     "in_flight": 0,
     "max_in_flight": 0,
@@ -106,6 +112,15 @@ class StubGithubHandler(BaseHTTPRequestHandler):
         full_name = parsed.path[len(prefix) : -len(suffix)]
         authorization = self.headers.get("Authorization")
         token = authorization[len("Bearer ") :] if authorization else None
+        if full_name in STUB["redirects"]:
+            self.send_response(301)
+            self.send_header(
+                "Location",
+                f"{STUB['base']}/repos/{STUB['redirects'][full_name]}/releases",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         STUB["requests"].append(
             {
                 "repo": full_name,
@@ -171,6 +186,7 @@ def main():
     stub = ThreadingHTTPServer(("127.0.0.1", args.stub_port), StubGithubHandler)
     threading.Thread(target=stub.serve_forever, daemon=True).start()
     stub_base = f"http://127.0.0.1:{stub.server_address[1]}"
+    STUB["base"] = stub_base
 
     sql("CREATE DATABASE " + name)
     binary = (args.binary_dir / "octo-rill").resolve()
@@ -331,6 +347,17 @@ def main():
                 for repo_id, full_name in PACE_REPOS
             ),
             association(PAYLOAD_USER, EPSILON_REPO, EPSILON_FULL_NAME),
+            usage(MOVED_REPO, MOVED_OLD_NAME, "github_public", status="ready"),
+            task(
+                "task-moved",
+                "sync.repo_release",
+                {
+                    "user_id": PAYLOAD_USER,
+                    "repo_id": MOVED_REPO,
+                    "repo_full_name": MOVED_OLD_NAME,
+                    "reason": "fallback_probe",
+                },
+            ),
             usage(EPSILON_REPO, EPSILON_FULL_NAME, "github_public", status="ready"),
             task(
                 "task-epsilon",
@@ -361,6 +388,12 @@ def main():
                 github_release(DELTA_FULL_NAME, "v4.0.0", 9004, "2026-11-18T00:00:00Z")
             ],
         }
+        STUB["redirects"][MOVED_OLD_NAME] = MOVED_NEW_NAME
+        STUB["public"].add(MOVED_NEW_NAME)
+        STUB["tokens"][MOVED_NEW_NAME] = set()
+        STUB["releases"][MOVED_NEW_NAME] = [
+            github_release(MOVED_NEW_NAME, "v6.0.0", 9006, "2026-11-18T00:00:00Z")
+        ]
         STUB["rate_limited"].add(EPSILON_FULL_NAME)
         STUB["public"].add(EPSILON_FULL_NAME)
         STUB["tokens"][EPSILON_FULL_NAME] = set()
@@ -554,6 +587,16 @@ def main():
             assert epsilon_auth[:2] == [f"Bearer {PAYLOAD_TOKEN}", None], epsilon_auth
             assert usage_status(EPSILON_REPO).split("|")[0] == "ready", usage_status(EPSILON_REPO)
 
+            # --- a renamed repository is followed, not failed ----------------
+            status, error_message, result_json = wait_for("task-moved")
+            assert status == "succeeded", (status, error_message, result_json)
+            moved = json.loads(result_json)
+            assert moved["fetched_count"] == 1, moved
+            assert sql(
+                "SELECT tag_name FROM public.repo_releases WHERE release_id = 9006",
+                database_url,
+            ) == "v6.0.0"
+
             # --- account lane is bounded, not serial ------------------------
             status, error_message, result_json = wait_for("task-pace")
             assert status == "succeeded", (status, error_message, result_json)
@@ -591,6 +634,7 @@ def main():
                         "account_lane_resilience": "pass",
                         "account_lane_concurrency": "pass",
                         "throttled_token_public_fallback": "pass",
+                        "renamed_repository_redirect": "pass",
                     }
                 )
             )
