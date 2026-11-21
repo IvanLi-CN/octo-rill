@@ -1,0 +1,462 @@
+{
+  "verified_tables": 90,
+  "failed": [],
+  "excluded": [
+    "runtime_owners (active runtime lease state)"
+  ],
+  "tables": [
+    {
+      "table": "follower_current_members",
+      "exit_code": 0,
+      "seconds": 0.17
+    },
+    {
+      "table": "release_reading_backfill_items",
+      "exit_code": 0,
+      "seconds": 0.22
+    },
+    {
+      "table": "user_api_keys",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "linuxdo_connections",
+      "exit_code": 0,
+      "seconds": 0.13
+    },
+    {
+      "table": "user_tokens",
+      "exit_code": 0,
+      "seconds": 0.23
+    },
+    {
+      "table": "translation_attempt_llm_calls",
+      "exit_code": 0,
+      "seconds": 0.26
+    },
+    {
+      "table": "repo_star_current_members",
+      "exit_code": 0,
+      "seconds": 0.3
+    },
+    {
+      "table": "repo_releases",
+      "exit_code": 0,
+      "seconds": 320.35
+    },
+    {
+      "table": "translation_attempt_events",
+      "exit_code": 0,
+      "seconds": 0.54
+    },
+    {
+      "table": "webhook_push_user_operation_leases",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "public_metrics_hourly_snapshots",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "users",
+      "exit_code": 0,
+      "seconds": 0.25
+    },
+    {
+      "table": "scheduled_task_dispatch_state",
+      "exit_code": 0,
+      "seconds": 0.14
+    },
+    {
+      "table": "llm_model_health",
+      "exit_code": 0,
+      "seconds": 0.37
+    },
+    {
+      "table": "repo_release_sync_state",
+      "exit_code": 0,
+      "seconds": 3.92
+    },
+    {
+      "table": "search_fts_user_lane_rows",
+      "exit_code": 0,
+      "seconds": 0.22
+    },
+    {
+      "table": "follower_sync_baselines",
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "table": "search_projection_backfill_state",
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "table": "search_metadata_backfill_queue",
+      "exit_code": 0,
+      "seconds": 0.32
+    },
+    {
+      "table": "online_migration_runs",
+      "exit_code": 0,
+      "seconds": 0.17
+    },
+    {
+      "table": "release_evidence_snapshots",
+      "exit_code": 0,
+      "seconds": 0.22
+    },
+    {
+      "table": "sync_state",
+      "exit_code": 0,
+      "seconds": 0.17
+    },
+    {
+      "table": "tower_sessions",
+      "exit_code": 0,
+      "seconds": 0.16,
+      "superseded_by": "timestamp-verify.log"
+    },
+    {
+      "table": "starred_repo_connection_memberships",
+      "exit_code": 0,
+      "seconds": 4.95
+    },
+    {
+      "table": "llm_call_events",
+      "exit_code": 0,
+      "seconds": 1.43
+    },
+    {
+      "table": "repo_star_sync_baselines",
+      "exit_code": 0,
+      "seconds": 0.13
+    },
+    {
+      "table": "search_rate_limits",
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "table": "content_current_result_projections",
+      "exit_code": 0,
+      "seconds": 7.68
+    },
+    {
+      "table": "translation_batch_items",
+      "exit_code": 0,
+      "seconds": 10.05
+    },
+    {
+      "table": "release_evidence_snapshot_items",
+      "exit_code": 0,
+      "seconds": 0.11
+    },
+    {
+      "table": "admin_runtime_settings",
+      "exit_code": 0,
+      "seconds": 0.14
+    },
+    {
+      "table": "release_reading_backfill_runs",
+      "exit_code": 0,
+      "seconds": 0.31
+    },
+    {
+      "table": "content_attempt_events",
+      "exit_code": 0,
+      "seconds": 424.8
+    },
+    {
+      "table": "search_documents",
+      "exit_code": 0,
+      "seconds": 103.95
+    },
+    {
+      "table": "content_result_projections",
+      "exit_code": 0,
+      "seconds": 10.89
+    },
+    {
+      "table": "repo_refresh_governance_snapshots",
+      "exit_code": 0,
+      "seconds": 0.6
+    },
+    {
+      "table": "llm_recovery_flags",
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "table": "releases",
+      "exit_code": 0,
+      "seconds": 16.64
+    },
+    {
+      "table": "content_batch_items",
+      "exit_code": 0,
+      "seconds": 146.02
+    },
+    {
+      "table": "content_work_items",
+      "exit_code": 0,
+      "seconds": 108.03
+    },
+    {
+      "table": "repo_refresh_governance_cycle_members",
+      "exit_code": 0,
+      "seconds": 0.51
+    },
+    {
+      "table": "webhook_push_repos",
+      "exit_code": 0,
+      "seconds": 0.25
+    },
+    {
+      "table": "notifications",
+      "exit_code": 0,
+      "seconds": 3.83
+    },
+    {
+      "table": "repo_release_work_items",
+      "exit_code": 0,
+      "seconds": 5.23
+    },
+    {
+      "table": "llm_calls",
+      "exit_code": 0,
+      "seconds": 3.92
+    },
+    {
+      "table": "search_projection_outbox_failed",
+      "exit_code": 0,
+      "seconds": 0.16
+    },
+    {
+      "table": "user_passkeys",
+      "exit_code": 0,
+      "seconds": 0.14
+    },
+    {
+      "table": "content_work_identities",
+      "exit_code": 0,
+      "seconds": 17.57
+    },
+    {
+      "table": "search_document_user_lanes",
+      "exit_code": 0,
+      "seconds": 0.77
+    },
+    {
+      "table": "repo_refresh_governance_cycles",
+      "exit_code": 0,
+      "seconds": 2.92
+    },
+    {
+      "table": "job_task_events",
+      "exit_code": 0,
+      "seconds": 499.96,
+      "superseded_by": "job-events-final-verify.log"
+    },
+    {
+      "table": "content_identity_upgrade_control",
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "table": "search_fts_document_rows",
+      "exit_code": 0,
+      "seconds": 1.89
+    },
+    {
+      "table": "reaction_pat_tokens",
+      "exit_code": 0,
+      "seconds": 0.17
+    },
+    {
+      "table": "content_legacy_observations",
+      "exit_code": 0,
+      "seconds": 50.98
+    },
+    {
+      "table": "social_activity_events",
+      "exit_code": 0,
+      "seconds": 20.26
+    },
+    {
+      "table": "_sqlx_migrations",
+      "exit_code": 0,
+      "seconds": 0.16
+    },
+    {
+      "table": "daily_brief_hour_slots",
+      "exit_code": 0,
+      "seconds": 0.23
+    },
+    {
+      "table": "online_migration_leases",
+      "exit_code": 0,
+      "seconds": 0.2
+    },
+    {
+      "table": "brief_release_memberships",
+      "exit_code": 0,
+      "seconds": 6.83
+    },
+    {
+      "table": "sync_subscription_events",
+      "exit_code": 0,
+      "seconds": 1.01
+    },
+    {
+      "table": "content_processing_control",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "translation_requests",
+      "exit_code": 0,
+      "seconds": 6.0
+    },
+    {
+      "table": "content_attempt_llm_calls",
+      "exit_code": 0,
+      "seconds": 12.57
+    },
+    {
+      "table": "user_repo_associations",
+      "exit_code": 0,
+      "seconds": 7.62
+    },
+    {
+      "table": "content_attempt_provider_admissions",
+      "exit_code": 0,
+      "seconds": 28.09
+    },
+    {
+      "table": "online_migration_operations",
+      "exit_code": 0,
+      "seconds": 0.23
+    },
+    {
+      "table": "repo_refresh_governance_retention_state",
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "table": "content_work_admission_events",
+      "exit_code": 0,
+      "seconds": 9.91
+    },
+    {
+      "table": "release_evidence_index",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "content_request_links",
+      "exit_code": 0,
+      "seconds": 22.6
+    },
+    {
+      "table": "github_connections",
+      "exit_code": 0,
+      "seconds": 0.2
+    },
+    {
+      "table": "job_tasks",
+      "exit_code": 0,
+      "seconds": 413.1,
+      "superseded_by": "job-tasks-float-verify.log"
+    },
+    {
+      "table": "translation_batches",
+      "exit_code": 0,
+      "seconds": 4.37
+    },
+    {
+      "table": "content_batches",
+      "exit_code": 0,
+      "seconds": 204.16
+    },
+    {
+      "table": "search_projection_outbox",
+      "exit_code": 0,
+      "seconds": 0.21
+    },
+    {
+      "table": "admin_collection_processing_coverage",
+      "exit_code": 0,
+      "seconds": 111.49
+    },
+    {
+      "table": "star_sync_epochs",
+      "exit_code": 0,
+      "seconds": 0.15
+    },
+    {
+      "table": "repo_release_watchers",
+      "exit_code": 0,
+      "seconds": 78.07
+    },
+    {
+      "table": "owned_repo_star_baselines",
+      "exit_code": 0,
+      "seconds": 0.54
+    },
+    {
+      "table": "content_work_identity_members",
+      "exit_code": 0,
+      "seconds": 16.94
+    },
+    {
+      "table": "translation_work_items",
+      "exit_code": 0,
+      "seconds": 5.4
+    },
+    {
+      "table": "ai_translations",
+      "exit_code": 0,
+      "seconds": 96.94
+    },
+    {
+      "table": "webhook_push_reconcile_demands",
+      "exit_code": 0,
+      "seconds": 0.21
+    },
+    {
+      "table": "webhook_push_deliveries",
+      "exit_code": 0,
+      "seconds": 0.47
+    },
+    {
+      "table": "briefs",
+      "exit_code": 0,
+      "seconds": 8.61
+    },
+    {
+      "table": "admin_dashboard_daily_rollups",
+      "exit_code": 0,
+      "seconds": 0.27
+    },
+    {
+      "table": "public_repo_release_usage",
+      "exit_code": 0,
+      "seconds": 0.24
+    },
+    {
+      "table": "llm_diagnostic_access_audit",
+      "exit_code": 0,
+      "seconds": 0.24
+    },
+    {
+      "table": "starred_repos",
+      "exit_code": 0,
+      "seconds": 5.32
+    }
+  ]
+}

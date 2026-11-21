@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "migration": {
+    "id": "sqlite-postgresql-complete",
+    "status": "in_progress"
+  },
+  "durable_state": {
+    "source_compatibility_range": "SQLite SQLx history through 0105; PostgreSQL baseline 0001\u20130009",
+    "target": "PostgreSQL 18 with forward migrations 0010\u20130013"
+  },
+  "operations": [
+    {
+      "order": 1,
+      "id": "snapshot",
+      "status": "verified",
+      "source_bytes": 10985185280,
+      "sha256": "d37bc6e0c2a69a1b8ef2c8a610ee56c16076a819d5cda63b5e0ca346478bd9a8",
+      "method": "sqlite VACUUM INTO read-only",
+      "compacted_bytes": 7392002048,
+      "source_table_bytes": 10985185280,
+      "seconds": 119
+    },
+    {
+      "order": 2,
+      "id": "ddl",
+      "status": "baseline_plus_forward_migrations_0010_0014",
+      "deployed_migrations_immutable": true
+    },
+    {
+      "order": 3,
+      "id": "copy",
+      "status": "production_copy_imported",
+      "pauseable": "between committed tables",
+      "seconds": 461,
+      "tables": 90,
+      "note": "skips sqlite _sqlx_migrations and FTS projections"
+    },
+    {
+      "order": 4,
+      "id": "equivalence-verification",
+      "status": "verified_on_pristine_copy",
+      "excluded": [
+        "runtime_owners active lease state"
+      ],
+      "note": "runtime-mutated tables (request counters, runtime_owners) are proven app-written drift, not migration loss",
+      "tables": 90,
+      "pipeline_seconds": 1783
+    },
+    {
+      "order": 5,
+      "id": "application-parity",
+      "status": "all_four_followups_complete",
+      "seed_suites_passing": 15,
+      "seed_suite_assertions": 110,
+      "gaps": [
+        "baseline drift detection",
+        "legacy sqlite modules not deleted",
+        "production cutover not authorized"
+      ],
+      "fresh_database_bootstrap": true,
+      "write_probe": {
+        "passed": 14,
+        "failed": 0,
+        "restored": true,
+        "skipped_external": 24,
+        "skipped_scope": 22
+      },
+      "schedulers": [
+        "daily_brief",
+        "subscriptions",
+        "star_sync",
+        "recent_failures",
+        "webhook_push",
+        "account_pause",
+        "admin_rollup"
+      ],
+      "unit_tests": "1271 passed / 0 failed / 4 ignored",
+      "global_content_overlay": {
+        "seed_suite": "7/7",
+        "production_parity": {
+          "sample": 30,
+          "passed": 30,
+          "direct_ready": 22,
+          "unresolvable_identity": 8
+        }
+      },
+      "star_epoch_slicing": "5/5 seed checks",
+      "repo_release_worker": "10/10 webhook checks",
+      "translation_task_audit": "task_id_llm_audit pass",
+      "repo_release_fallback": {
+        "seed_suite": "5/5",
+        "public_usage_repos": 84,
+        "repos_without_user_token": 11
+      },
+      "star_epoch_enqueue": "due-epoch probe + single-flight",
+      "detail_payload_fields": [
+        "request_id",
+        "auto_translate"
+      ],
+      "async_translation_prompt": "persisted source_snapshot_json blocks",
+      "legacy_defect_issues": [
+        381,
+        382,
+        383
+      ]
+    },
+    {
+      "order": 6,
+      "id": "production-copy-read-acceptance",
+      "status": "initial_pass_complete",
+      "passed": 75,
+      "failed": 2,
+      "not_run": 7,
+      "failure_classes": [
+        "missing production encryption key",
+        "task log files absent from snapshot"
+      ],
+      "read": {
+        "passed": 75,
+        "failed": 2,
+        "not_run": 7
+      }
+    }
+  ],
+  "recovery": {
+    "source_unchanged": true,
+    "production_cutover_authorized": false,
+    "faulty_release": "forward repair only",
+    "reentry": "same-count canonical content equality enforced; corrupted target rejected"
+  },
+  "validation": {
+    "seeded_pg18": "import/reentry/tamper rejection/session copy, actual HTTP auth/read handlers/search access/disabled worker tests passed",
+    "production_snapshot_read_acceptance": "not_complete"
+  }
+}
