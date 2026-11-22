@@ -403,10 +403,6 @@ async fn serve_sqlite(config: AppConfig) -> Result<()> {
         )
         .route("/admin/jobs/migrations", get(online_migrations::admin_list))
         .route(
-            "/admin/jobs/migrations/{migration_id}",
-            get(online_migrations::admin_detail),
-        )
-        .route(
             "/admin/jobs/migrations/{migration_id}/pause",
             post(online_migrations::admin_pause),
         )

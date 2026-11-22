@@ -942,21 +942,6 @@ pub async fn admin_list(
     Ok(Json(json!({"run": run, "operations": operations})))
 }
 
-pub async fn admin_detail(
-    state: State<Arc<AppState>>,
-    session: Session,
-    path: Path<String>,
-) -> Result<Json<Value>, crate::error::ApiError> {
-    if path.0 != MIGRATION_ID {
-        return Err(crate::error::ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "not_found",
-            "migration not found",
-        ));
-    }
-    admin_list(state, session).await
-}
-
 pub async fn admin_pause(
     State(state): State<Arc<AppState>>,
     session: Session,

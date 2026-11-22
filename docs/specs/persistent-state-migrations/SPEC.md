@@ -16,7 +16,7 @@ This topic governs release-to-release changes to OctoRill's durable SQLite state
 
 ## Interfaces
 
-The administrator authentication boundary exposes `GET /admin/jobs/migrations`, `GET /admin/jobs/migrations/{migration_id}`, `POST /admin/jobs/migrations/{migration_id}/pause`, and `POST /admin/jobs/migrations/{migration_id}/resume`. These endpoints expose redacted state only and do not create user-facing migration APIs.
+The administrator authentication boundary exposes `GET /admin/jobs/migrations`, `POST /admin/jobs/migrations/{migration_id}/pause`, and `POST /admin/jobs/migrations/{migration_id}/resume`. The read endpoint returns the run together with every operation in `operation_order`; it is the only migration read surface, because the runtime defines exactly one migration. These endpoints expose redacted state only and do not create user-facing migration APIs.
 
 ## Verification
 
