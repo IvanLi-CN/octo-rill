@@ -9,6 +9,7 @@
 
 use std::{collections::HashMap, fmt, time::Duration};
 
+use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres};
@@ -25,16 +26,19 @@ const USER_AGENT: &str = "OctoRill";
 const API_VERSION: &str = "2022-11-28";
 /// Legacy access kind for repositories registered by unauthenticated readers.
 const PUBLIC_ACCESS_KIND: &str = "github_public";
-/// Failure classes that mean "this credential cannot read *this* repository",
-/// so the next candidate user is worth trying. Every other class describes the
-/// upstream call itself (rate limit, timeout, network, decode) and would fail
-/// identically for any candidate.
-const ROTATING_REASON_CODES: [&str; 5] = [
+/// Failure classes whose outcome can differ for another candidate user: the
+/// credential cannot read *this* repository, or GitHub is throttling that
+/// token. Rate limits are counted per token (and per token plus IP for the
+/// secondary limit), so one throttled candidate says nothing about the next.
+/// Every other class describes the upstream call itself (timeout, network,
+/// decode) and would fail identically for any candidate.
+const ROTATING_REASON_CODES: [&str; 6] = [
     "credentials_missing",
     "credentials_invalid",
     "credentials_forbidden",
     "scope_insufficient",
     "repo_inaccessible",
+    "rate_limited",
 ];
 
 /// Classified upstream or local failure for one repository refresh.
@@ -227,22 +231,106 @@ pub(crate) async fn fetch_releases(
     }
     let sync_state = load_sync_state(pool, request.repo_id).await?;
 
-    let mut first_failure: Option<RefreshFailure> = None;
-    let mut upstream_failure: Option<RefreshFailure> = None;
-    for candidate in &candidates {
-        match fetch_for_user(
+    let (fetch, via, candidate_user_id) = match rotate_candidates(
+        &candidates,
+        request.requested_by_user_id,
+        request.repo_full_name,
+        &CredentialAttempt {
             pool,
             http,
             encryption_key,
             request,
-            candidate,
-            sync_state.as_ref(),
+            sync_state: sync_state.as_ref(),
             credentials,
+        },
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(failure) => {
+            // Legacy attempted the anonymous read after any candidate failure,
+            // so a throttled token does not hide a public repository.
+            if !public_usage.needs_public_fallback {
+                return Err(failure);
+            }
+            let fetch = fetch_public(http, request, sync_state.as_ref()).await?;
+            return Ok(ReleaseFetchOutcome {
+                fetch,
+                via: FetchVia::Public,
+                candidate_user_id: None,
+                public_usage,
+            });
+        }
+    };
+    Ok(ReleaseFetchOutcome {
+        fetch,
+        via,
+        candidate_user_id: Some(candidate_user_id),
+        public_usage,
+    })
+}
+
+/// One candidate user's chance at reading the repository.
+///
+/// Both callers of [`rotate_candidates`] live in this module: the production
+/// implementation over GitHub connections, and the rotation tests over
+/// scripted answers.
+#[async_trait]
+trait CandidateAttempt {
+    async fn attempt(
+        &self,
+        candidate: &str,
+    ) -> std::result::Result<RepositoryFetch, RefreshFailure>;
+}
+
+/// The production attempt: every GitHub connection of one candidate user.
+struct CredentialAttempt<'a> {
+    pool: &'a PgPool,
+    http: &'a Client,
+    encryption_key: &'a EncryptionKey,
+    request: &'a ReleaseFetchRequest<'a>,
+    sync_state: Option<&'a SyncStateRow>,
+    credentials: &'a ReleaseCredentialCache,
+}
+
+#[async_trait]
+impl CandidateAttempt for CredentialAttempt<'_> {
+    async fn attempt(
+        &self,
+        candidate: &str,
+    ) -> std::result::Result<RepositoryFetch, RefreshFailure> {
+        fetch_for_user(
+            self.pool,
+            self.http,
+            self.encryption_key,
+            self.request,
+            candidate,
+            self.sync_state,
+            self.credentials,
         )
         .await
-        {
+    }
+}
+
+/// Try the candidate users in order, returning the first read that succeeds.
+///
+/// A failure classified as [`RefreshFailure::rotates_candidate`] means another
+/// candidate may still read the repository, so the rotation continues; any
+/// other failure describes the upstream call itself and stops it. When every
+/// candidate fails, the classification carrying an HTTP status wins over a
+/// purely local one, and the first attempt decides between two of equal rank.
+async fn rotate_candidates(
+    candidates: &[String],
+    requested_by_user_id: &str,
+    repo_full_name: &str,
+    attempt: &impl CandidateAttempt,
+) -> std::result::Result<(RepositoryFetch, FetchVia, String), RefreshFailure> {
+    let mut first_failure: Option<RefreshFailure> = None;
+    let mut upstream_failure: Option<RefreshFailure> = None;
+    for candidate in candidates {
+        match attempt.attempt(candidate.as_str()).await {
             Ok(fetch) => {
-                let via = if candidate == request.requested_by_user_id {
+                let via = if candidate == requested_by_user_id {
                     FetchVia::User
                 } else {
                     FetchVia::Candidate
@@ -251,18 +339,13 @@ pub(crate) async fn fetch_releases(
                     warn!(
                         event = "upstream.call",
                         operation = "repo_release_fetch",
-                        repo = request.repo_full_name,
-                        requested_by = request.requested_by_user_id,
+                        repo = repo_full_name,
+                        requested_by = requested_by_user_id,
                         candidate_user_id = candidate,
                         "reading repository releases through a rotated candidate user"
                     );
                 }
-                return Ok(ReleaseFetchOutcome {
-                    fetch,
-                    via,
-                    candidate_user_id: Some(candidate.clone()),
-                    public_usage,
-                });
+                return Ok((fetch, via, candidate.clone()));
             }
             Err(failure) => {
                 let rotates = failure.rotates_candidate();
@@ -273,35 +356,19 @@ pub(crate) async fn fetch_releases(
                 }
                 first_failure.get_or_insert(failure);
                 if !rotates {
-                    // Not a credential problem: another candidate token would
-                    // hit the same upstream condition. The anonymous read can
-                    // still succeed, so stop rotating but keep the fallback.
+                    // Not a credential or throttle problem: another candidate
+                    // token would hit the same upstream condition. The
+                    // anonymous read can still succeed, so stop rotating but
+                    // keep the fallback.
                     break;
                 }
             }
         }
     }
-
-    // Legacy attempted the anonymous read after any candidate failure, so a
-    // rate-limited or throttled token does not hide a public repository.
-    if public_usage.needs_public_fallback {
-        match fetch_public(http, request, sync_state.as_ref()).await {
-            Ok(fetch) => {
-                return Ok(ReleaseFetchOutcome {
-                    fetch,
-                    via: FetchVia::Public,
-                    candidate_user_id: None,
-                    public_usage,
-                });
-            }
-            Err(failure) => return Err(failure),
-        }
-    }
-
     Err(upstream_failure.or(first_failure).unwrap_or_else(|| {
         RefreshFailure::new(
             "credentials_missing",
-            format!("no usable GitHub connection for {}", request.repo_full_name),
+            format!("no usable GitHub connection for {repo_full_name}"),
             false,
             None,
         )
@@ -760,6 +827,8 @@ pub(crate) fn classify_http_error(
 mod tests {
     use super::*;
 
+    type AttemptResult = std::result::Result<RepositoryFetch, RefreshFailure>;
+
     #[test]
     fn http_errors_are_classified_like_the_legacy_lane() {
         let headers = reqwest::header::HeaderMap::new();
@@ -788,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn only_credential_and_permission_classes_rotate() {
+    fn credential_permission_and_throttle_classes_rotate() {
         for code in ROTATING_REASON_CODES {
             assert!(
                 RefreshFailure::new(code, "synthetic", false, None).rotates_candidate(),
@@ -796,7 +865,6 @@ mod tests {
             );
         }
         for code in [
-            "rate_limited",
             "timeout",
             "network_error",
             "request_error",
@@ -810,6 +878,137 @@ mod tests {
                 "{code} must not rotate"
             );
         }
+    }
+
+    /// The failure GitHub produces for a token whose primary limit is spent.
+    fn throttled_403() -> RefreshFailure {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        let failure = classify_http_error(StatusCode::FORBIDDEN, &headers, "");
+        assert_eq!(failure.reason_code, "rate_limited");
+        assert_eq!(failure.status, Some(403));
+        failure
+    }
+
+    /// Rotation probe whose answers are scripted, so candidate order and the
+    /// final classification are asserted without a database or network.
+    struct ScriptedAttempt {
+        calls: std::sync::Mutex<Vec<String>>,
+        answer: fn(&str) -> AttemptResult,
+    }
+
+    impl ScriptedAttempt {
+        fn new(answer: fn(&str) -> AttemptResult) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                answer,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CandidateAttempt for ScriptedAttempt {
+        async fn attempt(&self, candidate: &str) -> AttemptResult {
+            self.calls.lock().unwrap().push(candidate.to_owned());
+            (self.answer)(candidate)
+        }
+    }
+
+    fn readable() -> RepositoryFetch {
+        RepositoryFetch {
+            pages_fetched: 1,
+            stopped_reason: "empty_page".to_owned(),
+            ..RepositoryFetch::default()
+        }
+    }
+
+    fn throttled_first(candidate: &str) -> AttemptResult {
+        if candidate == "user-a" {
+            return Err(throttled_403());
+        }
+        Ok(readable())
+    }
+
+    fn always_throttled(_candidate: &str) -> AttemptResult {
+        Err(throttled_403())
+    }
+
+    fn missing_then_throttled(candidate: &str) -> AttemptResult {
+        if candidate == "user-a" {
+            return Err(RefreshFailure::new(
+                "credentials_missing",
+                "no usable connection",
+                false,
+                None,
+            ));
+        }
+        Err(throttled_403())
+    }
+
+    fn upstream_http_error(_candidate: &str) -> AttemptResult {
+        Err(RefreshFailure::new(
+            "github_http_error",
+            "sync repo releases: github returned 500",
+            false,
+            Some(500),
+        ))
+    }
+
+    #[tokio::test]
+    async fn rate_limited_candidate_rotates_to_the_next_user() {
+        let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
+        let attempt = ScriptedAttempt::new(throttled_first);
+        let (fetch, via, candidate_user_id) =
+            rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+                .await
+                .expect("the second candidate reads the repository");
+        assert_eq!(attempt.calls().as_slice(), ["user-a", "user-b"]);
+        assert_eq!(via, FetchVia::Candidate);
+        assert_eq!(candidate_user_id, "user-b");
+        assert_eq!(fetch.pages_fetched, 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_throttled_rotation_reports_rate_limited() {
+        let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
+        let attempt = ScriptedAttempt::new(always_throttled);
+        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+            .await
+            .expect_err("every candidate is throttled");
+        assert_eq!(attempt.calls().as_slice(), ["user-a", "user-b"]);
+        assert_eq!(failure.reason_code, "rate_limited");
+        assert_eq!(failure.status, Some(403));
+    }
+
+    #[tokio::test]
+    async fn a_local_failure_does_not_hide_the_upstream_status() {
+        let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
+        let attempt = ScriptedAttempt::new(missing_then_throttled);
+        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+            .await
+            .expect_err("no candidate reads the repository");
+        assert_eq!(attempt.calls().as_slice(), ["user-a", "user-b"]);
+        // `first_failure` is the status-less credentials_missing, but the
+        // surfaced classification must stay the throttled upstream answer so
+        // the worker keeps its retry backoff.
+        assert_eq!(failure.reason_code, "rate_limited");
+        assert_eq!(failure.status, Some(403));
+        assert!(failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn non_rotating_failures_stop_the_rotation() {
+        let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
+        let attempt = ScriptedAttempt::new(upstream_http_error);
+        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+            .await
+            .expect_err("the upstream call itself failed");
+        assert_eq!(attempt.calls().as_slice(), ["user-a"]);
+        assert_eq!(failure.reason_code, "github_http_error");
     }
 
     #[test]
