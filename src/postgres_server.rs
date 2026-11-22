@@ -94,6 +94,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
+                config.ai.clone(),
             ),
         )
         .register(
@@ -102,6 +103,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
+                config.ai.clone(),
             ),
         )
         .register(
@@ -118,6 +120,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
+                config.ai.clone(),
             ),
         )
         .register(
@@ -126,6 +129,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
                 runtime.pool.clone(),
                 http.clone(),
                 config.encryption_key.clone(),
+                config.ai.clone(),
             ),
         )
         .register(
