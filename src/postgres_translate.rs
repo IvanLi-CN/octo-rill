@@ -1629,15 +1629,27 @@ async fn begin_request(
 ///   retry, otherwise the new task would fail on its finished state.
 ///
 /// At most [`AUTO_RELEASE_TRANSLATION_CAP`] releases are considered per call.
-/// A failure for one release is logged and never aborts the others or the
-/// calling sync task. Returns the number of tasks queued.
+/// A sync that inserts more reports the excess instead of dropping it silently;
+/// the later releases stay untranslated until a backfill lane claims them. A
+/// failure for one release is logged and never aborts the others or the calling
+/// sync task. Returns the number of tasks queued.
 pub(crate) async fn enqueue_release_translations(
     pool: &PgPool,
     user_id: &str,
     release_ids: &[i64],
     source: &str,
 ) -> anyhow::Result<usize> {
-    let release_ids = capped_release_ids(release_ids);
+    let (release_ids, skipped) = release_id_batch(release_ids);
+    if skipped > 0 {
+        warn!(
+            event = "translation.enqueue",
+            user_id,
+            source,
+            considered = release_ids.len(),
+            skipped,
+            "automatic release translation batch truncated"
+        );
+    }
     if release_ids.is_empty() {
         return Ok(0);
     }
@@ -1693,15 +1705,19 @@ pub(crate) async fn enqueue_release_translations(
     Ok(queued)
 }
 
-/// Deduplicate the caller's release ids and bound the batch.
-fn capped_release_ids(release_ids: &[i64]) -> Vec<i64> {
+/// Deduplicate the caller's release ids, keep their order and bound the batch.
+/// The second value counts the releases the cap left out so the caller can
+/// report a truncated sync instead of losing them quietly.
+fn release_id_batch(release_ids: &[i64]) -> (Vec<i64>, usize) {
     let mut seen = HashSet::with_capacity(release_ids.len());
-    release_ids
+    let mut unique = release_ids
         .iter()
         .copied()
         .filter(|release_id| seen.insert(*release_id))
-        .take(AUTO_RELEASE_TRANSLATION_CAP)
-        .collect()
+        .collect::<Vec<_>>();
+    let skipped = unique.len().saturating_sub(AUTO_RELEASE_TRANSLATION_CAP);
+    unique.truncate(AUTO_RELEASE_TRANSLATION_CAP);
+    (unique, skipped)
 }
 
 /// A release with neither a name nor a body has nothing to translate. The
@@ -3284,18 +3300,20 @@ fn db_failure(error: sqlx::Error) -> Response {
 mod tests {
     use super::{
         AUTO_RELEASE_TRANSLATION_CAP, AutoTranslationDecision, auto_translation_decision,
-        capped_release_ids, release_has_translatable_content,
+        release_has_translatable_content, release_id_batch,
     };
 
     #[test]
     fn automatic_enqueue_bounds_and_deduplicates_the_release_batch() {
         let ids = (1..=40).chain([7, 8]).collect::<Vec<i64>>();
-        let capped = capped_release_ids(&ids);
+        let (capped, skipped) = release_id_batch(&ids);
         assert_eq!(capped.len(), AUTO_RELEASE_TRANSLATION_CAP);
         assert_eq!(capped.first().copied(), Some(1));
         assert_eq!(capped.last().copied(), Some(25));
-        assert!(capped_release_ids(&[]).is_empty());
-        assert_eq!(capped_release_ids(&[9, 9, 9]), vec![9]);
+        // The sync must be able to report what the cap left out.
+        assert_eq!(skipped, 40 - AUTO_RELEASE_TRANSLATION_CAP);
+        assert_eq!(release_id_batch(&[]), (Vec::new(), 0));
+        assert_eq!(release_id_batch(&[9, 9, 9]), (vec![9], 0));
     }
 
     #[test]
