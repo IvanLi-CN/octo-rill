@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""Validate the PostgreSQL job center read surface with synthetic isolated data.
+
+Covers `GET /api/admin/jobs/overview` (six KPI counters and their 24h windows),
+`GET /api/admin/jobs/realtime` (`task_group` semantics, status/task_type
+filters, exact totals, page metadata, the complete item shape and subscription
+diagnostics) and `GET /api/admin/jobs/events` (real `text/event-stream`
+response, `Last-Event-ID` resume, admin-only access).
+"""
+import argparse
+import base64
+import json
+import os
+import pathlib
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+from pg_seed_common import psql
+
+
+TASK_FIELDS = {
+    'id',
+    'task_type',
+    'status',
+    'source',
+    'skipped',
+    'requested_by',
+    'parent_task_id',
+    'cancel_requested',
+    'error_message',
+    'created_at',
+    'started_at',
+    'finished_at',
+    'updated_at',
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--admin-url', required=True)
+    parser.add_argument('--binary-dir', type=pathlib.Path, default=pathlib.Path('target/debug'))
+    parser.add_argument('--port', type=int, default=3033)
+    args = parser.parse_args()
+    name = 'octo_rill_jobs_center_seed_' + str(os.getpid())
+    url = urlunsplit(urlsplit(args.admin_url)._replace(path='/' + name))
+
+    def sql(query, db=args.admin_url):
+        return psql(db, query)
+
+    sql('CREATE DATABASE ' + name)
+    binary = (args.binary_dir / 'octo-rill').resolve()
+    helper = (args.binary_dir / 'octo-rill-validation-session').resolve()
+    env = dict(
+        os.environ,
+        DATABASE_URL=url,
+        OCTORILL_ENCRYPTION_KEY_BASE64=base64.b64encode(bytes(32)).decode(),
+        GITHUB_CLIENT_ID='validation',
+        GITHUB_CLIENT_SECRET='validation',
+        GITHUB_OAUTH_REDIRECT_URL=f'http://127.0.0.1:{args.port}/auth/github/callback',
+        OCTORILL_BIND_ADDR=f'127.0.0.1:{args.port}',
+        OCTORILL_PG_WORKER_ENABLED='0',
+        OCTORILL_PG_SCHEDULER_ENABLED='0',
+        OCTORILL_PG_BOOTSTRAP_ONLY='1',
+    )
+    env.pop('AI_MODEL', None)
+    env.pop('AI_API_KEY', None)
+    process = None
+    try:
+        # Runtime baseline (migrations_pg), including job_tasks, its events,
+        # the daily brief slots and the application tables.
+        subprocess.run([binary], env=env, check=True, stdout=subprocess.DEVNULL)
+        sql(
+            """
+            INSERT INTO public.users
+              (id, github_user_id, login, created_at, updated_at, is_admin, is_disabled)
+            VALUES
+              ('seed-admin', 101, 'seed-admin', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1, 0),
+              ('seed-user', 102, 'seed-user', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0, 0);
+            """,
+            url,
+        )
+        # Every row below is created relative to NOW() so the 24h KPI windows
+        # stay meaningful whenever the suite runs. `rt-old` is deliberately
+        # outside the window.
+        sql(
+            """
+            INSERT INTO public.job_tasks
+              (id, task_type, status, source, requested_by, payload_json, result_json,
+               error_message, cancel_requested, created_at, started_at, finished_at, updated_at)
+            VALUES
+              ('rt-1', 'translate.release.batch', 'succeeded', 'api.translate', NULL,
+               '{"release_ids":[1]}', '{"total":1}', NULL, 0,
+               now() - interval '60 minutes', now() - interval '59 minutes',
+               now() - interval '59 minutes', now() - interval '59 minutes'),
+              ('rt-2', 'summarize.release.smart.batch', 'failed', 'scheduler', NULL,
+               '{}', NULL, 'summarize boom', 0,
+               now() - interval '50 minutes', now() - interval '49 minutes',
+               now() - interval '49 minutes', now() - interval '49 minutes'),
+              ('rt-3', 'sync.notifications', 'running', 'api.sync', 'seed-user',
+               '{}', NULL, NULL, 1,
+               now() - interval '40 minutes', now() - interval '39 minutes',
+               NULL, now() - interval '39 minutes'),
+              ('rt-old', 'translate.release.batch', 'succeeded', 'api.translate', NULL,
+               '{}', '{"total":1}', NULL, 0,
+               now() - interval '48 hours', now() - interval '48 hours',
+               now() - interval '48 hours', now() - interval '48 hours'),
+              ('sch-1', 'brief.daily_slot', 'succeeded', 'scheduler', NULL,
+               '{"hour_utc":6}', '{"generated":1}', NULL, 0,
+               now() - interval '30 minutes', now() - interval '29 minutes',
+               now() - interval '29 minutes', now() - interval '29 minutes'),
+              ('sch-2', 'brief.daily_slot', 'queued', 'scheduler', NULL,
+               '{"hour_utc":7}', NULL, NULL, 0,
+               now() - interval '20 minutes', NULL, NULL,
+               now() - interval '20 minutes'),
+              ('sch-3', 'retry.recent_failures', 'succeeded', 'scheduler', NULL,
+               '{}', '{"retried":0}', NULL, 0,
+               now() - interval '10 minutes', now() - interval '9 minutes',
+               now() - interval '9 minutes', now() - interval '9 minutes'),
+              ('sch-4', 'webhook.push.audit', 'succeeded', 'scheduler', NULL,
+               '{}', '{"audited":0}', NULL, 0,
+               now() - interval '5 minutes', now() - interval '4 minutes',
+               now() - interval '4 minutes', now() - interval '4 minutes'),
+              ('us-1', 'sync.starred.delta', 'succeeded', 'scheduler', 'seed-user',
+               '{"user_id":"seed-user"}', '{"skipped":false}', NULL, 0,
+               now() - interval '55 minutes', now() - interval '54 minutes',
+               now() - interval '54 minutes', now() - interval '54 minutes'),
+              ('us-2', 'sync.starred.reconcile', 'failed', 'scheduler', 'seed-user',
+               '{"user_id":"seed-user"}', NULL, 'reconcile boom', 0,
+               now() - interval '45 minutes', now() - interval '44 minutes',
+               now() - interval '44 minutes', now() - interval '44 minutes'),
+              ('sub-1', 'sync.subscriptions', 'succeeded', 'scheduler', NULL,
+               '{"trigger":"scheduler","schedule_key":"daily-06"}',
+               '{"skipped":true,"skip_reason":"previous_run_active"}', NULL, 0,
+               now() - interval '35 minutes', now() - interval '34 minutes',
+               now() - interval '34 minutes', now() - interval '34 minutes'),
+              ('sub-2', 'sync.subscriptions', 'failed', 'scheduler', NULL,
+               '{"trigger":"manual"}',
+               '{"release":{"total_repos":4,"succeeded_repos":1,"failed_repos":1},'
+               '"social":{"total_users":2,"succeeded_users":2},"critical_events":1}',
+               'subscription boom', 0,
+               now() - interval '25 minutes', now() - interval '24 minutes',
+               now() - interval '24 minutes', now() - interval '24 minutes'),
+              ('sub-3', 'sync.subscriptions', 'running', 'scheduler', NULL,
+               '{"trigger":"scheduler"}', NULL, NULL, 0,
+               now() - interval '15 minutes', now() - interval '14 minutes',
+               NULL, now() - interval '14 minutes');
+            INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES
+              ('sub-1-collect', 'sub-1', 'task.progress',
+               '{"stage":"collect","total_users":7}', now() - interval '34 minutes'),
+              ('sub-1-release', 'sub-1', 'task.progress',
+               '{"stage":"release_summary","total_repos":3,"succeeded_repos":3}',
+               now() - interval '33 minutes');
+            INSERT INTO public.sync_subscription_events
+              (id, task_id, stage, event_type, severity, recoverable, attempt,
+               user_id, repo_id, repo_full_name, payload_json, created_at)
+            VALUES
+              ('sub-ev-1', 'sub-1', 'collect', 'subscription.progress', 'info', 1, 1,
+               'seed-user', 10, 'acme/rocket', '{"message":"collected"}',
+               '2026-11-01T00:00:00Z');
+            """,
+            url,
+        )
+
+        with tempfile.TemporaryDirectory(prefix='octo-rill-jobs-center-test-') as tmp:
+            tmp = pathlib.Path(tmp)
+            cookies = {}
+            for user in ('seed-admin', 'seed-user'):
+                file = tmp / user
+                subprocess.run(
+                    [
+                        helper,
+                        '--postgres-url',
+                        url,
+                        '--user-id',
+                        user,
+                        '--cookie-file',
+                        file,
+                        '--isolated-validation-copy',
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+                cookies[user] = file.read_text().strip()
+            env.pop('OCTORILL_PG_BOOTSTRAP_ONLY')
+            log = (tmp / 'server.log').open('w+')
+            process = subprocess.Popen([binary], env=env, stdout=log, stderr=subprocess.STDOUT)
+            base = f'http://127.0.0.1:{args.port}'
+            for _ in range(150):
+                try:
+                    urllib.request.urlopen(base + '/health', timeout=1).close()
+                    break
+                except Exception:
+                    if process.poll() is not None:
+                        log.seek(0)
+                        raise RuntimeError(log.read()[-8000:])
+                    time.sleep(.1)
+            else:
+                raise RuntimeError('validation server did not become ready')
+
+            def request(path, user='seed-admin'):
+                headers = {'Cookie': cookies[user]} if user else {}
+                req = urllib.request.Request(base + path, headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as response:
+                        raw = response.read()
+                        return response.status, (json.loads(raw) if raw else None)
+                except urllib.error.HTTPError as error:
+                    raw = error.read()
+                    if error.code >= 500:
+                        print('--- server log tail ---', flush=True)
+                        print((tmp / 'server.log').read_text()[-4000:], flush=True)
+                    return error.code, (json.loads(raw) if raw else None)
+
+            def realtime(params, user='seed-admin'):
+                return request('/api/admin/jobs/realtime?' + urlencode(params), user)
+
+            # ---- authentication -------------------------------------------------
+            for path in (
+                '/api/admin/jobs/overview',
+                '/api/admin/jobs/realtime?status=all',
+                '/api/admin/jobs/events',
+            ):
+                code, body = request(path, None)
+                assert code == 401, (path, code, body)
+                code, body = request(path, 'seed-user')
+                assert code == 403, (path, code, body)
+
+            # ---- overview -------------------------------------------------------
+            code, overview = request('/api/admin/jobs/overview')
+            assert code == 200, (code, overview)
+            assert set(overview) == {
+                'queued',
+                'running',
+                'failed_24h',
+                'succeeded_24h',
+                'enabled_scheduled_slots',
+                'total_scheduled_slots',
+            }, overview
+            assert overview['queued'] == 1, overview
+            assert overview['running'] == 2, overview
+            assert overview['failed_24h'] == 3, overview
+            # rt-old finished 48h ago and must stay outside the window.
+            assert overview['succeeded_24h'] == 6, overview
+            assert overview['enabled_scheduled_slots'] == 24, overview
+            assert overview['total_scheduled_slots'] == 24, overview
+
+            # ---- task_group semantics ------------------------------------------
+            code, realtime_page = realtime(
+                {'status': 'all', 'task_group': 'realtime', 'page': 1, 'page_size': 2}
+            )
+            assert code == 200, (code, realtime_page)
+            assert realtime_page['total'] == 4, realtime_page
+            assert realtime_page['page'] == 1 and realtime_page['page_size'] == 2
+            ids = [item['id'] for item in realtime_page['items']]
+            assert ids == ['rt-3', 'rt-2'], ids
+            item = realtime_page['items'][0]
+            assert TASK_FIELDS <= set(item), item
+            assert 'task_id' not in item, item
+            assert item['status'] == 'running' and item['cancel_requested'] is True, item
+            assert item['created_at'] and item['finished_at'] is None, item
+            assert 'diagnostics' not in item, item
+            assert realtime_page['items'][1]['error_message'] == 'summarize boom'
+
+            code, second_page = realtime(
+                {'status': 'all', 'task_group': 'realtime', 'page': 2, 'page_size': 2}
+            )
+            assert code == 200, (code, second_page)
+            assert [entry['id'] for entry in second_page['items']] == ['rt-1', 'rt-old']
+            assert second_page['total'] == 4, second_page
+
+            code, scheduled_page = realtime({'status': 'all', 'task_group': 'scheduled'})
+            assert code == 200, (code, scheduled_page)
+            scheduled_ids = [entry['id'] for entry in scheduled_page['items']]
+            # `sync.subscriptions` is a scheduled task type in the legacy
+            # contract, so it belongs to this group as well.
+            assert scheduled_page['total'] == 7, scheduled_page
+            assert scheduled_ids == [
+                'sch-4',
+                'sch-3',
+                'sub-3',
+                'sch-2',
+                'sub-2',
+                'sch-1',
+                'sub-1',
+            ], scheduled_ids
+            assert 'us-1' not in scheduled_ids
+            scheduled_types = {entry['task_type'] for entry in scheduled_page['items']}
+            assert 'sync.starred.delta' not in scheduled_types, scheduled_types
+            scheduled_by_id = {entry['id']: entry for entry in scheduled_page['items']}
+            assert 'diagnostics' not in scheduled_by_id['sch-1'], scheduled_by_id['sch-1']
+            assert scheduled_by_id['sub-1']['diagnostics']['sync_subscriptions'][
+                'skipped'
+            ] is True
+
+            code, user_sync_page = realtime({'status': 'all', 'task_group': 'user_sync'})
+            assert code == 200, (code, user_sync_page)
+            assert user_sync_page['total'] == 2, user_sync_page
+            assert [entry['task_type'] for entry in user_sync_page['items']] == [
+                'sync.starred.reconcile',
+                'sync.starred.delta',
+            ], user_sync_page
+
+            # ---- status / task_type / exclude filters --------------------------
+            code, failed_page = realtime({'status': 'failed', 'task_group': 'realtime'})
+            assert code == 200 and failed_page['total'] == 1, failed_page
+            assert [entry['id'] for entry in failed_page['items']] == ['rt-2'], failed_page
+
+            code, type_page = realtime(
+                {'status': 'all', 'task_type': 'brief.daily_slot'}
+            )
+            assert code == 200 and type_page['total'] == 2, type_page
+
+            code, excluded_page = realtime(
+                {'status': 'all', 'exclude_task_type': 'brief.daily_slot'}
+            )
+            assert code == 200, excluded_page
+            excluded_types = {entry['task_type'] for entry in excluded_page['items']}
+            assert 'brief.daily_slot' not in excluded_types, excluded_page
+            assert excluded_page['total'] == 11, excluded_page
+
+            # ---- subscription tab and its diagnostics --------------------------
+            code, subscription_page = realtime(
+                {'status': 'all', 'task_type': 'sync.subscriptions'}
+            )
+            assert code == 200, (code, subscription_page)
+            assert subscription_page['total'] == 3, subscription_page
+            assert [entry['id'] for entry in subscription_page['items']] == [
+                'sub-3',
+                'sub-2',
+                'sub-1',
+            ], subscription_page
+            by_id = {entry['id']: entry for entry in subscription_page['items']}
+            assert by_id['sub-1']['skipped'] is True, by_id['sub-1']
+            diagnostics = by_id['sub-1']['diagnostics']
+            assert diagnostics['business_outcome']['code'] == 'disabled', diagnostics
+            subscriptions = diagnostics['sync_subscriptions']
+            assert subscriptions['skipped'] is True
+            assert subscriptions['skip_reason'] == 'previous_run_active'
+            assert subscriptions['trigger'] == 'scheduler'
+            assert subscriptions['schedule_key'] == 'daily-06'
+            # result_json has no collect object, so the progress event fills it.
+            assert subscriptions['collect']['total_users'] == 7, subscriptions['collect']
+            assert subscriptions['release']['total_repos'] == 3, subscriptions['release']
+            assert subscriptions['log_available'] is False
+            assert [event['id'] for event in subscriptions['recent_events']] == ['sub-ev-1']
+            assert subscriptions['recent_events'][0]['message'] == 'collected'
+            assert by_id['sub-1']['diagnostics']['business_outcome']['label'] == '已跳过'
+
+            failed_diagnostics = by_id['sub-2']['diagnostics']
+            assert failed_diagnostics['business_outcome']['code'] == 'failed', failed_diagnostics
+            assert failed_diagnostics['business_outcome']['message'] == 'subscription boom'
+            failed_release = failed_diagnostics['sync_subscriptions']['release']
+            assert failed_release['total_repos'] == 4, failed_release
+            assert failed_release['succeeded_repos'] == 1, failed_release
+            assert failed_release['failed_repos'] == 1, failed_release
+            assert failed_diagnostics['sync_subscriptions']['critical_events'] == 1
+
+            running_diagnostics = by_id['sub-3']['diagnostics']
+            assert running_diagnostics['business_outcome']['code'] == 'unknown', running_diagnostics
+
+            # ---- pagination guards ---------------------------------------------
+            code, clamped = realtime({'status': 'all', 'task_group': 'realtime', 'page_size': 500})
+            assert code == 200 and clamped['page_size'] == 100, clamped
+            code, overflow = realtime(
+                {'status': 'all', 'page': 9223372036854775807, 'page_size': 100}
+            )
+            assert code == 400 and overflow['code'] == 'bad_request', (code, overflow)
+
+            # ---- SSE stream ------------------------------------------------------
+            stream = open_stream(base, cookies['seed-admin'], None)
+            try:
+                content_type = stream.headers.get('Content-Type', '')
+                assert content_type.startswith('text/event-stream'), content_type
+                assert read_frame(stream, lambda text: 'stream-ready' in text) is not None, (
+                    'stream-ready comment missing'
+                )
+                sql(
+                    "INSERT INTO public.job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) "
+                    "VALUES ('sse-task', 'translate.release.batch', 'queued', 'validation', '{}', now(), now())",
+                    url,
+                )
+                sql(
+                    "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) "
+                    "VALUES ('sse-event-1', 'sse-task', 'task.created', '{\"task_id\":\"sse-task\"}', now())",
+                    url,
+                )
+                frame = read_frame(stream, lambda text: 'sse-event-1' in text)
+                assert frame is not None, 'no job event frame within the deadline'
+                assert 'event: job.event' in frame, frame
+                assert 'id: job-sse-event-1' in frame, frame
+                payload = json.loads(
+                    next(line[len('data: '):] for line in frame.splitlines() if line.startswith('data: '))
+                )
+                assert payload['event_id'] == 'sse-event-1', payload
+                assert payload['task_id'] == 'sse-task', payload
+                assert payload['task_type'] == 'translate.release.batch', payload
+                assert payload['status'] == 'queued', payload
+                assert payload['event_type'] == 'task.created', payload
+            finally:
+                stream.close()
+
+            # Last-Event-ID resumes after the delivered event instead of
+            # replaying it.
+            stream = open_stream(base, cookies['seed-admin'], 'job-sse-event-1')
+            try:
+                sql(
+                    "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) "
+                    "VALUES ('sse-event-2', 'sse-task', 'task.started', '{\"task_id\":\"sse-task\"}', now())",
+                    url,
+                )
+                frame, seen = read_frame_with_history(
+                    stream, lambda text: 'sse-event-2' in text
+                )
+                assert frame is not None, 'no resumed job event frame within the deadline'
+                assert 'sse-event-1' not in seen, 'Last-Event-ID must not replay the acknowledged event'
+            finally:
+                stream.close()
+
+            print(
+                json.dumps(
+                    {
+                        'overview_kpis': 'pass',
+                        'task_group_semantics': 'pass',
+                        'filters_and_pagination': 'pass',
+                        'item_shape': 'pass',
+                        'subscription_diagnostics': 'pass',
+                        'sse_event_stream': 'pass',
+                        'sse_last_event_id_resume': 'pass',
+                        'admin_only_access': 'pass',
+                    }
+                )
+            )
+    finally:
+        if process is not None:
+            process.send_signal(2)
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        sql('DROP DATABASE ' + name + ' WITH (FORCE)')
+
+
+def open_stream(base, cookie, last_event_id):
+    headers = {'Cookie': cookie, 'Accept': 'text/event-stream'}
+    if last_event_id:
+        headers['Last-Event-ID'] = last_event_id
+    request = urllib.request.Request(base + '/api/admin/jobs/events', headers=headers)
+    return urllib.request.urlopen(request, timeout=30)
+
+
+def read_frame(stream, predicate, timeout=15.0):
+    frame, _ = read_frame_with_history(stream, predicate, timeout)
+    return frame
+
+
+def read_frame_with_history(stream, predicate, timeout=15.0):
+    """Read SSE frames until one matches `predicate`.
+
+    Returns the matching frame and every frame read on the way, so callers can
+    assert which frames were *not* delivered.
+    """
+    deadline = time.monotonic() + timeout
+    lines = []
+    seen = []
+    while time.monotonic() < deadline:
+        try:
+            line = stream.readline()
+        except (TimeoutError, OSError):
+            return None, ''.join(seen)
+        if not line:
+            break
+        text = line.decode('utf-8', 'replace')
+        if text in ('\n', '\r\n'):
+            frame = ''.join(lines)
+            lines = []
+            if frame:
+                seen.append(frame)
+                if predicate(frame):
+                    return frame, ''.join(seen)
+            continue
+        lines.append(text)
+    return None, ''.join(seen)
+
+
+if __name__ == '__main__':
+    main()

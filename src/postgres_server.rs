@@ -259,9 +259,15 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             "/api/tasks/{task_id}/cancel",
             axum::routing::post(cancel_task),
         )
-        .route("/api/admin/jobs/overview", get(admin_jobs_overview))
+        .route(
+            "/api/admin/jobs/overview",
+            get(crate::postgres_admin_jobs::overview),
+        )
         .route("/api/admin/dashboard", get(admin_dashboard))
-        .route("/api/admin/jobs/events", get(admin_job_events))
+        .route(
+            "/api/admin/jobs/events",
+            get(crate::postgres_admin_jobs::events_stream),
+        )
         .route("/api/admin/users", get(admin_users))
         .route(
             "/api/admin/repos/overview",
@@ -390,7 +396,10 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             "/api/admin/users/{user_id}/profile",
             get(admin_user_profile).patch(crate::postgres_admin_actions::admin_patch_user_profile),
         )
-        .route("/api/admin/jobs/realtime", get(admin_realtime_tasks))
+        .route(
+            "/api/admin/jobs/realtime",
+            get(crate::postgres_admin_jobs::realtime_tasks),
+        )
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/reaction-token/status", get(reaction_token_status))
         .route(
@@ -2983,42 +2992,6 @@ pub(super) async fn require_admin(
     Ok(user_id)
 }
 
-async fn admin_jobs_overview(
-    State(state): State<PostgresServerState>,
-    session: Session,
-) -> impl IntoResponse {
-    if let Err(status) = require_admin(&state, &session).await {
-        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
-    }
-    match sqlx::query_as::<_, (String, i64)>(
-        "SELECT status, COUNT(*) FROM public.job_tasks GROUP BY status ORDER BY status",
-    )
-    .fetch_all(&state.runtime.pool)
-    .await
-    {
-        Ok(rows) => {
-            let counts = rows
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>();
-            (
-                StatusCode::OK,
-                axum::Json(
-                    json!({"counts": counts, "source": "postgresql", "generated_at": Utc::now()}),
-                ),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            warn!(%error, "PostgreSQL admin job overview query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
 async fn admin_dashboard(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -3055,50 +3028,6 @@ async fn admin_dashboard(
         }
         (Err(error), _) | (_, Err(error)) => {
             warn!(%error, "PostgreSQL admin dashboard query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn admin_job_events(
-    State(state): State<PostgresServerState>,
-    session: Session,
-) -> impl IntoResponse {
-    if let Err(status) = require_admin(&state, &session).await {
-        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
-    }
-    match sqlx::query(
-        "SELECT id, task_id, event_type, payload_json, created_at FROM public.job_task_events ORDER BY created_at DESC, id DESC LIMIT 200",
-    )
-    .fetch_all(&state.runtime.pool)
-    .await
-    {
-        Ok(rows) => {
-            use sqlx::Row;
-            let items = rows
-                .into_iter()
-                .map(|row| {
-                    json!({
-                        "id": row.get::<String, _>("id"),
-                        "task_id": row.get::<String, _>("task_id"),
-                        "event_type": row.get::<String, _>("event_type"),
-                        "payload": serde_json::from_str::<serde_json::Value>(&row.get::<String, _>("payload_json")).unwrap_or(json!({})),
-                        "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at"),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (
-                StatusCode::OK,
-                axum::Json(json!({"items": items, "source": "postgresql"})),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            warn!(%error, "PostgreSQL admin task events query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
@@ -3412,49 +3341,6 @@ pub(crate) async fn admin_user_profile(
             .into_response(),
         Err(error) => {
             warn!(%error, user_id = %user_id, "PostgreSQL admin user profile query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"code": "database_error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn admin_realtime_tasks(
-    State(state): State<PostgresServerState>,
-    session: Session,
-) -> impl IntoResponse {
-    if let Err(status) = require_admin(&state, &session).await {
-        return (status, axum::Json(json!({"code": "admin_required"}))).into_response();
-    }
-    let rows = sqlx::query(
-        "SELECT id, task_type, status, source, requested_by, created_at, updated_at, error_message FROM public.job_tasks WHERE status IN ('queued', 'running') ORDER BY created_at ASC, id ASC LIMIT 200",
-    )
-    .fetch_all(&state.runtime.pool)
-    .await;
-    match rows {
-        Ok(rows) => {
-            use sqlx::Row;
-            let items = rows
-                .into_iter()
-                .map(|row| {
-                    json!({
-                        "task_id": row.get::<String, _>("id"),
-                        "task_type": row.get::<String, _>("task_type"),
-                        "status": row.get::<String, _>("status"),
-                        "source": row.get::<String, _>("source"),
-                        "requested_by": row.get::<Option<String>, _>("requested_by"),
-                        "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at"),
-                        "updated_at": row.get::<chrono::DateTime<Utc>, _>("updated_at"),
-                        "error": row.get::<Option<String>, _>("error_message")
-                    })
-                })
-                .collect::<Vec<_>>();
-            (StatusCode::OK, axum::Json(json!({"items": items}))).into_response()
-        }
-        Err(error) => {
-            warn!(%error, "PostgreSQL realtime task query failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"code": "database_error"})),
