@@ -835,6 +835,12 @@ pub(crate) async fn admin_patch_llm_runtime_config(
         .bind(now_at)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE public.llm_model_health SET cooldown_until = NULL, updated_at = $1 WHERE last_failure_class = 'configuration' AND cooldown_until IS NOT NULL",
+        )
+        .bind(now_at)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await
     }
     .await;

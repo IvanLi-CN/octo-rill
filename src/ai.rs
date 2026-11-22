@@ -55,6 +55,11 @@ const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const LLM_MODEL_FINAL_FAILURE_THRESHOLD: u32 = 2;
 const LLM_MODEL_FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const LLM_MODEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// How long a model stays out of routing after the gateway rejects its
+/// credentials (HTTP 401/403). This is a model-level fault, not a transient
+/// upstream problem, so retrying the same model soon only burns attempts.
+/// Operators clear it earlier by saving the LLM runtime configuration.
+const LLM_MODEL_CREDENTIAL_REJECTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const AI_RESPONSE_MISSING_CONTENT_ERROR: &str = "AI response missing content";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +385,7 @@ impl LlmScheduler {
                 let health = health_for_model(&routing.health, model)
                     .cloned()
                     .unwrap_or_default();
+                let parked = model_route_is_parked(&health, now);
                 let cooldown_until = health
                     .cooldown_until
                     .filter(|cooldown_until| *cooldown_until > now)
@@ -387,7 +393,9 @@ impl LlmScheduler {
                 LlmSchedulerModelRuntimeStatus {
                     model: model.clone(),
                     priority: i64::try_from(idx + 1).unwrap_or(i64::MAX),
-                    status: if cooldown_until.is_some() {
+                    status: if parked {
+                        "parked"
+                    } else if cooldown_until.is_some() {
                         "cooldown"
                     } else {
                         "ready"
@@ -418,8 +426,11 @@ impl LlmScheduler {
         let mut ready = Vec::new();
         let mut cooled = Vec::new();
         for model in ordered_models {
-            let cooldown_until =
-                health_for_model(&routing.health, &model).and_then(|entry| entry.cooldown_until);
+            let entry = health_for_model(&routing.health, &model);
+            if entry.is_some_and(|entry| model_route_is_parked(entry, now)) {
+                continue;
+            }
+            let cooldown_until = entry.and_then(|entry| entry.cooldown_until);
             if cooldown_until.is_none_or(|until| until <= now) {
                 ready.push(model);
             } else {
@@ -440,8 +451,11 @@ impl LlmScheduler {
         let mut ready = Vec::new();
         let mut cooled = Vec::new();
         for model in ordered_models {
-            let cooldown_until =
-                health_for_model(&routing.health, &model).and_then(|entry| entry.cooldown_until);
+            let entry = health_for_model(&routing.health, &model);
+            if entry.is_some_and(|entry| model_route_is_parked(entry, now)) {
+                continue;
+            }
+            let cooldown_until = entry.and_then(|entry| entry.cooldown_until);
             if cooldown_until.is_none_or(|until| until <= now) {
                 ready.push(model);
             } else if let Some(until) = cooldown_until {
@@ -455,6 +469,13 @@ impl LlmScheduler {
         cooled.into_iter().take(1).map(|(model, _)| model).collect()
     }
 
+    pub async fn is_model_parked(&self, model: &str) -> bool {
+        let routing = self.routing.read().await;
+        let now = Utc::now();
+        health_for_model(&routing.health, model)
+            .is_some_and(|entry| model_route_is_parked(entry, now))
+    }
+
     pub async fn all_routes_cooldown_until(&self, ordered_snapshot: &[String]) -> Option<String> {
         let routing = self.routing.read().await;
         let now = Utc::now();
@@ -464,8 +485,14 @@ impl LlmScheduler {
         }
         let mut cooldowns = Vec::with_capacity(ordered_models.len());
         for model in &ordered_models {
-            let cooldown_until = health_for_model(&routing.health, model)
-                .and_then(|entry| entry.cooldown_until.filter(|until| *until > now));
+            let entry = health_for_model(&routing.health, model);
+            if entry.is_some_and(|entry| model_route_is_parked(entry, now)) {
+                // A parked model is not cooling down: no timer makes it usable
+                // again on its own terms that work could wait for.
+                return None;
+            }
+            let cooldown_until =
+                entry.and_then(|entry| entry.cooldown_until.filter(|until| *until > now));
             let cooldown_until = cooldown_until?;
             cooldowns.push(cooldown_until);
         }
@@ -477,14 +504,17 @@ impl LlmScheduler {
         if normalized.is_empty() {
             return;
         }
+        let now = Utc::now();
         let mut routing = self.routing.write().await;
         let entry = routing
             .health
             .entry(normalized)
             .or_insert_with(ModelRouteHealthState::default);
+        let parked = model_route_is_parked(entry, now);
         if entry
             .cooldown_until
-            .is_some_and(|cooldown_until| cooldown_until <= Utc::now())
+            .is_some_and(|cooldown_until| cooldown_until <= now)
+            || parked
         {
             entry.cooldown_until = None;
         }
@@ -528,6 +558,65 @@ impl LlmScheduler {
             last_failure_class: entry.last_failure_class.clone(),
             last_failure_at: entry.last_failure_at.map(|value| value.to_rfc3339()),
         })
+    }
+
+    /// Takes a model out of routing after the upstream gateway rejected its
+    /// credentials (HTTP 401/403). The park is persisted as a `configuration`
+    /// health row with a long cooldown, so it survives restarts until the
+    /// cooldown expires or an operator saves the LLM runtime configuration.
+    pub async fn park_model(&self, model: &str) -> Option<admin_runtime::LlmModelHealth> {
+        let normalized = normalize_model_name(model);
+        if normalized.is_empty() {
+            return None;
+        }
+        let now = Utc::now();
+        let mut routing = self.routing.write().await;
+        let entry = routing
+            .health
+            .entry(normalized.clone())
+            .or_insert_with(ModelRouteHealthState::default);
+        if entry.window_started_at.is_none() {
+            entry.window_started_at = Some(now);
+        }
+        entry.relevant_failure_count = entry.relevant_failure_count.saturating_add(1);
+        entry.last_failure_class = Some(LlmFailureClass::Configuration.as_str().to_owned());
+        entry.last_failure_at = Some(now);
+        let seconds =
+            i64::try_from(LLM_MODEL_CREDENTIAL_REJECTION_COOLDOWN.as_secs()).unwrap_or(i64::MAX);
+        entry.cooldown_until = Some(now + chrono::Duration::seconds(seconds));
+        Some(admin_runtime::LlmModelHealth {
+            model: normalized,
+            relevant_failure_count: i64::from(entry.relevant_failure_count),
+            window_started_at: entry.window_started_at.map(|value| value.to_rfc3339()),
+            cooldown_until: entry.cooldown_until.map(|value| value.to_rfc3339()),
+            last_failure_class: entry.last_failure_class.clone(),
+            last_failure_at: entry.last_failure_at.map(|value| value.to_rfc3339()),
+        })
+    }
+
+    /// Clears credential-rejection parks after an operator saves the LLM
+    /// runtime configuration. Returns the health rows that must be persisted
+    /// without a cooldown so a later reload does not restore the park.
+    pub async fn release_model_parks(&self) -> Vec<admin_runtime::LlmModelHealth> {
+        let now = Utc::now();
+        let mut routing = self.routing.write().await;
+        let mut released = Vec::new();
+        for (model, entry) in routing.health.iter_mut() {
+            if !model_route_is_parked(entry, now) {
+                continue;
+            }
+            entry.cooldown_until = None;
+            released.push(admin_runtime::LlmModelHealth {
+                model: model.clone(),
+                relevant_failure_count: i64::from(entry.relevant_failure_count),
+                window_started_at: entry.window_started_at.map(|value| value.to_rfc3339()),
+                cooldown_until: None,
+                last_failure_class: entry.last_failure_class.clone(),
+                last_failure_at: entry.last_failure_at.map(|value| value.to_rfc3339()),
+            });
+        }
+        released.sort_by(|left, right| left.model.cmp(&right.model));
+        released
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
@@ -645,9 +734,11 @@ fn select_model_from_routing<'a>(
 ) -> Option<&'a str> {
     let mut earliest_cooled: Option<(&'a str, DateTime<Utc>)> = None;
     for model in ordered_models {
-        let Some(cooldown_until) =
-            health_for_model(health, model).and_then(|entry| entry.cooldown_until)
-        else {
+        let entry = health_for_model(health, model);
+        if entry.is_some_and(|entry| model_route_is_parked(entry, now)) {
+            continue;
+        }
+        let Some(cooldown_until) = entry.and_then(|entry| entry.cooldown_until) else {
             return Some(model.as_str());
         };
         if cooldown_until <= now {
@@ -659,6 +750,16 @@ fn select_model_from_routing<'a>(
         }
     }
     earliest_cooled.map(|(model, _)| model)
+}
+
+/// A model is parked when its last recorded failure was a credential rejection
+/// and its cooldown is still in the future. Parked models are never returned by
+/// candidate selection, not even as the last-resort cooled candidate.
+fn model_route_is_parked(entry: &ModelRouteHealthState, now: DateTime<Utc>) -> bool {
+    entry.last_failure_class.as_deref() == Some(LlmFailureClass::Configuration.as_str())
+        && entry
+            .cooldown_until
+            .is_some_and(|cooldown_until| cooldown_until > now)
 }
 
 fn health_for_model<'a>(
@@ -1975,6 +2076,13 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+/// HTTP statuses that mean the gateway rejected this model's credentials. The
+/// key may be valid for other routes, so the fault is scoped to the model and
+/// must not be retried as a transient upstream error.
+fn is_credential_rejection_status(status: Option<i64>) -> bool {
+    matches!(status, Some(401) | Some(403))
+}
+
 fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
@@ -2634,11 +2742,27 @@ async fn persist_model_failure_health(
     model: &str,
     failure_class: LlmFailureClass,
 ) {
-    let Some(health) = state
+    let health = state
         .llm_scheduler
         .record_model_final_failure(model, failure_class.as_str())
-        .await
-    else {
+        .await;
+    persist_model_health(state, model, failure_class, health).await;
+}
+
+/// Persists the park of a model whose credentials the gateway rejected, so the
+/// route stays out of the candidate list after a restart.
+async fn persist_model_park_health(state: &AppState, model: &str) {
+    let health = state.llm_scheduler.park_model(model).await;
+    persist_model_health(state, model, LlmFailureClass::Configuration, health).await;
+}
+
+async fn persist_model_health(
+    state: &AppState,
+    model: &str,
+    failure_class: LlmFailureClass,
+    health: Option<admin_runtime::LlmModelHealth>,
+) {
+    let Some(health) = health else {
         return;
     };
     if let Err(err) =
@@ -3277,6 +3401,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
             .and_then(|models| models.first())
             .map(String::as_str)
             .filter(|model| !model.trim().is_empty())
+        && !state.llm_scheduler.is_model_parked(model).await
     {
         candidates.push(model.to_owned());
     }
@@ -3330,6 +3455,10 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
     let mut candidate_attempts = 0_usize;
     let mut fallback_count = 0_i64;
     let mut attempt = 0_usize;
+    // Attempts charged against `LLM_REQUEST_MAX_ATTEMPTS`. Credential
+    // rejections are model-level faults and must not consume the budget of the
+    // remaining candidates in this call.
+    let mut budgeted_attempts = 0_usize;
     loop {
         attempt = attempt.saturating_add(1);
         candidate_attempts = candidate_attempts.saturating_add(1);
@@ -3589,12 +3718,19 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 )
                 .await;
 
-                let can_retry_same_candidate = matches!(
-                    failure_class,
-                    LlmFailureClass::Transient | LlmFailureClass::RateLimited
-                ) && candidate_attempts
-                    < LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS
-                    && attempt < LLM_REQUEST_MAX_ATTEMPTS;
+                let credential_rejected = failure_class == LlmFailureClass::Configuration
+                    && is_credential_rejection_status(provider_http_status);
+                if !credential_rejected {
+                    budgeted_attempts = budgeted_attempts.saturating_add(1);
+                }
+
+                let can_retry_same_candidate = !credential_rejected
+                    && matches!(
+                        failure_class,
+                        LlmFailureClass::Transient | LlmFailureClass::RateLimited
+                    )
+                    && candidate_attempts < LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS
+                    && budgeted_attempts < LLM_REQUEST_MAX_ATTEMPTS;
                 let has_next_candidate = candidate_index + 1 < candidates.len();
 
                 if can_retry_same_candidate {
@@ -3675,15 +3811,18 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     continue;
                 }
 
-                if failure_class.is_recoverable() {
+                if credential_rejected {
+                    persist_model_park_health(state, model_for_call.as_str()).await;
+                } else if failure_class.is_recoverable() {
                     persist_model_failure_health(state, model_for_call.as_str(), failure_class)
                         .await;
                 }
 
-                if failure_class != LlmFailureClass::Configuration
-                    && has_next_candidate
-                    && attempt < LLM_REQUEST_MAX_ATTEMPTS
-                {
+                let can_fall_back = has_next_candidate
+                    && (credential_rejected
+                        || (failure_class.is_recoverable()
+                            && budgeted_attempts < LLM_REQUEST_MAX_ATTEMPTS));
+                if can_fall_back {
                     let next_model = candidates[candidate_index + 1].clone();
                     let previous_model = model_for_call.clone();
                     candidate_index += 1;
@@ -8311,6 +8450,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_scheduler_parks_credential_rejected_model_until_released() {
+        let scheduler = LlmScheduler::new(1);
+        scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+
+        let health = scheduler.park_model("model-a").await.expect("park model-a");
+        assert_eq!(health.last_failure_class.as_deref(), Some("configuration"));
+        assert!(health.cooldown_until.is_some());
+        assert!(scheduler.is_model_parked("model-a").await);
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-b".to_owned()]
+        );
+
+        scheduler.park_model("model-b").await.expect("park model-b");
+        assert!(
+            scheduler.route_candidates(None).await.is_empty(),
+            "parked routes must not be used as the last-resort cooled candidate"
+        );
+        let status = scheduler.routing_status(None).await;
+        assert!(status.selected_model_for_new_calls.is_none());
+        assert!(
+            status
+                .model_statuses
+                .iter()
+                .all(|item| item.status == "parked")
+        );
+        assert!(
+            scheduler
+                .all_routes_cooldown_until(&["model-a".to_owned(), "model-b".to_owned()])
+                .await
+                .is_none(),
+            "a park is not a provider cooldown that work could wait for"
+        );
+
+        let released = scheduler.release_model_parks().await;
+        assert_eq!(released.len(), 2);
+        assert!(released.iter().all(|item| item.cooldown_until.is_none()));
+        assert!(!scheduler.is_model_parked("model-a").await);
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-a".to_owned(), "model-b".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_restores_persisted_park_until_cooldown_expires() {
+        let scheduler = LlmScheduler::new(1);
+        scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+        let now = Utc::now();
+        scheduler
+            .set_model_health(vec![admin_runtime::LlmModelHealth {
+                model: "model-a".to_owned(),
+                relevant_failure_count: 1,
+                window_started_at: Some(now.to_rfc3339()),
+                cooldown_until: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+                last_failure_class: Some("configuration".to_owned()),
+                last_failure_at: Some(now.to_rfc3339()),
+            }])
+            .await;
+
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-b".to_owned()]
+        );
+        let status = scheduler.routing_status(None).await;
+        let model_a = status
+            .model_statuses
+            .iter()
+            .find(|item| item.model == "model-a")
+            .expect("model-a status");
+        assert_eq!(model_a.status, "parked");
+
+        scheduler
+            .set_model_health(vec![admin_runtime::LlmModelHealth {
+                model: "model-a".to_owned(),
+                relevant_failure_count: 1,
+                window_started_at: Some(now.to_rfc3339()),
+                cooldown_until: Some((now - chrono::Duration::hours(1)).to_rfc3339()),
+                last_failure_class: Some("configuration".to_owned()),
+                last_failure_at: Some((now - chrono::Duration::hours(1)).to_rfc3339()),
+            }])
+            .await;
+
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-a".to_owned(), "model-b".to_owned()],
+            "an expired park returns the model to the candidate list"
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_admin_override_after_persist_clears_only_on_success() {
         let state = setup_llm_state().await;
         let snapshot = LlmCallAdminOverride {
@@ -8742,6 +8976,87 @@ mod tests {
         .await
         .expect("count route switch events");
         assert_eq!(switched, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_parks_model_after_401_and_skips_it_next_call() {
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&observed);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let model = payload["model"].as_str().unwrap_or_default().to_owned();
+                    recorder.lock().await.push(model.clone());
+                    if model == "model-a" {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "invalid_api_key",
+                                    "message": "Token expired"
+                                }
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        state
+            .llm_scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+
+        let result = chat_completion(state.as_ref(), "system", "user", 128)
+            .await
+            .expect("a credential rejection on model-a must not end the call");
+        assert_eq!(result, "ok");
+        assert_eq!(
+            observed.lock().await.clone(),
+            vec!["model-a".to_owned(), "model-b".to_owned()]
+        );
+
+        let health = sqlx::query(
+            "SELECT last_failure_class, cooldown_until FROM llm_model_health WHERE model = 'model-a'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("parked model health row");
+        assert_eq!(
+            health
+                .get::<Option<String>, _>("last_failure_class")
+                .as_deref(),
+            Some("configuration")
+        );
+        assert!(health.get::<Option<String>, _>("cooldown_until").is_some());
+        assert!(state.llm_scheduler.is_model_parked("model-a").await);
+        assert_eq!(
+            state.llm_scheduler.route_candidates(None).await,
+            vec!["model-b".to_owned()]
+        );
+
+        let second = chat_completion(state.as_ref(), "system", "user", 128)
+            .await
+            .expect("the next call should use the remaining candidate");
+        assert_eq!(second, "ok");
+        assert_eq!(
+            observed.lock().await.clone(),
+            vec![
+                "model-a".to_owned(),
+                "model-b".to_owned(),
+                "model-b".to_owned()
+            ],
+            "the parked model must not be attempted again"
+        );
     }
 
     #[tokio::test]

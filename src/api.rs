@@ -7755,6 +7755,12 @@ pub async fn admin_patch_llm_runtime_config(
         )
         .await?;
         admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+        // Saving the runtime LLM configuration is the operator's signal that a
+        // credential rejection may be resolved; re-admit parked models.
+        for health in state.llm_scheduler.release_model_parks().await {
+            admin_runtime::upsert_llm_model_health(&state.pool, &state.sqlite_writer, &health)
+                .await?;
+        }
         if route_changed {
             content_processing::on_runtime_configuration_reload(state.as_ref()).await?;
         }
