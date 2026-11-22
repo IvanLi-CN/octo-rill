@@ -44,6 +44,7 @@ mod online_migrations;
 mod passkeys;
 mod postgres_admin_actions;
 mod postgres_admin_ai_records;
+mod postgres_admin_dashboard;
 mod postgres_admin_llm;
 mod postgres_auth_ext;
 mod postgres_content_overlay;
