@@ -162,6 +162,28 @@ def main():
               ('sub-ev-1', 'sub-1', 'collect', 'subscription.progress', 'info', 1, 1,
                'seed-user', 10, 'acme/rocket', '{"message":"collected"}',
                '2026-11-01T00:00:00Z');
+            -- 30 progress events on `sub-3` exceed the 20-row window, while the
+            -- oldest row is the only `collect` summary and must still be
+            -- retained, so the bounded reads stay discriminating.
+            INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at)
+            SELECT 'sub-3-progress-' || lpad(g::text, 2, '0'), 'sub-3', 'task.progress',
+                   CASE WHEN g = 1
+                        THEN '{"stage":"collect","total_users":11}'
+                        ELSE json_build_object('stage', 'release_progress',
+                                               'releases_written', g)::text
+                   END,
+                   now() - interval '14 minutes' + (g || ' seconds')::interval
+            FROM generate_series(1, 30) AS g;
+            -- 25 subscription events on `sub-2` prove the newest-20 window.
+            INSERT INTO public.sync_subscription_events
+              (id, task_id, stage, event_type, severity, recoverable, attempt,
+               user_id, repo_id, repo_full_name, payload_json, created_at)
+            SELECT 'sub-ev-2-' || lpad(g::text, 2, '0'), 'sub-2', 'release',
+                   'subscription.progress', 'info', 1, 1, 'seed-user', 10,
+                   'acme/rocket',
+                   json_build_object('message', 'event-' || g)::text,
+                   (now() - interval '20 minutes' + (g || ' seconds')::interval)::text
+            FROM generate_series(1, 25) AS g;
             """,
             url,
         )
@@ -359,9 +381,59 @@ def main():
             assert failed_release['succeeded_repos'] == 1, failed_release
             assert failed_release['failed_repos'] == 1, failed_release
             assert failed_diagnostics['sync_subscriptions']['critical_events'] == 1
+            # 25 seeded events must collapse to the newest 20, newest first.
+            failed_events = failed_diagnostics['sync_subscriptions']['recent_events']
+            assert len(failed_events) == 20, failed_events
+            assert failed_events[0]['id'] == 'sub-ev-2-25', failed_events[0]
+            assert failed_events[0]['message'] == 'event-25', failed_events[0]
+            assert failed_events[-1]['id'] == 'sub-ev-2-06', failed_events[-1]
 
             running_diagnostics = by_id['sub-3']['diagnostics']
             assert running_diagnostics['business_outcome']['code'] == 'unknown', running_diagnostics
+            running_subscriptions = running_diagnostics['sync_subscriptions']
+            # 30 progress events: the newest 20 fill `releases_written`, while the
+            # oldest `collect` summary is retained beyond that window.
+            assert running_subscriptions['collect']['total_users'] == 11, running_subscriptions
+            assert running_subscriptions['releases_written'] == 30, running_subscriptions
+            assert running_subscriptions['recent_events'] == [], running_subscriptions
+
+            # ---- migration read plans ------------------------------------------
+            indexes = set(
+                sql(
+                    "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'",
+                    url,
+                ).splitlines()
+            )
+            for index_name in (
+                'idx_job_tasks_pg_realtime_created',
+                'idx_job_tasks_pg_task_type_created',
+                'idx_job_tasks_pg_finished_status',
+                'idx_job_task_events_pg_stream',
+                'idx_sync_subscription_events_pg_task_created',
+            ):
+                assert index_name in indexes, (index_name, sorted(indexes))
+            # Ordering-driven reads must actually be index-served; the 24h
+            # counters are checked by existence because a 13-row fixture lets
+            # the planner prefer the other status-leading index.
+            for index, statement in (
+                (
+                    'idx_sync_subscription_events_pg_task_created',
+                    "SELECT id FROM public.sync_subscription_events WHERE task_id = 'sub-2' "
+                    'ORDER BY created_at DESC, id DESC LIMIT 20',
+                ),
+                (
+                    'idx_job_tasks_pg_realtime_created',
+                    'SELECT id FROM public.job_tasks ORDER BY created_at DESC, id DESC LIMIT 20',
+                ),
+                (
+                    'idx_job_task_events_pg_stream',
+                    'SELECT id FROM public.job_task_events ORDER BY created_at, id LIMIT 200',
+                ),
+            ):
+                plan = sql(
+                    'SET enable_seqscan = off; EXPLAIN ' + statement, url
+                )
+                assert index in plan, (index, plan)
 
             # ---- pagination guards ---------------------------------------------
             code, clamped = realtime({'status': 'all', 'task_group': 'realtime', 'page_size': 500})
@@ -500,6 +572,7 @@ def main():
                         'filters_and_pagination': 'pass',
                         'item_shape': 'pass',
                         'subscription_diagnostics': 'pass',
+                        'bounded_diagnostics_and_plans': 'pass',
                         'sse_event_stream': 'pass',
                         'sse_last_event_id_resume': 'pass',
                         'task_detail_contract': 'pass',

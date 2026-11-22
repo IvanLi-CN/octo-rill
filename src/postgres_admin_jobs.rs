@@ -81,18 +81,42 @@ pub(super) async fn overview(
         return require_admin_response(status);
     }
     let since = Utc::now() - chrono::Duration::hours(24);
-    let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
-        "SELECT
-           COUNT(*) FILTER (WHERE status = 'queued'),
-           COUNT(*) FILTER (WHERE status = 'running'),
-           COUNT(*) FILTER (WHERE status = 'failed' AND finished_at >= $1),
-           COUNT(*) FILTER (WHERE status = 'succeeded' AND finished_at >= $1),
-           (SELECT COUNT(*) FROM public.daily_brief_hour_slots WHERE enabled = 1),
-           (SELECT COUNT(*) FROM public.daily_brief_hour_slots)
-         FROM public.job_tasks",
-    )
-    .bind(since)
-    .fetch_one(&state.runtime.pool)
+    let pool = &state.runtime.pool;
+    // Keep the four counters as separate statements: the per-status 24h windows
+    // can then use the partial `(status, finished_at)` index, which a single
+    // aggregate over `FILTER` clauses can never do.
+    let counts = async {
+        let queued = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public.job_tasks WHERE status = 'queued'",
+        )
+        .fetch_one(pool)
+        .await?;
+        let running = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public.job_tasks WHERE status = 'running'",
+        )
+        .fetch_one(pool)
+        .await?;
+        let failed_24h = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public.job_tasks
+             WHERE status = 'failed' AND finished_at IS NOT NULL AND finished_at >= $1",
+        )
+        .bind(since)
+        .fetch_one(pool)
+        .await?;
+        let succeeded_24h = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM public.job_tasks
+             WHERE status = 'succeeded' AND finished_at IS NOT NULL AND finished_at >= $1",
+        )
+        .bind(since)
+        .fetch_one(pool)
+        .await?;
+        let slots = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*) FILTER (WHERE enabled = 1), COUNT(*) FROM public.daily_brief_hour_slots",
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok::<_, sqlx::Error>((queued, running, failed_24h, succeeded_24h, slots.0, slots.1))
+    }
     .await;
     match counts {
         Ok((queued, running, failed_24h, succeeded_24h, enabled_slots, total_slots)) => {

@@ -18,3 +18,8 @@ CREATE INDEX IF NOT EXISTS idx_job_tasks_pg_finished_status
 
 CREATE INDEX IF NOT EXISTS idx_job_task_events_pg_stream
     ON public.job_task_events (created_at, id);
+
+-- The subscription diagnostics list/detail reads bound events per task with a
+-- newest-first window; the legacy schema had this exact index.
+CREATE INDEX IF NOT EXISTS idx_sync_subscription_events_pg_task_created
+    ON public.sync_subscription_events (task_id, created_at DESC, id DESC);
