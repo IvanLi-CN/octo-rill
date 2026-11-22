@@ -2328,7 +2328,7 @@ async fn execute_release_evidence_task(
     let heartbeat_state = state.clone();
     let heartbeat_task_id = task_id.to_owned();
     let heartbeat_snapshot_id = snapshot_id.to_owned();
-    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_stop = Arc::new(tokio::sync::Notify::new());
     let heartbeat_healthy = Arc::new(AtomicBool::new(true));
     let heartbeat_stop_task = Arc::clone(&heartbeat_stop);
     let heartbeat_healthy_task = Arc::clone(&heartbeat_healthy);
@@ -2337,9 +2337,10 @@ async fn execute_release_evidence_task(
             tokio::time::interval(Duration::from_secs(RELEASE_EVIDENCE_LEASE_HEARTBEAT_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-            if heartbeat_stop_task.load(Ordering::Acquire) {
-                break;
+            tokio::select! {
+                biased;
+                _ = heartbeat_stop_task.notified() => break,
+                _ = interval.tick() => {}
             }
             match renew_release_evidence_lease(
                 &heartbeat_state,
@@ -2369,8 +2370,11 @@ async fn execute_release_evidence_task(
             retryable: true,
         }),
     };
-    heartbeat_stop.store(true, Ordering::Release);
-    heartbeat.abort();
+    // Stopping the heartbeat must not cancel an in-flight renewal: aborting it
+    // would drop an open SQLite write transaction and return its pooled
+    // connection at non-zero transaction depth, so the terminal snapshot write
+    // below would fail with a non-retryable begin error.
+    heartbeat_stop.notify_one();
     let _ = heartbeat.await;
     if !heartbeat_healthy.load(Ordering::Acquire) {
         return Err(anyhow!("release evidence lease was lost during collection"));
@@ -16142,17 +16146,31 @@ mod tests {
                 .parse::<Value>()
                 .expect("parse non-ahead task payload");
 
-        super::execute_release_evidence_task(state.as_ref(), &task_id, &payload)
+        let execution_error =
+            super::execute_release_evidence_task(state.as_ref(), &task_id, &payload)
+                .await
+                .expect_err("non-ahead evidence must not become ready");
+        // The terminal snapshot state is written through the SQLite write
+        // coordinator, so wait for it to settle instead of trusting a single
+        // read on a saturated runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (status, error_code): (String, Option<String>) = loop {
+            let observed: (String, Option<String>) = sqlx::query_as(
+                "SELECT status, last_error_code FROM release_evidence_snapshots WHERE id = ?",
+            )
+            .bind(&queued.reference.snapshot_id)
+            .fetch_one(&pool)
             .await
-            .expect_err("non-ahead evidence must not become ready");
-        let (status, error_code): (String, Option<String>) = sqlx::query_as(
-            "SELECT status, last_error_code FROM release_evidence_snapshots WHERE id = ?",
-        )
-        .bind(&queued.reference.snapshot_id)
-        .fetch_one(&pool)
-        .await
-        .expect("load non-ahead evidence status");
-        assert_eq!(status, STATUS_FAILED);
+            .expect("load non-ahead evidence status");
+            if observed.0 != STATUS_RUNNING || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            status, STATUS_FAILED,
+            "snapshot stayed {status} after the bounded wait; last_error_code={error_code:?}; task error: {execution_error:#}"
+        );
         assert_eq!(error_code.as_deref(), Some("github_evidence_insufficient"));
     }
 
