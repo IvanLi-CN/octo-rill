@@ -3,6 +3,8 @@
 //! Each executor owns one business vertical's upstream calls and PostgreSQL
 //! writes. Durable claim/finalize semantics remain in `postgres_worker`.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,7 +13,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::AiConfig,
@@ -1120,6 +1122,11 @@ impl TaskExecutor for ReleasesExecutor {
                 "repositories": 0,
                 "user_id": user_id,
                 "translations_enqueued": 0,
+                "failed_count": 0,
+                "deferred_count": 0,
+                "failure_ratio": 0.0,
+                "failure_reasons": {},
+                "degraded": false,
             })
             .to_string());
         }
@@ -1149,6 +1156,7 @@ impl TaskExecutor for ReleasesExecutor {
         let mut total = 0usize;
         let mut repositories = 0usize;
         let mut failed = Vec::new();
+        let mut failed_reason_codes = Vec::new();
         let mut deferred = Vec::new();
         let mut new_release_ids = Vec::new();
         for outcome in outcomes {
@@ -1162,6 +1170,7 @@ impl TaskExecutor for ReleasesExecutor {
                 continue;
             }
             if let Some(failure) = outcome.failure {
+                failed_reason_codes.push(failure.reason_code);
                 failed.push(json!({
                     "repo_id": outcome.repo_id,
                     "repo_full_name": outcome.repo_full_name,
@@ -1173,6 +1182,28 @@ impl TaskExecutor for ReleasesExecutor {
             total += outcome.fetched;
             new_release_ids.extend(outcome.new_release_ids);
         }
+        let summary = summarize_release_run(repositories, failed_reason_codes, deferred.len());
+        if summary.failed_count > 0 {
+            warn!(
+                event = "task.summary",
+                operation = "sync.releases",
+                user_id = user_id.as_str(),
+                repositories,
+                failed = summary.failed_count,
+                deferred = summary.deferred_count,
+                failure_ratio = summary.failure_ratio,
+                failure_reasons = summary.top_reasons(),
+                "account release sync finished with repository failures"
+            );
+        }
+        if summary.all_failed {
+            bail!(
+                "every repository whose read was attempted failed: {} failed ({}), {} deferred",
+                summary.failed_count,
+                summary.top_reasons(),
+                summary.deferred_count
+            );
+        }
         let translations_enqueued = self.enqueue_translations(&user_id, &new_release_ids).await;
         Ok(json!({
             "releases": total,
@@ -1181,6 +1212,11 @@ impl TaskExecutor for ReleasesExecutor {
             "failed_repositories": failed,
             "deferred_repositories": deferred,
             "translations_enqueued": translations_enqueued,
+            "failed_count": summary.failed_count,
+            "deferred_count": summary.deferred_count,
+            "failure_ratio": summary.failure_ratio,
+            "failure_reasons": summary.failure_reasons,
+            "degraded": summary.degraded,
         })
         .to_string())
     }
@@ -1228,6 +1264,72 @@ impl ReleasesExecutor {
                 0
             }
         }
+    }
+}
+
+/// Aggregated outcome of one account-wide release sync.
+///
+/// The per-repository warnings made a bad run log 100+ lines while the task
+/// still finished `succeeded`. The task now reports one summary line and states
+/// in its result whether it was degraded or failed outright.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReleaseRunSummary {
+    pub(crate) failed_count: usize,
+    pub(crate) deferred_count: usize,
+    /// Failed repositories over attempted repositories (succeeded + failed).
+    /// Deferrals never reached GitHub, so they are not attempts.
+    pub(crate) failure_ratio: f64,
+    /// Failure reason code → repository count.
+    pub(crate) failure_reasons: BTreeMap<&'static str, usize>,
+    /// At least one repository failed while others were read.
+    pub(crate) degraded: bool,
+    /// No repository could be read at all: the task must be recorded failed.
+    pub(crate) all_failed: bool,
+}
+
+impl ReleaseRunSummary {
+    /// `reason=count` pairs, most frequent first, bounded to one log line.
+    fn top_reasons(&self) -> String {
+        let mut rows: Vec<_> = self.failure_reasons.iter().collect();
+        rows.sort_by(|(left_code, left_count), (right_code, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_code.cmp(right_code))
+        });
+        rows.into_iter()
+            .take(5)
+            .map(|(code, count)| format!("{code}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Aggregate per-repository outcomes of one run. Pure so the degraded and
+/// all-failed decisions are testable without a database or network.
+pub(crate) fn summarize_release_run(
+    repositories: usize,
+    failures: impl IntoIterator<Item = &'static str>,
+    deferred_count: usize,
+) -> ReleaseRunSummary {
+    let mut failure_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut failed_count = 0usize;
+    for reason_code in failures {
+        failed_count += 1;
+        *failure_reasons.entry(reason_code).or_insert(0) += 1;
+    }
+    let attempted = repositories + failed_count;
+    let failure_ratio = if attempted == 0 {
+        0.0
+    } else {
+        ((failed_count as f64 / attempted as f64) * 100.0).round() / 100.0
+    };
+    ReleaseRunSummary {
+        failed_count,
+        deferred_count,
+        failure_ratio,
+        failure_reasons,
+        degraded: failed_count > 0 && repositories > 0,
+        all_failed: failed_count > 0 && repositories == 0,
     }
 }
 
@@ -1293,7 +1395,7 @@ async fn fetch_one_account_repo(
             return skipped(Some(deferral), None);
         }
         Err(ReleaseFetchError::Failed(failure)) => {
-            warn!(
+            debug!(
                 event = "upstream.call",
                 operation = "sync.releases",
                 repo = repo.full_name,
@@ -1842,8 +1944,49 @@ fn task_user_id(payload: &Value, task: &ClaimedTask) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimedTask, ReleaseUpsert, push_inserted_release, task_user_id};
+    use super::{
+        ClaimedTask, ReleaseUpsert, push_inserted_release, summarize_release_run, task_user_id,
+    };
     use serde_json::json;
+
+    #[test]
+    fn release_run_summary_marks_partial_failure_as_degraded() {
+        let summary = summarize_release_run(7, ["timeout", "timeout", "rate_limited"], 2);
+        assert_eq!(summary.failed_count, 3);
+        assert_eq!(summary.deferred_count, 2);
+        // 3 failures out of 10 attempted repositories (7 read + 3 failed);
+        // deferrals reached no upstream and do not dilute the ratio.
+        assert_eq!(summary.failure_ratio, 0.3);
+        assert!(summary.degraded);
+        assert!(!summary.all_failed);
+        assert_eq!(summary.top_reasons(), "timeout=2,rate_limited=1");
+    }
+
+    #[test]
+    fn release_run_summary_fails_the_task_when_nothing_was_read() {
+        let summary = summarize_release_run(0, ["network_error", "decode_error"], 0);
+        assert_eq!(summary.failed_count, 2);
+        assert_eq!(summary.failure_ratio, 1.0);
+        assert!(summary.all_failed);
+        assert!(!summary.degraded);
+        assert_eq!(summary.top_reasons(), "decode_error=1,network_error=1");
+    }
+
+    #[test]
+    fn release_run_summary_rounds_the_failure_ratio_and_ignores_deferrals() {
+        let summary = summarize_release_run(2, ["timeout"], 3);
+        assert_eq!(summary.failure_ratio, 0.33);
+        assert!(summary.degraded);
+        assert!(!summary.all_failed);
+
+        let deferred_only = summarize_release_run(0, [], 4);
+        assert_eq!(deferred_only.failed_count, 0);
+        assert_eq!(deferred_only.deferred_count, 4);
+        assert_eq!(deferred_only.failure_ratio, 0.0);
+        assert!(!deferred_only.degraded);
+        assert!(!deferred_only.all_failed);
+        assert_eq!(deferred_only.top_reasons(), "");
+    }
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
