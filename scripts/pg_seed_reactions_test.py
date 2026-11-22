@@ -389,13 +389,27 @@ def main():
             code, body = call('POST', '/api/feed/reactions/refresh', 'seed-user',
                               {'release_ids': ['121']})
             assert code == 200 and body == {'items': []}, body
+            # A refresh persists live counts but must never move the stored source
+            # revision: `repo_releases.updated_at` is the content version the LLM
+            # work items are compared against.
+            revision_before = sql("SELECT updated_at FROM public.repo_releases WHERE release_id=120", url)
+            with stub.lock:
+                stub.totals[RELEASE_NODE] = 9
             code, body = call('POST', '/api/feed/reactions/refresh', 'seed-user',
                               {'release_ids': ['120', '121', '130', '120']})
             assert code == 200 and len(body['items']) == 1, body
             item = body['items'][0]
             assert item['release_id'] == '120' and item['reactions']['status'] == 'ready', item
-            assert item['reactions']['counts']['plus1'] == 1 and item['reactions']['viewer']['plus1'] is False, item
-            assert sql("SELECT react_plus1 FROM public.repo_releases WHERE release_id=120", url) == '1'
+            assert item['reactions']['counts']['plus1'] == 9 and item['reactions']['viewer']['plus1'] is False, item
+            assert sql("SELECT react_plus1 FROM public.repo_releases WHERE release_id=120", url) == '9'
+            assert sql("SELECT updated_at FROM public.repo_releases WHERE release_id=120", url) == revision_before
+            # Repeating the refresh with no upstream movement is also a no-op for
+            # the revision, so a steady-state dashboard cannot keep bumping it.
+            code, body = call('POST', '/api/feed/reactions/refresh', 'seed-user', {'release_ids': ['120']})
+            assert code == 200 and body['items'][0]['reactions']['counts']['plus1'] == 9, body
+            assert sql("SELECT updated_at FROM public.repo_releases WHERE release_id=120", url) == revision_before
+            with stub.lock:
+                stub.totals[RELEASE_NODE] = 1
             code, body = call('POST', '/api/feed/reactions/refresh', 'seed-nopat', {'release_ids': ['122']})
             assert code == 200 and body == {'items': []}, body
             results['feed_reaction_refresh'] = 'pass'

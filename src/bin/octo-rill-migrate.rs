@@ -4,7 +4,7 @@
 //! the one-way data movement boundary so that a failed import never mutates the
 //! SQLite source and can be rerun against an isolated PostgreSQL database.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -65,6 +65,39 @@ enum Command {
     Verify,
     /// Rebuild PostgreSQL search projections after authoritative data import.
     Rebuild,
+    /// Rewrite cached release revisions from GitHub, bypassing the revision guard.
+    RepairReleaseRevisions(RepairReleaseRevisionsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("release_target")
+        .required(true)
+        .args(["repo_id", "release_id"])
+))]
+struct RepairReleaseRevisionsArgs {
+    /// Repair every cached release of this repository.
+    #[arg(long, conflicts_with = "release_id")]
+    repo_id: Option<i64>,
+    /// Repair one GitHub release id.
+    #[arg(long)]
+    release_id: Option<i64>,
+    /// Report the planned writes; this is the default mode.
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    /// Write the repaired release content and revisions.
+    #[arg(long)]
+    apply: bool,
+    /// GitHub token; omit for public repositories (env: GITHUB_TOKEN).
+    #[arg(long, env = "GITHUB_TOKEN")]
+    github_token: Option<String>,
+    /// GitHub REST base URL, matching the runtime endpoint seam.
+    #[arg(
+        long,
+        env = "OCTORILL_GITHUB_API_BASE",
+        default_value = "https://api.github.com"
+    )]
+    github_api_base: String,
 }
 
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -100,7 +133,6 @@ enum Cell {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    validate_sqlite_source(&args.sqlite_source)?;
     validate_postgres_target(&args.postgres_url)?;
     let (mut pg, connection) = tokio_postgres::connect(&args.postgres_url, NoTls)
         .await
@@ -113,18 +145,24 @@ async fn main() -> Result<()> {
 
     match args.command {
         Command::Preflight => {
+            validate_sqlite_source(&args.sqlite_source)?;
             let sqlite = open_sqlite_source(&args).await?;
             preflight(&sqlite, &pg, &args).await?
         }
         Command::Import => {
+            validate_sqlite_source(&args.sqlite_source)?;
             let sqlite = open_sqlite_source(&args).await?;
             import(&sqlite, &mut pg, &args).await?
         }
         Command::Verify => {
+            validate_sqlite_source(&args.sqlite_source)?;
             let sqlite = open_sqlite_source(&args).await?;
             verify(&sqlite, &mut pg, &args).await?
         }
         Command::Rebuild => rebuild(&mut pg).await?,
+        Command::RepairReleaseRevisions(options) => {
+            repair_release_revisions(&mut pg, &options).await?
+        }
     }
     Ok(())
 }
@@ -804,6 +842,320 @@ async fn rebuild(pg: &mut Client) -> Result<()> {
     Ok(())
 }
 
+/// Releases per repair page; the GitHub maximum.
+const REPAIR_RELEASES_PER_PAGE: usize = 100;
+/// Page budget for one repair read, matching the runtime repository read.
+const REPAIR_MAX_PAGES: usize = 20;
+
+/// One cached release as stored in `public.repo_releases`.
+#[derive(Debug, Clone)]
+struct CachedReleaseRevision {
+    release_id: i64,
+    content: ReleaseRevisionContent,
+}
+
+/// The content and revision columns a repository read owns.
+///
+/// `updated_at` doubles as the release source revision: the content processing
+/// lanes compare it against the revision snapshot recorded on a work item, and
+/// the release worker refuses upstream writes older than it. Only a GitHub read
+/// may move it; reaction persistence must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseRevisionContent {
+    node_id: Option<String>,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    created_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    revision: String,
+}
+
+impl ReleaseRevisionContent {
+    fn from_github(release: &serde_json::Value) -> Result<Self> {
+        let release_id = release
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| anyhow!("GitHub release entry has no numeric id"))?;
+        let optional_text = |key: &str| {
+            release
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let published_at = optional_text("published_at");
+        let created_at = optional_text("created_at");
+        let updated_at = release
+            .get("updated_at")
+            .and_then(serde_json::Value::as_str);
+        let revision = updated_at
+            .or(published_at.as_deref())
+            .or(created_at.as_deref())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!("GitHub release {release_id} has no updated_at/published_at/created_at")
+            })?
+            .to_owned();
+        Ok(Self {
+            node_id: optional_text("node_id"),
+            tag_name: optional_text("tag_name").unwrap_or_default(),
+            name: optional_text("name"),
+            body: optional_text("body"),
+            html_url: optional_text("html_url").unwrap_or_default(),
+            published_at,
+            created_at,
+            is_prerelease: i64::from(
+                release
+                    .get("prerelease")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            is_draft: i64::from(
+                release
+                    .get("draft")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            revision,
+        })
+    }
+}
+
+/// Re-read the stored releases behind a polluted revision from GitHub and write
+/// the content and `updated_at` back verbatim.
+///
+/// The runtime release worker refuses an upstream revision older than the local
+/// one, so a row whose `updated_at` was advanced past GitHub keeps rejecting the
+/// real content forever. This command is the controlled way out: it never
+/// compares revisions and it writes nothing unless `--apply` is given.
+async fn repair_release_revisions(
+    pg: &mut Client,
+    options: &RepairReleaseRevisionsArgs,
+) -> Result<()> {
+    let rows = pg
+        .query(
+            r#"
+            SELECT release_id, node_id, tag_name, name, body, html_url, published_at,
+                   created_at, is_prerelease, is_draft, updated_at
+            FROM public.repo_releases
+            WHERE ($1::bigint IS NULL OR repo_id = $1)
+              AND ($2::bigint IS NULL OR release_id = $2)
+            ORDER BY repo_id, release_id
+            "#,
+            &[&options.repo_id, &options.release_id],
+        )
+        .await
+        .context("load cached releases to repair")?;
+    if rows.is_empty() {
+        bail!("no cached releases match the requested target");
+    }
+
+    let mut targets: BTreeMap<String, Vec<CachedReleaseRevision>> = BTreeMap::new();
+    for row in &rows {
+        let html_url = row.get::<_, String>("html_url");
+        let content = ReleaseRevisionContent {
+            node_id: row.get("node_id"),
+            tag_name: row.get("tag_name"),
+            name: row.get("name"),
+            body: row.get("body"),
+            html_url: html_url.clone(),
+            published_at: row.get("published_at"),
+            created_at: row.get("created_at"),
+            is_prerelease: row.get("is_prerelease"),
+            is_draft: row.get("is_draft"),
+            revision: row.get("updated_at"),
+        };
+        targets
+            .entry(release_repository(&html_url)?)
+            .or_default()
+            .push(CachedReleaseRevision {
+                release_id: row.get("release_id"),
+                content,
+            });
+    }
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build GitHub HTTP client")?;
+    let token = options
+        .github_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let base = options.github_api_base.trim().trim_end_matches('/');
+    // `--dry-run` is the explicit spelling of the default; only `--apply` writes.
+    let apply = options.apply && !options.dry_run;
+
+    let mut updates: Vec<(i64, ReleaseRevisionContent)> = Vec::new();
+    let mut current = 0usize;
+    let mut missing = 0usize;
+    for (full_name, releases) in &targets {
+        let fetched = fetch_github_release_revisions(&http, base, full_name, token).await?;
+        let mut fetched = fetched
+            .iter()
+            .map(|entry| {
+                let content = ReleaseRevisionContent::from_github(entry)?;
+                let release_id = entry
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .expect("release id is validated by ReleaseRevisionContent::from_github");
+                Ok((release_id, content))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        for release in releases {
+            let Some(upstream) = fetched.remove(&release.release_id) else {
+                missing += 1;
+                println!(
+                    "missing upstream: release {} of {full_name} is not returned by GitHub",
+                    release.release_id
+                );
+                continue;
+            };
+            if upstream == release.content {
+                current += 1;
+                println!(
+                    "already current: release {} of {full_name} at revision {}",
+                    release.release_id, release.content.revision
+                );
+                continue;
+            }
+            println!(
+                "{}: release {} of {full_name} revision {} -> {} (body {} bytes, previous {} bytes)",
+                if apply { "repairing" } else { "would repair" },
+                release.release_id,
+                release.content.revision,
+                upstream.revision,
+                upstream.body.as_deref().map_or(0, str::len),
+                release.content.body.as_deref().map_or(0, str::len)
+            );
+            updates.push((release.release_id, upstream));
+        }
+    }
+
+    if apply && !updates.is_empty() {
+        let transaction = pg
+            .transaction()
+            .await
+            .context("begin release revision repair")?;
+        for (release_id, content) in &updates {
+            transaction
+                .execute(
+                    r#"
+                    UPDATE public.repo_releases
+                    SET node_id = $2,
+                        tag_name = $3,
+                        name = $4,
+                        body = $5,
+                        html_url = $6,
+                        published_at = $7,
+                        created_at = $8,
+                        is_prerelease = $9,
+                        is_draft = $10,
+                        updated_at = $11
+                    WHERE release_id = $1
+                    "#,
+                    &[
+                        release_id,
+                        &content.node_id,
+                        &content.tag_name,
+                        &content.name,
+                        &content.body,
+                        &content.html_url,
+                        &content.published_at,
+                        &content.created_at,
+                        &content.is_prerelease,
+                        &content.is_draft,
+                        &content.revision,
+                    ],
+                )
+                .await
+                .with_context(|| format!("write repaired release {release_id}"))?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit release revision repair")?;
+    }
+
+    println!(
+        "repair-release-revisions: {} releases across {} repositories: {} {}, {} already current, {} missing upstream{}",
+        rows.len(),
+        targets.len(),
+        updates.len(),
+        if apply { "repaired" } else { "to repair" },
+        current,
+        missing,
+        if apply {
+            ""
+        } else {
+            " (dry run: no rows written)"
+        }
+    );
+    Ok(())
+}
+
+/// Read every release page for one repository, as the runtime worker does.
+async fn fetch_github_release_revisions(
+    http: &reqwest::Client,
+    base: &str,
+    full_name: &str,
+    token: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut releases = Vec::new();
+    for page in 1..=REPAIR_MAX_PAGES {
+        let mut request = http
+            .get(format!(
+                "{base}/repos/{full_name}/releases?per_page={REPAIR_RELEASES_PER_PAGE}&page={page}"
+            ))
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "OctoRill")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = token {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("read GitHub releases for {full_name} page {page}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "GitHub rejected the release read for {full_name} (HTTP {}): {}",
+                status.as_u16(),
+                body.chars().take(500).collect::<String>()
+            );
+        }
+        let page_releases = response
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .with_context(|| format!("decode GitHub releases for {full_name} page {page}"))?;
+        let count = page_releases.len();
+        releases.extend(page_releases);
+        if count < REPAIR_RELEASES_PER_PAGE {
+            return Ok(releases);
+        }
+    }
+    bail!("GitHub releases for {full_name} exceed the {REPAIR_MAX_PAGES}-page repair budget")
+}
+
+/// Resolve `owner/repo` from a cached release `html_url`.
+fn release_repository(html_url: &str) -> Result<String> {
+    let url = url::Url::parse(html_url)
+        .with_context(|| format!("cached release html_url is not a URL: {html_url}"))?;
+    let mut segments = url.path_segments().into_iter().flatten();
+    let owner = segments.next().unwrap_or_default();
+    let repository = segments.next().unwrap_or_default();
+    if owner.is_empty() || repository.is_empty() {
+        bail!("cached release html_url does not name a repository: {html_url}");
+    }
+    Ok(format!("{owner}/{repository}"))
+}
+
 async fn copy_table(
     sqlite: &SqlitePool,
     pg: &mut Client,
@@ -1433,5 +1785,52 @@ mod tests {
                 .to_string()
                 .contains("cyclic SQLite foreign-key dependencies")
         );
+    }
+
+    #[test]
+    fn repair_derives_the_repository_from_the_cached_release_url() {
+        assert_eq!(
+            release_repository("https://github.com/octo/rocket/releases/tag/v1.2.3").unwrap(),
+            "octo/rocket"
+        );
+        assert!(release_repository("https://github.com/octo").is_err());
+        assert!(release_repository("not a url").is_err());
+    }
+
+    #[test]
+    fn repair_prefers_the_github_revision_and_keeps_the_body_verbatim() {
+        let release = serde_json::json!({
+            "id": 454410070_i64,
+            "node_id": "RE_kwDO",
+            "tag_name": "v1.2.3",
+            "name": "Release v1.2.3",
+            "body": "- body\r\n- item",
+            "html_url": "https://github.com/octo/rocket/releases/tag/v1.2.3",
+            "published_at": "2026-11-01T10:00:00Z",
+            "created_at": "2026-11-01T09:00:00Z",
+            "updated_at": "2026-11-02T10:00:00Z",
+            "prerelease": false,
+            "draft": false,
+        });
+        let content = ReleaseRevisionContent::from_github(&release).unwrap();
+        assert_eq!(content.revision, "2026-11-02T10:00:00Z");
+        assert_eq!(content.body.as_deref(), Some("- body\r\n- item"));
+        assert_eq!(content.is_prerelease, 0);
+        assert_eq!(content.is_draft, 0);
+
+        let without_update = serde_json::json!({
+            "id": 1_i64,
+            "published_at": "2026-11-01T10:00:00Z",
+            "created_at": "2026-11-01T09:00:00Z",
+        });
+        assert_eq!(
+            ReleaseRevisionContent::from_github(&without_update)
+                .unwrap()
+                .revision,
+            "2026-11-01T10:00:00Z"
+        );
+
+        let without_dates = serde_json::json!({ "id": 2_i64 });
+        assert!(ReleaseRevisionContent::from_github(&without_dates).is_err());
     }
 }
