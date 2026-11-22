@@ -865,7 +865,6 @@ function filterTasks(
 		"sync.releases": true,
 		"sync.notifications": true,
 		"webhook.push.manage": true,
-		"webhook.push.reconcile": true,
 		"retry.recent_failures": true,
 		"release.reading_backfill": true,
 	};
