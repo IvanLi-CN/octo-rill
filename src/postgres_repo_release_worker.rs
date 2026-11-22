@@ -323,7 +323,8 @@ impl TaskExecutor for RepoReleaseRefreshExecutor {
 
 impl RepoReleaseRefreshExecutor {
     /// Queue automatic release translation for the releases this refresh
-    /// inserted. `content_pending` keeps describing the stored new ids; the
+    /// inserted and drain one bounded slice of the backlog the batch cap left
+    /// behind. `content_pending` keeps describing the stored new ids; the
     /// enqueue only turns them into `translation.generate` tasks.
     ///
     /// The refresh already committed before this runs, so a failure is reported
@@ -334,27 +335,61 @@ impl RepoReleaseRefreshExecutor {
         payload: &RepoReleaseTaskPayload,
         stats: &RefreshStats,
     ) -> usize {
-        if self.ai.is_none() || stats.new_release_ids.is_empty() {
+        if self.ai.is_none() {
             return 0;
         }
-        match crate::postgres_translate::enqueue_release_translations(
+        let mut enqueued = 0usize;
+        if !stats.new_release_ids.is_empty() {
+            match crate::postgres_translate::enqueue_release_translations(
+                &self.pool,
+                &payload.user_id,
+                &stats.new_release_ids,
+                "sync.repo_release.auto_translate",
+            )
+            .await
+            {
+                Ok(count) => {
+                    info!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        translations_enqueued = count,
+                        "automatic release translation queued"
+                    );
+                    enqueued = count;
+                }
+                Err(error) => {
+                    warn!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        error = %error,
+                        "automatic release translation enqueue failed"
+                    );
+                }
+            }
+        }
+        match crate::postgres_translate::enqueue_pending_translation_tasks(
             &self.pool,
             &payload.user_id,
-            &stats.new_release_ids,
-            "sync.repo_release.auto_translate",
+            "sync.repo_release.translation_backlog",
         )
         .await
         {
             Ok(count) => {
-                info!(
-                    event = "translation.enqueue",
-                    operation = TASK_TYPE,
-                    user_id = payload.user_id,
-                    repo_id = payload.repo_id,
-                    translations_enqueued = count,
-                    "automatic release translation queued"
-                );
-                count
+                if count > 0 {
+                    info!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        translations_drained = count,
+                        "automatic translation backlog drained"
+                    );
+                }
+                enqueued + count
             }
             Err(error) => {
                 warn!(
@@ -363,9 +398,9 @@ impl RepoReleaseRefreshExecutor {
                     user_id = payload.user_id,
                     repo_id = payload.repo_id,
                     error = %error,
-                    "automatic release translation enqueue failed"
+                    "automatic translation backlog drain failed"
                 );
-                0
+                enqueued
             }
         }
     }
