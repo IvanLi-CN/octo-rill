@@ -59,6 +59,13 @@
 - Inputs: 冻结时刻、快照、目标库。
 - Outputs: 成功判定或回滚动作及其公告内容。
 
+### REQ-PGR-008
+
+- 未认证 Release 读取 MUST 共用一份进程级预算，初始余量低于 GitHub 的 60 次/小时 IP 限额，并按 `X-RateLimit-Remaining`/`X-RateLimit-Reset` 校准；每个真实匿名请求（含 304、重定向跳转）MUST 先扣减，预算为 0 时 MUST NOT 发请求。
+- 预算耗尽 MUST 返回独立延后结果：MUST NOT 记为失败、MUST NOT 写重试退避、MUST NOT 改写 `public_repo_release_usage` 状态；单仓任务与账号级任务都只延后该仓库并留待下一周期。候选轮换判定 MUST NOT 受预算影响。
+- Inputs: 匿名响应头、请求时刻、进程内共享预算。
+- Outputs: 允许或延后决定、`deferred_budget` 结果、预算余量与延后次数指标。
+
 ## Verification
 
 ### VER-PGR-001
@@ -102,6 +109,12 @@
 - Method: `仓库外运维记录` 演练记录与生产副本读写探测。
 - covers: `REQ-PGR-007`
 - Pass condition: 可逆写全部还原，读探测除环境限制项外通过，回滚契约与公告文本已确认。
+
+### VER-PGR-008
+
+- Method: `cargo test --locked --bin octo-rill postgres_repo_release` 与 `scripts/pg_seed_repo_release_anon_budget_test.py`。
+- covers: `REQ-PGR-008`
+- Pass condition: 多页匿名读取按页扣减、响应头校准剩余额度、预算耗尽时延后且 usage 状态与退避不变、零预算不再发请求全部通过。
 
 ## Related ADRs
 

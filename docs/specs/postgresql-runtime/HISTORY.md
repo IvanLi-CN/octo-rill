@@ -14,6 +14,7 @@
 
 ## Related Changes
 
+- issue #384：未认证 Release 读取纳入进程级预算（`REQ-PGR-008`）；预算耗尽记为延后，不再混入失败分类，验证入口为 `scripts/pg_seed_repo_release_anon_budget_test.py`。
 - 交付记录：`仓库外运维记录,completed,verification,cutover-plan}.md` 与 `migration-record.json`。
 
 ## References
