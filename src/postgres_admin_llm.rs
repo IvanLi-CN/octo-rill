@@ -251,7 +251,21 @@ pub(super) async fn status(State(state): State<PostgresServerState>, session: Se
         let health=sqlx::query_scalar::<_,Value>("SELECT to_jsonb(h) FROM public.llm_model_health h").fetch_all(&state.runtime.pool).await?;
         let recovery=sqlx::query_scalar::<_,Value>("SELECT to_jsonb(f) FROM public.llm_recovery_flags f WHERE id=1").fetch_optional(&state.runtime.pool).await?.unwrap_or(json!({}));
         let mut selected=None;let mut statuses=Vec::new();let mut earliest:Option<(String,chrono::DateTime<chrono::FixedOffset>)>=None;
-        for (i,model) in models.iter().enumerate(){let h=health.iter().find(|h|h["model"]==*model).or_else(||health.iter().find(|h|h["model"].as_str().is_some_and(|v|v==model.trim().to_ascii_lowercase())));let cooldown=h.and_then(|h|h["cooldown_until"].as_str()).and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok());let cooling=cooldown.is_some_and(|v|v>Utc::now());if !cooling&&selected.is_none(){selected=Some(model.clone());};if let Some(until)=cooldown.filter(|v|*v>Utc::now())&&earliest.as_ref().is_none_or(|(_,old)|until<*old){earliest=Some((model.clone(),until));}let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(model));let failures=h.and_then(|h|h["relevant_failure_count"].as_i64()).unwrap_or(0);statuses.push(json!({"model":model,"priority":i+1,"status":if cooling{"cooldown"}else{"ready"},"consecutive_final_failures":failures,"relevant_failure_count":failures,"cooldown_until":cooldown.filter(|v|*v>Utc::now()).map(|v|v.to_rfc3339()),"effective_input_limit":limit,"effective_input_limit_source":source}));}
+        for (i,model) in models.iter().enumerate(){
+            let h=health.iter().find(|h|h["model"]==*model).or_else(||health.iter().find(|h|h["model"].as_str().is_some_and(|v|v==model.trim().to_ascii_lowercase())));
+            let cooldown=h.and_then(|h|h["cooldown_until"].as_str()).and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok());
+            let cooling=cooldown.is_some_and(|v|v>Utc::now());
+            // A configuration failure with a future cooldown is a credential
+            // rejection: the route stays out of selection until the park
+            // expires or the operator saves the runtime model list.
+            let parked=h.is_some_and(|h|h["last_failure_class"]=="configuration")&&cooling;
+            if !cooling&&selected.is_none(){selected=Some(model.clone());}
+            if !parked&&let Some(until)=cooldown.filter(|v|*v>Utc::now())&&earliest.as_ref().is_none_or(|(_,old)|until<*old){earliest=Some((model.clone(),until));}
+            let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(model));
+            let failures=h.and_then(|h|h["relevant_failure_count"].as_i64()).unwrap_or(0);
+            let status=if parked{"parked"}else if cooling{"cooldown"}else{"ready"};
+            statuses.push(json!({"model":model,"priority":i+1,"status":status,"consecutive_final_failures":failures,"relevant_failure_count":failures,"cooldown_until":cooldown.filter(|v|*v>Utc::now()).map(|v|v.to_rfc3339()),"effective_input_limit":limit,"effective_input_limit_source":source}));
+        }
         if selected.is_none(){selected=earliest.map(|(model,_)|model);}
         let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(selected.as_deref().unwrap_or_default()));
         let in_flight:i64=stats.try_get("running")?;let enabled=state.ai_model.is_some()&&std::env::var("OCTORILL_PG_WORKER_ENABLED").as_deref()!=Ok("0");let actual_max=if enabled{1}else{0};
