@@ -513,7 +513,7 @@ def main():
 
             log_text = log_path.read_text()
             assert "anonymous GitHub read deferred: budget exhausted" in log_text
-            assert 'deferred_reason="anonymous_budget"' in log_text
+            assert '"deferred_reason":"anonymous_budget"' in log_text
 
             print(
                 json.dumps(
