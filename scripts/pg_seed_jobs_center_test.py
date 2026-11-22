@@ -405,14 +405,16 @@ def main():
                 stream.close()
 
             # Last-Event-ID resumes after the delivered event instead of
-            # replaying it.
+            # replaying it. The newer event exists before the stream opens, so a
+            # resume that ignores the header and starts at the newest cursor
+            # can only block here; only a real resume delivers it.
+            sql(
+                "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) "
+                "VALUES ('sse-event-2', 'sse-task', 'task.started', '{\"task_id\":\"sse-task\"}', now())",
+                url,
+            )
             stream = open_stream(base, cookies['seed-admin'], 'job-sse-event-1')
             try:
-                sql(
-                    "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) "
-                    "VALUES ('sse-event-2', 'sse-task', 'task.started', '{\"task_id\":\"sse-task\"}', now())",
-                    url,
-                )
                 frame, seen = read_frame_with_history(
                     stream, lambda text: 'sse-event-2' in text
                 )

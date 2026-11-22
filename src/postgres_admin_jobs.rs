@@ -39,6 +39,8 @@ const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 100;
 const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STREAM_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(8);
+/// TEXT-timestamp event sources are sampled every 4th job-event tick (2s).
+const STREAM_TEXT_SOURCE_TICK_INTERVAL: u64 = 4;
 const STREAM_BATCH_LIMIT: i64 = 200;
 const SYNC_SUBSCRIPTION_EVENT_LIMIT: usize = 20;
 
@@ -1073,6 +1075,7 @@ pub(super) async fn events_stream(
         // Complete the SSE handshake immediately so the client connection
         // state settles before the first read interval.
         yield Ok::<Event, Infallible>(Event::default().comment("stream-ready"));
+        let mut tick: u64 = 0;
         loop {
             for row in load_job_event_batch(&pool, &job).await {
                 job = StreamCursor { at: row.created_at, id: row.id.clone() };
@@ -1093,7 +1096,13 @@ pub(super) async fn events_stream(
                 );
             }
 
-            for row in load_llm_event_batch(&pool, &llm).await {
+            // The TEXT timestamp columns behind these two sources cannot use an
+            // index through the guarded timestamp cast the imported schemas
+            // need, so each poll is a bounded sequential read. Sample them one
+            // tick in `STREAM_TEXT_SOURCE_TICK_INTERVAL` instead of every
+            // interval; the admin UI debounces refreshes far above that rate.
+            if tick.is_multiple_of(STREAM_TEXT_SOURCE_TICK_INTERVAL) {
+                for row in load_llm_event_batch(&pool, &llm).await {
                 llm = StreamCursor { at: row.created_at, id: row.id.clone() };
                 let payload = LlmStreamPayload {
                     event_id: row.id.clone(),
@@ -1161,7 +1170,9 @@ pub(super) async fn events_stream(
                         .data(data),
                 );
             }
+            }
 
+            tick = tick.wrapping_add(1);
             sleep(STREAM_POLL_INTERVAL).await;
         }
     };
