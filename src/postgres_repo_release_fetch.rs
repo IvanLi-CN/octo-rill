@@ -11,6 +11,12 @@
 //! [`AnonymousBudget`]: GitHub counts anonymous requests per egress IP (60 per
 //! hour), so a per-token accounting cannot see the exhaustion coming. A read
 //! that finds the budget spent is deferred, not failed.
+//!
+//! The accelerator in front of `api.github.com` intermittently answers a 5xx
+//! or a non-JSON body while the next request succeeds, so every page request
+//! is sent at most twice: the initial call and one retry after a short
+//! backoff. Only transport failures and upstream 5xx answers are retried; a
+//! final denial for the credential or repository is not.
 
 use std::{
     collections::HashMap,
@@ -23,7 +29,7 @@ use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::crypto::EncryptionKey;
 
@@ -32,6 +38,13 @@ pub(crate) const RELEASES_PER_PAGE: usize = 100;
 /// Page budget for one repository read, matching the legacy lane.
 pub(crate) const MAX_PAGES: usize = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Requests per page: the initial call plus one retry. One retry absorbs a
+/// single proxy hiccup; more attempts would multiply the cost of an upstream
+/// outage across every repository of an account.
+const MAX_REQUEST_ATTEMPTS: usize = 2;
+/// Backoff before each retry. Two attempts only spend the first tier; the
+/// second documents the ceiling should the attempt budget ever grow.
+const RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(1)];
 const USER_AGENT: &str = "OctoRill";
 const API_VERSION: &str = "2022-11-28";
 /// Legacy access kind for repositories registered by unauthenticated readers.
@@ -323,6 +336,25 @@ impl RefreshFailure {
     /// Whether another candidate user may still read the repository.
     pub(crate) fn rotates_candidate(&self) -> bool {
         ROTATING_REASON_CODES.contains(&self.reason_code)
+    }
+
+    /// Whether re-sending the same request could plausibly succeed.
+    ///
+    /// Only transport-level failures and upstream 5xx answers qualify: the
+    /// proxy in front of the API is known to inject single 502/503/504
+    /// responses and HTML error bodies between two healthy calls. Rate limits
+    /// are excluded on purpose — an immediate retry spends the same exhausted
+    /// allowance, so candidate rotation stays in charge — as are denials for
+    /// the credential or the repository itself.
+    pub(crate) fn retries_request(&self) -> bool {
+        if matches!(
+            self.reason_code,
+            "network_error" | "timeout" | "decode_error"
+        ) {
+            return self.retryable;
+        }
+        self.status
+            .is_some_and(|status| (500..=599).contains(&status))
     }
 }
 
@@ -923,25 +955,34 @@ async fn fetch_public(
     fetch_with_token(http, request, None, sync_state, Some(budget)).await
 }
 
-async fn fetch_with_token(
+/// One page request, already classified into the only three shapes the paging
+/// loop cares about.
+#[derive(Debug)]
+struct PageResponse {
+    not_modified: bool,
+    releases: Vec<Value>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+/// Send one page, retrying the same URL at most once for transient failures.
+///
+/// The retry repeats the request instead of advancing the cursor, so the paging
+/// loop never counts a page twice and never appends a partially decoded body.
+/// Anonymous attempts charge the budget per request, exactly like GitHub counts
+/// them, so a retried anonymous page spends two units.
+async fn request_page(
     http: &Client,
     request: &ReleaseFetchRequest<'_>,
     token: Option<&str>,
     sync_state: Option<&SyncStateRow>,
     budget: Option<&AnonymousBudget>,
-) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
-    let mut fetch = RepositoryFetch {
-        stopped_reason: "page_budget".to_owned(),
-        ..RepositoryFetch::default()
-    };
-    for page in 1..=MAX_PAGES {
-        let url = format!(
-            "{}/repos/{}/releases?per_page={RELEASES_PER_PAGE}&page={page}",
-            crate::github_api::rest_base(),
-            request.repo_full_name
-        );
+    page: usize,
+    url: &str,
+) -> std::result::Result<PageResponse, ReleaseFetchError> {
+    for attempt in 1..=MAX_REQUEST_ATTEMPTS {
         let mut builder = http
-            .get(url.clone())
+            .get(url.to_owned())
             .timeout(REQUEST_TIMEOUT)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::ACCEPT, "application/vnd.github+json")
@@ -965,7 +1006,16 @@ async fn fetch_with_token(
                 .acquire(unix_now())
                 .map_err(|deferral| defer_anonymous_read(request, page, deferral))?;
         }
-        let response = builder.send().await.map_err(classify_request_error)?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let failure = classify_request_error(error);
+                if retry_page(request, page, attempt, &failure).await {
+                    continue;
+                }
+                return Err(failure.into());
+            }
+        };
         let status = response.status();
         let headers = response.headers().clone();
         if let Some(budget) = budget {
@@ -979,30 +1029,110 @@ async fn fetch_with_token(
             let (remaining, reset_at_unix) = parse_rate_limit(&headers);
             budget.observe(remaining, reset_at_unix);
         }
-        if page == 1 {
-            fetch.etag = header_value(&headers, header::ETAG);
-            fetch.last_modified = header_value(&headers, header::LAST_MODIFIED);
-        }
-        fetch.pages_fetched = page;
+        let etag = header_value(&headers, header::ETAG);
+        let last_modified = header_value(&headers, header::LAST_MODIFIED);
         if status == StatusCode::NOT_MODIFIED {
+            return Ok(PageResponse {
+                not_modified: true,
+                releases: Vec::new(),
+                etag,
+                last_modified,
+            });
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let failure = classify_http_error(status, &headers, &body);
+            if retry_page(request, page, attempt, &failure).await {
+                continue;
+            }
+            return Err(failure.into());
+        }
+        match response.json::<Vec<Value>>().await {
+            Ok(releases) => {
+                return Ok(PageResponse {
+                    not_modified: false,
+                    releases,
+                    etag,
+                    last_modified,
+                });
+            }
+            Err(error) => {
+                let failure = RefreshFailure::new(
+                    "decode_error",
+                    format!("decode GitHub releases: {error}"),
+                    error.is_body() || error.is_connect() || error.is_timeout(),
+                    None,
+                );
+                if retry_page(request, page, attempt, &failure).await {
+                    continue;
+                }
+                return Err(failure.into());
+            }
+        }
+    }
+    unreachable!("the last page attempt returns instead of exhausting the loop")
+}
+
+/// Wait out the retry backoff and report the retry. Returns `false` when the
+/// failure is final or the attempt budget is spent.
+async fn retry_page(
+    request: &ReleaseFetchRequest<'_>,
+    page: usize,
+    attempt: usize,
+    failure: &RefreshFailure,
+) -> bool {
+    if attempt >= MAX_REQUEST_ATTEMPTS || !failure.retries_request() {
+        return false;
+    }
+    let backoff = RETRY_BACKOFFS
+        .get(attempt - 1)
+        .copied()
+        .unwrap_or_else(|| RETRY_BACKOFFS[RETRY_BACKOFFS.len() - 1]);
+    debug!(
+        event = "upstream.call",
+        operation = "repo_release_fetch",
+        repo = request.repo_full_name,
+        page,
+        attempt,
+        error_kind = failure.reason_code,
+        backoff_ms = backoff.as_millis(),
+        "retrying transient GitHub release page failure"
+    );
+    tokio::time::sleep(backoff).await;
+    true
+}
+
+async fn fetch_with_token(
+    http: &Client,
+    request: &ReleaseFetchRequest<'_>,
+    token: Option<&str>,
+    sync_state: Option<&SyncStateRow>,
+    budget: Option<&AnonymousBudget>,
+) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
+    let mut fetch = RepositoryFetch {
+        stopped_reason: "page_budget".to_owned(),
+        ..RepositoryFetch::default()
+    };
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "{}/repos/{}/releases?per_page={RELEASES_PER_PAGE}&page={page}",
+            crate::github_api::rest_base(),
+            request.repo_full_name
+        );
+        let page_response =
+            request_page(http, request, token, sync_state, budget, page, url.as_str()).await?;
+        fetch.pages_fetched = page;
+        if page == 1 {
+            fetch.etag = page_response.etag;
+            fetch.last_modified = page_response.last_modified;
+        }
+        if page_response.not_modified {
             fetch.not_modified = true;
             fetch.stopped_reason = "not_modified".to_owned();
             return Ok(fetch);
         }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, &headers, &body).into());
-        }
-        let page_releases = response.json::<Vec<Value>>().await.map_err(|error| {
-            RefreshFailure::new(
-                "decode_error",
-                format!("decode GitHub releases: {error}"),
-                error.is_body() || error.is_connect() || error.is_timeout(),
-                None,
-            )
-        })?;
-        let page_len = page_releases.len();
-        fetch.releases.extend(page_releases);
+        let page_len = page_response.releases.len();
+        fetch.releases.extend(page_response.releases);
         if page_len == 0 {
             fetch.stopped_reason = "empty_page".to_owned();
             return Ok(fetch);
@@ -1349,6 +1479,146 @@ mod tests {
         let failure = RefreshFailure::new("timeout", "sync repo releases", true, None);
         assert_eq!(failure.summary(), "timeout: sync repo releases");
         assert_eq!(failure.to_string(), failure.summary());
+    }
+
+    #[test]
+    fn transient_failures_retry_the_same_request() {
+        let headers = reqwest::header::HeaderMap::new();
+        // The accelerator answers 502/503/504 with an HTML body; the next call
+        // for the same page often succeeds, so the page is re-sent.
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let failure = classify_http_error(status, &headers, "<html>bad gateway</html>");
+            assert_eq!(failure.reason_code, "rate_limited", "{status}");
+            assert!(failure.retryable, "{status}");
+            assert!(failure.retries_request(), "{status} must retry");
+        }
+        for code in ["network_error", "timeout", "decode_error"] {
+            assert!(
+                RefreshFailure::new(code, "synthetic", true, None).retries_request(),
+                "{code} must retry"
+            );
+        }
+        // A 200 answer whose body is not the releases array is the same
+        // transient class the proxy injects; only body-level decode errors
+        // carry `retryable`, which is what the predicate reads.
+        assert!(!RefreshFailure::new("decode_error", "synthetic", false, None).retries_request());
+    }
+
+    #[test]
+    fn final_failures_do_not_retry_the_same_request() {
+        let headers = reqwest::header::HeaderMap::new();
+        for failure in [
+            classify_http_error(StatusCode::NOT_FOUND, &headers, ""),
+            classify_http_error(StatusCode::UNAUTHORIZED, &headers, ""),
+            classify_http_error(
+                StatusCode::FORBIDDEN,
+                &headers,
+                "Resource not accessible by integration",
+            ),
+            classify_http_error(StatusCode::TOO_MANY_REQUESTS, &headers, ""),
+            throttled_403(),
+        ] {
+            assert!(
+                !failure.retries_request(),
+                "{} must be final (status {:?})",
+                failure.reason_code,
+                failure.status
+            );
+        }
+        assert!(
+            !RefreshFailure::new("repo_inaccessible", "synthetic", false, Some(451))
+                .retries_request()
+        );
+        assert!(
+            !RefreshFailure::new("deferred_budget", "synthetic", false, None).retries_request()
+        );
+    }
+
+    #[test]
+    fn retry_backoff_starts_short_and_is_capped_at_one_second() {
+        // Two attempts per page spend only the first tier; the table documents
+        // the policy the PR body publishes.
+        assert_eq!(MAX_REQUEST_ATTEMPTS, 2);
+        assert_eq!(
+            RETRY_BACKOFFS,
+            [Duration::from_millis(300), Duration::from_secs(1)]
+        );
+    }
+
+    /// Serve one scripted HTTP response per connection, in order, and return
+    /// the base URL plus the number of connections the client opened.
+    async fn scripted_server(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback test server");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut served = 0usize;
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept test request");
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write test response");
+                served += 1;
+            }
+            served
+        });
+        (base, server)
+    }
+
+    fn fetch_request() -> ReleaseFetchRequest<'static> {
+        ReleaseFetchRequest {
+            repo_id: 1,
+            repo_full_name: "seed/repo",
+            requested_by_user_id: "user-a",
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_page_failure_is_retried_once_without_double_counting() {
+        let (base, server) = scripted_server(vec![
+            ("504 Gateway Timeout", "<html>gateway timeout</html>"),
+            ("200 OK", r#"[{"id":1,"tag_name":"v1"}]"#),
+        ])
+        .await;
+        let http = Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=1");
+        let page = request_page(&http, &fetch_request(), None, None, None, 1, &url)
+            .await
+            .expect("the retried page is read");
+        assert!(!page.not_modified);
+        assert_eq!(page.releases.len(), 1);
+        // The page was requested twice but decoded and appended once.
+        assert_eq!(server.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_page_failure_is_not_retried() {
+        let (base, server) = scripted_server(vec![("404 Not Found", "{}")]).await;
+        let http = Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=1");
+        let failure = failure_of(
+            request_page(&http, &fetch_request(), None, None, None, 1, &url)
+                .await
+                .expect_err("a 404 is a final answer"),
+        );
+        assert_eq!(failure.reason_code, "repo_inaccessible");
+        assert_eq!(server.await.unwrap(), 1);
     }
 
     #[test]
