@@ -423,6 +423,75 @@ def main():
             finally:
                 stream.close()
 
+            # ---- task detail contract -----------------------------------------
+            code, detail = request('/api/admin/jobs/realtime/sub-1')
+            assert code == 200, (code, detail)
+            assert set(detail) == {'task', 'events', 'event_meta', 'diagnostics'}, detail
+            task = detail['task']
+            assert task['id'] == 'sub-1', task
+            assert task['task_type'] == 'sync.subscriptions', task
+            assert isinstance(task['payload_json'], str), task
+            assert json.loads(task['payload_json'])['trigger'] == 'scheduler', task
+            assert isinstance(task['result_json'], str), task
+            assert task['cancel_requested'] is False, task
+            assert 'log_file_path' not in task, task
+            assert 'payload' not in task and 'result' not in task, task
+            assert [event['id'] for event in detail['events']] == [
+                'sub-1-release',
+                'sub-1-collect',
+            ], detail['events']
+            assert set(detail['events'][0]) == {
+                'id',
+                'event_type',
+                'payload_json',
+                'created_at',
+            }, detail['events'][0]
+            assert detail['event_meta'] == {
+                'returned': 2,
+                'total': 2,
+                'limit': 200,
+                'truncated': False,
+            }, detail['event_meta']
+            assert detail['diagnostics']['sync_subscriptions']['skipped'] is True
+            assert detail['diagnostics']['business_outcome']['code'] == 'disabled'
+
+            code, quiet_detail = request('/api/admin/jobs/realtime/rt-3')
+            assert code == 200, (code, quiet_detail)
+            assert quiet_detail['events'] == [], quiet_detail
+            assert quiet_detail['event_meta'] == {
+                'returned': 0,
+                'total': 0,
+                'limit': 200,
+                'truncated': False,
+            }, quiet_detail['event_meta']
+            assert quiet_detail['diagnostics'] is None, quiet_detail
+
+            code, body = request('/api/admin/jobs/realtime/does-not-exist')
+            assert code == 404 and body['code'] == 'not_found', (code, body)
+            code, _ = request('/api/admin/jobs/realtime/sub-1', 'seed-user')
+            assert code == 403, code
+            code, _ = request('/api/admin/jobs/realtime/sub-1', None)
+            assert code == 401, code
+
+            sql(
+                "INSERT INTO public.job_tasks (id, task_type, status, source, payload_json, created_at, updated_at) "
+                "VALUES ('dt-many', 'translate.release.batch', 'succeeded', 'validation', '{}', now(), now()); "
+                "INSERT INTO public.job_task_events (id, task_id, event_type, payload_json, created_at) "
+                "SELECT 'dt-many-' || g, 'dt-many', 'task.progress', '{}', now() + (g || ' seconds')::interval "
+                "FROM generate_series(1, 205) AS g;",
+                url,
+            )
+            code, truncated = request('/api/admin/jobs/realtime/dt-many')
+            assert code == 200, (code, truncated)
+            assert truncated['event_meta'] == {
+                'returned': 200,
+                'total': 205,
+                'limit': 200,
+                'truncated': True,
+            }, truncated['event_meta']
+            assert truncated['events'][0]['id'] == 'dt-many-205', truncated['events'][0]
+            assert truncated['diagnostics'] is None, truncated
+
             print(
                 json.dumps(
                     {
@@ -433,6 +502,7 @@ def main():
                         'subscription_diagnostics': 'pass',
                         'sse_event_stream': 'pass',
                         'sse_last_event_id_resume': 'pass',
+                        'task_detail_contract': 'pass',
                         'admin_only_access': 'pass',
                     }
                 )

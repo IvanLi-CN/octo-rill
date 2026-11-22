@@ -11,7 +11,7 @@ use std::{collections::HashMap, convert::Infallible, path::Path, time::Duration}
 use async_stream::stream;
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
@@ -971,6 +971,180 @@ fn json_get_object<'a>(
     object
         .and_then(|object| object.get(key))
         .and_then(Value::as_object)
+}
+
+// ------------------------------------------------------------- task detail
+
+const DETAIL_EVENT_LIMIT: i64 = 200;
+
+#[derive(Debug, FromRow)]
+struct RealtimeTaskDetailRow {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    requested_by: Option<String>,
+    parent_task_id: Option<String>,
+    cancel_requested: i64,
+    error_message: Option<String>,
+    payload_json: String,
+    result_json: Option<String>,
+    log_file_path: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct RealtimeTaskDetailItem {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    requested_by: Option<String>,
+    parent_task_id: Option<String>,
+    cancel_requested: bool,
+    error_message: Option<String>,
+    payload_json: String,
+    result_json: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct TaskEventItem {
+    id: String,
+    event_type: String,
+    payload_json: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskEventMeta {
+    returned: i64,
+    total: i64,
+    limit: i64,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RealtimeTaskDetailResponse {
+    task: RealtimeTaskDetailItem,
+    events: Vec<TaskEventItem>,
+    event_meta: TaskEventMeta,
+    diagnostics: Option<TaskDiagnostics>,
+}
+
+pub(super) async fn task_detail(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    AxumPath(task_id): AxumPath<String>,
+) -> Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return require_admin_response(status);
+    }
+    match load_task_detail(&state.runtime.pool, &task_id).await {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": "not_found", "message": "task not found"})),
+        )
+            .into_response(),
+        Err(error) => database_error(error, "admin realtime task detail"),
+    }
+}
+
+async fn load_task_detail(
+    pool: &PgPool,
+    task_id: &str,
+) -> Result<Option<RealtimeTaskDetailResponse>, sqlx::Error> {
+    let Some(row) = sqlx::query_as::<_, RealtimeTaskDetailRow>(
+        "SELECT id, task_type, status, source, requested_by, parent_task_id, cancel_requested, \
+         error_message, payload_json, result_json, log_file_path, created_at, started_at, \
+         finished_at, updated_at \
+         FROM public.job_tasks WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let event_total = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM public.job_task_events WHERE task_id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    let events = sqlx::query_as::<_, TaskEventItem>(
+        "SELECT id, event_type, payload_json, created_at \
+         FROM public.job_task_events WHERE task_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(task_id)
+    .bind(DETAIL_EVENT_LIMIT)
+    .fetch_all(pool)
+    .await?;
+    let returned = i64::try_from(events.len()).unwrap_or(DETAIL_EVENT_LIMIT);
+    let event_total = event_total.max(returned);
+    let event_meta = TaskEventMeta {
+        returned,
+        total: event_total,
+        limit: DETAIL_EVENT_LIMIT,
+        truncated: event_total > returned,
+    };
+    // Only the subscription task type has a legacy list/detail diagnostics
+    // builder; the other task types keep the historical `null` payload.
+    let diagnostics = if row.task_type == TASK_SYNC_SUBSCRIPTIONS {
+        let ids = std::slice::from_ref(&row.id);
+        let progress = load_progress_events(pool, ids)
+            .await?
+            .remove(&row.id)
+            .unwrap_or_default();
+        let subscription_events = load_subscription_events(pool, ids)
+            .await?
+            .remove(&row.id)
+            .unwrap_or_default();
+        let subscription_task = SubscriptionTaskRow {
+            id: row.id.clone(),
+            status: row.status.clone(),
+            payload_json: row.payload_json.clone(),
+            result_json: row.result_json.clone(),
+            error_message: row.error_message.clone(),
+            log_file_path: row.log_file_path.clone(),
+        };
+        Some(build_subscription_diagnostics(
+            &subscription_task,
+            &progress,
+            &subscription_events,
+        ))
+    } else {
+        None
+    };
+    Ok(Some(RealtimeTaskDetailResponse {
+        task: RealtimeTaskDetailItem {
+            id: row.id,
+            task_type: row.task_type,
+            status: row.status,
+            source: row.source,
+            requested_by: row.requested_by,
+            parent_task_id: row.parent_task_id,
+            cancel_requested: row.cancel_requested != 0,
+            error_message: row.error_message,
+            payload_json: row.payload_json,
+            result_json: row.result_json,
+            created_at: row.created_at,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            updated_at: row.updated_at,
+        },
+        events,
+        event_meta,
+        diagnostics,
+    }))
 }
 
 // -------------------------------------------------------------- SSE stream
