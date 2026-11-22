@@ -362,10 +362,6 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         )
         .route("/api/admin/jobs/migrations", get(admin_migrations))
         .route(
-            "/api/admin/jobs/migrations/{migration_id}",
-            get(admin_migration_detail),
-        )
-        .route(
             "/api/admin/jobs/migrations/{migration_id}/pause",
             axum::routing::post(crate::postgres_admin_actions::admin_pause_online_migration),
         )
@@ -4220,17 +4216,6 @@ pub(crate) async fn admin_migrations(
                 .into_response()
         }
     }
-}
-
-pub(crate) async fn admin_migration_detail(
-    state: State<PostgresServerState>,
-    session: Session,
-    Path(id): Path<String>,
-) -> axum::response::Response {
-    if id != "content-processing-online-v2" {
-        return (StatusCode::NOT_FOUND, Json(json!({"code":"not_found"}))).into_response();
-    }
-    admin_migrations(state, session).await
 }
 
 async fn admin_webhook_runtime_config(
