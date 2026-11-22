@@ -114,6 +114,8 @@
 - 压力分档分别按 `(queued + running) / repo_release_worker_concurrency` 与活跃 Dashboard 任务数计算，最终压力取两者最大档位；压力只增加窗口，不减少有效关注仓库覆盖。
 - `latest / balanced / capacity` 使用固定的规模、共享人数和压力加权矩阵，结果钳制在 1–30 分钟。共享人数读取治理快照，缺失时按 1 计算并记录 `snapshot_missing`。
 - 任务 `result_json.release_freshness_assessment`、`release_freshness_assessed` 事件和 `repo_release_watchers` 逐仓字段共同构成审计合同。管理员任务详情展示摘要，并通过分页接口查询仓库决策明细。
+- 逐仓明细按 watcher 状态（`pending` / `succeeded` / `failed` / `deferred`）白名单筛选，响应同时返回状态计数；`deferred` 表示匿名 GitHub 读取预算耗尽导致的延后，界面以“已延后 / 预算延后”呈现，并进入状态筛选与统计。
+- 账户级 `sync.access_refresh` 结果中的 `deferred_repositories` 以同样的“已延后 / 预算延后”语义展示；管理界面不得直接渲染裸机器状态或原因码。
 - `release.releases` 保留复用缓存后的兼容总量；`current_run_releases` 与抓取/写入字段只统计本轮实际处理的 work item。
 
 ### 全量 cycle
@@ -235,6 +237,10 @@
 - Given 管理员在仓库明细中选择目标窗口 `W1` 与 `W3`，并把迫切值范围设为 `2.0-4.0`
   When 前端防抖后请求 `GET /api/admin/repos`
   Then 请求包含 `target_windows=1,3`、`urgency_min=2.0`、`urgency_max=4.0`，返回的 `items` 与 `total` 都只统计匹配全量筛选条件的仓库。
+
+- Given 某仓库的 Release 读取因匿名 GitHub 预算耗尽被延后
+  When 管理员查看 `sync.access_refresh` 任务详情或新鲜度逐仓明细
+  Then 该仓库显示为“已延后 / 预算延后”，可被状态筛选与状态计数命中，页面不出现裸的 `deferred` 状态串或原因码。
 
 ## Visual Evidence
 
@@ -401,6 +407,23 @@
   evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
   evidence_note: 证明正常 393x852 CSS px 移动浏览器视口首屏中，统计卡片保持单列可读，并可继续滚动查看 Release 新鲜度审计区。
   ![Dashboard Release 新鲜度移动证据](./assets/dashboard-release-freshness-mobile.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-task-type-detail--sync-access-refresh-deferred-budget`
+  state: `account-level deferred repositories, desktop component surface`
+  target_program: `mock-only`
+  capture_scope: `element`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  surface_selector: `[data-visual-evidence-surface]`
+  target_selector: `[data-visual-evidence-target]`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_binding_sha: `05a425bf72622b9caa828c84ce7a74c737ef538b`
+  evidence_note: 证明任务详情把账户级匿名预算延后的仓库渲染为“已延后 / 预算延后”，计数与逐仓原因清晰，原始 JSON 保持折叠。
+  ![仓库刷新延后证据](./assets/repo-refresh-deferred-desktop.png)
 
 ## 关系 / Supersede
 

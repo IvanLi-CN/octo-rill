@@ -68,4 +68,5 @@
 - Release 阶段开始时冻结评估时刻、策略档位、有效仓库集合、队列压力和活跃 Dashboard 任务数。窗口严格钳制在 1–30 分钟，压力只放宽窗口，不跳过有效仓库或拒绝同步。
 - `admin_runtime_settings.dashboard_release_freshness_profile` 只接受 `latest / balanced / capacity`，缺省为 `balanced`；共享快照缺失时按 1 人计算并保留 `snapshot_missing`。
 - `repo_release_watchers` 保存逐仓窗口、决策和评估 JSON；`result_json.release_freshness_assessment` 与 `release_freshness_assessed` 事件保存任务级汇总。管理员查询仅限 `sync.access_refresh`，沿用 watcher 生命周期清理。
+- 逐仓明细接口支持 `status` 白名单筛选（`pending` / `succeeded` / `failed` / `deferred`）并返回 `status_counts`；任务详情把 `deferred_repositories` 和延后 watcher 渲染为“已延后 / 预算延后”，并为筛选与渲染补 Storybook 交互与 Playwright E2E 覆盖。
 - `release.releases` 继续表示兼容总量；`current_run_releases`、抓取/写入/分页字段只统计本轮 work item，`reused_fresh_count` 与 `reused_running_count` 单独记录缓存和进行中任务复用。
