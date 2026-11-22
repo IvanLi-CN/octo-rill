@@ -4636,6 +4636,7 @@ struct PgFreshnessQuery {
     page: Option<i64>,
     page_size: Option<i64>,
     decision: Option<String>,
+    status: Option<String>,
     reason: Option<String>,
 }
 async fn admin_release_freshness(
@@ -4655,10 +4656,14 @@ async fn admin_release_freshness(
             .await;
     match kind{Ok(Some(kind)) if kind=="sync.access_refresh"=>{},Ok(Some(_))=>return(StatusCode::BAD_REQUEST,Json(json!({"code":"bad_request","message":"release freshness audit is only available for sync.access_refresh tasks"}))).into_response(),Ok(None)=>return(StatusCode::NOT_FOUND,Json(json!({"code":"not_found"}))).into_response(),Err(error)=>{warn!(%error,"PostgreSQL freshness task lookup failed");return(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"code":"database_error"}))).into_response();}}
     let decision = query.decision.unwrap_or_default().trim().to_owned();
+    let status = query.status.unwrap_or_default().trim().to_owned();
     let reason = query.reason.unwrap_or_default().trim().to_owned();
     if !matches!(
         decision.as_str(),
         "" | "fetch" | "reused_fresh" | "reused_running"
+    ) || !matches!(
+        status.as_str(),
+        "" | "pending" | "succeeded" | "failed" | "deferred"
     ) || reason.len() > 64
         || !reason
             .bytes()
@@ -4669,12 +4674,15 @@ async fn admin_release_freshness(
     let page = query.page.unwrap_or(1).max(1);
     let size = query.page_size.unwrap_or(50).clamp(1, 100);
     let result=async{
-        let filter=" WHERE rw.task_id=$1 AND ($2='' OR rw.freshness_decision=$2) AND ($3='' OR CASE WHEN pg_input_is_valid(rw.freshness_assessment_json,'jsonb') THEN (rw.freshness_assessment_json::jsonb->'reason_codes') ? $3 ELSE false END)";
-        let total=sqlx::query_scalar::<_,i64>(&format!("SELECT COUNT(*) FROM public.repo_release_watchers rw {filter}")).bind(&task_id).bind(&decision).bind(&reason).fetch_one(&state.runtime.pool).await?;
-        let sql=format!("SELECT wi.repo_id,wi.repo_full_name,rw.status,rw.reused_fresh,rw.freshness_window_minutes,rw.freshness_decision,rw.freshness_assessment_json,wi.last_success_at,rw.error_text FROM public.repo_release_watchers rw JOIN public.repo_release_work_items wi ON wi.id=rw.work_item_id {filter} ORDER BY wi.repo_id,rw.id LIMIT $4 OFFSET $5");
-        let rows=sqlx::query(&sql).bind(&task_id).bind(&decision).bind(&reason).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
+        let scope=" WHERE rw.task_id=$1 AND ($2='' OR rw.freshness_decision=$2) AND ($3='' OR CASE WHEN pg_input_is_valid(rw.freshness_assessment_json,'jsonb') THEN (rw.freshness_assessment_json::jsonb->'reason_codes') ? $3 ELSE false END)";
+        let filter=format!("{scope} AND ($4='' OR rw.status=$4)");
+        let total=sqlx::query_scalar::<_,i64>(&format!("SELECT COUNT(*) FROM public.repo_release_watchers rw {filter}")).bind(&task_id).bind(&decision).bind(&reason).bind(&status).fetch_one(&state.runtime.pool).await?;
+        let mut status_counts=json!({"pending":0i64,"succeeded":0i64,"failed":0i64,"deferred":0i64});
+        for row in sqlx::query(&format!("SELECT rw.status,COUNT(*) AS total FROM public.repo_release_watchers rw {scope} GROUP BY rw.status")).bind(&task_id).bind(&decision).bind(&reason).fetch_all(&state.runtime.pool).await?{let name:String=row.get("status");if let Some(slot)=status_counts.get_mut(name.as_str()){*slot=json!(row.get::<i64,_>("total"));}}
+        let sql=format!("SELECT wi.repo_id,wi.repo_full_name,rw.status,rw.reused_fresh,rw.freshness_window_minutes,rw.freshness_decision,rw.freshness_assessment_json,wi.last_success_at,rw.error_text FROM public.repo_release_watchers rw JOIN public.repo_release_work_items wi ON wi.id=rw.work_item_id {filter} ORDER BY wi.repo_id,rw.id LIMIT $5 OFFSET $6");
+        let rows=sqlx::query(&sql).bind(&task_id).bind(&decision).bind(&reason).bind(&status).bind(size).bind(page.saturating_sub(1).saturating_mul(size)).fetch_all(&state.runtime.pool).await?;
         let items=rows.into_iter().map(|r|{let raw:Option<String>=r.get("freshness_assessment_json");let assessment=raw.and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok());let last=assessment.as_ref().and_then(|a|a["last_success_at"].as_str()).map(str::to_owned).or(r.get::<Option<String>,_>("last_success_at"));json!({"repo_id":r.get::<i64,_>("repo_id"),"repo_full_name":r.get::<String,_>("repo_full_name"),"status":r.get::<String,_>("status"),"reused_fresh":r.get::<i64,_>("reused_fresh")!=0,"freshness_window_minutes":r.get::<Option<i64>,_>("freshness_window_minutes"),"freshness_decision":r.get::<Option<String>,_>("freshness_decision"),"assessment":assessment,"last_success_at":last,"error_text":r.get::<Option<String>,_>("error_text")})}).collect::<Vec<_>>();
-        Ok::<_,sqlx::Error>(json!({"items":items,"page":page,"page_size":size,"total":total}))
+        Ok::<_,sqlx::Error>(json!({"items":items,"page":page,"page_size":size,"total":total,"status_counts":status_counts}))
     }.await;
     match result {
         Ok(body) => Json(body).into_response(),

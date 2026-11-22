@@ -1157,10 +1157,15 @@ export type AdminReleaseFreshnessAssessment = {
 	queued_count: number;
 	decision_counts: Record<string, number>;
 };
+export type AdminReleaseFreshnessStatus =
+	| "pending"
+	| "succeeded"
+	| "failed"
+	| "deferred";
 export type AdminReleaseFreshnessAuditItem = {
 	repo_id: number;
 	repo_full_name: string;
-	status: string;
+	status: AdminReleaseFreshnessStatus;
 	reused_fresh: boolean;
 	freshness_window_minutes: number | null;
 	freshness_decision: "fetch" | "reused_fresh" | "reused_running" | null;
@@ -1178,6 +1183,7 @@ export type AdminReleaseFreshnessAuditResponse = {
 	page: number;
 	page_size: number;
 	total: number;
+	status_counts?: Partial<Record<AdminReleaseFreshnessStatus, number>>;
 };
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;

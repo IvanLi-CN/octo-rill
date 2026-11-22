@@ -30,6 +30,7 @@ export default defineConfig((env) =>
 									"command-palette-search",
 									"demo-inspector",
 									"version-update-notice",
+									"repo-refresh-deferred",
 								],
 								exclude: [],
 								skip: [],

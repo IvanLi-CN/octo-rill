@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type {
 	AdminLlmCallItem,
 	AdminReleaseFreshnessAuditItem,
+	AdminReleaseFreshnessStatus,
 	AdminRealtimeTaskDetailResponse,
 } from "@/api";
 import { apiGetAdminReleaseFreshnessAudit } from "@/api";
@@ -111,6 +112,77 @@ function freshnessDecisionLabel(decision: string | null | undefined): string {
 	if (decision === "reused_fresh") return "复用新鲜缓存";
 	if (decision === "reused_running") return "复用进行中任务";
 	return "未评估";
+}
+
+const RELEASE_FRESHNESS_STATUS_ORDER: AdminReleaseFreshnessStatus[] = [
+	"pending",
+	"succeeded",
+	"failed",
+	"deferred",
+];
+
+function releaseFreshnessStatusLabel(status: AdminReleaseFreshnessStatus) {
+	switch (status) {
+		case "pending":
+			return "待处理";
+		case "succeeded":
+			return "已成功";
+		case "failed":
+			return "已失败";
+		case "deferred":
+			return "已延后";
+	}
+}
+
+function releaseFreshnessStatusTone(status: AdminReleaseFreshnessStatus) {
+	switch (status) {
+		case "succeeded":
+			return "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-400/40 dark:bg-emerald-500/15 dark:text-emerald-100";
+		case "failed":
+			return "border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-400/40 dark:bg-rose-500/15 dark:text-rose-100";
+		case "deferred":
+			return "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/40 dark:bg-amber-500/15 dark:text-amber-100";
+		case "pending":
+			return "border-border bg-muted/35 text-muted-foreground";
+	}
+}
+
+type DeferredRepositoryEntry = {
+	repo_id: number;
+	repo_full_name: string;
+	reason_code: string;
+	anonymous_budget_remaining: number | null;
+};
+
+function readDeferredRepositories(
+	result: JsonRecord | null,
+): DeferredRepositoryEntry[] {
+	if (!result) return [];
+	const nested = readObject(result, "releases");
+	const raw = Array.isArray(result.deferred_repositories)
+		? result.deferred_repositories
+		: Array.isArray(nested?.deferred_repositories)
+			? nested.deferred_repositories
+			: [];
+	return raw.flatMap((item) => {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+		const entry = item as JsonRecord;
+		const repoId = readNumber(entry, "repo_id");
+		const repoFullName = readString(entry, "repo_full_name");
+		const reasonCode = readString(entry, "reason_code");
+		if (repoId === null || !repoFullName || !reasonCode) return [];
+		return [
+			{
+				repo_id: repoId,
+				repo_full_name: repoFullName,
+				reason_code: reasonCode,
+				anonymous_budget_remaining: readNumber(
+					entry,
+					"anonymous_budget_remaining",
+				),
+			},
+		];
+	});
 }
 
 function freshnessPressureLabel(level: string | undefined): string {
@@ -1097,6 +1169,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 	);
 	const freshnessAssessment =
 		accessRefreshDiagnostics?.release_freshness_assessment ?? null;
+	const deferredRepositories = readDeferredRepositories(result);
 	const [freshnessAuditOpen, setFreshnessAuditOpen] = useState(false);
 	const [freshnessAuditLoading, setFreshnessAuditLoading] = useState(false);
 	const [freshnessAuditError, setFreshnessAuditError] = useState<string | null>(
@@ -1106,8 +1179,12 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 		AdminReleaseFreshnessAuditItem[]
 	>([]);
 	const [freshnessAuditTotal, setFreshnessAuditTotal] = useState(0);
+	const [freshnessAuditStatusCounts, setFreshnessAuditStatusCounts] = useState<
+		Partial<Record<AdminReleaseFreshnessStatus, number>>
+	>({});
 	const [freshnessAuditPage, setFreshnessAuditPage] = useState(1);
 	const [freshnessAuditDecision, setFreshnessAuditDecision] = useState("");
+	const [freshnessAuditStatus, setFreshnessAuditStatus] = useState("");
 	const [freshnessAuditReason, setFreshnessAuditReason] = useState("");
 
 	useEffect(() => {
@@ -1125,12 +1202,14 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 			page_size: "50",
 		});
 		if (freshnessAuditDecision) params.set("decision", freshnessAuditDecision);
+		if (freshnessAuditStatus) params.set("status", freshnessAuditStatus);
 		if (freshnessAuditReason) params.set("reason", freshnessAuditReason);
 		void apiGetAdminReleaseFreshnessAudit(props.detail.task.id, params)
 			.then((response) => {
 				if (cancelled) return;
 				setFreshnessAuditItems(response.items);
 				setFreshnessAuditTotal(response.total);
+				setFreshnessAuditStatusCounts(response.status_counts ?? {});
 			})
 			.catch((error: unknown) => {
 				if (!cancelled) {
@@ -1152,6 +1231,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 		freshnessAuditOpen,
 		freshnessAuditPage,
 		freshnessAuditReason,
+		freshnessAuditStatus,
 		props.detail.task.id,
 		props.detail.task.task_type,
 	]);
@@ -1199,6 +1279,41 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					</div>
 				))}
 			</div>
+			{deferredRepositories.length > 0 ? (
+				<div className={detailCardClass}>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<p className="text-muted-foreground text-[11px]">仓库刷新延后</p>
+						<span
+							className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${releaseFreshnessStatusTone("deferred")}`}
+						>
+							已延后 {deferredRepositories.length}
+						</span>
+					</div>
+					<p className="text-muted-foreground mt-1 text-xs">
+						匿名 GitHub
+						读取预算耗尽，本轮跳过这些仓库；不计为失败，也不写重试退避，下一周期重新排队。
+					</p>
+					<div className="mt-2 space-y-2">
+						{deferredRepositories.map((item) => (
+							<div key={item.repo_id} className="rounded-md border p-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="text-xs font-medium">{item.repo_full_name}</p>
+									<span className="text-[11px] font-medium text-amber-700 dark:text-amber-200">
+										{item.reason_code === "deferred_budget"
+											? "预算延后"
+											: "延后"}
+									</span>
+								</div>
+								{item.anonymous_budget_remaining !== null ? (
+									<p className="text-muted-foreground mt-1 text-[11px]">
+										匿名预算剩余 {item.anonymous_budget_remaining}
+									</p>
+								) : null}
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
 			{accessRefreshDiagnostics ? (
 				<div className={detailCardClass}>
 					<div className="flex flex-wrap items-start justify-between gap-3">
@@ -1290,6 +1405,22 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 									<option value="reused_fresh">复用新鲜缓存</option>
 									<option value="reused_running">复用进行中任务</option>
 								</select>
+								<select
+									value={freshnessAuditStatus}
+									onChange={(event) => {
+										setFreshnessAuditStatus(event.target.value);
+										setFreshnessAuditPage(1);
+									}}
+									aria-label="按仓库刷新状态筛选"
+									className="h-9 rounded-md border bg-background px-2 text-sm"
+								>
+									<option value="">全部状态</option>
+									{RELEASE_FRESHNESS_STATUS_ORDER.map((status) => (
+										<option key={status} value={status}>
+											状态：{releaseFreshnessStatusLabel(status)}
+										</option>
+									))}
+								</select>
 								<input
 									value={freshnessAuditReason}
 									onChange={(event) => {
@@ -1301,6 +1432,19 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 									className="h-9 rounded-md border bg-background px-2 text-sm"
 								/>
 							</div>
+							{Object.keys(freshnessAuditStatusCounts).length > 0 ? (
+								<div className="flex flex-wrap gap-1.5">
+									{RELEASE_FRESHNESS_STATUS_ORDER.map((status) => (
+										<span
+											key={status}
+											className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${releaseFreshnessStatusTone(status)}`}
+										>
+											{releaseFreshnessStatusLabel(status)}{" "}
+											{freshnessAuditStatusCounts[status] ?? 0}
+										</span>
+									))}
+								</div>
+							) : null}
 							{freshnessAuditLoading ? (
 								<p className="text-muted-foreground flex items-center gap-2 text-xs">
 									<RefreshCw className="size-3.5 animate-spin" />{" "}
@@ -1318,16 +1462,23 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 								<div className="space-y-2">
 									{freshnessAuditItems.map((item) => (
 										<div
-											key={`${item.repo_id}:${item.freshness_decision}`}
+											key={`${item.repo_id}:${item.status}:${item.freshness_decision}`}
 											className="rounded-md border p-2"
 										>
 											<div className="flex flex-wrap items-center justify-between gap-2">
 												<p className="text-xs font-medium">
 													{item.repo_full_name}
 												</p>
-												<span className="text-xs font-medium">
-													{freshnessDecisionLabel(item.freshness_decision)}
-												</span>
+												<div className="flex flex-wrap items-center gap-1.5">
+													<span
+														className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${releaseFreshnessStatusTone(item.status)}`}
+													>
+														{releaseFreshnessStatusLabel(item.status)}
+													</span>
+													<span className="text-xs font-medium">
+														{freshnessDecisionLabel(item.freshness_decision)}
+													</span>
+												</div>
 											</div>
 											<p className="text-muted-foreground mt-1 text-[11px]">
 												窗口 {item.freshness_window_minutes ?? "-"} 分钟 ·
@@ -1336,6 +1487,15 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 											{item.assessment?.reason_codes?.length ? (
 												<p className="text-muted-foreground mt-1 text-[11px]">
 													原因：{item.assessment.reason_codes.join("、")}
+												</p>
+											) : null}
+											{item.error_text ? (
+												<p className="text-muted-foreground mt-1 text-[11px]">
+													说明：
+													{item.status === "deferred" &&
+													item.error_text.startsWith("deferred_budget")
+														? "匿名 GitHub 读取预算耗尽，本轮未抓取，下一周期重新排队"
+														: item.error_text}
 												</p>
 											) : null}
 										</div>
