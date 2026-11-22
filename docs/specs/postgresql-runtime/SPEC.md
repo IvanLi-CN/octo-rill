@@ -69,6 +69,14 @@
 - Inputs: 匿名响应头、请求时刻、进程内共享预算。
 - Outputs: 允许或延后决定、`deferred_budget` 结果、预算余量与延后次数指标。
 
+### REQ-PGR-009
+
+- 账号级与单仓 Release 刷新 MUST 只为本次真正插入 `public.repo_releases` 的 Release 排队 `translation.generate` 工作；未配置 AI provider 时 MUST NOT 写入任何翻译行或任务。
+- 自动排队 MUST 复用请求/工作项/任务三段式，并按 `(scope_user_id, kind, variant, entity_id, target_lang, source_hash)` 去重：结果已为 `ready` 的工作项 MUST NOT 再排队；同一工作项已有 `queued`/`running` 翻译任务时 MUST NOT 重复排队；无在途任务的终态工作项按授权重试语义重新入队。
+- 单次排队调用 MUST 最多考虑 25 个 Release；因上限未排队的数量 MUST 记录告警，单个 Release 入队失败 MUST 只记录告警，两者都 MUST NOT 中断其余 Release 或刷新任务。两个执行器的 `result_json` MUST 报告 `translations_enqueued`。
+- Inputs: 刷新插入的 Release ID、请求用户、AI provider 配置。
+- Outputs: `translation_work_items`/`translation_requests`/`job_tasks` 行与 `translations_enqueued` 计数。
+
 ## Verification
 
 ### VER-PGR-001
@@ -118,6 +126,12 @@
 - Method: `cargo test --locked --bin octo-rill postgres_repo_release` 与 `scripts/pg_seed_repo_release_anon_budget_test.py`。
 - covers: `REQ-PGR-008`
 - Pass condition: 多页匿名读取按页扣减、响应头校准剩余额度、预算耗尽时延后且 usage 状态与退避不变、零预算不再发请求全部通过。
+
+### VER-PGR-009
+
+- Method: `cargo test --locked --bin octo-rill postgres_translate`、`cargo test --locked --bin octo-rill postgres_tasks` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
+- covers: `REQ-PGR-009`
+- Pass condition: 批次上限与去重、超限截断告警、空内容跳过、`ready` 与在途任务不重复排队、终态工作项重新入队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
 
 ## Related ADRs
 
