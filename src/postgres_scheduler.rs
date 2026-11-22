@@ -1266,7 +1266,7 @@ fn local_day_start_utc(time_zone: Tz, day: chrono::NaiveDate) -> Result<DateTime
         .ok_or_else(|| anyhow!("invalid local day boundary"))
 }
 
-fn local_day_bounds_utc(
+pub(crate) fn local_day_bounds_utc(
     time_zone: Tz,
     day: chrono::NaiveDate,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -1280,19 +1280,19 @@ fn local_day_bounds_utc(
 }
 
 #[derive(Default)]
-struct AdminDashboardTaskCounts {
-    queued: i64,
-    running: i64,
-    succeeded: i64,
-    failed: i64,
-    canceled: i64,
-    business_ok: i64,
-    business_partial: i64,
-    business_failed: i64,
-    business_disabled: i64,
+pub(crate) struct AdminDashboardTaskCounts {
+    pub(crate) queued: i64,
+    pub(crate) running: i64,
+    pub(crate) succeeded: i64,
+    pub(crate) failed: i64,
+    pub(crate) canceled: i64,
+    pub(crate) business_ok: i64,
+    pub(crate) business_partial: i64,
+    pub(crate) business_failed: i64,
+    pub(crate) business_disabled: i64,
 }
 
-async fn load_admin_dashboard_task_counts(
+pub(crate) async fn load_admin_dashboard_task_counts(
     pool: &PgPool,
     task_type: &str,
     start_utc: DateTime<Utc>,
