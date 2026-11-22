@@ -311,11 +311,14 @@ pub(crate) async fn schedule_next_slice(
 /// Record a retryable slice failure and hand the epoch back to the queue.
 ///
 /// The epoch keeps its cursor and counters, stores the upstream error and a
-/// retry time instead of pretending the sweep finished.
+/// retry time instead of pretending the sweep finished. A caller whose lease was
+/// already taken over by another executor is ignored, so the deferral cannot
+/// release a live slice out from under the new owner.
 pub(crate) async fn defer_epoch_after_failure(
     pool: &PgPool,
     epoch_id: &str,
     reason: &str,
+    lease_owner_id: &str,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let next_slice_not_before =
@@ -325,12 +328,14 @@ pub(crate) async fn defer_epoch_after_failure(
         "UPDATE public.star_sync_epochs \
          SET status = 'queued', failure_reason = $2, next_slice_not_before = $3, \
              lease_owner_id = NULL, lease_expires_at = NULL, updated_at = $4 \
-         WHERE id = $1 AND status IN ('queued', 'running')",
+         WHERE id = $1 AND status IN ('queued', 'running') \
+           AND (lease_owner_id IS NULL OR lease_owner_id = $5)",
     )
     .bind(epoch_id)
     .bind(reason)
     .bind(next_slice_not_before.as_str())
     .bind(now_rfc3339.as_str())
+    .bind(lease_owner_id)
     .execute(pool)
     .await
     .context("defer PostgreSQL star epoch after a failed slice")?;
