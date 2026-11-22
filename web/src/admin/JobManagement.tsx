@@ -7596,20 +7596,29 @@ export function JobManagement({
 														<p className="text-muted-foreground mt-1 text-xs">
 															{modelStatus.status === "cooldown"
 																? `冷却至 ${formatLocalDateTime(modelStatus.cooldown_until)}`
-																: "可用"}
+																: modelStatus.status === "parked"
+																	? `凭据被拒绝，已从路由摘除${
+																			modelStatus.cooldown_until
+																				? `（${formatLocalDateTime(modelStatus.cooldown_until)} 后重试）`
+																				: ""
+																		}`
+																	: "可用"}
 														</p>
 													</div>
 													<div className="flex shrink-0 items-center gap-1">
 														<Badge
 															variant={
-																modelStatus.status === "cooldown"
+																modelStatus.status === "cooldown" ||
+																modelStatus.status === "parked"
 																	? "secondary"
 																	: "outline"
 															}
 														>
 															{modelStatus.status === "cooldown"
 																? "冷却中"
-																: "就绪"}
+																: modelStatus.status === "parked"
+																	? "已摘除"
+																	: "就绪"}
 														</Badge>
 														<LlmCallActionsMenu
 															target={{ model: modelStatus.model }}
