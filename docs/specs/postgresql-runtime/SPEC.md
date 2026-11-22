@@ -45,8 +45,10 @@
 ### REQ-PGR-005
 
 - 单仓 Release 刷新 MUST 共用一套判定：候选用户轮换仅在凭据/权限类失败时发生，公共仓库可在凭据耗尽后匿名读取，并发上限取自 `repo_release_worker_concurrency`；账号级任务 MUST NOT 因单仓不可读而整体失败。
+- 每个分页请求 MUST 至多发送两次（初次 + 一次重试），仅在 transport `network_error`、`timeout`、HTTP 5xx 与成功状态下的非 JSON 响应体可重试；退避 MUST 为 300 ms。`repo_inaccessible`、`credentials_forbidden`、401/403/404/451、限流与 `deferred_budget` MUST NOT 重试。重试 MUST 重发同一页，MUST NOT 重复计页或追加部分解码结果。
+- 账号级 `sync.releases` 的 `result_json` MUST 包含 `failed_count`、`deferred_count`、`failure_ratio`（0–1，两位小数）、`failure_reasons` 与 `degraded`；部分仓库失败时任务保持 `succeeded` 并标记 `degraded=true`，所有实际尝试均失败时任务 MUST 记为 `failed`。每个任务 MUST 只输出一条聚合告警，MUST NOT 逐仓库告警。
 - Inputs: 仓库、请求用户、连接凭据、usage 登记。
-- Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态与失败分类。
+- Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态、失败分类与账号级聚合摘要。
 
 ### REQ-PGR-006
 
@@ -95,9 +97,9 @@
 
 ### VER-PGR-005
 
-- Method: `scripts/pg_seed_repo_release_fallback_test.py`。
+- Method: `scripts/pg_seed_repo_release_fallback_test.py` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
 - covers: `REQ-PGR-005`
-- Pass condition: 候选轮换、公共 fallback、失败分类、usage 状态、账号级韧性与在途并发上界全部通过。
+- Pass condition: 候选轮换、公共 fallback、失败分类、usage 状态、账号级韧性、在途并发上界、瞬时失败单次重试与页面不重复计数、`degraded`／全失败判定全部通过。
 
 ### VER-PGR-006
 
