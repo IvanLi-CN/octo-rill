@@ -12,6 +12,7 @@
 
 - `runtime authority`: 唯一接受运行时写入的持久化存储。
 - `import`: `octo-rill-migrate` 把 SQLite 快照写入新建 PostgreSQL 库的操作，含 `preflight`/`import`/`verify`/`rebuild`。
+- `release revision repair`: `octo-rill-migrate repair-release-revisions` 从 GitHub 重读缓存 Release，并以强制覆盖写回内容与 `updated_at`；用于修复被非内容写入推进的源修订号。
 - `work item` / `task`: 分别为 legacy 刷新队列行与 PostgreSQL `job_tasks` 行；运行时只认后者。
 - Interface: `octo-rill-migrate` 子命令、`DATABASE_URL`、`OCTORILL_PG_WORKER_ENABLED`、`OCTORILL_PG_SCHEDULER_ENABLED`、`admin_runtime_settings.repo_release_worker_concurrency`。
 

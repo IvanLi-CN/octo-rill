@@ -1135,9 +1135,8 @@ async fn persist_release_reaction_counts(
             react_heart = $3,
             react_hooray = $4,
             react_rocket = $5,
-            react_eyes = $6,
-            updated_at = $7
-        WHERE release_id = $8
+            react_eyes = $6
+        WHERE release_id = $7
         "#,
     )
     .bind(counts.plus1)
@@ -1146,7 +1145,6 @@ async fn persist_release_reaction_counts(
     .bind(counts.hooray)
     .bind(counts.rocket)
     .bind(counts.eyes)
-    .bind(chrono::Utc::now().to_rfc3339())
     .bind(release_id)
     .execute(&state.runtime.pool)
     .await

@@ -19021,8 +19021,7 @@ async fn persist_release_reaction_counts_best_effort(
                     react_heart = ?,
                     react_hooray = ?,
                     react_rocket = ?,
-                    react_eyes = ?,
-                    updated_at = ?
+                    react_eyes = ?
                 WHERE release_id = ?
                 "#,
             )
@@ -19032,7 +19031,6 @@ async fn persist_release_reaction_counts_best_effort(
             .bind(counts.hooray)
             .bind(counts.rocket)
             .bind(counts.eyes)
-            .bind(chrono::Utc::now().to_rfc3339())
             .bind(release_id)
             .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
@@ -42145,6 +42143,73 @@ line two",
                 .await
                 .expect("load stored reaction count");
         assert_eq!(stored_plus1, 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_persist_updates_counts_without_bumping_the_release_revision() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+        let row = ReleaseReactionRow {
+            release_id: 120,
+            node_id: Some("node-120".to_owned()),
+        };
+        let reaction = LiveReleaseReactions {
+            counts: ReleaseReactionCounts {
+                plus1: 7,
+                laugh: 1,
+                heart: 2,
+                hooray: 3,
+                rocket: 4,
+                eyes: 5,
+            },
+            viewer: ReleaseReactionViewer {
+                plus1: false,
+                laugh: false,
+                heart: false,
+                hooray: false,
+                rocket: false,
+                eyes: false,
+            },
+        };
+        let revision_before: String =
+            sqlx::query_scalar("SELECT updated_at FROM repo_releases WHERE release_id = ?")
+                .bind(120_i64)
+                .fetch_one(&pool)
+                .await
+                .expect("load release revision before reaction persist");
+
+        let (_item, persisted) = build_feed_reaction_refresh_item(state.as_ref(), &row, &reaction)
+            .await
+            .expect("persist refreshed reaction counts");
+        assert!(persisted);
+
+        let (revision_after, plus1, laugh, heart, hooray, rocket, eyes): (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT updated_at, react_plus1, react_laugh, react_heart,
+                   react_hooray, react_rocket, react_eyes
+            FROM repo_releases
+            WHERE release_id = ?
+            "#,
+        )
+        .bind(120_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load stored release after reaction persist");
+
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(
+            (plus1, laugh, heart, hooray, rocket, eyes),
+            (7, 1, 2, 3, 4, 5)
+        );
     }
 
     #[tokio::test]
