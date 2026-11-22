@@ -62,6 +62,10 @@ pub(super) struct PostgresServerState {
 /// CORS, observability, workers, and graceful shutdown. A route without a
 /// native PG implementation remains registered and fails closed explicitly.
 pub async fn serve_postgres(config: AppConfig) -> Result<()> {
+    let metrics_config = crate::metrics::MetricsConfig::from_env()?;
+    let metrics = crate::metrics::install_global(Arc::new(crate::metrics::Metrics::new()));
+    metrics.set_enabled(metrics_config.enabled);
+
     let runtime = crate::postgres_runtime::connect_from_config(&config).await?;
     crate::postgres_runtime::verify_application_schema(&runtime.pool).await?;
     let owner_id: Arc<str> = local_id::generate_local_id().into();
@@ -660,6 +664,16 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             .layer(access_log)
             .layer(propagate_request_id),
     );
+
+    let _metrics_listener = match crate::metrics::spawn_listener(&metrics_config, metrics.clone())
+        .await
+    {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(error = %error, "metrics listener unavailable; continuing without metrics endpoint");
+            None
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await

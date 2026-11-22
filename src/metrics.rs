@@ -31,6 +31,8 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout_at},
 };
 
+use crate::postgres_repo_release_fetch::ANONYMOUS_BUDGET_LIMIT;
+
 const MAX_EXPOSITION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SERIES: u64 = 20_000;
 const FIXED_SERIES_BUDGET: u64 = 32;
@@ -257,6 +259,9 @@ impl Metrics {
         let worker_duration = Family::new_with_constructor(http_histogram as fn() -> Histogram);
         let worker_active = Family::default();
         let anonymous_github_budget_remaining = Gauge::default();
+        // The budget module only publishes after a spend. Publish the ceiling
+        // here so a restarted process exposes it before any anonymous read.
+        anonymous_github_budget_remaining.set(i64::from(ANONYMOUS_BUDGET_LIMIT));
         let anonymous_github_deferrals = Counter::default();
         let process_rss_bytes = Gauge::default();
         let process_cpu_seconds = Gauge::default();

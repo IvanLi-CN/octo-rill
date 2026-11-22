@@ -157,10 +157,11 @@ impl BudgetState {
 }
 
 /// The one budget of this process. Both release executors share this `Arc`.
-static SHARED_ANONYMOUS_BUDGET: LazyLock<Arc<AnonymousBudget>> = LazyLock::new(|| {
-    publish_anonymous_budget(ANONYMOUS_BUDGET_LIMIT);
-    Arc::new(AnonymousBudget::with_limit(ANONYMOUS_BUDGET_LIMIT))
-});
+///
+/// The metrics registry publishes `ANONYMOUS_BUDGET_LIMIT` itself, so creating
+/// this budget must not publish a second initial value.
+static SHARED_ANONYMOUS_BUDGET: LazyLock<Arc<AnonymousBudget>> =
+    LazyLock::new(|| Arc::new(AnonymousBudget::with_limit(ANONYMOUS_BUDGET_LIMIT)));
 
 pub(crate) fn shared_anonymous_budget() -> Arc<AnonymousBudget> {
     Arc::clone(&SHARED_ANONYMOUS_BUDGET)
@@ -1132,6 +1133,16 @@ mod tests {
 
     type AttemptResult = std::result::Result<RepositoryFetch, ReleaseFetchError>;
 
+    /// Budget operations publish into the process-wide gauge, so tests that
+    /// spend budget must not interleave.
+    static BUDGET_PUBLISH_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn budget_publish_lock() -> std::sync::MutexGuard<'static, ()> {
+        BUDGET_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn http_errors_are_classified_like_the_legacy_lane() {
         let headers = reqwest::header::HeaderMap::new();
@@ -1349,6 +1360,7 @@ mod tests {
 
     #[test]
     fn anonymous_budget_defers_once_spent() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(2);
         assert!(budget.acquire(1_000).is_ok());
         assert!(budget.acquire(1_000).is_ok());
@@ -1365,7 +1377,22 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_budget_gauge_starts_at_the_limit() {
+        let _lock = budget_publish_lock();
+        // The registry seeds the gauge; the budget only publishes after a spend.
+        let metrics = crate::metrics::install_global(Arc::new(crate::metrics::Metrics::new()));
+        metrics.set_enabled(true);
+        let budget = AnonymousBudget::with_limit(ANONYMOUS_BUDGET_LIMIT);
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_anonymous_github_budget_remaining 50"));
+        assert!(budget.acquire(1_000).is_ok());
+        let body = metrics.encode().expect("encode metrics");
+        assert!(body.contains("octorill_anonymous_github_budget_remaining 49"));
+    }
+
+    #[test]
     fn anonymous_budget_refills_when_the_window_rolls_over() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(1);
         budget.observe(None, Some(2_000));
         assert!(budget.acquire(1_999).is_ok());
@@ -1380,6 +1407,7 @@ mod tests {
 
     #[test]
     fn anonymous_budget_refills_an_hour_after_a_headerless_spend() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(1);
         assert!(budget.acquire(1_000).is_ok());
         assert!(budget.acquire(1_000).is_err());
@@ -1391,6 +1419,7 @@ mod tests {
 
     #[test]
     fn rate_limit_headers_lower_the_local_budget() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(50);
         assert!(budget.acquire(1_000).is_ok());
         // Another client on the same egress IP spent 48 of the allowance.
@@ -1403,6 +1432,7 @@ mod tests {
 
     #[test]
     fn a_later_reset_window_replaces_the_stale_count() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(50);
         budget.observe(Some(5), Some(5_000));
         assert_eq!(budget.remaining(), 5);
@@ -1414,6 +1444,7 @@ mod tests {
 
     #[test]
     fn a_followed_redirect_is_charged_without_deferring() {
+        let _lock = budget_publish_lock();
         let budget = AnonymousBudget::with_limit(2);
         assert!(budget.acquire(1_000).is_ok());
         budget.charge_redirect();
