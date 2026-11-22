@@ -159,6 +159,20 @@ async function installAdminJobsMocks(
 			finished_at: "2026-02-26T14:40:01Z",
 			updated_at: "2026-02-26T14:40:01Z",
 		},
+		{
+			id: "task-access-refresh-1",
+			task_type: "sync.access_refresh",
+			status: "succeeded",
+			source: "dashboard.access_refresh",
+			requested_by: CURRENT_USER_ID,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-02-26T15:00:00Z",
+			started_at: "2026-02-26T15:00:02Z",
+			finished_at: "2026-02-26T15:02:10Z",
+			updated_at: "2026-02-26T15:02:10Z",
+		},
 	];
 
 	const llmCalls = [
@@ -1257,6 +1271,59 @@ async function installAdminJobsMocks(
 			});
 		}
 
+		if (req.method() === "GET" && pathname.endsWith("/release-freshness")) {
+			const status = url.searchParams.get("status");
+			const scoped = [
+				{
+					repo_id: 3001,
+					repo_full_name: "octo/audit-pending",
+					status: "pending",
+					reused_fresh: false,
+					freshness_window_minutes: 1,
+					freshness_decision: "fetch",
+					assessment: { reason_codes: ["outside_window"] },
+					last_success_at: "2026-02-26T11:58:00Z",
+					error_text: null,
+				},
+				{
+					repo_id: 3002,
+					repo_full_name: "octo/audit-succeeded",
+					status: "succeeded",
+					reused_fresh: true,
+					freshness_window_minutes: 8,
+					freshness_decision: "reused_fresh",
+					assessment: { reason_codes: ["within_window"] },
+					last_success_at: "2026-02-26T11:58:00Z",
+					error_text: null,
+				},
+				{
+					repo_id: 3003,
+					repo_full_name: "octo/audit-postponed",
+					status: "deferred",
+					reused_fresh: false,
+					freshness_window_minutes: null,
+					freshness_decision: null,
+					assessment: { reason_codes: ["outside_window"] },
+					last_success_at: "2026-02-26T11:58:00Z",
+					error_text: "deferred_budget: anonymous GitHub read budget exhausted",
+				},
+			];
+			const statusCounts = { pending: 0, succeeded: 0, failed: 0, deferred: 0 };
+			for (const item of scoped) {
+				statusCounts[item.status as keyof typeof statusCounts] += 1;
+			}
+			const items = status
+				? scoped.filter((item) => item.status === status)
+				: scoped;
+			return json(route, {
+				items,
+				page: 1,
+				page_size: 50,
+				total: items.length,
+				status_counts: statusCounts,
+			});
+		}
+
 		if (
 			req.method() === "GET" &&
 			pathname.startsWith("/api/admin/jobs/realtime/") &&
@@ -1692,6 +1759,80 @@ async function installAdminJobsMocks(
 								skipped: true,
 							}),
 							created_at: "2026-02-26T14:40:01Z",
+						},
+					],
+				});
+			}
+
+			if (taskId === "task-access-refresh-1") {
+				return json(route, {
+					task: {
+						...task,
+						payload_json: JSON.stringify({
+							user_id: CURRENT_USER_ID,
+							dashboard_adaptive_release_freshness: true,
+						}),
+						result_json: JSON.stringify({
+							releases: 118,
+							repositories: 38,
+							user_id: CURRENT_USER_ID,
+							failed_repositories: [],
+							deferred_repositories: [
+								{
+									repo_id: 2001,
+									repo_full_name: "octo/solaris-lab",
+									reason_code: "deferred_budget",
+									anonymous_budget_remaining: 0,
+								},
+								{
+									repo_id: 2002,
+									repo_full_name: "octo/atlas-notes",
+									reason_code: "deferred_budget",
+									anonymous_budget_remaining: 0,
+								},
+							],
+						}),
+					},
+					event_meta: {
+						returned: 1,
+						total: 1,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: {
+						business_outcome: {
+							code: "ok",
+							label: "同步完成",
+							message: "Release 阶段完成，部分仓库延后到下一周期。",
+						},
+						sync_access_refresh: {
+							log_available: false,
+							log_download_path: null,
+							star_repos: 38,
+							release_repos: 38,
+							releases: 118,
+							current_run_releases: 118,
+							fetched_count: 100,
+							inserted_count: 30,
+							updated_count: 8,
+							unchanged_count: 62,
+							pages_fetched: 38,
+							reused_fresh_count: 0,
+							reused_running_count: 0,
+							social_repo_stars: 0,
+							social_followers: 0,
+							social_events: 0,
+							notifications: 0,
+							social_error: null,
+							notifications_error: null,
+						},
+					},
+					events: [
+						{
+							id: "evt-task-access-refresh-1",
+							event_type: "task.completed",
+							payload_json: JSON.stringify({ status: "succeeded" }),
+							created_at: "2026-02-26T15:02:10Z",
 						},
 					],
 				});
@@ -2681,6 +2822,45 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await expect(page.getByRole("dialog", { name: "任务详情" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
+});
+
+test("access refresh detail surfaces deferred repositories and filters the freshness audit by status", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs/tasks/task-access-refresh-1", {
+		waitUntil: "domcontentloaded",
+	});
+	const taskSheet = page.getByRole("dialog", { name: "任务详情" });
+	await expect(taskSheet).toBeVisible();
+	await expect(taskSheet.getByText("仓库刷新延后")).toBeVisible();
+	await expect(taskSheet.getByText("已延后 2", { exact: true })).toBeVisible();
+	await expect(
+		taskSheet.getByText("octo/solaris-lab", { exact: true }),
+	).toBeVisible();
+	await expect(
+		taskSheet.getByText("octo/atlas-notes", { exact: true }),
+	).toBeVisible();
+	await expect(taskSheet.getByText("预算延后")).toHaveCount(2);
+	await expect(taskSheet.getByText(/deferred_budget/)).not.toBeVisible();
+
+	await taskSheet.getByRole("button", { name: "查看仓库决策明细" }).click();
+	await expect(taskSheet.getByText("octo/audit-postponed")).toBeVisible();
+	await expect(taskSheet.getByText("已延后 1", { exact: true })).toBeVisible();
+	await expect(
+		taskSheet.getByText(
+			"匿名 GitHub 读取预算耗尽，本轮未抓取，下一周期重新排队",
+		),
+	).toBeVisible();
+	await taskSheet
+		.getByRole("combobox", { name: "按仓库刷新状态筛选" })
+		.selectOption("deferred");
+	await expect(taskSheet.getByText("octo/audit-postponed")).toBeVisible();
+	await expect(taskSheet.getByText("octo/audit-pending")).toHaveCount(0);
+	for (const node of await taskSheet.getByText(/deferred/i).all()) {
+		await expect(node).not.toBeVisible();
+	}
 });
 
 test("content processing audit shows retry state, model, error, and call detail", async ({

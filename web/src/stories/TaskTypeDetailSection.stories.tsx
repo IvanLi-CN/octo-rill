@@ -7,8 +7,10 @@ import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import type { AdminRealtimeTaskDetailResponse } from "@/api";
 
 const freshnessAuditItems = Array.from({ length: 75 }, (_, index) => {
-	const decision =
-		index % 3 === 0
+	const deferral = index % 7 === 4;
+	const decision = deferral
+		? null
+		: index % 3 === 0
 			? "reused_running"
 			: index % 3 === 1
 				? "reused_fresh"
@@ -16,13 +18,18 @@ const freshnessAuditItems = Array.from({ length: 75 }, (_, index) => {
 	return {
 		repo_id: 1000 + index,
 		repo_full_name: `octo/release-${String(index + 1).padStart(2, "0")}`,
-		status: decision === "fetch" ? "queued" : "succeeded",
+		status: deferral
+			? "deferred"
+			: decision === "fetch"
+				? "pending"
+				: "succeeded",
 		reused_fresh: decision === "reused_fresh",
-		freshness_window_minutes: decision === "fetch" ? 1 : 8,
+		freshness_window_minutes: decision === "fetch" ? 1 : deferral ? null : 8,
 		freshness_decision: decision,
 		assessment: {
-			reason_codes:
-				decision === "fetch"
+			reason_codes: deferral
+				? ["outside_window"]
+				: decision === "fetch"
 					? index % 2 === 0
 						? ["outside_window"]
 						: ["snapshot_missing"]
@@ -34,7 +41,9 @@ const freshnessAuditItems = Array.from({ length: 75 }, (_, index) => {
 		},
 		last_success_at:
 			decision === "reused_running" ? null : "2026-02-26T11:58:00Z",
-		error_text: null,
+		error_text: deferral
+			? "deferred_budget: anonymous GitHub read budget exhausted"
+			: null,
 	};
 });
 
@@ -80,13 +89,23 @@ function ReleaseFreshnessAuditMock({ children }: { children: ReactNode }) {
 			}
 			const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
 			const decision = url.searchParams.get("decision");
+			const status = url.searchParams.get("status");
 			const reason = url.searchParams.get("reason");
-			const filtered = freshnessAuditItems.filter((item) => {
+			const scoped = freshnessAuditItems.filter((item) => {
 				if (decision && item.freshness_decision !== decision) return false;
 				if (reason && !item.assessment.reason_codes.includes(reason))
 					return false;
 				return true;
 			});
+			const filtered = status
+				? scoped.filter((item) => item.status === status)
+				: scoped;
+			const statusCounts = { pending: 0, succeeded: 0, failed: 0, deferred: 0 };
+			for (const item of scoped) {
+				if (item.status in statusCounts) {
+					statusCounts[item.status as keyof typeof statusCounts] += 1;
+				}
+			}
 			const pageSize = 50;
 			return new Response(
 				JSON.stringify({
@@ -94,6 +113,7 @@ function ReleaseFreshnessAuditMock({ children }: { children: ReactNode }) {
 					page,
 					page_size: pageSize,
 					total: filtered.length,
+					status_counts: statusCounts,
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
 			);
@@ -359,6 +379,7 @@ export const SyncAccessRefreshFailed: Story = {
 };
 
 export const SyncAccessRefreshFreshnessAudit: Story = {
+	tags: ["repo-refresh-deferred"],
 	parameters: {
 		viewport: { defaultViewport: "taskDetailDesktop1440" },
 	},
@@ -458,6 +479,20 @@ export const SyncAccessRefreshFreshnessAudit: Story = {
 		await waitFor(() => {
 			expect(canvas.getByText("octo/release-51")).toBeVisible();
 		});
+		await userEvent.selectOptions(
+			canvas.getByRole("combobox", { name: "按仓库刷新状态筛选" }),
+			"deferred",
+		);
+		await waitFor(() => {
+			expect(canvas.getByText("octo/release-05")).toBeVisible();
+		});
+		expect(canvas.getByText("已延后 11", { exact: true })).toBeVisible();
+		expect(
+			canvas.getAllByText(/匿名 GitHub 读取预算耗尽，本轮未抓取/),
+		).toHaveLength(11);
+		for (const node of canvas.queryAllByText(/deferred/i)) {
+			expect(node).not.toBeVisible();
+		}
 	},
 };
 
@@ -465,6 +500,66 @@ export const SyncAccessRefreshFreshnessAuditMobile: Story = {
 	...SyncAccessRefreshFreshnessAudit,
 	parameters: {
 		viewport: { defaultViewport: "taskDetailMobile393" },
+	},
+};
+
+export const SyncAccessRefreshDeferredBudget: Story = {
+	tags: ["repo-refresh-deferred"],
+	decorators: [
+		(Story) => (
+			<div
+				data-visual-evidence-surface
+				className="mx-auto w-full max-w-[1072px] bg-background p-6"
+			>
+				<div data-visual-evidence-target>
+					<Story />
+				</div>
+			</div>
+		),
+	],
+	parameters: {
+		viewport: { defaultViewport: "taskDetailDesktop1440" },
+		docs: {
+			description: {
+				story:
+					"匿名 GitHub 读取预算耗尽时，账户级 Release 同步只延后该仓库：结果里出现 deferred_repositories，详情页以“已延后”与“预算延后”解释，不记为失败。",
+			},
+		},
+	},
+	args: {
+		detail: buildDetail(
+			"sync.access_refresh",
+			{ user_id: TARGET_USER_ID },
+			{
+				releases: 120,
+				repositories: 40,
+				user_id: TARGET_USER_ID,
+				failed_repositories: [],
+				deferred_repositories: [
+					{
+						repo_id: 2001,
+						repo_full_name: "octo/solaris-lab",
+						reason_code: "deferred_budget",
+						anonymous_budget_remaining: 0,
+					},
+					{
+						repo_id: 2002,
+						repo_full_name: "octo/atlas-notes",
+						reason_code: "deferred_budget",
+						anonymous_budget_remaining: 0,
+					},
+				],
+			},
+		),
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		expect(canvas.getByText("仓库刷新延后")).toBeVisible();
+		expect(canvas.getByText("已延后 2", { exact: true })).toBeVisible();
+		expect(canvas.getByText("octo/solaris-lab")).toBeVisible();
+		expect(canvas.getByText("octo/atlas-notes")).toBeVisible();
+		expect(canvas.getAllByText("预算延后")).toHaveLength(2);
+		expect(canvas.getByText(/deferred_budget/)).not.toBeVisible();
 	},
 };
 
