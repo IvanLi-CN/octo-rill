@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     config::AiConfig,
@@ -19,8 +19,9 @@ use crate::{
     local_id,
     postgres_jobs::ClaimedTask,
     postgres_repo_release_fetch::{
-        RefreshFailure, ReleaseCredentialCache, ReleaseFetchRequest, fetch_releases,
-        mark_public_usage_failed, mark_public_usage_ready,
+        AnonymousBudget, BudgetDeferral, RefreshFailure, ReleaseCredentialCache, ReleaseFetchError,
+        ReleaseFetchRequest, fetch_releases, mark_public_usage_failed, mark_public_usage_ready,
+        shared_anonymous_budget,
     },
     postgres_star_epochs::{self, StarEpochProgress, StarEpochRow, StarSlicePage},
     postgres_worker::TaskExecutor,
@@ -40,6 +41,9 @@ pub struct ReleasesExecutor {
     pool: PgPool,
     http: Client,
     encryption_key: EncryptionKey,
+    /// The process-wide unauthenticated read allowance, shared with the
+    /// single-repository worker lane.
+    budget: std::sync::Arc<AnonymousBudget>,
 }
 
 #[derive(Clone)]
@@ -82,6 +86,7 @@ impl ReleasesExecutor {
             pool,
             http,
             encryption_key,
+            budget: shared_anonymous_budget(),
         }
     }
 }
@@ -1112,20 +1117,7 @@ impl TaskExecutor for ReleasesExecutor {
             let now = now.as_str();
             let user_id = user_id.as_str();
             pending.push(async move {
-                fetch_one_account_repo(self, user_id, repo, now, credentials)
-                    .await
-                    .map(|fetched| AccountRepoOutcome {
-                        repo_id: repo.repo_id,
-                        repo_full_name: repo.full_name.clone(),
-                        fetched,
-                        failure: None,
-                    })
-                    .unwrap_or_else(|failure| AccountRepoOutcome {
-                        repo_id: repo.repo_id,
-                        repo_full_name: repo.full_name.clone(),
-                        fetched: 0,
-                        failure: Some(failure),
-                    })
+                fetch_one_account_repo(self, user_id, repo, now, credentials).await
             });
         }
         let mut outcomes = stream::iter(pending)
@@ -1137,7 +1129,17 @@ impl TaskExecutor for ReleasesExecutor {
         let mut total = 0usize;
         let mut repositories = 0usize;
         let mut failed = Vec::new();
+        let mut deferred = Vec::new();
         for outcome in outcomes {
+            if let Some(deferral) = outcome.deferred {
+                deferred.push(json!({
+                    "repo_id": outcome.repo_id,
+                    "repo_full_name": outcome.repo_full_name,
+                    "reason_code": "deferred_budget",
+                    "anonymous_budget_remaining": deferral.remaining,
+                }));
+                continue;
+            }
             if let Some(failure) = outcome.failure {
                 failed.push(json!({
                     "repo_id": outcome.repo_id,
@@ -1154,6 +1156,7 @@ impl TaskExecutor for ReleasesExecutor {
             "repositories": repositories,
             "user_id": user_id,
             "failed_repositories": failed,
+            "deferred_repositories": deferred,
         })
         .to_string())
     }
@@ -1164,19 +1167,30 @@ struct AccountRepoOutcome {
     repo_full_name: String,
     fetched: usize,
     failure: Option<RefreshFailure>,
+    /// Set when the anonymous budget could not pay for this repository.
+    deferred: Option<BudgetDeferral>,
 }
 
 /// Fetch and persist one repository of an account-wide sync. A repository this
 /// account cannot read must not fail the whole sync: the shared decision
 /// rotates to another candidate user and, for a public repository, to an
-/// unauthenticated read.
+/// unauthenticated read. A read the anonymous budget cannot pay for is skipped
+/// without recording any failure.
 async fn fetch_one_account_repo(
     executor: &ReleasesExecutor,
     user_id: &str,
     repo: &StarredRepoRow,
     now: &str,
     credentials: &ReleaseCredentialCache,
-) -> std::result::Result<usize, RefreshFailure> {
+) -> AccountRepoOutcome {
+    let skipped =
+        |deferred: Option<BudgetDeferral>, failure: Option<RefreshFailure>| AccountRepoOutcome {
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.clone(),
+            fetched: 0,
+            failure,
+            deferred,
+        };
     let outcome = match fetch_releases(
         &executor.pool,
         &executor.http,
@@ -1187,11 +1201,25 @@ async fn fetch_one_account_repo(
             requested_by_user_id: user_id,
         },
         credentials,
+        executor.budget.as_ref(),
     )
     .await
     {
         Ok(outcome) => outcome,
-        Err(failure) => {
+        Err(ReleaseFetchError::Deferred(deferral)) => {
+            info!(
+                event = "upstream.call",
+                operation = "sync.releases",
+                repo = repo.full_name,
+                user_id,
+                deferred_reason = "anonymous_budget",
+                anonymous_budget_remaining = deferral.remaining,
+                anonymous_budget_reset_at = deferral.reset_at_unix,
+                "repository releases deferred: anonymous GitHub budget exhausted"
+            );
+            return skipped(Some(deferral), None);
+        }
+        Err(ReleaseFetchError::Failed(failure)) => {
             warn!(
                 event = "upstream.call",
                 operation = "sync.releases",
@@ -1212,7 +1240,7 @@ async fn fetch_one_account_repo(
                     "failed to record public release usage failure"
                 );
             }
-            return Err(failure);
+            return skipped(None, Some(failure));
         }
     };
     if outcome.public_usage.exists
@@ -1227,14 +1255,29 @@ async fn fetch_one_account_repo(
         );
     }
     if outcome.fetch.not_modified {
-        return Ok(0);
+        return AccountRepoOutcome {
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.clone(),
+            fetched: 0,
+            failure: None,
+            deferred: None,
+        };
     }
     for release in &outcome.fetch.releases {
-        upsert_release(&executor.pool, user_id, repo, release, now)
+        if let Err(failure) = upsert_release(&executor.pool, user_id, repo, release, now)
             .await
-            .map_err(RefreshFailure::local)?;
+            .map_err(RefreshFailure::local)
+        {
+            return skipped(None, Some(failure));
+        }
     }
-    Ok(outcome.fetch.releases.len())
+    AccountRepoOutcome {
+        repo_id: repo.repo_id,
+        repo_full_name: repo.full_name.clone(),
+        fetched: outcome.fetch.releases.len(),
+        failure: None,
+        deferred: None,
+    }
 }
 
 async fn load_repo_release_concurrency(pool: &PgPool) -> usize {

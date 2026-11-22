@@ -214,6 +214,10 @@ pub struct Metrics {
     worker_operations: Family<WorkerLabels, Counter>,
     worker_duration: HistogramFamily<WorkerLabels>,
     worker_active: Family<ExecutorLabels, Gauge>,
+    /// Unauthenticated GitHub requests this process may still send.
+    anonymous_github_budget_remaining: Gauge,
+    /// Anonymous GitHub reads skipped because that budget was spent.
+    anonymous_github_deferrals: Counter,
     process_rss_bytes: Gauge<f64, AtomicU64>,
     process_cpu_seconds: Gauge<f64, AtomicU64>,
     db_bytes: Gauge<f64, AtomicU64>,
@@ -252,6 +256,8 @@ impl Metrics {
         let worker_operations = Family::default();
         let worker_duration = Family::new_with_constructor(http_histogram as fn() -> Histogram);
         let worker_active = Family::default();
+        let anonymous_github_budget_remaining = Gauge::default();
+        let anonymous_github_deferrals = Counter::default();
         let process_rss_bytes = Gauge::default();
         let process_cpu_seconds = Gauge::default();
         let db_bytes = Gauge::default();
@@ -345,6 +351,16 @@ impl Metrics {
             "Active background workers",
             worker_active.clone(),
         );
+        registry.register(
+            "anonymous_github_budget_remaining",
+            "Unauthenticated GitHub requests still allowed in this process",
+            anonymous_github_budget_remaining.clone(),
+        );
+        registry.register(
+            "anonymous_github_deferrals",
+            "Anonymous GitHub reads deferred for an exhausted budget",
+            anonymous_github_deferrals.clone(),
+        );
         registry.register_with_unit(
             "process_rss",
             "Process resident memory",
@@ -420,6 +436,8 @@ impl Metrics {
             worker_operations,
             worker_duration,
             worker_active,
+            anonymous_github_budget_remaining,
+            anonymous_github_deferrals,
             process_rss_bytes,
             process_cpu_seconds,
             db_bytes,
@@ -692,6 +710,23 @@ impl Metrics {
         self.queue_oldest_age
             .get_or_create(&labels)
             .set(oldest_age_seconds.unwrap_or(0.0).max(0.0));
+    }
+
+    /// Publish the anonymous GitHub allowance left in this process.
+    pub fn set_anonymous_github_budget(&self, remaining: u32) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.anonymous_github_budget_remaining
+            .set(i64::from(remaining));
+    }
+
+    /// Count one anonymous GitHub read skipped because the budget was spent.
+    pub fn record_anonymous_github_deferral(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.anonymous_github_deferrals.inc();
     }
 
     pub fn record_sampler_failure(&self) {

@@ -24,9 +24,10 @@ use crate::{
     local_id,
     postgres_jobs::ClaimedTask,
     postgres_repo_release_fetch::{
-        FetchVia, PublicReleaseUsageAccess, RefreshFailure, ReleaseCredentialCache,
-        ReleaseFetchOutcome, ReleaseFetchRequest, RepositoryFetch, fetch_releases,
-        mark_public_usage_failed, mark_public_usage_ready,
+        AnonymousBudget, BudgetDeferral, FetchVia, PublicReleaseUsageAccess, RefreshFailure,
+        ReleaseCredentialCache, ReleaseFetchError, ReleaseFetchOutcome, ReleaseFetchRequest,
+        RepositoryFetch, fetch_releases, mark_public_usage_failed, mark_public_usage_ready,
+        shared_anonymous_budget,
     },
     postgres_worker::TaskExecutor,
 };
@@ -46,6 +47,9 @@ pub struct RepoReleaseRefreshExecutor {
     pool: PgPool,
     http: Client,
     encryption_key: EncryptionKey,
+    /// The process-wide unauthenticated read allowance, shared with the
+    /// account lane.
+    budget: std::sync::Arc<AnonymousBudget>,
 }
 
 impl RepoReleaseRefreshExecutor {
@@ -54,6 +58,7 @@ impl RepoReleaseRefreshExecutor {
             pool,
             http,
             encryption_key,
+            budget: shared_anonymous_budget(),
         }
     }
 }
@@ -251,7 +256,40 @@ impl TaskExecutor for RepoReleaseRefreshExecutor {
                 );
                 Ok(stats.into_result_json(&payload))
             }
-            Err(failure) => {
+            Err(ReleaseFetchError::Deferred(deferral)) => {
+                if let Err(persist_error) = self.record_deferred(&payload, &lease, deferral).await {
+                    warn!(
+                        event = "worker.repo_release",
+                        task_id = task.id,
+                        repo_id = payload.repo_id,
+                        error = %persist_error,
+                        "failed to persist repo release deferral state"
+                    );
+                }
+                info!(
+                    event = "worker.repo_release",
+                    task_id = task.id,
+                    repo_id = payload.repo_id,
+                    repo = payload.repo_full_name,
+                    deferred_reason = "anonymous_budget",
+                    anonymous_budget_remaining = deferral.remaining,
+                    anonymous_budget_reset_at = deferral.reset_at_unix,
+                    "repository release refresh deferred: anonymous GitHub budget exhausted"
+                );
+                Ok(json!({
+                    "task": TASK_TYPE,
+                    "user_id": payload.user_id,
+                    "repo_id": payload.repo_id,
+                    "repo_full_name": payload.repo_full_name,
+                    "reason": payload.reason,
+                    "delivery_id": payload.delivery_id,
+                    "work_item_id": lease.id,
+                    "deferred_budget": true,
+                    "anonymous_budget_remaining": deferral.remaining,
+                })
+                .to_string())
+            }
+            Err(ReleaseFetchError::Failed(failure)) => {
                 if let Err(persist_error) = self.record_failure(&payload, &lease, &failure).await {
                     warn!(
                         event = "worker.repo_release",
@@ -417,7 +455,7 @@ impl RepoReleaseRefreshExecutor {
         &self,
         payload: &RepoReleaseTaskPayload,
         lease: &WorkItemLease,
-    ) -> std::result::Result<RefreshStats, RefreshFailure> {
+    ) -> std::result::Result<RefreshStats, ReleaseFetchError> {
         let outcome = fetch_releases(
             &self.pool,
             &self.http,
@@ -428,11 +466,12 @@ impl RepoReleaseRefreshExecutor {
                 requested_by_user_id: payload.user_id.as_str(),
             },
             &ReleaseCredentialCache::default(),
+            self.budget.as_ref(),
         )
         .await?;
         self.persist_success(payload, lease, outcome)
             .await
-            .map_err(RefreshFailure::local)
+            .map_err(|error| ReleaseFetchError::Failed(RefreshFailure::local(error)))
     }
 
     /// Persist the fetched snapshot, the work item outcome and the sync state in
@@ -544,6 +583,85 @@ impl RepoReleaseRefreshExecutor {
             .await
             .context("commit repo release refresh finalize")?;
         Ok(stats)
+    }
+
+    /// Release the work item for a read the anonymous budget could not pay for.
+    ///
+    /// Nothing failed upstream, so this must not write `failed` anywhere: no
+    /// `repo_release_sync_state.backoff_until`, no `last_error_text`, and no
+    /// `public_repo_release_usage.last_sync_status` change. The row keeps its
+    /// last success and the periodic scheduler re-queues the repository.
+    async fn record_deferred(
+        &self,
+        payload: &RepoReleaseTaskPayload,
+        lease: &WorkItemLease,
+        deferral: BudgetDeferral,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let error_text = deferral.summary();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("begin repo release deferral finalize")?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE public.repo_release_work_items
+            SET status = 'deferred',
+                priority = 0,
+                has_new_repo_watchers = 0,
+                deadline_at = $2,
+                error_text = $3,
+                finished_at = $2,
+                updated_at = $2,
+                runtime_owner_id = NULL,
+                lease_heartbeat_at = NULL
+            WHERE id = $1
+              AND status = 'running'
+              AND started_at = $4
+              AND runtime_owner_id = $5
+            "#,
+        )
+        .bind(&lease.id)
+        .bind(&now)
+        .bind(&error_text)
+        .bind(&lease.started_at)
+        .bind(&lease.task_id)
+        .execute(&mut *transaction)
+        .await
+        .context("defer repo release work item")?
+        .rows_affected();
+        if updated == 0 {
+            warn!(
+                event = "worker.repo_release",
+                repo_id = payload.repo_id,
+                work_item_id = lease.id,
+                "repo release work item lease lost before deferral finalize"
+            );
+            sqlx::query(
+                "UPDATE public.repo_release_watchers SET status = 'deferred', error_text = $2, updated_at = $3 WHERE task_id = $1 AND status = 'pending'",
+            )
+            .bind(&lease.task_id)
+            .bind(&error_text)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .context("defer this task's repo release watcher")?;
+        } else {
+            mark_watchers(
+                &mut transaction,
+                &lease.id,
+                "deferred",
+                Some(error_text.as_str()),
+                &now,
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit repo release deferral finalize")?;
+        Ok(())
     }
 
     /// Classify and persist the failure, including the retry backoff the

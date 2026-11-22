@@ -6,8 +6,18 @@
 //! with a `github_public` usage row, fell back to an unauthenticated read.
 //! Both PostgreSQL executors (`sync.repo_release` and `sync.releases`) need the
 //! same decision, so it lives here once instead of drifting apart per lane.
+//!
+//! The unauthenticated fallback is bounded by one process-wide
+//! [`AnonymousBudget`]: GitHub counts anonymous requests per egress IP (60 per
+//! hour), so a per-token accounting cannot see the exhaustion coming. A read
+//! that finds the budget spent is deferred, not failed.
 
-use std::{collections::HashMap, fmt, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, header};
@@ -40,6 +50,241 @@ const ROTATING_REASON_CODES: [&str; 6] = [
     "repo_inaccessible",
     "rate_limited",
 ];
+
+/// Unauthenticated reads share GitHub's primary allowance for the egress IP:
+/// 60 requests per hour. The local budget starts below that ceiling because the
+/// same address also serves redirect hops and any other client behind the same
+/// NAT, and because one repository refresh may spend several pages of it.
+pub(crate) const ANONYMOUS_BUDGET_LIMIT: u32 = 50;
+/// GitHub's primary rate-limit window; the fallback when no header names it.
+const ANONYMOUS_BUDGET_WINDOW_SECS: i64 = 3_600;
+
+/// A read that was not sent because the anonymous budget is spent.
+///
+/// This is not a failure: nothing upstream rejected the request and no error
+/// state must be recorded. The next scheduled cycle retries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetDeferral {
+    /// Anonymous requests left when the read was deferred; always zero.
+    pub(crate) remaining: u32,
+    /// Unix seconds when GitHub refills the allowance, when a response said so.
+    pub(crate) reset_at_unix: Option<i64>,
+}
+
+impl BudgetDeferral {
+    pub(crate) fn summary(self) -> String {
+        match self
+            .reset_at_unix
+            .and_then(|reset| chrono::DateTime::from_timestamp(reset, 0))
+        {
+            Some(reset) => format!(
+                "deferred_budget: anonymous GitHub read budget exhausted; refills at {}",
+                reset.to_rfc3339()
+            ),
+            None => "deferred_budget: anonymous GitHub read budget exhausted".to_owned(),
+        }
+    }
+}
+
+/// Why a repository read produced no snapshot.
+#[derive(Debug, Clone)]
+pub(crate) enum ReleaseFetchError {
+    /// The upstream read, or the local bookkeeping around it, failed.
+    Failed(RefreshFailure),
+    /// The anonymous budget is spent, so no request was sent at all.
+    Deferred(BudgetDeferral),
+}
+
+impl ReleaseFetchError {
+    /// Whether another candidate user may still read the repository.
+    fn rotates_candidate(&self) -> bool {
+        match self {
+            Self::Failed(failure) => failure.rotates_candidate(),
+            Self::Deferred(_) => false,
+        }
+    }
+
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Failed(failure) => failure.status,
+            Self::Deferred(_) => None,
+        }
+    }
+}
+
+impl From<RefreshFailure> for ReleaseFetchError {
+    fn from(failure: RefreshFailure) -> Self {
+        Self::Failed(failure)
+    }
+}
+
+/// Process-wide allowance for unauthenticated GitHub requests.
+///
+/// GitHub counts anonymous requests per egress IP, so every anonymous read of
+/// this process — the single-repository worker lane and the account lane alike —
+/// draws from the instance behind [`shared_anonymous_budget`]. The guarded
+/// struct is constructed directly by tests so the window logic needs neither a
+/// server nor the wall clock.
+#[derive(Debug)]
+pub(crate) struct AnonymousBudget {
+    limit: u32,
+    state: StdMutex<BudgetState>,
+}
+
+#[derive(Debug)]
+struct BudgetState {
+    remaining: u32,
+    /// Unix seconds when GitHub refills the allowance, when known.
+    reset_at_unix: Option<i64>,
+    /// Unix seconds of the last charge, the fallback window anchor.
+    last_spend_unix: Option<i64>,
+}
+
+impl BudgetState {
+    /// Whether the local window has ended.
+    ///
+    /// The instant comes from GitHub's reset header. Without one, the guard
+    /// falls back to an hour after the last charge: a local counter that
+    /// outlived its real allowance would otherwise wedge anonymous reads.
+    fn refill_due(&self, now_unix: i64) -> bool {
+        self.reset_at_unix
+            .or_else(|| {
+                self.last_spend_unix
+                    .map(|spent| spent + ANONYMOUS_BUDGET_WINDOW_SECS)
+            })
+            .is_some_and(|refill_at| now_unix >= refill_at)
+    }
+}
+
+/// The one budget of this process. Both release executors share this `Arc`.
+static SHARED_ANONYMOUS_BUDGET: LazyLock<Arc<AnonymousBudget>> = LazyLock::new(|| {
+    publish_anonymous_budget(ANONYMOUS_BUDGET_LIMIT);
+    Arc::new(AnonymousBudget::with_limit(ANONYMOUS_BUDGET_LIMIT))
+});
+
+pub(crate) fn shared_anonymous_budget() -> Arc<AnonymousBudget> {
+    Arc::clone(&SHARED_ANONYMOUS_BUDGET)
+}
+
+impl AnonymousBudget {
+    pub(crate) fn with_limit(limit: u32) -> Self {
+        Self {
+            limit,
+            state: StdMutex::new(BudgetState {
+                remaining: limit,
+                reset_at_unix: None,
+                last_spend_unix: None,
+            }),
+        }
+    }
+
+    /// Requests left before the next refill. Read by the budget tests.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u32 {
+        self.guard().remaining
+    }
+
+    /// Charge one anonymous request, or report that the read must be deferred.
+    ///
+    /// The caller charges *before* sending, so a request that ends in an error
+    /// or a 304 still counts: GitHub charged it too.
+    pub(crate) fn acquire(&self, now_unix: i64) -> std::result::Result<(), BudgetDeferral> {
+        let mut state = self.guard();
+        if state.refill_due(now_unix) {
+            // The window rolled over. Refill to the local ceiling; the next
+            // response header calibrates the true count.
+            state.remaining = self.limit;
+            state.reset_at_unix = None;
+            state.last_spend_unix = None;
+        }
+        if state.remaining == 0 {
+            return Err(BudgetDeferral {
+                remaining: 0,
+                reset_at_unix: state.reset_at_unix,
+            });
+        }
+        state.remaining -= 1;
+        state.last_spend_unix = Some(now_unix);
+        let remaining = state.remaining;
+        drop(state);
+        publish_anonymous_budget(remaining);
+        Ok(())
+    }
+
+    /// Account for one redirect hop the shared HTTP client followed.
+    ///
+    /// The hop was already sent, so this only records it: it never defers, and
+    /// it cannot take the count below zero.
+    pub(crate) fn charge_redirect(&self) {
+        let mut state = self.guard();
+        state.remaining = state.remaining.saturating_sub(1);
+        let remaining = state.remaining;
+        drop(state);
+        publish_anonymous_budget(remaining);
+    }
+
+    /// Reconcile with the `X-RateLimit-*` headers of a request just spent.
+    ///
+    /// The remaining count is authoritative only downwards: those headers also
+    /// count anonymous requests this process never issued from the same egress
+    /// IP. A later reset window is the exception — GitHub refilled the counter,
+    /// so that header value replaces the stale local count.
+    pub(crate) fn observe(&self, remaining: Option<u32>, reset_at_unix: Option<i64>) {
+        let mut state = self.guard();
+        let new_window = matches!(
+            (reset_at_unix, state.reset_at_unix),
+            (Some(reset), Some(stored)) if reset > stored
+        );
+        if new_window {
+            state.remaining = remaining.unwrap_or(self.limit).min(self.limit);
+            state.reset_at_unix = reset_at_unix;
+        } else {
+            if reset_at_unix.is_some() {
+                state.reset_at_unix = reset_at_unix;
+            }
+            if let Some(remaining) = remaining {
+                state.remaining = state.remaining.min(remaining);
+            }
+        }
+        let remaining = state.remaining;
+        drop(state);
+        publish_anonymous_budget(remaining);
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, BudgetState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Publish the remaining allowance for scrapers; a no-op without a registry.
+fn publish_anonymous_budget(remaining: u32) {
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.set_anonymous_github_budget(remaining);
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// GitHub's primary rate-limit view of a response, for anonymous calibration.
+fn parse_rate_limit(headers: &reqwest::header::HeaderMap) -> (Option<u32>, Option<i64>) {
+    let parse = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    };
+    (
+        parse("x-ratelimit-remaining").and_then(|value| u32::try_from(value).ok()),
+        parse("x-ratelimit-reset"),
+    )
+}
 
 /// Classified upstream or local failure for one repository refresh.
 #[derive(Debug, Clone)]
@@ -200,13 +445,17 @@ struct UsageCountsRow {
 
 /// Read one repository's releases, rotating candidate users and falling back
 /// to an unauthenticated read of a registered public repository.
+///
+/// `budget` is the process-wide anonymous allowance; only the fallback draws
+/// from it, so candidate rotation is decided exactly as before.
 pub(crate) async fn fetch_releases(
     pool: &PgPool,
     http: &Client,
     encryption_key: &EncryptionKey,
     request: &ReleaseFetchRequest<'_>,
     credentials: &ReleaseCredentialCache,
-) -> std::result::Result<ReleaseFetchOutcome, RefreshFailure> {
+    budget: &AnonymousBudget,
+) -> std::result::Result<ReleaseFetchOutcome, ReleaseFetchError> {
     let public_usage = load_public_release_usage_access(pool, request.repo_id).await?;
     let mut candidates = load_candidate_user_ids(pool, request.repo_id).await?;
     // The user the task was queued for keeps the first attempt when the rule
@@ -227,7 +476,8 @@ pub(crate) async fn fetch_releases(
             ),
             false,
             None,
-        ));
+        )
+        .into());
     }
     let sync_state = load_sync_state(pool, request.repo_id).await?;
 
@@ -247,13 +497,16 @@ pub(crate) async fn fetch_releases(
     .await
     {
         Ok(read) => read,
-        Err(failure) => {
+        // A deferral describes the budget, not the repository: retrying another
+        // credential or the anonymous path would spend money we do not have.
+        Err(deferral @ ReleaseFetchError::Deferred(_)) => return Err(deferral),
+        Err(ReleaseFetchError::Failed(failure)) => {
             // Legacy attempted the anonymous read after any candidate failure,
             // so a throttled token does not hide a public repository.
             if !public_usage.needs_public_fallback {
-                return Err(failure);
+                return Err(failure.into());
             }
-            let fetch = fetch_public(http, request, sync_state.as_ref()).await?;
+            let fetch = fetch_public(http, request, sync_state.as_ref(), budget).await?;
             return Ok(ReleaseFetchOutcome {
                 fetch,
                 via: FetchVia::Public,
@@ -280,7 +533,7 @@ trait CandidateAttempt {
     async fn attempt(
         &self,
         candidate: &str,
-    ) -> std::result::Result<RepositoryFetch, RefreshFailure>;
+    ) -> std::result::Result<RepositoryFetch, ReleaseFetchError>;
 }
 
 /// The production attempt: every GitHub connection of one candidate user.
@@ -298,7 +551,7 @@ impl CandidateAttempt for CredentialAttempt<'_> {
     async fn attempt(
         &self,
         candidate: &str,
-    ) -> std::result::Result<RepositoryFetch, RefreshFailure> {
+    ) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
         fetch_for_user(
             self.pool,
             self.http,
@@ -324,9 +577,9 @@ async fn rotate_candidates(
     requested_by_user_id: &str,
     repo_full_name: &str,
     attempt: &impl CandidateAttempt,
-) -> std::result::Result<(RepositoryFetch, FetchVia, String), RefreshFailure> {
-    let mut first_failure: Option<RefreshFailure> = None;
-    let mut upstream_failure: Option<RefreshFailure> = None;
+) -> std::result::Result<(RepositoryFetch, FetchVia, String), ReleaseFetchError> {
+    let mut first_failure: Option<ReleaseFetchError> = None;
+    let mut upstream_failure: Option<ReleaseFetchError> = None;
     for candidate in candidates {
         match attempt.attempt(candidate.as_str()).await {
             Ok(fetch) => {
@@ -347,14 +600,14 @@ async fn rotate_candidates(
                 }
                 return Ok((fetch, via, candidate.clone()));
             }
-            Err(failure) => {
-                let rotates = failure.rotates_candidate();
+            Err(error) => {
+                let rotates = error.rotates_candidate();
                 // A candidate without a usable connection says nothing about
                 // the repository, so an actual upstream classification wins.
-                if failure.status.is_some() && upstream_failure.is_none() {
-                    upstream_failure = Some(failure.clone());
+                if error.http_status().is_some() && upstream_failure.is_none() {
+                    upstream_failure = Some(error.clone());
                 }
-                first_failure.get_or_insert(failure);
+                first_failure.get_or_insert(error);
                 if !rotates {
                     // Not a credential or throttle problem: another candidate
                     // token would hit the same upstream condition. The
@@ -372,6 +625,7 @@ async fn rotate_candidates(
             false,
             None,
         )
+        .into()
     }))
 }
 
@@ -577,7 +831,7 @@ async fn fetch_for_user(
     user_id: &str,
     sync_state: Option<&SyncStateRow>,
     credentials: &ReleaseCredentialCache,
-) -> std::result::Result<RepositoryFetch, RefreshFailure> {
+) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
     let connections = credentials
         .connections_for(pool, user_id)
         .await
@@ -595,7 +849,8 @@ async fn fetch_for_user(
             format!("no GitHub connection for user {user_id}"),
             false,
             None,
-        ));
+        )
+        .into());
     }
     let mut last_failure = None;
     for connection in connections {
@@ -619,13 +874,14 @@ async fn fetch_for_user(
                         false,
                         None,
                     )
+                    .into()
                 });
                 continue;
             }
         };
-        match fetch_with_token(http, request, Some(token.as_str()), sync_state).await {
+        match fetch_with_token(http, request, Some(token.as_str()), sync_state, None).await {
             Ok(fetch) => return Ok(fetch),
-            Err(failure) if failure.rotates_candidate() => {
+            Err(ReleaseFetchError::Failed(failure)) if failure.rotates_candidate() => {
                 warn!(
                     event = "upstream.call",
                     operation = "repo_release_fetch",
@@ -636,9 +892,9 @@ async fn fetch_for_user(
                     http_status = failure.status,
                     "GitHub connection could not read repository releases"
                 );
-                last_failure = Some(failure);
+                last_failure = Some(failure.into());
             }
-            Err(failure) => return Err(failure),
+            Err(error) => return Err(error),
         }
     }
     Err(last_failure.unwrap_or_else(|| {
@@ -648,16 +904,22 @@ async fn fetch_for_user(
             false,
             None,
         )
+        .into()
     }))
 }
 
 /// Unauthenticated read of a public repository.
+///
+/// Every page of it is charged to the process-wide anonymous budget before the
+/// request leaves, and GitHub's rate-limit headers recalibrate that budget on
+/// the way back.
 async fn fetch_public(
     http: &Client,
     request: &ReleaseFetchRequest<'_>,
     sync_state: Option<&SyncStateRow>,
-) -> std::result::Result<RepositoryFetch, RefreshFailure> {
-    fetch_with_token(http, request, None, sync_state).await
+    budget: &AnonymousBudget,
+) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
+    fetch_with_token(http, request, None, sync_state, Some(budget)).await
 }
 
 async fn fetch_with_token(
@@ -665,7 +927,8 @@ async fn fetch_with_token(
     request: &ReleaseFetchRequest<'_>,
     token: Option<&str>,
     sync_state: Option<&SyncStateRow>,
-) -> std::result::Result<RepositoryFetch, RefreshFailure> {
+    budget: Option<&AnonymousBudget>,
+) -> std::result::Result<RepositoryFetch, ReleaseFetchError> {
     let mut fetch = RepositoryFetch {
         stopped_reason: "page_budget".to_owned(),
         ..RepositoryFetch::default()
@@ -677,7 +940,7 @@ async fn fetch_with_token(
             request.repo_full_name
         );
         let mut builder = http
-            .get(url)
+            .get(url.clone())
             .timeout(REQUEST_TIMEOUT)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::ACCEPT, "application/vnd.github+json")
@@ -694,9 +957,27 @@ async fn fetch_with_token(
                 builder = builder.header(header::IF_MODIFIED_SINCE, last_modified);
             }
         }
+        // Charge before sending: GitHub counts the request even when it answers
+        // 304 or an error, and a redirect hop is another request on the wire.
+        if let Some(budget) = budget {
+            budget
+                .acquire(unix_now())
+                .map_err(|deferral| defer_anonymous_read(request, page, deferral))?;
+        }
         let response = builder.send().await.map_err(classify_request_error)?;
         let status = response.status();
         let headers = response.headers().clone();
+        if let Some(budget) = budget {
+            // A renamed repository answers 301 and the shared client follows
+            // it; that hop is another request from the same address. The client
+            // hides how many hops it took, so charge the one that is certain and
+            // let the rate-limit header below correct any residue.
+            if response.url().as_str() != url {
+                budget.charge_redirect();
+            }
+            let (remaining, reset_at_unix) = parse_rate_limit(&headers);
+            budget.observe(remaining, reset_at_unix);
+        }
         if page == 1 {
             fetch.etag = header_value(&headers, header::ETAG);
             fetch.last_modified = header_value(&headers, header::LAST_MODIFIED);
@@ -709,7 +990,7 @@ async fn fetch_with_token(
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, &headers, &body));
+            return Err(classify_http_error(status, &headers, &body).into());
         }
         let page_releases = response.json::<Vec<Value>>().await.map_err(|error| {
             RefreshFailure::new(
@@ -738,6 +1019,28 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: header::HeaderName) 
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Report a spent anonymous budget: the request was never sent.
+fn defer_anonymous_read(
+    request: &ReleaseFetchRequest<'_>,
+    page: usize,
+    deferral: BudgetDeferral,
+) -> ReleaseFetchError {
+    warn!(
+        event = "upstream.call",
+        operation = "repo_release_fetch",
+        repo = request.repo_full_name,
+        page,
+        deferred_reason = "anonymous_budget",
+        anonymous_budget_remaining = deferral.remaining,
+        anonymous_budget_reset_at = deferral.reset_at_unix,
+        "anonymous GitHub read deferred: budget exhausted"
+    );
+    if let Some(metrics) = crate::metrics::global() {
+        metrics.record_anonymous_github_deferral();
+    }
+    ReleaseFetchError::Deferred(deferral)
 }
 
 pub(crate) fn classify_request_error(error: reqwest::Error) -> RefreshFailure {
@@ -827,7 +1130,7 @@ pub(crate) fn classify_http_error(
 mod tests {
     use super::*;
 
-    type AttemptResult = std::result::Result<RepositoryFetch, RefreshFailure>;
+    type AttemptResult = std::result::Result<RepositoryFetch, ReleaseFetchError>;
 
     #[test]
     fn http_errors_are_classified_like_the_legacy_lane() {
@@ -926,15 +1229,26 @@ mod tests {
         }
     }
 
+    /// The classification of a rotation that ended in failure. A deferral is a
+    /// different outcome, so the rotation tests must never see one.
+    fn failure_of(error: ReleaseFetchError) -> RefreshFailure {
+        match error {
+            ReleaseFetchError::Failed(failure) => failure,
+            ReleaseFetchError::Deferred(deferral) => {
+                panic!("credential rotation reported a budget deferral: {deferral:?}")
+            }
+        }
+    }
+
     fn throttled_first(candidate: &str) -> AttemptResult {
         if candidate == "user-a" {
-            return Err(throttled_403());
+            return Err(throttled_403().into());
         }
         Ok(readable())
     }
 
     fn always_throttled(_candidate: &str) -> AttemptResult {
-        Err(throttled_403())
+        Err(throttled_403().into())
     }
 
     fn missing_then_throttled(candidate: &str) -> AttemptResult {
@@ -944,9 +1258,10 @@ mod tests {
                 "no usable connection",
                 false,
                 None,
-            ));
+            )
+            .into());
         }
-        Err(throttled_403())
+        Err(throttled_403().into())
     }
 
     fn upstream_http_error(_candidate: &str) -> AttemptResult {
@@ -955,7 +1270,8 @@ mod tests {
             "sync repo releases: github returned 500",
             false,
             Some(500),
-        ))
+        )
+        .into())
     }
 
     #[tokio::test]
@@ -976,9 +1292,11 @@ mod tests {
     async fn exhausted_throttled_rotation_reports_rate_limited() {
         let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
         let attempt = ScriptedAttempt::new(always_throttled);
-        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
-            .await
-            .expect_err("every candidate is throttled");
+        let failure = failure_of(
+            rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+                .await
+                .expect_err("every candidate is throttled"),
+        );
         assert_eq!(attempt.calls().as_slice(), ["user-a", "user-b"]);
         assert_eq!(failure.reason_code, "rate_limited");
         assert_eq!(failure.status, Some(403));
@@ -988,9 +1306,11 @@ mod tests {
     async fn a_local_failure_does_not_hide_the_upstream_status() {
         let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
         let attempt = ScriptedAttempt::new(missing_then_throttled);
-        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
-            .await
-            .expect_err("no candidate reads the repository");
+        let failure = failure_of(
+            rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+                .await
+                .expect_err("no candidate reads the repository"),
+        );
         assert_eq!(attempt.calls().as_slice(), ["user-a", "user-b"]);
         // `first_failure` is the status-less credentials_missing, but the
         // surfaced classification must stay the throttled upstream answer so
@@ -1004,9 +1324,11 @@ mod tests {
     async fn non_rotating_failures_stop_the_rotation() {
         let candidates = vec!["user-a".to_owned(), "user-b".to_owned()];
         let attempt = ScriptedAttempt::new(upstream_http_error);
-        let failure = rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
-            .await
-            .expect_err("the upstream call itself failed");
+        let failure = failure_of(
+            rotate_candidates(&candidates, "user-a", "private/repo", &attempt)
+                .await
+                .expect_err("the upstream call itself failed"),
+        );
         assert_eq!(attempt.calls().as_slice(), ["user-a"]);
         assert_eq!(failure.reason_code, "github_http_error");
     }
@@ -1023,6 +1345,94 @@ mod tests {
         assert_eq!(FetchVia::User.as_str(), "user");
         assert_eq!(FetchVia::Candidate.as_str(), "candidate");
         assert_eq!(FetchVia::Public.as_str(), "public");
+    }
+
+    #[test]
+    fn anonymous_budget_defers_once_spent() {
+        let budget = AnonymousBudget::with_limit(2);
+        assert!(budget.acquire(1_000).is_ok());
+        assert!(budget.acquire(1_000).is_ok());
+        assert_eq!(budget.remaining(), 0);
+        let deferral = budget
+            .acquire(1_000)
+            .expect_err("a spent budget must defer, not borrow");
+        assert_eq!(deferral.remaining, 0);
+        assert_eq!(
+            deferral.summary(),
+            "deferred_budget: anonymous GitHub read budget exhausted"
+        );
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn anonymous_budget_refills_when_the_window_rolls_over() {
+        let budget = AnonymousBudget::with_limit(1);
+        budget.observe(None, Some(2_000));
+        assert!(budget.acquire(1_999).is_ok());
+        let deferral = budget
+            .acquire(1_999)
+            .expect_err("the hour has not rolled over");
+        assert_eq!(deferral.reset_at_unix, Some(2_000));
+        // The reset timestamp is inclusive: GitHub refills at that second.
+        assert!(budget.acquire(2_000).is_ok());
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn anonymous_budget_refills_an_hour_after_a_headerless_spend() {
+        let budget = AnonymousBudget::with_limit(1);
+        assert!(budget.acquire(1_000).is_ok());
+        assert!(budget.acquire(1_000).is_err());
+        // No response ever named the reset instant: fall back to one window
+        // after the last charge instead of wedging the budget forever.
+        assert!(budget.acquire(1_000 + 3_599).is_err());
+        assert!(budget.acquire(1_000 + 3_600).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_headers_lower_the_local_budget() {
+        let budget = AnonymousBudget::with_limit(50);
+        assert!(budget.acquire(1_000).is_ok());
+        // Another client on the same egress IP spent 48 of the allowance.
+        budget.observe(Some(2), Some(5_000));
+        assert_eq!(budget.remaining(), 2);
+        assert!(budget.acquire(1_000).is_ok());
+        assert!(budget.acquire(1_000).is_ok());
+        assert!(budget.acquire(1_000).is_err());
+    }
+
+    #[test]
+    fn a_later_reset_window_replaces_the_stale_count() {
+        let budget = AnonymousBudget::with_limit(50);
+        budget.observe(Some(5), Some(5_000));
+        assert_eq!(budget.remaining(), 5);
+        // GitHub reports the next hour: the counter refilled, but never beyond
+        // the local ceiling.
+        budget.observe(Some(59), Some(8_600));
+        assert_eq!(budget.remaining(), 50);
+    }
+
+    #[test]
+    fn a_followed_redirect_is_charged_without_deferring() {
+        let budget = AnonymousBudget::with_limit(2);
+        assert!(budget.acquire(1_000).is_ok());
+        budget.charge_redirect();
+        assert_eq!(budget.remaining(), 0);
+        // The hop was already on the wire: recording it must not overflow.
+        budget.charge_redirect();
+        assert_eq!(budget.remaining(), 0);
+        assert!(budget.acquire(1_000).is_err());
+    }
+
+    #[test]
+    fn rate_limit_headers_are_parsed_from_the_response() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_rate_limit(&headers), (None, None));
+        headers.insert("x-ratelimit-remaining", "7".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1764000000".parse().unwrap());
+        assert_eq!(parse_rate_limit(&headers), (Some(7), Some(1_764_000_000)));
+        headers.insert("x-ratelimit-remaining", "not-a-number".parse().unwrap());
+        assert_eq!(parse_rate_limit(&headers), (None, Some(1_764_000_000)));
     }
 
     #[test]
