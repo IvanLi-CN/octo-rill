@@ -7,7 +7,8 @@ The suite drives the real task worker against a local stub GraphQL endpoint
 1. the first execution creates an epoch and advances exactly one page,
 2. a slice that is not due is skipped, and a due slice continues the cursor,
 3. a failing slice records the error plus a retry time without succeeding,
-4. the terminal slice finalizes the epoch and prunes vanished memberships.
+4. the terminal slice finalizes the epoch and prunes vanished memberships,
+5. an over-limit page defers the epoch instead of ending it.
 """
 import argparse
 import base64
@@ -439,6 +440,37 @@ def main():
             expect(starred_repo_ids(), [101, 102, 103, 104], "unstarred repo leaves the aggregate")
             expect(member_repo_ids(), [101, 102, 103, 104], "unstarred repo leaves the members")
 
+            # -- 5. an over-limit page defers instead of ending the epoch ----
+            sql(
+                "UPDATE public.star_sync_epochs"
+                f" SET completed_at = '{BACKDATED}', started_at = '{BACKDATED}'"
+                f" WHERE github_connection_id = '{CONNECTION_ID}' AND status = 'succeeded'"
+            )
+            stub.over_limit = True
+            status, result, error = run_task()
+            expect(status, "failed", "over-limit task status")
+            expect("over-limit" in (error or ""), True, f"over-limit task error ({error})")
+            epoch = connection_epoch()
+            expect(epoch["status"], "queued", "over-limit slice must not finish the epoch")
+            expect(epoch["completed_at"], None, "over-limit slice must not set completed_at")
+            expect(epoch["processed_pages"], 0, "over-limit slice must not advance pages")
+            expect(epoch["failure_reason"], "github_is_over_limit", "over-limit reason")
+            expect(
+                is_past(epoch["next_slice_not_before"]),
+                False,
+                "over-limit slice schedules a retry time",
+            )
+            expect(starred_repo_ids(), [101, 102, 103, 104], "over-limit slice prunes nothing")
+            over_limit_epoch_id = epoch["id"]
+
+            stub.over_limit = False
+            backdate_next_slice()
+            status, result, error = run_task()
+            expect(status, "succeeded", f"post-over-limit task status ({error})")
+            expect(result["epoch_id"], over_limit_epoch_id, "retry resumes the over-limit epoch")
+            expect(result["status"], "queued", "post-over-limit epoch state")
+            expect(result["processed_pages"], 1, "post-over-limit slice advances one page")
+
             print(
                 json.dumps(
                     {
@@ -447,6 +479,7 @@ def main():
                         "slice_completion": "pass",
                         "slice_failure_retry": "pass",
                         "membership_diff": "pass",
+                        "over_limit_retry": "pass",
                     }
                 )
             )

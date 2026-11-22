@@ -821,6 +821,7 @@ impl StarredExecutor {
                         &self.pool,
                         epoch.id.as_str(),
                         format!("{error:#}").as_str(),
+                        lease_owner_id,
                         now,
                     )
                     .await?;
@@ -829,10 +830,14 @@ impl StarredExecutor {
             }
         };
         if page.is_over_limit {
-            postgres_star_epochs::fail_epoch(
+            // `isOverLimit=true` proves only that this page is incomplete, never
+            // that the connection is unusable: keep the cursor and retry the
+            // same slice instead of waiting for the next full-sweep window.
+            postgres_star_epochs::defer_epoch_after_failure(
                 &self.pool,
                 epoch.id.as_str(),
                 "github_is_over_limit",
+                lease_owner_id,
                 now,
             )
             .await?;
@@ -846,6 +851,7 @@ impl StarredExecutor {
                 &self.pool,
                 epoch.id.as_str(),
                 format!("{error:#}").as_str(),
+                lease_owner_id,
                 now,
             )
             .await?;

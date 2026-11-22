@@ -10,7 +10,11 @@ paths observable:
 * only a `github_public` usage row exists and nobody holds a usable token
   (unauthenticated fallback, `via=public`);
 * a private repository with no candidate and no public row fails with the
-  original upstream classification (`repo_inaccessible`).
+  original upstream classification (`repo_inaccessible`);
+* a throttled candidate token is rotated past when the next candidate can read
+  the repository (rate limits are counted per token, not per repository);
+* when every candidate is throttled the refresh still fails as `rate_limited`
+  and records the retry backoff.
 
 `public_repo_release_usage.last_sync_status` is asserted for every outcome, and
 the account-level `sync.releases` lane must keep going when one of the user's
@@ -54,6 +58,10 @@ EPSILON_FULL_NAME = "public/epsilon"
 MOVED_REPO = 4747
 MOVED_OLD_NAME = "legacy/renamed"
 MOVED_NEW_NAME = "renamed/repo"
+ZETA_REPO = 4848
+ZETA_FULL_NAME = "private/zeta"
+ETA_REPO = 4949
+ETA_FULL_NAME = "private/eta"
 
 ETAG = '"stub-releases-v1"'
 
@@ -72,6 +80,9 @@ STUB = {
     # Repositories whose authenticated read is throttled; the anonymous read
     # must still be attempted.
     "rate_limited": set(),
+    # Repositories throttled for specific tokens only, so another candidate
+    # token can still read them.
+    "throttled_tokens": {},
     # Repositories renamed upstream: GitHub answers 301 and the client must follow.
     "redirects": {},
     "base": "",
@@ -129,13 +140,11 @@ class StubGithubHandler(BaseHTTPRequestHandler):
                 "if_none_match": self.headers.get("If-None-Match"),
             }
         )
-        if full_name in STUB["rate_limited"] and authorization:
-            self.send_response(403)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-RateLimit-Remaining", "0")
-            self.send_header("X-RateLimit-Reset", "9999999999")
-            self.end_headers()
-            self.wfile.write(b'{"message":"API rate limit exceeded"}')
+        if authorization and (
+            full_name in STUB["rate_limited"]
+            or token in STUB["throttled_tokens"].get(full_name, ())
+        ):
+            self.respond_rate_limited()
             return
         with STUB["lock"]:
             STUB["in_flight"] += 1
@@ -154,6 +163,16 @@ class StubGithubHandler(BaseHTTPRequestHandler):
         finally:
             with STUB["lock"]:
                 STUB["in_flight"] -= 1
+
+    def respond_rate_limited(self):
+        payload = b'{"message":"API rate limit exceeded"}'
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("X-RateLimit-Remaining", "0")
+        self.send_header("X-RateLimit-Reset", "9999999999")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def respond(self, status, body):
         payload = json.dumps(body).encode()
@@ -369,6 +388,32 @@ def main():
                     "reason": "fallback_probe",
                 },
             ),
+            # zeta is throttled only for the payload user's token, eta for every
+            # candidate token. Neither has a usage row, so no public fallback.
+            association(PAYLOAD_USER, ZETA_REPO, ZETA_FULL_NAME),
+            association(FOLLOWER_USER, ZETA_REPO, ZETA_FULL_NAME),
+            association(PAYLOAD_USER, ETA_REPO, ETA_FULL_NAME),
+            association(FOLLOWER_USER, ETA_REPO, ETA_FULL_NAME),
+            task(
+                "task-zeta",
+                "sync.repo_release",
+                {
+                    "user_id": PAYLOAD_USER,
+                    "repo_id": ZETA_REPO,
+                    "repo_full_name": ZETA_FULL_NAME,
+                    "reason": "fallback_probe",
+                },
+            ),
+            task(
+                "task-eta",
+                "sync.repo_release",
+                {
+                    "user_id": PAYLOAD_USER,
+                    "repo_id": ETA_REPO,
+                    "repo_full_name": ETA_FULL_NAME,
+                    "reason": "fallback_probe",
+                },
+            ),
             task("task-account", "sync.releases", {"user_id": ACCOUNT_USER}),
             task("task-pace", "sync.releases", {"user_id": PACE_USER}),
         ]
@@ -400,6 +445,16 @@ def main():
         STUB["releases"][EPSILON_FULL_NAME] = [
             github_release(EPSILON_FULL_NAME, "v5.0.0", 9005, "2026-11-18T00:00:00Z")
         ]
+        STUB["tokens"][ZETA_FULL_NAME] = {FOLLOWER_TOKEN}
+        STUB["releases"][ZETA_FULL_NAME] = [
+            github_release(ZETA_FULL_NAME, "v7.0.0", 9101, "2026-11-18T00:00:00Z")
+        ]
+        STUB["throttled_tokens"][ZETA_FULL_NAME] = {PAYLOAD_TOKEN}
+        STUB["tokens"][ETA_FULL_NAME] = {FOLLOWER_TOKEN}
+        STUB["releases"][ETA_FULL_NAME] = [
+            github_release(ETA_FULL_NAME, "v8.0.0", 9102, "2026-11-18T00:00:00Z")
+        ]
+        STUB["throttled_tokens"][ETA_FULL_NAME] = {PAYLOAD_TOKEN, FOLLOWER_TOKEN}
         for pace_repo_id, pace_full_name in PACE_REPOS:
             STUB["public"].add(pace_full_name)
             STUB["tokens"][pace_full_name] = set()
@@ -587,6 +642,50 @@ def main():
             assert epsilon_auth[:2] == [f"Bearer {PAYLOAD_TOKEN}", None], epsilon_auth
             assert usage_status(EPSILON_REPO).split("|")[0] == "ready", usage_status(EPSILON_REPO)
 
+            # --- a throttled candidate leaves the read to the next one ------
+            status, error_message, result_json = wait_for("task-zeta")
+            assert status == "succeeded", (status, error_message, result_json)
+            zeta = json.loads(result_json)
+            assert zeta["via"] == "candidate", zeta
+            assert "candidate_user_id" not in zeta, zeta
+            zeta_auth = [r["authorization"] for r in requests_for(ZETA_FULL_NAME)]
+            # The payload token is throttled, so the refresh must ask the
+            # follower's token instead of failing the repository.
+            assert zeta_auth == [
+                f"Bearer {PAYLOAD_TOKEN}",
+                f"Bearer {FOLLOWER_TOKEN}",
+            ], zeta_auth
+            assert work_item(ZETA_REPO)[0] == "succeeded", work_item(ZETA_REPO)
+            assert sql(
+                "SELECT tag_name FROM public.repo_releases WHERE release_id = 9101", database_url
+            ) == "v7.0.0"
+
+            # --- every candidate throttled: classify and back off -----------
+            status, error_message, result_json = wait_for("task-eta")
+            assert status == "failed", (status, error_message, result_json)
+            assert error_message.startswith("rate_limited:"), error_message
+            eta_item = work_item(ETA_REPO)
+            assert eta_item[0] == "failed", eta_item
+            assert eta_item[1].startswith("rate_limited:"), eta_item
+            eta_auth = [r["authorization"] for r in requests_for(ETA_FULL_NAME)]
+            # Both candidate tokens were tried and no anonymous read exists for
+            # a repository without a usage row.
+            assert eta_auth == [
+                f"Bearer {PAYLOAD_TOKEN}",
+                f"Bearer {FOLLOWER_TOKEN}",
+            ], eta_auth
+            eta_error, eta_backoff = sql(
+                "SELECT COALESCE(last_error_text, ''), COALESCE(backoff_until, '')"
+                f" FROM public.repo_release_sync_state WHERE repo_id = {ETA_REPO}",
+                database_url,
+            ).split("|", 1)
+            assert eta_error.startswith("rate_limited:"), eta_error
+            assert eta_backoff != "", eta_backoff
+            assert sql(
+                "SELECT COUNT(*) FROM public.repo_releases WHERE repo_id = " + str(ETA_REPO),
+                database_url,
+            ) == "0"
+
             # --- a renamed repository is followed, not failed ----------------
             status, error_message, result_json = wait_for("task-moved")
             assert status == "succeeded", (status, error_message, result_json)
@@ -634,6 +733,8 @@ def main():
                         "account_lane_resilience": "pass",
                         "account_lane_concurrency": "pass",
                         "throttled_token_public_fallback": "pass",
+                        "throttled_candidate_rotation": "pass",
+                        "throttled_candidates_exhausted": "pass",
                         "renamed_repository_redirect": "pass",
                     }
                 )

@@ -88,6 +88,11 @@ const STARRED_RECENT_WINDOW_SIZE: usize = 50;
 const STAR_SYNC_DELTA_PAGE_SIZE: usize = 50;
 const STAR_SYNC_FULL_PAGE_SIZE: usize = 100;
 const STAR_SYNC_EPOCH_LEASE_MINUTES: i64 = 2;
+/// Delay before a deferred (retryable) Star slice may run again.
+///
+/// Mirrors `postgres_star_epochs::STAR_SYNC_EPOCH_RETRY_MINUTES` so both
+/// runtimes retry a failed page on the same cadence.
+const STAR_SYNC_EPOCH_RETRY_MINUTES: i64 = 15;
 #[cfg(test)]
 const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 #[cfg(test)]
@@ -14088,6 +14093,78 @@ async fn fail_star_reconciliation_epoch(
         .await
 }
 
+/// Hand a failed slice back to the scheduler instead of ending the epoch.
+///
+/// The cursor and counters are preserved, so the retry resumes the same page.
+/// `next_slice_not_before` carries the retry time, `failure_reason` keeps the
+/// cause visible, and the lease is released so no stale lease blocks the retry.
+/// A caller whose lease was already taken over by another executor is ignored,
+/// which keeps the deferral from stealing a live slice.
+async fn defer_star_reconciliation_epoch(
+    state: &AppState,
+    epoch_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let retry_at = (now + chrono::Duration::minutes(STAR_SYNC_EPOCH_RETRY_MINUTES)).to_rfc3339();
+    let now_rfc3339 = now.to_rfc3339();
+    state
+        .sqlite_writer
+        .write("star_sync_epoch_defer", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE star_sync_epochs
+                SET status = 'queued',
+                    failure_reason = ?,
+                    next_slice_not_before = ?,
+                    lease_owner_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND (lease_owner_id IS NULL OR lease_owner_id = ?)
+                "#,
+            )
+            .bind(reason)
+            .bind(retry_at.as_str())
+            .bind(now_rfc3339.as_str())
+            .bind(epoch_id)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
+            .await
+            .context("defer star epoch after a failed slice")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
+/// Record a slice failure with the classification that decides its lifetime.
+///
+/// Transient causes (page fetch, rate limit, 5xx, transport) keep the epoch
+/// schedulable; causes a retry cannot fix (expired or under-scoped credentials,
+/// inaccessible connection) still end it.
+async fn record_star_reconciliation_slice_failure(
+    state: &AppState,
+    epoch_id: &str,
+    err: &SyncRequestError,
+) -> Result<()> {
+    tracing::warn!(
+        event = "sync.starred.reconcile.slice_failure",
+        epoch_id,
+        retryable = err.retryable,
+        error_kind = err.reason_code,
+        error_stage = err.phase,
+        error_chain = %err.message,
+        "star reconciliation slice failed"
+    );
+    let reason = format!("{}: {}", err.reason_code, err.message);
+    if err.retryable {
+        defer_star_reconciliation_epoch(state, epoch_id, reason.as_str()).await
+    } else {
+        fail_star_reconciliation_epoch(state, epoch_id, reason.as_str()).await
+    }
+}
+
 async fn schedule_next_star_reconciliation_slice(
     state: &AppState,
     epoch: &StarSyncEpochRow,
@@ -14314,7 +14391,7 @@ pub async fn sync_starred_reconciliation_slice(
     {
         Ok(connection) => connection,
         Err(err) => {
-            fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.message.as_str()).await?;
+            record_star_reconciliation_slice_failure(state, epoch.id.as_str(), &err).await?;
             return Err(err.into_anyhow());
         }
     };
@@ -14328,12 +14405,15 @@ pub async fn sync_starred_reconciliation_slice(
     {
         Ok(page) => page,
         Err(err) => {
-            fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.message.as_str()).await?;
+            record_star_reconciliation_slice_failure(state, epoch.id.as_str(), &err).await?;
             return Err(err.into_anyhow());
         }
     };
     if page.is_over_limit {
-        fail_star_reconciliation_epoch(state, epoch.id.as_str(), "github_is_over_limit").await?;
+        // `isOverLimit=true` only proves this page is incomplete; it never makes
+        // the connection unusable, so keep the cursor and resume later instead
+        // of waiting for the next full-sweep window.
+        defer_star_reconciliation_epoch(state, epoch.id.as_str(), "github_is_over_limit").await?;
         anyhow::bail!("star reconciliation refused to prune an over-limit GitHub connection");
     }
     if let Err(err) = apply_starred_membership_page(
@@ -14345,7 +14425,9 @@ pub async fn sync_starred_reconciliation_slice(
     )
     .await
     {
-        fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.to_string().as_str()).await?;
+        // The page write is idempotent per `(connection, repo)`, so the same
+        // cursor can be replayed instead of ending the sweep on a local error.
+        defer_star_reconciliation_epoch(state, epoch.id.as_str(), err.to_string().as_str()).await?;
         return Err(err);
     }
     let full_sweep_interval_minutes =
@@ -26742,6 +26824,386 @@ mod tests {
         .await
         .expect("load aggregate starred repos");
         assert_eq!(remaining_repos, vec![43]);
+    }
+
+    /// Serve one fixed GraphQL reply per request, enough to drive one Star slice.
+    async fn spawn_star_graphql_stub(status_line: &str, body: Value) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind star graphql stub");
+        let addr = listener
+            .local_addr()
+            .expect("resolve star graphql stub addr");
+        let body = serde_json::to_vec(&body).expect("serialize star graphql stub body");
+        let status_line = status_line.to_owned();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                let status_line = status_line.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 8192];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await;
+                    let mut response = format!(
+                        "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&body);
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                });
+            }
+        });
+        Url::parse(&format!("http://{addr}/graphql")).expect("parse star graphql stub url")
+    }
+
+    fn star_graphql_page_body(is_over_limit: bool) -> Value {
+        json!({
+            "data": {
+                "viewer": {
+                    "starredRepositories": {
+                        "totalCount": 7,
+                        "isOverLimit": is_over_limit,
+                        "pageInfo": { "hasNextPage": true, "endCursor": "next-cursor" },
+                        "edges": [],
+                    }
+                }
+            }
+        })
+    }
+
+    /// Seed one user, one encrypted GitHub connection and one running Star epoch.
+    async fn seed_star_slice_epoch(
+        state: &AppState,
+        epoch_id: &str,
+        user_id: &str,
+        connection_id: &str,
+        lease_owner_id: &str,
+    ) {
+        let pool = &state.pool;
+        seed_user(pool, user_id).await;
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("test-token")
+            .expect("encrypt github access token");
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id,
+              user_id,
+              github_user_id,
+              login,
+              access_token_ciphertext,
+              access_token_nonce,
+              scopes,
+              linked_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(connection_id)
+        .bind(user_id)
+        .bind(30_215_106_i64)
+        .bind("octo")
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("read:user")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(pool)
+        .await
+        .expect("seed github connection");
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO star_sync_epochs (
+              id, user_id, github_connection_id, status, started_at, next_cursor,
+              total_count_at_start, processed_pages, processed_items, next_slice_not_before,
+              lease_owner_id, lease_expires_at, completed_at, failure_reason, created_at, updated_at
+            ) VALUES (?, ?, ?, 'running', ?, 'resume-cursor', 7, 0, 0, NULL, ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(epoch_id)
+        .bind(user_id)
+        .bind(connection_id)
+        .bind(now.to_rfc3339())
+        .bind(lease_owner_id)
+        // A claimable epoch: the previous lease already lapsed, which is exactly
+        // the state the scheduler hands to an executor.
+        .bind("2000-01-01T00:00:00Z")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("seed running star epoch");
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct StarEpochSliceState {
+        status: String,
+        failure_reason: Option<String>,
+        next_slice_not_before: Option<String>,
+        next_cursor: Option<String>,
+        lease_owner_id: Option<String>,
+        lease_expires_at: Option<String>,
+        completed_at: Option<String>,
+        processed_pages: i64,
+        processed_items: i64,
+    }
+
+    async fn load_star_epoch_slice_state(pool: &SqlitePool, epoch_id: &str) -> StarEpochSliceState {
+        sqlx::query_as::<_, StarEpochSliceState>(
+            r#"
+            SELECT status, failure_reason, next_slice_not_before, next_cursor, lease_owner_id,
+                   lease_expires_at, completed_at, processed_pages, processed_items
+            FROM star_sync_epochs
+            WHERE id = ?
+            "#,
+        )
+        .bind(epoch_id)
+        .fetch_one(pool)
+        .await
+        .expect("load star epoch slice state")
+    }
+
+    fn assert_star_retry_scheduled(epoch: &StarEpochSliceState) {
+        let retry_at = epoch
+            .next_slice_not_before
+            .as_deref()
+            .expect("deferred epoch records a retry time");
+        let retry_at = DateTime::parse_from_rfc3339(retry_at)
+            .expect("parse deferred retry time")
+            .with_timezone(&Utc);
+        let wait = retry_at - Utc::now();
+        assert!(
+            (chrono::Duration::minutes(14)..=chrono::Duration::minutes(16)).contains(&wait),
+            "retry time must be the 15 minute slice backoff, got {wait}"
+        );
+    }
+
+    #[tokio::test]
+    async fn star_reconciliation_slice_defers_retryable_fetch_failure() {
+        let stub = spawn_star_graphql_stub(
+            "503 Service Unavailable",
+            json!({ "message": "upstream unavailable" }),
+        )
+        .await;
+        let pool = setup_pool().await;
+        let state = setup_state_with_graphql_url(pool.clone(), stub);
+        let user_id = test_user_id("star-slice-retryable-user");
+        let connection_id = test_user_id("star-slice-retryable-connection");
+        let epoch_id = test_user_id("star-slice-retryable-epoch");
+        seed_star_slice_epoch(
+            state.as_ref(),
+            epoch_id.as_str(),
+            user_id.as_str(),
+            connection_id.as_str(),
+            state.runtime_owner_id.as_str(),
+        )
+        .await;
+
+        let error = super::sync_starred_reconciliation_slice(state.as_ref(), epoch_id.as_str())
+            .await
+            .expect_err("a 503 page fetch must fail the slice");
+        assert!(
+            error.to_string().contains("503"),
+            "slice error must keep the upstream status: {error}"
+        );
+
+        let epoch = load_star_epoch_slice_state(&pool, epoch_id.as_str()).await;
+        assert_eq!(
+            epoch.status, "queued",
+            "retryable failure must stay resumable"
+        );
+        assert_eq!(
+            epoch.completed_at, None,
+            "retryable failure is not terminal"
+        );
+        assert_eq!(
+            epoch.next_cursor.as_deref(),
+            Some("resume-cursor"),
+            "retryable failure must keep the cursor"
+        );
+        assert_eq!(epoch.processed_pages, 0);
+        assert_eq!(epoch.processed_items, 0);
+        assert_eq!(epoch.lease_owner_id, None, "retry must release the lease");
+        assert_eq!(epoch.lease_expires_at, None);
+        assert!(
+            epoch
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("rate_limited")),
+            "retry reason must be recorded: {:?}",
+            epoch.failure_reason
+        );
+        assert_star_retry_scheduled(&epoch);
+
+        let epochs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM star_sync_epochs")
+            .fetch_one(&pool)
+            .await
+            .expect("count star epochs");
+        assert_eq!(epochs, 1, "a deferred slice must not create a second epoch");
+        assert!(
+            super::claim_star_reconciliation_epoch_slice(
+                state.as_ref(),
+                epoch_id.as_str(),
+                Utc::now()
+            )
+            .await
+            .expect("claim deferred epoch")
+            .is_none(),
+            "a deferred epoch must not be claimed before its retry time"
+        );
+
+        sqlx::query("UPDATE star_sync_epochs SET next_slice_not_before = ? WHERE id = ?")
+            .bind("2000-01-01T00:00:00Z")
+            .bind(epoch_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("backdate deferred retry time");
+        let claimed = super::claim_star_reconciliation_epoch_slice(
+            state.as_ref(),
+            epoch_id.as_str(),
+            Utc::now(),
+        )
+        .await
+        .expect("claim due deferred epoch")
+        .expect("deferred epoch becomes claimable once due");
+        assert_eq!(claimed.next_cursor.as_deref(), Some("resume-cursor"));
+    }
+
+    #[tokio::test]
+    async fn star_reconciliation_slice_defers_over_limit_epoch() {
+        let stub = spawn_star_graphql_stub("200 OK", star_graphql_page_body(true)).await;
+        let pool = setup_pool().await;
+        let state = setup_state_with_graphql_url(pool.clone(), stub);
+        let user_id = test_user_id("star-slice-over-limit-user");
+        let connection_id = test_user_id("star-slice-over-limit-connection");
+        let epoch_id = test_user_id("star-slice-over-limit-epoch");
+        seed_star_slice_epoch(
+            state.as_ref(),
+            epoch_id.as_str(),
+            user_id.as_str(),
+            connection_id.as_str(),
+            state.runtime_owner_id.as_str(),
+        )
+        .await;
+
+        let error = super::sync_starred_reconciliation_slice(state.as_ref(), epoch_id.as_str())
+            .await
+            .expect_err("an over-limit page must not be treated as complete");
+        assert!(
+            error.to_string().contains("over-limit"),
+            "over-limit slice error: {error}"
+        );
+
+        let epoch = load_star_epoch_slice_state(&pool, epoch_id.as_str()).await;
+        assert_eq!(
+            epoch.status, "queued",
+            "over-limit epoch must stay resumable"
+        );
+        assert_eq!(epoch.completed_at, None);
+        assert_eq!(epoch.next_cursor.as_deref(), Some("resume-cursor"));
+        assert_eq!(
+            epoch.lease_owner_id, None,
+            "over-limit retry releases the lease"
+        );
+        assert_eq!(epoch.lease_expires_at, None);
+        assert_eq!(
+            epoch.failure_reason.as_deref(),
+            Some("github_is_over_limit"),
+            "over-limit retry records its own reason"
+        );
+        assert_star_retry_scheduled(&epoch);
+    }
+
+    #[tokio::test]
+    async fn star_reconciliation_slice_fails_credentials_epoch() {
+        let stub =
+            spawn_star_graphql_stub("401 Unauthorized", json!({ "message": "Bad credentials" }))
+                .await;
+        let pool = setup_pool().await;
+        let state = setup_state_with_graphql_url(pool.clone(), stub);
+        let user_id = test_user_id("star-slice-credentials-user");
+        let connection_id = test_user_id("star-slice-credentials-connection");
+        let epoch_id = test_user_id("star-slice-credentials-epoch");
+        seed_star_slice_epoch(
+            state.as_ref(),
+            epoch_id.as_str(),
+            user_id.as_str(),
+            connection_id.as_str(),
+            state.runtime_owner_id.as_str(),
+        )
+        .await;
+
+        let error = super::sync_starred_reconciliation_slice(state.as_ref(), epoch_id.as_str())
+            .await
+            .expect_err("a 401 page fetch must fail the slice");
+        assert!(
+            error.to_string().contains("401"),
+            "slice error must keep the upstream status: {error}"
+        );
+
+        let epoch = load_star_epoch_slice_state(&pool, epoch_id.as_str()).await;
+        assert_eq!(epoch.status, "failed", "expired credentials stay terminal");
+        assert!(
+            epoch.completed_at.is_some(),
+            "terminal epoch records its completion time"
+        );
+        assert_eq!(
+            epoch.next_slice_not_before, None,
+            "terminal epoch must not advertise a retry"
+        );
+        assert_eq!(epoch.lease_owner_id, None);
+        assert_eq!(epoch.lease_expires_at, None);
+        assert!(
+            epoch
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("credentials_invalid")),
+            "terminal reason must be recorded: {:?}",
+            epoch.failure_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn star_slice_defer_ignores_a_taken_over_lease() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("star-slice-lease-user");
+        let connection_id = test_user_id("star-slice-lease-connection");
+        let epoch_id = test_user_id("star-slice-lease-epoch");
+        seed_star_slice_epoch(
+            state.as_ref(),
+            epoch_id.as_str(),
+            user_id.as_str(),
+            connection_id.as_str(),
+            "another-executor",
+        )
+        .await;
+        sqlx::query("UPDATE star_sync_epochs SET lease_expires_at = ? WHERE id = ?")
+            .bind((Utc::now() + chrono::Duration::minutes(2)).to_rfc3339())
+            .bind(epoch_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("extend the foreign lease");
+
+        super::defer_star_reconciliation_epoch(state.as_ref(), epoch_id.as_str(), "late failure")
+            .await
+            .expect("defer with a foreign lease");
+
+        let epoch = load_star_epoch_slice_state(&pool, epoch_id.as_str()).await;
+        assert_eq!(epoch.status, "running", "a live slice keeps its status");
+        assert_eq!(
+            epoch.lease_owner_id.as_deref(),
+            Some("another-executor"),
+            "a late defer must not release somebody else's lease"
+        );
+        assert_eq!(epoch.next_slice_not_before, None);
+        assert_eq!(epoch.failure_reason, None);
     }
 
     #[tokio::test]
