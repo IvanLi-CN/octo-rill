@@ -1166,6 +1166,8 @@ function taskTypeLabel(taskType: string) {
 			return "同步通知";
 		case "translate.release":
 			return "翻译 Release";
+		case "translation.generate":
+			return "翻译生成";
 		case "translate.release.batch":
 			return "批量翻译 Release";
 		case "summarize.release.smart.batch":
@@ -1174,6 +1176,14 @@ function taskTypeLabel(taskType: string) {
 			return "翻译 Release 详情";
 		case "translate.notification":
 			return "翻译通知";
+		case "sync.repo_release":
+			return "同步仓库 Release";
+		case "webhook.push.manage":
+			return "Webhook 管理";
+		case "webhook.push.reconcile":
+			return "Webhook 对账";
+		case "release.reading_backfill":
+			return "阅读回填";
 		default:
 			return taskType;
 	}
@@ -1514,20 +1524,23 @@ type RealtimeStatusFilter =
 const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
 const TASK_PAGE_SIZE = 20;
-const USER_SYNC_TASK_TYPES = new Set([
-	"sync.starred.delta",
-	"sync.starred.reconcile",
-]);
-const GENERAL_SCHEDULED_TASK_TYPES = new Set([
-	"brief.daily_slot",
-	"sync.subscriptions",
-	"retry.recent_failures",
-	"webhook.push.audit",
-]);
-const SCHEDULED_TASK_TYPES = new Set([
+const USER_SYNC_TASK_TYPES: Record<string, true> = {
+	"sync.starred": true,
+};
+const GENERAL_SCHEDULED_TASK_TYPES: Record<string, true> = {
+	"brief.daily_slot": true,
+	"brief.generate": true,
+	"sync.releases": true,
+	"sync.notifications": true,
+	"webhook.push.manage": true,
+	"webhook.push.reconcile": true,
+	"retry.recent_failures": true,
+	"release.reading_backfill": true,
+};
+const SCHEDULED_TASK_TYPES: Record<string, true> = {
 	...GENERAL_SCHEDULED_TASK_TYPES,
 	...USER_SYNC_TASK_TYPES,
-]);
+};
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
 
@@ -4865,7 +4878,7 @@ export function JobManagement({
 					return;
 				}
 				const realtimeOnlyItems = res.items.filter(
-					(task) => !SCHEDULED_TASK_TYPES.has(task.task_type),
+					(task) => !SCHEDULED_TASK_TYPES[task.task_type],
 				);
 				// Fallback for older backend versions that ignore task_group.
 				const realtimeTotal =
@@ -4916,8 +4929,8 @@ export function JobManagement({
 				if (requestId !== scheduledRunsRequestIdRef.current) {
 					return;
 				}
-				const scheduledItems = res.items.filter((task) =>
-					GENERAL_SCHEDULED_TASK_TYPES.has(task.task_type),
+				const scheduledItems = res.items.filter(
+					(task) => GENERAL_SCHEDULED_TASK_TYPES[task.task_type],
 				);
 				const scheduledTotal =
 					scheduledItems.length === res.items.length
@@ -4967,8 +4980,8 @@ export function JobManagement({
 				if (requestId !== userSyncRunsRequestIdRef.current) {
 					return;
 				}
-				const userSyncItems = res.items.filter((task) =>
-					USER_SYNC_TASK_TYPES.has(task.task_type),
+				const userSyncItems = res.items.filter(
+					(task) => USER_SYNC_TASK_TYPES[task.task_type],
 				);
 				const userSyncTotal =
 					userSyncItems.length === res.items.length
@@ -6343,6 +6356,8 @@ export function JobManagement({
 	const openLlmDetailTone = llmDetail ? taskStatusTone(llmDetail.status) : null;
 	const cancelRequestedBadgeClass =
 		"border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
+	const legacyTaskBadgeClass =
+		"border-stone-300 bg-stone-100 text-stone-700 dark:border-stone-500/60 dark:bg-stone-500/20 dark:text-stone-200";
 
 	return (
 		<div className="space-y-4">
@@ -7342,6 +7357,12 @@ export function JobManagement({
 																		)}
 																		tone={tone}
 																	/>
+																	{task.legacy ? (
+																		<FlagBadge
+																			label="旧 SQLite 期"
+																			className={legacyTaskBadgeClass}
+																		/>
+																	) : null}
 																	<span className="hidden rounded-md border bg-background px-1.5 py-0.5 font-mono text-[11px] sm:inline">
 																		{sourceLabel(task.source)}
 																	</span>
@@ -9150,6 +9171,12 @@ export function JobManagement({
 												label={taskStatusLabel(activeTaskDetail.task.status)}
 												tone={activeDetailTone}
 											/>
+											{activeTaskDetail.task.legacy ? (
+												<FlagBadge
+													label="旧 SQLite 期"
+													className={legacyTaskBadgeClass}
+												/>
+											) : null}
 											{activeTaskDetail.task.cancel_requested ? (
 												<FlagBadge
 													label="已请求取消"

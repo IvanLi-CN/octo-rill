@@ -97,7 +97,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             ),
         )
         .register(
-            "sync.repo_release",
+            crate::admin_job_groups::TASK_SYNC_REPO_RELEASE,
             RepoReleaseRefreshExecutor::new(
                 runtime.pool.clone(),
                 http.clone(),
@@ -138,7 +138,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             ),
         )
         .register(
-            "webhook.push.reconcile",
+            crate::admin_job_groups::TASK_WEBHOOK_PUSH_RECONCILE,
             WebhookExecutor::new(
                 runtime.pool.clone(),
                 http.clone(),
@@ -149,7 +149,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         .register("brief.generate", BriefExecutor::new(runtime.pool.clone()))
         .register("brief.daily_slot", BriefExecutor::new(runtime.pool.clone()))
         .register(
-            "translation.generate",
+            crate::admin_job_groups::TASK_TRANSLATION_GENERATE,
             TranslationExecutor::new(runtime.pool.clone(), http.clone(), config.ai.clone()),
         )
         .build();
@@ -165,6 +165,18 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
         ai_model: config.ai.as_ref().map(|ai| ai.model.clone()),
         ai: config.ai.clone(),
     };
+    debug_assert_eq!(
+        state.task_registry.registered_task_types(),
+        {
+            let mut expected = crate::admin_job_groups::POSTGRES_TASK_EXECUTOR_TYPES
+                .iter()
+                .map(|task_type| (*task_type).to_owned())
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected
+        },
+        "executor registry drifted from the admin job task groups"
+    );
     info!(
         task_types = ?state.task_registry.registered_task_types(),
         "PostgreSQL task executors registered"
