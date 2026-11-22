@@ -235,8 +235,17 @@ def main():
 
             code, body = request('/api/admin/jobs/overview')
             assert code == 200, (code, body)
-            assert body['source'] == 'postgresql', body
-            assert body['counts'] is not None, body
+            assert set(body) == {
+                'queued',
+                'running',
+                'failed_24h',
+                'succeeded_24h',
+                'enabled_scheduled_slots',
+                'total_scheduled_slots',
+            }, body
+            assert all(isinstance(value, int) for value in body.values()), body
+            assert body['enabled_scheduled_slots'] == 24, body
+            assert body['total_scheduled_slots'] == 24, body
             checks['admin_jobs_overview'] = 'pass'
 
             # The imported shape carries the translation retry columns; a fresh
