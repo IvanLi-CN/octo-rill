@@ -3117,7 +3117,11 @@ async fn route_models(pool: &PgPool, fallback_model: &str) -> Result<Vec<String>
                 LlmFailure::configuration()
             })?
         }
-        _ => Vec::new(),
+        Some(_) => Vec::new(),
+        None => {
+            tracing::warn!("PostgreSQL LLM routing settings row is missing");
+            return Err(LlmFailure::configuration());
+        }
     };
     let mut models = crate::admin_runtime::normalize_llm_models(parsed);
     if models.is_empty() {
@@ -4521,6 +4525,21 @@ mod tests {
                 route_models(&pool, "fallback").await?,
                 vec!["fallback".to_owned()]
             );
+            sqlx::query("DELETE FROM public.admin_runtime_settings WHERE id = 1")
+                .execute(&pool)
+                .await?;
+            let missing_error = route_models(&pool, "fallback")
+                .await
+                .expect_err("a missing routing settings row must fail closed");
+            assert_eq!(
+                missing_error.class,
+                crate::ai::LlmFailureClass::Configuration
+            );
+            sqlx::query(
+                "INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '[]')",
+            )
+            .execute(&pool)
+            .await?;
             sqlx::query(
                 "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"alpha\", \"beta\"]' WHERE id = 1",
             )
@@ -4574,8 +4593,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    async fn postgres_translate_complete_falls_back_after_429_and_audits_switch()
-    -> anyhow::Result<()> {
+    async fn postgres_translate_complete_routes_failures_and_audits_switch() -> anyhow::Result<()> {
         use axum::{Json, Router, http::StatusCode, routing::post};
         use sqlx::PgPool;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4602,10 +4620,23 @@ mod tests {
                 async move {
                     let model = payload["model"].as_str().unwrap_or_default().to_owned();
                     recorder.lock().await.push(model.clone());
-                    if model == "model-a" || handler_fail_all.load(Ordering::SeqCst) {
+                    let status = if model == "model-a" || handler_fail_all.load(Ordering::SeqCst) {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else if model == "park-me" {
+                        StatusCode::UNAUTHORIZED
+                    } else if model == "bad-400" {
+                        StatusCode::BAD_REQUEST
+                    } else if model == "bad-404" {
+                        StatusCode::NOT_FOUND
+                    } else if model == "bad-422" {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    } else {
+                        StatusCode::OK
+                    };
+                    if status != StatusCode::OK {
                         return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({"error": {"message": "rpm exhausted"}})),
+                            status,
+                            Json(serde_json::json!({"error": {"message": "upstream rejected"}})),
                         );
                     }
                     (
@@ -4706,10 +4737,10 @@ mod tests {
                 .await
                 .expect_err("all failing candidates must exhaust the attempt budget");
             assert_eq!(failure.class, crate::ai::LlmFailureClass::RateLimited);
-            let observed = observed.lock().await.clone();
-            assert_eq!(observed.len(), 11);
+            let observed_after_budget = observed.lock().await.clone();
+            assert_eq!(observed_after_budget.len(), 11);
             assert_eq!(
-                observed[3..].to_vec(),
+                observed_after_budget[3..].to_vec(),
                 vec![
                     "f1".to_owned(),
                     "f1".to_owned(),
@@ -4730,6 +4761,103 @@ mod tests {
                     .fetch_one(&pool)
                     .await?;
             assert_eq!(f5_health, 0, "the ninth candidate is never attempted");
+            fail_all.store(false, Ordering::SeqCst);
+            sqlx::query(
+                "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"park-me\", \"after-park\"]' WHERE id = 1",
+            )
+            .execute(&pool)
+            .await?;
+            let content = audit.complete("body", "system", "user", 64).await?;
+            assert_eq!(content, "ok");
+            let observed_after_park = observed.lock().await.clone();
+            assert_eq!(observed_after_park.len(), 13);
+            assert_eq!(
+                observed_after_park[11..].to_vec(),
+                vec!["park-me".to_owned(), "after-park".to_owned()]
+            );
+            let (parked_until, parked_class): (
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT cooldown_until, last_failure_class FROM public.llm_model_health WHERE model = 'park-me'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(parked_class.as_deref(), Some("configuration"));
+            assert!(
+                parked_until.expect("a credential rejection parks the model")
+                    > chrono::Utc::now() + chrono::Duration::hours(23)
+            );
+            let after_park_health: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.llm_model_health WHERE model = 'after-park'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(after_park_health, 0);
+            let last_row: (String, i64) = sqlx::query_as(
+                "SELECT c.model, c.fallback_count FROM public.llm_calls c JOIN public.translation_attempt_llm_calls l ON l.llm_call_id = c.id ORDER BY l.ordinal DESC LIMIT 1",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(last_row.0, "after-park");
+            assert_eq!(last_row.1, 1);
+            sqlx::query(
+                "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"bad-400\", \"bad-404\", \"bad-422\", \"after-bad\"]' WHERE id = 1",
+            )
+            .execute(&pool)
+            .await?;
+            let content = audit.complete("body", "system", "user", 64).await?;
+            assert_eq!(content, "ok");
+            let observed_after_bad = observed.lock().await.clone();
+            assert_eq!(observed_after_bad.len(), 17);
+            assert_eq!(
+                observed_after_bad[13..].to_vec(),
+                vec![
+                    "bad-400".to_owned(),
+                    "bad-404".to_owned(),
+                    "bad-422".to_owned(),
+                    "after-bad".to_owned()
+                ]
+            );
+            let bad_health: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.llm_model_health WHERE model IN ('bad-400', 'bad-404', 'bad-422')",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(bad_health, 0, "request-level 4xx must not cool models");
+            let after_bad_health: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.llm_model_health WHERE model = 'after-bad'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(after_bad_health, 0);
+            let last_row: (String, i64) = sqlx::query_as(
+                "SELECT c.model, c.fallback_count FROM public.llm_calls c JOIN public.translation_attempt_llm_calls l ON l.llm_call_id = c.id ORDER BY l.ordinal DESC LIMIT 1",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(last_row.0, "after-bad");
+            assert_eq!(last_row.1, 3);
+            let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(calls, 17);
+            sqlx::raw_sql(
+                "DROP TABLE public.llm_model_health; CREATE TABLE public.llm_model_health(model text PRIMARY KEY, cooldown_until text, last_failure_class text); INSERT INTO public.llm_model_health(model, cooldown_until, last_failure_class) VALUES ('broken', 'not-a-time', 'rate_limited');",
+            )
+            .execute(&pool)
+            .await?;
+            let before_health_failure = observed.lock().await.len();
+            let failure = audit
+                .complete("body", "system", "user", 64)
+                .await
+                .expect_err("malformed health must fail closed");
+            assert_eq!(failure.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(observed.lock().await.len(), before_health_failure);
+            let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(calls, 17, "malformed health must not create a provider call");
             Ok::<_, anyhow::Error>(())
         }
         .await;

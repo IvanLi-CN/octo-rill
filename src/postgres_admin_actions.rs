@@ -13,7 +13,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -835,12 +835,7 @@ pub(crate) async fn admin_patch_llm_runtime_config(
         .bind(now_at)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE public.llm_model_health SET cooldown_until = NULL, updated_at = $1 WHERE last_failure_class = 'configuration' AND cooldown_until IS NOT NULL",
-        )
-        .bind(now_at)
-        .execute(&mut *tx)
-        .await?;
+        clear_credential_park_cooldowns(&mut *tx, now_at).await?;
         tx.commit().await
     }
     .await;
@@ -849,6 +844,22 @@ pub(crate) async fn admin_patch_llm_runtime_config(
     }
 
     crate::postgres_admin_llm::status(State(state), session).await
+}
+
+async fn clear_credential_park_cooldowns<'c, E>(
+    executor: E,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = Postgres>,
+{
+    sqlx::query(
+        "UPDATE public.llm_model_health SET cooldown_until = NULL, updated_at = $1 WHERE last_failure_class = 'configuration' AND cooldown_until IS NOT NULL",
+    )
+    .bind(now)
+    .execute(executor)
+    .await
+    .map(|result| result.rows_affected())
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,4 +1704,66 @@ pub(crate) async fn admin_patch_translation_runtime_config(
     }
 
     admin_translation_status(State(state), session).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_credential_park_cooldowns;
+    use chrono::{Duration, Utc};
+    use sqlx::PgPool;
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn admin_save_clears_credential_park_cooldowns() -> anyhow::Result<()> {
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("admin_health_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count bigint NOT NULL DEFAULT 0, window_started_at timestamptz, cooldown_until timestamptz, last_failure_class text, last_failure_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let now = Utc::now();
+            sqlx::query(
+                "INSERT INTO public.llm_model_health(model, relevant_failure_count, cooldown_until, last_failure_class, created_at, updated_at) VALUES ('parked', 2, $1, 'configuration', $2, $2), ('cooling', 2, $3, 'rate_limited', $2, $2)",
+            )
+            .bind(now + Duration::hours(24))
+            .bind(now)
+            .bind(now + Duration::minutes(5))
+            .execute(&pool)
+            .await?;
+            let updated = clear_credential_park_cooldowns(&pool, now).await?;
+            assert_eq!(updated, 1);
+            let parked: (Option<chrono::DateTime<Utc>>, Option<String>) = sqlx::query_as(
+                "SELECT cooldown_until, last_failure_class FROM public.llm_model_health WHERE model = 'parked'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(parked.0, None);
+            assert_eq!(parked.1.as_deref(), Some("configuration"));
+            let cooling: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT cooldown_until FROM public.llm_model_health WHERE model = 'cooling'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert!(cooling.is_some_and(|until| until > now));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
 }
