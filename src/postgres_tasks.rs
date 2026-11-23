@@ -1223,21 +1223,52 @@ impl TaskExecutor for ReleasesExecutor {
 }
 
 impl ReleasesExecutor {
-    /// Queue automatic release translation for the releases this sync inserted.
+    /// Queue automatic release translation for the releases this sync inserted
+    /// and drain one bounded slice of the backlog the batch cap left behind.
     ///
     /// The sync already committed its repository writes, so a failure here is
     /// reported and swallowed: the releases stay stored and the next sync of the
     /// same repository is unaffected. Without a configured AI provider the lane
     /// writes nothing.
     async fn enqueue_translations(&self, user_id: &str, new_release_ids: &[i64]) -> usize {
-        if self.ai.is_none() || new_release_ids.is_empty() {
+        if self.ai.is_none() {
             return 0;
         }
-        match crate::postgres_translate::enqueue_release_translations(
+        let mut enqueued = 0usize;
+        if !new_release_ids.is_empty() {
+            match crate::postgres_translate::enqueue_release_translations(
+                &self.pool,
+                user_id,
+                new_release_ids,
+                "sync.releases.auto_translate",
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(
+                            event = "translation.enqueue",
+                            operation = "sync.releases",
+                            user_id,
+                            translations_enqueued = count,
+                            "automatic release translation queued"
+                        );
+                    }
+                    enqueued = count;
+                }
+                Err(error) => warn!(
+                    event = "translation.enqueue",
+                    operation = "sync.releases",
+                    user_id,
+                    error = %error,
+                    "automatic release translation enqueue failed"
+                ),
+            }
+        }
+        match crate::postgres_translate::enqueue_pending_translation_tasks(
             &self.pool,
             user_id,
-            new_release_ids,
-            "sync.releases.auto_translate",
+            "sync.releases.translation_backlog",
         )
         .await
         {
@@ -1247,11 +1278,11 @@ impl ReleasesExecutor {
                         event = "translation.enqueue",
                         operation = "sync.releases",
                         user_id,
-                        translations_enqueued = count,
-                        "automatic release translation queued"
+                        translations_drained = count,
+                        "automatic translation backlog drained"
                     );
                 }
-                count
+                enqueued + count
             }
             Err(error) => {
                 warn!(
@@ -1259,9 +1290,9 @@ impl ReleasesExecutor {
                     operation = "sync.releases",
                     user_id,
                     error = %error,
-                    "automatic release translation enqueue failed"
+                    "automatic translation backlog drain failed"
                 );
-                0
+                enqueued
             }
         }
     }

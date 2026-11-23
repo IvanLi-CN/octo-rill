@@ -14,7 +14,8 @@
 
 ## Related Changes
 
-- 账号级与单仓 Release 刷新恢复自动翻译：只为本次插入的 Release 排队 `translation.generate`，按工作项去重并在有在途任务时跳过，单次最多 25 个 Release（`REQ-PGR-009`）。旧 `content_processing` 流水线不随本变更恢复。
+- 账号级与单仓 Release 刷新恢复自动翻译：只为本次插入的 Release 排队 `translation.generate`，按工作项去重并在有在途任务时跳过（`REQ-PGR-009`）。旧 `content_processing` 流水线不随本变更恢复。
+- 单次任务创建上限仍为 25 个 Release，但超出上限的候选改为写入 `queued` 工作项，由后续同步周期每次最多排空 25 个，冷启动不再丢翻译；排空跳过在途任务，不重排终态失败项（`REQ-PGR-009`）。
 - 瞬时 GitHub Release 读取失败（代理 5xx／HTML 错误体／`timeout`／`network_error`）改为每页最多两次请求、300 ms 退避；账号级任务结果新增 `failed_count`、`deferred_count`、`failure_ratio`、`failure_reasons`、`degraded`，部分失败标记 degraded，全部失败记为任务失败（`REQ-PGR-005`，验证入口 `cargo test --bin octo-rill postgres_repo_release`）。
 - issue #384：未认证 Release 读取纳入进程级预算（`REQ-PGR-008`）；预算耗尽记为延后，不再混入失败分类，验证入口为 `scripts/pg_seed_repo_release_anon_budget_test.py`。
 - 表情计数持久化不再写 `repo_releases.updated_at`：该列是 Release 源修订号，内容处理用它判断在途 work item 是否过期；被推进后 GitHub 真实修订与 LLM provider admission 判定互相冲突。修复入口为 `scripts/pg_seed_reactions_test.py`，存量污染行用 `octo-rill-migrate repair-release-revisions` 修复。
