@@ -46,6 +46,7 @@ web/*.tsbuildinfo
 !.codex/skills/**
 .codex/skills/**/__pycache__/
 .codex/skills/**/*.pyc
+.codex-artifacts/
 .impeccable/
 .serena/
 .serena
