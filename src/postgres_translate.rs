@@ -62,6 +62,10 @@ const RELEASE_TITLE_MAX_TOKENS: u32 = 120;
 /// every queued work item becomes an LLM call, so the sync lane must not turn
 /// one GitHub refresh into an unbounded provider burst.
 const AUTO_RELEASE_TRANSLATION_CAP: usize = 25;
+/// Total attempts one release source revision may make, including the first.
+/// Automatic recovery stops here so a permanently failing release cannot burn
+/// provider calls on every sync cycle.
+const AUTO_TRANSLATION_MAX_ATTEMPTS: i32 = 3;
 const RELEASE_BODY_MAX_TOKENS: u32 = 4_000;
 const NOTIFICATION_MAX_TOKENS: u32 = 1_100;
 const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1768,14 +1772,33 @@ fn auto_translation_decision(
     }
 }
 
+/// Delay before the next automatic attempt; `None` retires the work item.
+///
+/// The delays grow per attempt so a provider incident recovers without a retry
+/// storm, and [`AUTO_TRANSLATION_MAX_ATTEMPTS`] stops permanent failures.
+fn automatic_retry_delay(attempt_no: i32) -> Option<chrono::Duration> {
+    if attempt_no <= 0 || attempt_no >= AUTO_TRANSLATION_MAX_ATTEMPTS {
+        return None;
+    }
+    Some(match attempt_no {
+        1 => chrono::Duration::minutes(10),
+        _ => chrono::Duration::hours(1),
+    })
+}
+
 /// The persisted columns a queued release translation needs to become a task.
 struct AutomaticWorkItem {
     id: String,
-    status: String,
-    result_status: Option<String>,
     source_hash: String,
     source_blocks_json: String,
     target_slots_json: String,
+}
+
+/// The work item after the dedupe upsert, with the state the decision needs.
+struct UpsertedWorkItem {
+    work_item: AutomaticWorkItem,
+    status: String,
+    result_status: Option<String>,
 }
 
 /// Upsert the dedupe-keyed work item for one release target.
@@ -1788,7 +1811,7 @@ async fn upsert_translation_work_item(
     user_id: &str,
     target: &Target,
     now: chrono::DateTime<Utc>,
-) -> anyhow::Result<AutomaticWorkItem> {
+) -> anyhow::Result<UpsertedWorkItem> {
     let key = dedupe_key(user_id, target);
     let source_blocks_json = serde_json::to_string(&target.source_blocks)
         .context("serialize automatic translation source blocks")?;
@@ -1812,13 +1835,15 @@ async fn upsert_translation_work_item(
     .fetch_one(&mut **tx)
     .await
     .context("upsert automatic release translation work item")?;
-    Ok(AutomaticWorkItem {
-        id,
+    Ok(UpsertedWorkItem {
+        work_item: AutomaticWorkItem {
+            id,
+            source_hash: target.source_hash.clone(),
+            source_blocks_json,
+            target_slots_json,
+        },
         status,
         result_status,
-        source_hash: target.source_hash.clone(),
-        source_blocks_json,
-        target_slots_json,
     })
 }
 
@@ -1835,17 +1860,17 @@ async fn enqueue_one_release_translation(
         .begin()
         .await
         .context("begin automatic release translation enqueue")?;
-    let work_item = upsert_translation_work_item(&mut tx, user_id, target, now).await?;
+    let upserted = upsert_translation_work_item(&mut tx, user_id, target, now).await?;
     let task_in_flight = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM public.job_tasks WHERE task_type = 'translation.generate' AND status IN ('queued', 'running') AND pg_input_is_valid(payload_json, 'jsonb') AND payload_json::jsonb ->> 'work_item_id' = $1)",
     )
-    .bind(&work_item.id)
+    .bind(&upserted.work_item.id)
     .fetch_one(&mut *tx)
     .await
     .context("check in-flight automatic release translation task")?;
     let decision = auto_translation_decision(
-        &work_item.status,
-        work_item.result_status.as_deref(),
+        &upserted.status,
+        upserted.result_status.as_deref(),
         task_in_flight,
     );
     let AutoTranslationDecision::Enqueue { reset_work_item } = decision else {
@@ -1859,7 +1884,7 @@ async fn enqueue_one_release_translation(
             "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2",
         )
         .bind(now)
-        .bind(&work_item.id)
+        .bind(&upserted.work_item.id)
         .execute(&mut *tx)
         .await
         .context("requeue automatic release translation work item")?;
@@ -1870,11 +1895,11 @@ async fn enqueue_one_release_translation(
         source,
         &target.entity_id,
         TargetKind::ReleaseDetail,
-        &work_item,
+        &upserted.work_item,
         now,
     )
     .await?;
-    insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
+    insert_translation_task(&mut tx, user_id, source, &upserted.work_item.id, now).await?;
     tx.commit()
         .await
         .context("commit automatic release translation enqueue")?;
@@ -1956,26 +1981,114 @@ async fn insert_translation_task(
     Ok(())
 }
 
-/// Queue `translation.generate` tasks for release work items the batch cap left
-/// queued.
+/// Queue `translation.generate` tasks for the work items the batch cap and the
+/// failure policy left behind.
 ///
-/// One call turns at most [`AUTO_RELEASE_TRANSLATION_CAP`] orphaned work items
-/// into tasks, and the account release sync runs on the scheduler interval, so
-/// a large cold start drains over several cycles instead of flooding the single
-/// PostgreSQL task worker. Work items with a queued or running task are skipped
-/// (single flight), and failed or finished work items never match.
+/// One call handles at most [`AUTO_RELEASE_TRANSLATION_CAP`] work items. Due
+/// automatic retries go first; the rest of the budget drains the queued backlog.
+/// The account release sync runs on the scheduler interval, so a large cold
+/// start or a provider incident recovers over several cycles instead of flooding
+/// the single PostgreSQL task worker.
+///
+/// Retries only match work items whose last completed attempt was recoverable,
+/// whose scheduled `next_retry_at` has passed, and that have no queued or running
+/// task. [`automatic_retry_delay`] stops scheduling after
+/// [`AUTO_TRANSLATION_MAX_ATTEMPTS`] and `finish_request` never schedules a
+/// configuration failure, so a permanently broken release cannot retry forever.
 pub(crate) async fn enqueue_pending_translation_tasks(
     pool: &PgPool,
     user_id: &str,
     source: &str,
 ) -> anyhow::Result<usize> {
     let now = Utc::now();
+    let cap = i64::try_from(AUTO_RELEASE_TRANSLATION_CAP).unwrap_or(i64::MAX);
     let mut tx = pool
         .begin()
         .await
         .context("begin automatic translation backlog drain")?;
-    // `FOR UPDATE SKIP LOCKED` makes two concurrent lanes for the same user skip
-    // each other's rows instead of queueing the same work item twice.
+    // `FOR UPDATE OF wi SKIP LOCKED` makes two concurrent lanes for the same
+    // user skip each other's work items instead of queueing one twice.
+    let retries = sqlx::query(
+        r#"
+        SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
+        FROM public.translation_work_items AS wi
+        JOIN LATERAL (
+          SELECT event.retry_eligible, event.next_retry_at
+          FROM public.translation_attempt_events AS event
+          WHERE event.work_item_id = wi.id
+            AND event.event_type = 'attempt_completed'
+          ORDER BY event.attempt_no DESC
+          LIMIT 1
+        ) AS last ON true
+        WHERE wi.scope_user_id = $1
+          AND wi.kind = 'release_detail'
+          AND wi.variant = 'detail'
+          AND wi.status = 'failed'
+          AND wi.result_status = 'error'
+          AND last.retry_eligible
+          AND last.next_retry_at IS NOT NULL
+          AND last.next_retry_at <= $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.job_tasks AS task
+            WHERE task.task_type = 'translation.generate'
+              AND task.status IN ('queued', 'running')
+              AND pg_input_is_valid(task.payload_json, 'jsonb')
+              AND task.payload_json::jsonb ->> 'work_item_id' = wi.id
+          )
+        ORDER BY last.next_retry_at ASC, wi.id ASC
+        LIMIT $3
+        FOR UPDATE OF wi SKIP LOCKED
+        "#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .bind(cap)
+    .fetch_all(&mut *tx)
+    .await
+    .context("select automatic translation retries")?;
+    let mut queued = 0usize;
+    let mut retried = 0usize;
+    for row in retries {
+        let work_item = AutomaticWorkItem {
+            id: row.try_get("id")?,
+            source_hash: row.try_get("source_hash")?,
+            source_blocks_json: row.try_get("source_blocks_json")?,
+            target_slots_json: row.try_get("target_slots_json")?,
+        };
+        // Reuse the authorized-retry reset: the next attempt starts from a clean
+        // queued state and the executor accepts it again.
+        sqlx::query(
+            "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, deadline_at = $1, updated_at = $1 WHERE id = $2",
+        )
+        .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
+        .bind(&work_item.id)
+        .execute(&mut *tx)
+        .await
+        .context("requeue automatic translation retry")?;
+        let entity_id = row.try_get::<String, _>("entity_id")?;
+        insert_translation_request(
+            &mut tx,
+            user_id,
+            source,
+            &entity_id,
+            TargetKind::ReleaseDetail,
+            &work_item,
+            now,
+        )
+        .await?;
+        insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
+        retried += 1;
+    }
+    queued += retried;
+    let remaining = AUTO_RELEASE_TRANSLATION_CAP.saturating_sub(retried);
+    if remaining == 0 {
+        tx.commit()
+            .await
+            .context("commit automatic translation backlog drain")?;
+        log_drain(user_id, source, retried, 0);
+        return Ok(queued);
+    }
     let rows = sqlx::query(
         r#"
         SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
@@ -1999,16 +2112,14 @@ pub(crate) async fn enqueue_pending_translation_tasks(
         "#,
     )
     .bind(user_id)
-    .bind(i64::try_from(AUTO_RELEASE_TRANSLATION_CAP).unwrap_or(i64::MAX))
+    .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
     .fetch_all(&mut *tx)
     .await
     .context("select automatic translation backlog")?;
-    let mut queued = 0usize;
+    let mut drained = 0usize;
     for row in rows {
         let work_item = AutomaticWorkItem {
             id: row.try_get("id")?,
-            status: "queued".to_owned(),
-            result_status: None,
             source_hash: row.try_get("source_hash")?,
             source_blocks_json: row.try_get("source_blocks_json")?,
             target_slots_json: row.try_get("target_slots_json")?,
@@ -2023,23 +2134,41 @@ pub(crate) async fn enqueue_pending_translation_tasks(
         .execute(&mut *tx)
         .await
         .context("refresh automatic translation backlog deadline")?;
+        let entity_id = row.try_get::<String, _>("entity_id")?;
         insert_translation_request(
             &mut tx,
             user_id,
             source,
-            row.try_get::<String, _>("entity_id")?.as_str(),
+            &entity_id,
             TargetKind::ReleaseDetail,
             &work_item,
             now,
         )
         .await?;
         insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
-        queued += 1;
+        drained += 1;
     }
     tx.commit()
         .await
         .context("commit automatic translation backlog drain")?;
-    Ok(queued)
+    log_drain(user_id, source, retried, drained);
+    Ok(queued + drained)
+}
+
+/// Emit one line per drain so operators can see recovery progress.
+fn log_drain(user_id: &str, source: &str, retried: usize, drained: usize) {
+    if retried > 0 {
+        info!(
+            event = "translation.retry",
+            user_id, source, retried, "automatic translation retried recoverable failures"
+        );
+    }
+    if drained > 0 {
+        info!(
+            event = "translation.enqueue",
+            user_id, source, drained, "automatic translation backlog drained"
+        );
+    }
 }
 
 /// Open the next attempt on an existing work item.
@@ -2076,6 +2205,7 @@ async fn start_attempt(
         None,
         None,
         false,
+        None,
         "[]",
         now,
     )
@@ -2109,6 +2239,7 @@ async fn start_attempt(
         None,
         None,
         false,
+        None,
         "[]",
         now,
     )
@@ -2130,6 +2261,7 @@ async fn insert_attempt_event(
     error_code: Option<&str>,
     error_summary: Option<&str>,
     retry_eligible: bool,
+    next_retry_at: Option<chrono::DateTime<Utc>>,
     llm_call_ids_json: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
@@ -2139,7 +2271,7 @@ async fn insert_attempt_event(
         None
     };
     sqlx::query(
-        "INSERT INTO public.translation_attempt_events (id, work_item_id, request_id, scope_user_id, kind, variant, entity_id, target_lang, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, llm_call_ids_json, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'initial',$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
+        "INSERT INTO public.translation_attempt_events (id, work_item_id, request_id, scope_user_id, kind, variant, entity_id, target_lang, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, llm_call_ids_json, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'initial',$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
     )
     .bind(local_id::generate_local_id())
     .bind(work_item_id)
@@ -2156,6 +2288,7 @@ async fn insert_attempt_event(
     .bind(error_summary)
     .bind(failure_class)
     .bind(i64::from(retry_eligible))
+    .bind(next_retry_at)
     .bind(llm_call_ids_json)
     .bind(now)
     .execute(&mut **tx)
@@ -2361,6 +2494,12 @@ async fn finish_request(
             .await?;
         }
     }
+    // Only a recoverable failure is scheduled for automatic recovery; the
+    // attempt cap and the per-attempt delay live in `automatic_retry_delay`.
+    let next_retry_at = (outcome.result_status != "ready" && outcome.retry_eligible)
+        .then(|| automatic_retry_delay(scope.attempt_no))
+        .flatten()
+        .map(|delay| now + delay);
     insert_attempt_event(
         &mut tx,
         &scope.work_item_id,
@@ -2374,6 +2513,7 @@ async fn finish_request(
         outcome.error_code,
         outcome.error_summary,
         outcome.retry_eligible,
+        next_retry_at,
         call_ids_json,
         now,
     )
@@ -3484,10 +3624,24 @@ fn db_failure(error: sqlx::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_RELEASE_TRANSLATION_CAP, AutoTranslationDecision, auto_translation_decision,
-        deduped_release_ids, enqueue_pending_translation_tasks, enqueue_release_translations,
+        AUTO_RELEASE_TRANSLATION_CAP, AUTO_TRANSLATION_MAX_ATTEMPTS, AutoTranslationDecision,
+        auto_translation_decision, automatic_retry_delay, deduped_release_ids,
+        enqueue_pending_translation_tasks, enqueue_release_translations,
         release_has_translatable_content,
     };
+
+    #[test]
+    fn automatic_retry_backs_off_and_stops_at_the_attempt_cap() {
+        assert_eq!(
+            automatic_retry_delay(1),
+            Some(chrono::Duration::minutes(10))
+        );
+        assert_eq!(automatic_retry_delay(2), Some(chrono::Duration::hours(1)));
+        assert_eq!(automatic_retry_delay(3), None);
+        assert_eq!(automatic_retry_delay(0), None);
+        assert_eq!(automatic_retry_delay(9), None);
+        assert_eq!(AUTO_TRANSLATION_MAX_ATTEMPTS, 3);
+    }
 
     #[test]
     fn automatic_enqueue_deduplicates_release_ids_in_caller_order() {
@@ -3526,6 +3680,85 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_backlog_retries_only_due_recoverable_failures() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_retry_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at timestamptz NOT NULL,status text NOT NULL,result_status text,error_text text,created_at timestamptz NOT NULL,finished_at timestamptz,updated_at timestamptz NOT NULL);
+                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no integer NOT NULL,event_type text NOT NULL,retry_eligible boolean NOT NULL DEFAULT false,next_retry_at timestamptz,created_at timestamptz NOT NULL);
+                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
+                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let now = chrono::Utc::now();
+            for (work_item_id, eligible, due_minutes) in
+                [("due", true, -10_i64), ("later", true, 60), ("permanent", false, -10)]
+            {
+                sqlx::query("INSERT INTO translation_work_items(id,dedupe_key,scope_user_id,kind,variant,entity_id,target_lang,protocol_version,model_profile,source_hash,source_blocks_json,target_slots_json,token_estimate,deadline_at,status,result_status,error_text,created_at,finished_at,updated_at) VALUES($1,$1,'user-a','release_detail','detail',$1,'zh-CN','translation-request.v1','postgres-default',$1,'[]','[]',0,$2,'failed','error','boom',$2,$2,$2)")
+                    .bind(work_item_id)
+                    .bind(now - chrono::Duration::minutes(5))
+                    .execute(&pool)
+                    .await?;
+                sqlx::query("INSERT INTO translation_attempt_events(id,work_item_id,attempt_no,event_type,retry_eligible,next_retry_at,created_at) VALUES($1,$2,1,'attempt_completed',$3,$4,$5)")
+                    .bind(format!("event-{work_item_id}"))
+                    .bind(work_item_id)
+                    .bind(eligible)
+                    .bind(now + chrono::Duration::minutes(due_minutes))
+                    .bind(now - chrono::Duration::minutes(5))
+                    .execute(&pool)
+                    .await?;
+            }
+            let retried = enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?;
+            assert_eq!(retried, 1, "only the due recoverable failure is retried");
+            let due_status: String =
+                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='due'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(due_status, "queued");
+            let later_status: String =
+                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='later'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(later_status, "failed", "backoff has not elapsed");
+            let permanent_status: String =
+                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='permanent'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(permanent_status, "failed", "non-recoverable errors stay failed");
+            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(tasks, 1);
+            assert_eq!(
+                enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?,
+                0,
+                "a live retry task is single-flight"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
     async fn postgres_backlog_drains_every_release_across_bounded_cycles() -> anyhow::Result<()> {
         use sqlx::PgPool;
         let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
@@ -3546,6 +3779,7 @@ mod tests {
                 CREATE TABLE brief_release_memberships(brief_id text,release_id bigint);
                 CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at timestamptz NOT NULL,status text NOT NULL,batch_id text,result_status text,title_zh text,summary_md text,body_md text,error_text text,cache_hit boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
                 CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,title_zh text,summary_md text,body_md text,error_text text,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
+                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no integer NOT NULL,event_type text NOT NULL,retry_eligible boolean NOT NULL DEFAULT false,next_retry_at timestamptz,created_at timestamptz NOT NULL);
                 CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
                 "#,
             )
