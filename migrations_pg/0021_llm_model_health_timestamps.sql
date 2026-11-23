@@ -7,14 +7,20 @@
 -- audit found zero invalid values before this migration.
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT 1
+    IF (
+        SELECT count(*)
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = 'llm_model_health'
-          AND column_name = 'cooldown_until'
-          AND data_type = 'text'
-    ) THEN
+          AND column_name IN (
+              'window_started_at',
+              'cooldown_until',
+              'last_failure_at',
+              'created_at',
+              'updated_at'
+          )
+          AND data_type IN ('text', 'character varying')
+    ) = 5 THEN
         ALTER TABLE public.llm_model_health
             ALTER COLUMN window_started_at TYPE timestamptz
                 USING NULLIF(window_started_at, '')::timestamptz,

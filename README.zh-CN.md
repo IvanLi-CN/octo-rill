@@ -80,7 +80,7 @@ cp .env.example .env.local
 
 - `AI_API_KEY`
 - `AI_BASE_URL`
-- `AI_MODEL`（已弃用为启动 fallback；实际路由以管理端有序模型列表为准）
+- `AI_MODEL`（可选的运行期 fallback；默认 `gpt-4o-mini`，仅在管理端有序模型列表为空时使用）
 
 启动后端：
 
