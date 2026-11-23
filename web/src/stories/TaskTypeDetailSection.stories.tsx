@@ -160,6 +160,8 @@ function buildDetail(
 		task: {
 			id: `task-${taskType}`,
 			task_type: taskType,
+			task_group: null,
+			legacy: false,
 			status: "succeeded",
 			source: "storybook.mock",
 			requested_by: TARGET_USER_ID,

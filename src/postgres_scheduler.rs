@@ -36,8 +36,8 @@ use tokio::time::Duration;
 use tracing::warn;
 
 use crate::{
-    admin_runtime, briefs, config::AppConfig, jobs, local_id, postgres_server::PostgresServerState,
-    postgres_star_epochs,
+    admin_job_groups, admin_runtime, briefs, config::AppConfig, jobs, local_id,
+    postgres_server::PostgresServerState, postgres_star_epochs,
 };
 
 /// Lane identifiers. Logged as the stable `lane` field on lane failures and
@@ -74,12 +74,6 @@ const WEBHOOK_AUDIT_MAX_INTERVAL_DAYS: i64 = 30;
 
 const SUBSCRIPTION_TASK_TYPES: [&str; 2] =
     [jobs::TASK_SYNC_RELEASES, jobs::TASK_SYNC_NOTIFICATIONS];
-
-const ADMIN_DASHBOARD_ROLLUP_TASK_TYPES: [&str; 3] = [
-    jobs::TASK_TRANSLATE_RELEASE_BATCH,
-    jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
-    jobs::TASK_BRIEF_DAILY_SLOT,
-];
 
 /// Deployment defaults the lanes need besides their PostgreSQL tables.
 #[derive(Clone, Debug)]
@@ -1205,8 +1199,9 @@ async fn upsert_admin_dashboard_rollup_for_day(
     let rollup_date = day.format("%Y-%m-%d").to_string();
     let time_zone_name = time_zone.name().to_owned();
     let updated_at = now.to_rfc3339();
-    for task_type in ADMIN_DASHBOARD_ROLLUP_TASK_TYPES {
-        let counts = load_admin_dashboard_task_counts(pool, task_type, start_utc, end_utc).await?;
+    for spec in admin_job_groups::runtime_task_specs() {
+        let counts =
+            load_admin_dashboard_task_counts(pool, spec.task_type, start_utc, end_utc).await?;
         sqlx::query(
             r#"
             INSERT INTO public.admin_dashboard_daily_rollups (
@@ -1233,7 +1228,7 @@ async fn upsert_admin_dashboard_rollup_for_day(
         )
         .bind(rollup_date.as_str())
         .bind(time_zone_name.as_str())
-        .bind(task_type)
+        .bind(spec.task_type)
         .bind(total_users)
         .bind(active_users)
         .bind(counts.queued)
@@ -1324,7 +1319,10 @@ pub(crate) async fn load_admin_dashboard_task_counts(
         }
         let payload = parse_json(payload_json.as_deref());
         let result = parse_json(result_json.as_deref());
-        let code = if task_type == jobs::TASK_BRIEF_DAILY_SLOT {
+        let code = if matches!(
+            task_type,
+            jobs::TASK_BRIEF_DAILY_SLOT | jobs::TASK_BRIEF_GENERATE
+        ) {
             brief_business_code(status.as_str(), result.as_ref())
         } else {
             release_batch_business_code(status.as_str(), payload.as_ref(), result.as_ref())

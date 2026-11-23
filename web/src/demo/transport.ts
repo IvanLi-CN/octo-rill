@@ -856,17 +856,28 @@ function filterTasks(
 	items: AdminRealtimeTaskItem[],
 	searchParams: URLSearchParams,
 ) {
-	const userSyncTaskTypes = new Set([
-		"sync.starred.delta",
-		"sync.starred.reconcile",
-	]);
-	const scheduledTaskTypes = new Set([
-		"brief.daily_slot",
-		"sync.subscriptions",
-		"retry.recent_failures",
-		"webhook.push.audit",
-		...userSyncTaskTypes,
-	]);
+	const userSyncTaskTypes: Record<string, true> = {
+		"sync.starred": true,
+	};
+	const scheduledTaskTypes: Record<string, true> = {
+		"brief.daily_slot": true,
+		"brief.generate": true,
+		"sync.releases": true,
+		"sync.notifications": true,
+		"webhook.push.manage": true,
+		"retry.recent_failures": true,
+		"release.reading_backfill": true,
+	};
+	const legacyTaskTypes: Record<string, true> = {
+		"sync.subscriptions": true,
+		"summarize.release.smart.batch": true,
+		"release.evidence": true,
+		"sync.starred.delta": true,
+		"sync.starred.reconcile": true,
+		"brief.history_recompute": true,
+		"brief.refresh_content": true,
+		"webhook.push.audit": true,
+	};
 	const status = searchParams.get("status") ?? "all";
 	const taskType = searchParams.get("task_type");
 	const taskGroup = searchParams.get("task_group");
@@ -882,16 +893,19 @@ function filterTasks(
 	}
 	if (taskGroup === "realtime") {
 		filtered = filtered.filter(
-			(item) => !scheduledTaskTypes.has(item.task_type),
+			(item) =>
+				!scheduledTaskTypes[item.task_type] &&
+				!userSyncTaskTypes[item.task_type] &&
+				!legacyTaskTypes[item.task_type],
 		);
 	} else if (taskGroup === "scheduled") {
-		filtered = filtered.filter(
-			(item) =>
-				scheduledTaskTypes.has(item.task_type) &&
-				!userSyncTaskTypes.has(item.task_type),
-		);
+		filtered = filtered.filter((item) => scheduledTaskTypes[item.task_type]);
 	} else if (taskGroup === "user_sync") {
-		filtered = filtered.filter((item) => userSyncTaskTypes.has(item.task_type));
+		filtered = filtered.filter((item) => userSyncTaskTypes[item.task_type]);
+	} else if (taskGroup === "legacy") {
+		filtered = filtered.filter((item) => legacyTaskTypes[item.task_type]);
+	} else if (taskGroup && taskGroup !== "all") {
+		filtered = filtered.filter((item) => item.task_group === taskGroup);
 	}
 
 	const start = Math.max(0, (page - 1) * pageSize);
@@ -1920,8 +1934,10 @@ function buildAdminDashboardResponse(
 
 	const statusItems: AdminDashboardResponse["status_breakdown"]["items"] = [
 		{
-			task_type: "translations",
-			label: "翻译",
+			task_type: "translation.generate",
+			task_group: "translation",
+			task_group_label: "翻译",
+			label: "翻译生成",
 			queued: 0,
 			running: 1,
 			succeeded: 1,
@@ -1933,10 +1949,27 @@ function buildAdminDashboardResponse(
 			business_success_rate: 0.5,
 		},
 		{
-			task_type: "summaries",
-			label: "润色",
-			queued: 1,
-			running: 0,
+			task_type: "sync.releases",
+			task_group: "sync",
+			task_group_label: "同步",
+			label: "同步 Release",
+			queued: 0,
+			running: 1,
+			succeeded: 1,
+			failed: 0,
+			canceled: 0,
+			business_counts: { ok: 1, partial: 0, failed: 0, disabled: 0 },
+			total: 2,
+			success_rate: 1,
+			business_success_rate: 1,
+		},
+		{
+			task_type: "brief.daily_slot",
+			task_group: "briefs",
+			task_group_label: "日报",
+			label: "定时日报",
+			queued: 0,
+			running: 1,
 			succeeded: 0,
 			failed: 0,
 			canceled: 0,
@@ -1946,10 +1979,12 @@ function buildAdminDashboardResponse(
 			business_success_rate: 0,
 		},
 		{
-			task_type: "briefs",
-			label: "日报",
-			queued: 0,
-			running: 1,
+			task_type: "webhook.push.manage",
+			task_group: "operations",
+			task_group_label: "运维",
+			label: "Webhook 管理",
+			queued: 1,
+			running: 0,
 			succeeded: 0,
 			failed: 0,
 			canceled: 0,
@@ -1982,8 +2017,9 @@ function buildAdminDashboardResponse(
 			running_tasks: runningTotal,
 			ongoing_by_task: {
 				translations: 1,
-				summaries: 1,
+				sync: 1,
 				briefs: 1,
+				operations: 1,
 			},
 		},
 		today_live: {
@@ -2006,6 +2042,8 @@ function buildAdminDashboardResponse(
 		},
 		task_share: statusItems.map((item) => ({
 			task_type: item.task_type,
+			task_group: item.task_group,
+			task_group_label: item.task_group_label,
 			label: item.label,
 			total: item.total,
 			share_ratio: totalTaskShare > 0 ? item.total / totalTaskShare : 0,
@@ -2023,14 +2061,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 0,
 				translations_business_failed: 0,
-				summaries_total: 0,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 0,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 0,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: "2026-07-03",
@@ -2041,14 +2083,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 1,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 0,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: "2026-07-04",
@@ -2059,14 +2105,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 1,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 0,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: "2026-07-05",
@@ -2077,14 +2127,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 0,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 0,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: "2026-07-06",
@@ -2095,14 +2149,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 1,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 0,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: "2026-07-07",
@@ -2113,14 +2171,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 0,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 1,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 			{
 				date: windowEnd,
@@ -2131,14 +2193,18 @@ function buildAdminDashboardResponse(
 				translations_failed: 0,
 				translations_partial: 1,
 				translations_business_failed: 0,
-				summaries_total: 1,
-				summaries_failed: 0,
-				summaries_partial: 0,
-				summaries_business_failed: 0,
+				sync_total: 1,
+				sync_failed: 0,
+				sync_partial: 0,
+				sync_business_failed: 0,
 				briefs_total: 1,
 				briefs_failed: 0,
 				briefs_partial: 0,
 				briefs_business_failed: 0,
+				operations_total: 1,
+				operations_failed: 0,
+				operations_partial: 0,
+				operations_business_failed: 0,
 			},
 		],
 		llm_health: {

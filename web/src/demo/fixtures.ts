@@ -1812,6 +1812,8 @@ function buildAdminJobs(): DemoJobsModel {
 		{
 			id: "task-sync-subscriptions",
 			task_type: "sync.subscriptions",
+			task_group: null,
+			legacy: true,
 			status: "running",
 			source: "manual",
 			requested_by: ADMIN_USER_ID,
@@ -1827,6 +1829,8 @@ function buildAdminJobs(): DemoJobsModel {
 		{
 			id: "task-sync-releases",
 			task_type: "sync.releases",
+			task_group: "sync",
+			legacy: false,
 			status: "succeeded",
 			source: "manual",
 			requested_by: ADMIN_USER_ID,
@@ -1843,7 +1847,9 @@ function buildAdminJobs(): DemoJobsModel {
 	const scheduledRuns: AdminRealtimeTaskItem[] = [
 		{
 			id: "task-starred-reconcile-0845",
-			task_type: "sync.starred.reconcile",
+			task_type: "sync.starred",
+			task_group: "sync",
+			legacy: false,
 			status: "running",
 			source: "scheduler",
 			requested_by: null,
@@ -1857,7 +1863,9 @@ function buildAdminJobs(): DemoJobsModel {
 		},
 		{
 			id: "task-starred-delta-0840",
-			task_type: "sync.starred.delta",
+			task_type: "sync.notifications",
+			task_group: "sync",
+			legacy: false,
 			status: "succeeded",
 			source: "scheduler",
 			requested_by: null,
@@ -1872,6 +1880,8 @@ function buildAdminJobs(): DemoJobsModel {
 		{
 			id: "task-brief-slot-08",
 			task_type: "brief.daily_slot",
+			task_group: "briefs",
+			legacy: false,
 			status: "running",
 			source: "scheduler",
 			requested_by: null,

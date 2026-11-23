@@ -51,9 +51,12 @@ const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 
 const TASK_COLORS = {
 	翻译: "#3b82f6",
-	润色: "#6366f1",
+	同步: "#6366f1",
 	日报: "#10b981",
+	运维: "#f59e0b",
 } as const;
+
+const TASK_GROUPS = ["translation", "sync", "briefs", "operations"] as const;
 
 const STATUS_COLORS = {
 	queued: "#f59e0b",
@@ -111,8 +114,9 @@ const OVERVIEW_SKELETON_KEYS = [
 ] as const;
 const LANE_SKELETON_KEYS = [
 	"lane-translate",
-	"lane-summary",
+	"lane-sync",
 	"lane-brief",
+	"lane-operations",
 ] as const;
 
 function formatCount(value: number | null | undefined) {
@@ -430,16 +434,55 @@ export function AdminDashboard() {
 	}, [loadDashboard, windowValue]);
 
 	const statusItems = data?.status_breakdown.items ?? [];
+	const totalTodayTasks = data?.status_breakdown.total ?? 0;
+
+	const groupBreakdown = useMemo(
+		() =>
+			TASK_GROUPS.map((group) => {
+				const items = statusItems.filter((item) => item.task_group === group);
+				const groupLabel = items[0]?.task_group_label ?? group;
+				const sum = (select: (item: AdminDashboardTaskStatusItem) => number) =>
+					items.reduce((total, item) => total + select(item), 0);
+				const succeeded = sum((item) => item.succeeded);
+				const failed = sum((item) => item.failed);
+				const canceled = sum((item) => item.canceled);
+				const finished = succeeded + failed + canceled;
+				const businessCounts = {
+					ok: sum((item) => item.business_counts.ok),
+					partial: sum((item) => item.business_counts.partial),
+					failed: sum((item) => item.business_counts.failed),
+					disabled: sum((item) => item.business_counts.disabled),
+				};
+				const businessTerminal =
+					businessCounts.ok +
+					businessCounts.partial +
+					businessCounts.failed +
+					businessCounts.disabled;
+				return {
+					label: groupLabel,
+					total: sum((item) => item.total),
+					succeeded,
+					failed,
+					canceled,
+					businessCounts,
+					success_rate: finished > 0 ? succeeded / finished : 0,
+					business_success_rate:
+						businessTerminal > 0 ? businessCounts.ok / businessTerminal : 0,
+				};
+			}),
+		[statusItems],
+	);
+
 	const todayChartData = useMemo(
 		() =>
-			statusItems.map((item) => ({
+			groupBreakdown.map((item) => ({
 				label: item.label,
-				ok: item.business_counts.ok,
-				partial: item.business_counts.partial,
-				failed: item.business_counts.failed,
-				disabled: item.business_counts.disabled,
+				ok: item.businessCounts.ok,
+				partial: item.businessCounts.partial,
+				failed: item.businessCounts.failed,
+				disabled: item.businessCounts.disabled,
 			})),
-		[statusItems],
+		[groupBreakdown],
 	);
 
 	const trendChartData = useMemo(
@@ -447,14 +490,17 @@ export function AdminDashboard() {
 			(data?.trend_points ?? []).map((item) => ({
 				label: item.label,
 				翻译: item.translations_total,
-				润色: item.summaries_total,
+				同步: item.sync_total,
 				日报: item.briefs_total,
+				运维: item.operations_total,
 				翻译部分成功: item.translations_partial,
 				翻译业务失败: item.translations_business_failed,
-				润色部分成功: item.summaries_partial,
-				润色业务失败: item.summaries_business_failed,
+				同步部分成功: item.sync_partial,
+				同步业务失败: item.sync_business_failed,
 				日报部分成功: item.briefs_partial,
 				日报业务失败: item.briefs_business_failed,
+				运维部分成功: item.operations_partial,
+				运维业务失败: item.operations_business_failed,
 				active_users: item.active_users,
 				total_users: item.total_users,
 			})),
@@ -463,31 +509,28 @@ export function AdminDashboard() {
 
 	const shareChartData = useMemo(
 		() =>
-			(data?.task_share ?? [])
+			groupBreakdown
 				.filter((item) => item.total > 0)
 				.map((item) => ({
 					name: item.label,
 					value: item.total,
 					fill: chartTaskColor(item.label),
-					share_ratio: item.share_ratio,
+					share_ratio: totalTodayTasks > 0 ? item.total / totalTodayTasks : 0,
 					success_rate: item.success_rate,
 					business_success_rate: item.business_success_rate,
-					business_counts: item.business_counts,
+					business_counts: item.businessCounts,
 				})),
-		[data],
+		[groupBreakdown, totalTodayTasks],
 	);
 
-	const highestVolumeTask = useMemo(() => {
-		return statusItems.reduce<AdminDashboardTaskStatusItem | null>(
-			(best, item) => {
-				if (!best || item.total > best.total) return item;
-				return best;
-			},
-			null,
-		);
-	}, [statusItems]);
-
-	const totalTodayTasks = data?.status_breakdown.total ?? 0;
+	const highestVolumeTask = useMemo(
+		() =>
+			groupBreakdown.reduce<(typeof groupBreakdown)[number] | null>(
+				(best, item) => (best && best.total >= item.total ? best : item),
+				null,
+			),
+		[groupBreakdown],
+	);
 	const businessCounts = data?.status_breakdown.business_counts ?? {
 		ok: 0,
 		partial: 0,
@@ -545,7 +588,8 @@ export function AdminDashboard() {
 						<div>
 							<CardTitle>运营总览</CardTitle>
 							<CardDescription>
-								展示用户规模、今日活跃与翻译 / 润色 / 日报三条链路的关键指标。
+								展示用户规模、今日活跃与翻译 / 同步 / 日报 /
+								运维四条链路的关键指标。
 							</CardDescription>
 						</div>
 						<div className="flex flex-wrap items-center gap-2">
@@ -973,9 +1017,9 @@ export function AdminDashboard() {
 									dotClass="bg-sky-500"
 								/>
 								<TaskLaneCard
-									label="润色"
-									value={data?.summary.ongoing_by_task.summaries ?? 0}
-									description="发布润色批任务"
+									label="同步"
+									value={data?.summary.ongoing_by_task.sync ?? 0}
+									description="星标、Release 与通知同步"
 									borderClass="border-l-indigo-500"
 									dotClass="bg-indigo-500"
 								/>
@@ -985,6 +1029,13 @@ export function AdminDashboard() {
 									description="日报生成任务"
 									borderClass="border-l-emerald-500"
 									dotClass="bg-emerald-500"
+								/>
+								<TaskLaneCard
+									label="运维"
+									value={data?.summary.ongoing_by_task.operations ?? 0}
+									description="Webhook、失败重试与阅读回填"
+									borderClass="border-l-amber-500"
+									dotClass="bg-amber-500"
 								/>
 							</div>
 							<div className={cn(SUBPANEL_CLASS, "space-y-3")}>
@@ -1136,9 +1187,9 @@ export function AdminDashboard() {
 										dotClass: "bg-sky-500",
 									},
 									{
-										label: "润色",
-										value: formatCount(latestTrendPoint?.summaries_total),
-										description: `部分成功 ${formatCount(latestTrendPoint?.summaries_partial)} · 业务失败 ${formatCount(latestTrendPoint?.summaries_business_failed)}`,
+										label: "同步",
+										value: formatCount(latestTrendPoint?.sync_total),
+										description: `部分成功 ${formatCount(latestTrendPoint?.sync_partial)} · 业务失败 ${formatCount(latestTrendPoint?.sync_business_failed)}`,
 										dotClass: "bg-indigo-500",
 									},
 									{
@@ -1146,6 +1197,12 @@ export function AdminDashboard() {
 										value: formatCount(latestTrendPoint?.briefs_total),
 										description: `部分成功 ${formatCount(latestTrendPoint?.briefs_partial)} · 业务失败 ${formatCount(latestTrendPoint?.briefs_business_failed)}`,
 										dotClass: "bg-emerald-500",
+									},
+									{
+										label: "运维",
+										value: formatCount(latestTrendPoint?.operations_total),
+										description: `部分成功 ${formatCount(latestTrendPoint?.operations_partial)} · 业务失败 ${formatCount(latestTrendPoint?.operations_business_failed)}`,
+										dotClass: "bg-amber-500",
 									},
 								]}
 							/>
@@ -1175,7 +1232,7 @@ export function AdminDashboard() {
 												/>
 											</linearGradient>
 											<linearGradient
-												id="admin-dashboard-summary"
+												id="admin-dashboard-sync"
 												x1="0"
 												y1="0"
 												x2="0"
@@ -1183,12 +1240,12 @@ export function AdminDashboard() {
 											>
 												<stop
 													offset="5%"
-													stopColor={TASK_COLORS.润色}
+													stopColor={TASK_COLORS.同步}
 													stopOpacity={0.22}
 												/>
 												<stop
 													offset="95%"
-													stopColor={TASK_COLORS.润色}
+													stopColor={TASK_COLORS.同步}
 													stopOpacity={0}
 												/>
 											</linearGradient>
@@ -1207,6 +1264,24 @@ export function AdminDashboard() {
 												<stop
 													offset="95%"
 													stopColor={TASK_COLORS.日报}
+													stopOpacity={0}
+												/>
+											</linearGradient>
+											<linearGradient
+												id="admin-dashboard-operations"
+												x1="0"
+												y1="0"
+												x2="0"
+												y2="1"
+											>
+												<stop
+													offset="5%"
+													stopColor={TASK_COLORS.运维}
+													stopOpacity={0.18}
+												/>
+												<stop
+													offset="95%"
+													stopColor={TASK_COLORS.运维}
 													stopOpacity={0}
 												/>
 											</linearGradient>
@@ -1240,9 +1315,9 @@ export function AdminDashboard() {
 										/>
 										<Area
 											type="monotone"
-											dataKey="润色"
-											stroke={TASK_COLORS.润色}
-											fill="url(#admin-dashboard-summary)"
+											dataKey="同步"
+											stroke={TASK_COLORS.同步}
+											fill="url(#admin-dashboard-sync)"
 											strokeWidth={2}
 											isAnimationActive={false}
 										/>
@@ -1251,6 +1326,14 @@ export function AdminDashboard() {
 											dataKey="日报"
 											stroke={TASK_COLORS.日报}
 											fill="url(#admin-dashboard-brief)"
+											strokeWidth={2}
+											isAnimationActive={false}
+										/>
+										<Area
+											type="monotone"
+											dataKey="运维"
+											stroke={TASK_COLORS.运维}
+											fill="url(#admin-dashboard-operations)"
 											strokeWidth={2}
 											isAnimationActive={false}
 										/>
@@ -1290,13 +1373,15 @@ export function AdminDashboard() {
 														<span
 															className="size-2.5 rounded-full"
 															style={{
-																backgroundColor: chartTaskColor(item.label),
+																backgroundColor: chartTaskColor(
+																	item.task_group_label,
+																),
 															}}
 														/>
 														<div>
 															<p className="font-medium">{item.label}</p>
 															<p className="text-muted-foreground mt-1 font-mono text-[11px]">
-																{item.task_type}
+																{item.task_group_label} · {item.task_type}
 															</p>
 														</div>
 													</div>

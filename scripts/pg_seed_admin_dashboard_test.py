@@ -23,7 +23,29 @@ from urllib.parse import urlsplit, urlunsplit
 from pg_seed_common import psql
 
 ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
-TASK_TYPES = ('translate.release.batch', 'summarize.release.smart.batch', 'brief.daily_slot')
+TASK_TYPES = ('translation.generate', 'sync.releases', 'brief.daily_slot')
+# Mirrors `ADMIN_JOB_TASK_GROUPS` in `src/admin_job_groups.rs`. The dashboard
+# breakdown lists every current PostgreSQL runtime type, not the legacy triple.
+RUNTIME_TASK_TYPES = (
+    'translation.generate',
+    'translate.release.batch',
+    'translate.release',
+    'translate.release_detail',
+    'translate.notification',
+    'sync.starred',
+    'sync.releases',
+    'sync.notifications',
+    'sync.repo_release',
+    'sync.all',
+    'sync.access_refresh',
+    'brief.daily_slot',
+    'brief.generate',
+    'webhook.push.manage',
+    'webhook.push.reconcile',
+    'retry.recent_failures',
+    'release.reading_backfill',
+)
+LEGACY_TASK_TYPE = 'sync.subscriptions'
 
 
 def local_id(seed):
@@ -113,7 +135,9 @@ def main():
              {'items': [{'status': 'ready'}, {'status': 'ready'}]}, created_today)
         task('translate-failed', TASK_TYPES[0], 'failed', translate_ok,
              {'total': 2, 'error': 2}, created_today)
-        task('summarize-running', TASK_TYPES[1], 'running', {'release_ids': [3]}, None, created_today)
+        task('sync-running', TASK_TYPES[1], 'running', {'repository_count': 3}, None, created_today)
+        # Imported SQLite history: kept in the table, but never counted or rolled up.
+        task('legacy-failed', LEGACY_TASK_TYPE, 'failed', {}, {'total': 1}, created_today)
         task('brief-ok', TASK_TYPES[2], 'succeeded', {}, {'total': 1, 'succeeded': 1, 'failed': 0, 'canceled': 0},
              created_today)
         task('brief-old', TASK_TYPES[2], 'failed', {},
@@ -124,7 +148,8 @@ def main():
             "active_users,queued_count,running_count,succeeded_count,failed_count,canceled_count,"
             "business_ok_count,business_partial_count,business_failed_count,business_disabled_count,updated_at) VALUES"
             f"({shell(yesterday_point)},'UTC',{shell(TASK_TYPES[0])},2,1,0,0,3,1,0,3,0,1,0,{shell(iso(now))}),"
-            f"({shell(yesterday_point)},'UTC',{shell(TASK_TYPES[2])},2,1,0,0,2,0,0,2,0,0,0,{shell(iso(now))});"
+            f"({shell(yesterday_point)},'UTC',{shell(TASK_TYPES[2])},2,1,0,0,2,0,0,2,0,0,0,{shell(iso(now))}),"
+            f"({shell(yesterday_point)},'UTC',{shell(LEGACY_TASK_TYPE)},2,1,0,0,0,5,0,0,0,5,0,{shell(iso(now))});"
         )
 
         sql(
@@ -185,21 +210,25 @@ def main():
             check('summary.queued_tasks', body['summary']['queued_tasks'], 0)
             check('summary.running_tasks', body['summary']['running_tasks'], 1)
             check('summary.ongoing_by_task', body['summary']['ongoing_by_task'],
-                  {'translations': 0, 'summaries': 1, 'briefs': 0})
+                  {'translations': 0, 'sync': 1, 'briefs': 0, 'operations': 0})
 
             check('today_live.date', body['today_live']['date'], today)
             check('today_live.running_tasks', body['today_live']['running_tasks'], 1)
 
             items = {item['task_type']: item for item in body['status_breakdown']['items']}
-            check('status_item_count', len(items), 3)
             check('translate.total', items[TASK_TYPES[0]]['total'], 2)
-            check('translate.labels', items[TASK_TYPES[0]]['label'], '翻译')
+            check('status_item_types', set(items), set(RUNTIME_TASK_TYPES))
+            check('legacy.excluded_from_breakdown', LEGACY_TASK_TYPE in items, False)
+            check('translate.total', items[TASK_TYPES[0]]['total'], 2)
+            check('translate.labels', items[TASK_TYPES[0]]['label'], '翻译生成')
+            check('translate.group', items[TASK_TYPES[0]]['task_group'], 'translation')
             check('translate.business_counts', items[TASK_TYPES[0]]['business_counts'],
                   {'ok': 1, 'partial': 0, 'failed': 1, 'disabled': 0})
             check('translate.success_rate', items[TASK_TYPES[0]]['success_rate'], 0.5)
             check('translate.business_success_rate', items[TASK_TYPES[0]]['business_success_rate'], 0.5)
             check('brief.old_task_excluded', items[TASK_TYPES[2]]['total'], 1)
-            check('summarize.running', items[TASK_TYPES[1]]['running'], 1)
+            check('sync.running', items[TASK_TYPES[1]]['running'], 1)
+            check('sync.group', items[TASK_TYPES[1]]['task_group'], 'sync')
             check('status_breakdown.total', body['status_breakdown']['total'], 4)
             check('status_breakdown.business_counts', body['status_breakdown']['business_counts'],
                   {'ok': 2, 'partial': 0, 'failed': 1, 'disabled': 0})
@@ -215,6 +244,8 @@ def main():
             check('trend_yesterday_translations_failed', by_date[yesterday]['translations_failed'], 1)
             check('trend_yesterday_briefs', by_date[yesterday]['briefs_total'], 2)
             check('trend_today_translations', by_date[today]['translations_total'], 2)
+            check('trend_today_sync', by_date[today]['sync_total'], 1)
+            check('trend_legacy_excluded', by_date[yesterday]['sync_total'], 0)
             check('trend_today_active_users', by_date[today]['active_users'], 1)
 
             check('llm.calls_24h', body['llm_health']['calls_24h'], 3)
