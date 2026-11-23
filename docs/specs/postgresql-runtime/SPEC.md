@@ -81,6 +81,14 @@
 - Inputs: 刷新插入的 Release ID、请求用户、AI provider 配置。
 - Outputs: `translation_work_items`/`translation_requests`/`job_tasks` 行与 `translations_enqueued` 计数。
 
+### REQ-PGR-010
+
+- 每个 `translation.generate` 上游调用 MUST 按 `admin_runtime_settings.llm_models_json` 的顺序选择候选，并读取 `llm_model_health`：`configuration` 失败直接停止；`empty_content` 切换到下一候选；`transient`/`rate_limited` 在同一候选最多尝试两次。单次逻辑调用的候选上游尝试总数 MUST NOT 超过 8。
+- 模型在滚动 10 分钟窗口内累计 2 次相关最终失败后 MUST 进入 10 分钟冷却；全部候选都在冷却时 MUST 选择 `cooldown_until` 最早到期者探测；`configuration` 的凭证拒绝 MUST 停放 24 小时。`llm_calls` MUST 记录实际 `model`、`final_model` 与 `fallback_count`。
+- `AI_MODEL` 仅为持久化模型列表为空时的启动 fallback，MUST NOT 覆盖非空列表；它作为选模真相源的地位已弃用。
+- Inputs: 持久化模型列表、`llm_model_health`、provider 响应。
+- Outputs: 选中的模型、候选切换与冷却事实、可归因的 LLM 审计行。
+
 ## Verification
 
 ### VER-PGR-001
@@ -136,6 +144,12 @@
 - Method: `cargo test --locked --bin octo-rill postgres_translate`、`TEST_PG_TRANSLATE_URL=… cargo test --locked --bin octo-rill postgres_backlog -- --ignored`、`cargo test --locked --bin octo-rill postgres_tasks` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
 - covers: `REQ-PGR-009`
 - Pass condition: 批次上限与去重、超限候选写入积压、积压跨周期有界排空且幂等、可恢复失败按退避与次数上限自动重试、未到期与不可恢复失败不重试、空内容跳过、`ready` 与在途任务不重复排队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
+
+### VER-PGR-010
+
+- Method: `postgres_translate` 路由单测覆盖可用/冷却/凭证停放排序；隔离 PostgreSQL 测试覆盖两次失败进入冷却与 `configuration` 停放；provider 切换由真实 429 场景验证。
+- covers: `REQ-PGR-010`
+- Pass condition: 候选顺序、冷却/停放、8 次上限、`model`/`final_model`/`fallback_count` 审计与 `AI_MODEL` 仅在空列表时生效均符合。
 
 ## Related ADRs
 

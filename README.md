@@ -80,7 +80,7 @@ If you want to test translation and daily briefs, also set:
 
 - `AI_API_KEY`
 - `AI_BASE_URL`
-- `AI_MODEL`
+- `AI_MODEL` (deprecated bootstrap fallback; the runtime routes over the administrator-ordered model list)
 
 Start the backend:
 

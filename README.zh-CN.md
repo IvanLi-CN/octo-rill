@@ -80,7 +80,7 @@ cp .env.example .env.local
 
 - `AI_API_KEY`
 - `AI_BASE_URL`
-- `AI_MODEL`
+- `AI_MODEL`（已弃用为启动 fallback；实际路由以管理端有序模型列表为准）
 
 启动后端：
 

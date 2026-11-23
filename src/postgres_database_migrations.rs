@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 20);
+        assert_eq!(MIGRATOR.iter().count(), 21);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -79,6 +79,12 @@ mod tests {
                 .sql
                 .contains("DELETE FROM public.translation_attempt_events")
         );
+        let health_timestamps = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 21)
+            .expect("llm model health timestamp migration");
+        assert!(health_timestamps.sql.contains("llm_model_health"));
+        assert!(health_timestamps.sql.contains("TIMESTAMPTZ"));
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()

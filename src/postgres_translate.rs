@@ -32,7 +32,7 @@ use axum::{
         sse::{Event, Sse},
     },
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::stream;
 use reqwest::Client;
 use serde::Deserialize;
@@ -2933,7 +2933,9 @@ async fn run_translation(
                 return Ok((translated_title, None));
             }
 
-            let chunks = split_markdown_chunks(&target.body, body_chunk_chars(audit.ai));
+            let primary_model = route_primary_model(audit.pool, audit.ai.model.as_str()).await;
+            let chunks =
+                split_markdown_chunks(&target.body, body_chunk_chars(primary_model.as_str()));
             let total = chunks.len();
             let mut translated = String::with_capacity(target.body.len());
             for (index, chunk) in chunks.iter().enumerate() {
@@ -2975,8 +2977,8 @@ async fn run_translation(
     }
 }
 
-fn body_chunk_chars(ai: &AiConfig) -> usize {
-    let (input_limit, _) = crate::ai::resolve_model_input_limit_for_model(ai.model.as_str());
+fn body_chunk_chars(model: &str) -> usize {
+    let (input_limit, _) = crate::ai::resolve_model_input_limit_for_model(model);
     ((input_limit as usize).saturating_mul(3)).clamp(2_000, 12_000)
 }
 
@@ -3076,6 +3078,177 @@ impl LlmFailure {
     }
 }
 
+/// Legacy routing bounds mirrored from `ai::LlmScheduler`: one logical call
+/// tries at most eight upstream requests, each candidate twice for transient or
+/// rate-limited failures, and a candidate that reaches two failures inside the
+/// rolling window rests for ten minutes.
+const ROUTE_MAX_UPSTREAM_ATTEMPTS: usize = 8;
+const ROUTE_ATTEMPTS_PER_MODEL: usize = 2;
+const MODEL_FAILURE_WINDOW_MINUTES: i64 = 10;
+const MODEL_FAILURE_COOLDOWN_MINUTES: i64 = 10;
+const MODEL_CREDENTIAL_COOLDOWN_HOURS: i64 = 24;
+const MODEL_FAILURE_THRESHOLD: i64 = 2;
+
+#[derive(Debug, Clone, Default)]
+struct ModelRouteHealth {
+    cooldown_until: Option<DateTime<Utc>>,
+    last_failure_class: Option<String>,
+}
+
+/// Read the administrator-ordered model list. `AI_MODEL` is retained only as
+/// the bootstrap fallback for a database whose list is still empty.
+async fn route_models(pool: &PgPool, fallback_model: &str) -> Vec<String> {
+    let raw = sqlx::query_scalar::<_, String>(
+        "SELECT llm_models_json FROM public.admin_runtime_settings WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let parsed = raw
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default();
+    let mut models = crate::admin_runtime::normalize_llm_models(parsed);
+    if models.is_empty() {
+        let fallback = fallback_model.trim();
+        if !fallback.is_empty() {
+            models.push(fallback.to_owned());
+        }
+    }
+    models
+}
+
+async fn load_route_health(pool: &PgPool) -> HashMap<String, ModelRouteHealth> {
+    let rows = sqlx::query(
+        "SELECT model, cooldown_until, last_failure_class FROM public.llm_model_health",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            let model = row.try_get::<String, _>("model").ok()?;
+            Some((
+                model,
+                ModelRouteHealth {
+                    cooldown_until: row
+                        .try_get::<Option<DateTime<Utc>>, _>("cooldown_until")
+                        .ok()
+                        .flatten(),
+                    last_failure_class: row
+                        .try_get::<Option<String>, _>("last_failure_class")
+                        .ok()
+                        .flatten(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Order candidates by administrator order, moving cooling models behind the
+/// available ones. When every model is cooling, the earliest expiry probes
+/// first. Credential-parked models stay out entirely until an operator saves
+/// the runtime configuration.
+fn route_candidates(
+    models: &[String],
+    health: &HashMap<String, ModelRouteHealth>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut available = Vec::new();
+    let mut cooling = Vec::new();
+    for model in models {
+        let state = health.get(model);
+        let parked = state.is_some_and(|state| {
+            state.last_failure_class.as_deref() == Some("configuration")
+                && state.cooldown_until.is_some_and(|until| until > now)
+        });
+        if parked {
+            continue;
+        }
+        match state.and_then(|state| state.cooldown_until) {
+            Some(until) if until > now => cooling.push((model.clone(), until)),
+            _ => available.push(model.clone()),
+        }
+    }
+    cooling.sort_by_key(|(_, until)| *until);
+    available.extend(cooling.into_iter().map(|(model, _)| model));
+    available
+}
+
+async fn route_primary_model(pool: &PgPool, fallback_model: &str) -> String {
+    let models = route_models(pool, fallback_model).await;
+    let health = load_route_health(pool).await;
+    route_candidates(&models, &health, Utc::now())
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| fallback_model.trim().to_owned())
+}
+
+async fn record_model_failure(pool: &PgPool, model: &str, class: crate::ai::LlmFailureClass) {
+    if model.trim().is_empty() {
+        return;
+    }
+    let now = Utc::now();
+    let result = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO public.llm_model_health (model, relevant_failure_count, created_at, updated_at) VALUES ($1, 0, $2, $2) ON CONFLICT (model) DO NOTHING",
+        )
+        .bind(model)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT relevant_failure_count, window_started_at FROM public.llm_model_health WHERE model = $1 FOR UPDATE",
+        )
+        .bind(model)
+        .fetch_one(&mut *tx)
+        .await?;
+        let previous_count = row.try_get::<i64, _>("relevant_failure_count").unwrap_or(0);
+        let previous_window = row
+            .try_get::<Option<DateTime<Utc>>, _>("window_started_at")
+            .ok()
+            .flatten();
+        let within_window = previous_window.is_some_and(|started| {
+            now.signed_duration_since(started) < chrono::Duration::minutes(MODEL_FAILURE_WINDOW_MINUTES)
+        });
+        let count = if within_window {
+            previous_count.saturating_add(1)
+        } else {
+            1
+        };
+        let window_started = if within_window {
+            previous_window.unwrap_or(now)
+        } else {
+            now
+        };
+        let cooldown_until = if class == crate::ai::LlmFailureClass::Configuration {
+            Some(now + chrono::Duration::hours(MODEL_CREDENTIAL_COOLDOWN_HOURS))
+        } else if count >= MODEL_FAILURE_THRESHOLD {
+            Some(now + chrono::Duration::minutes(MODEL_FAILURE_COOLDOWN_MINUTES))
+        } else {
+            None
+        };
+        sqlx::query(
+            "UPDATE public.llm_model_health SET relevant_failure_count = $2, window_started_at = $3, cooldown_until = $4, last_failure_class = $5, last_failure_at = $6, updated_at = $6 WHERE model = $1",
+        )
+        .bind(model)
+        .bind(count)
+        .bind(window_started)
+        .bind(cooldown_until)
+        .bind(class.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, model, "failed to persist PostgreSQL model route health");
+    }
+}
+
 struct AuditRecorder<'a> {
     pool: &'a PgPool,
     http: &'a Client,
@@ -3140,86 +3313,129 @@ impl AuditRecorder<'_> {
         user: &str,
         max_tokens: u32,
     ) -> Result<String, LlmFailure> {
-        let call_id = local_id::generate_local_id();
-        let ordinal = self.ordinal;
-        self.ordinal += 1;
-        let prompt_text = truncate_chars(&format!("{system}\n\n{user}"), 8_000);
-        let inserted = insert_call(
-            self.pool,
-            &call_id,
-            self.source,
-            self.ai.model.as_str(),
-            self.requested_by,
-            self.parent_task_id.as_deref(),
-            self.parent_task_type.as_deref(),
-            max_tokens,
-            &prompt_text,
-            &json!([
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ])
-            .to_string(),
-        )
-        .await;
-        if inserted {
-            self.call_ids.push(call_id.clone());
-            let _ = mark_call_running(self.pool, &call_id).await;
+        let models = route_models(self.pool, self.ai.model.as_str()).await;
+        let health = load_route_health(self.pool).await;
+        let candidates = route_candidates(&models, &health, Utc::now());
+        if candidates.is_empty() {
+            return Err(LlmFailure::configuration());
         }
+        let mut remaining = ROUTE_MAX_UPSTREAM_ATTEMPTS;
+        let mut failed_attempts = 0i64;
+        let mut last_failure: Option<LlmFailure> = None;
+        for model in candidates {
+            let mut final_class: Option<crate::ai::LlmFailureClass> = None;
+            for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                let call_id = local_id::generate_local_id();
+                let ordinal = self.ordinal;
+                self.ordinal += 1;
+                let prompt_text = truncate_chars(&format!("{system}\n\n{user}"), 8_000);
+                let inserted = insert_call(
+                    self.pool,
+                    &call_id,
+                    self.source,
+                    model.as_str(),
+                    self.requested_by,
+                    self.parent_task_id.as_deref(),
+                    self.parent_task_type.as_deref(),
+                    max_tokens,
+                    &prompt_text,
+                    &json!([
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ])
+                    .to_string(),
+                )
+                .await;
+                if inserted {
+                    self.call_ids.push(call_id.clone());
+                    let _ = mark_call_running(self.pool, &call_id).await;
+                }
 
-        let started = std::time::Instant::now();
-        let outcome = self.invoke(system, user, max_tokens).await;
-        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+                let started = std::time::Instant::now();
+                let outcome = self.invoke(model.as_str(), system, user, max_tokens).await;
+                let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
-        let audit = match &outcome {
-            Ok(response) => CallAudit {
-                status: "succeeded",
-                model: response.model.clone(),
-                provider_request_id: response.provider_request_id.clone(),
-                provider_http_status: response.provider_http_status,
-                input_tokens: response.input_tokens,
-                output_tokens: response.output_tokens,
-                total_tokens: response.total_tokens,
-                finish_reason: response.finish_reason.clone(),
-                failure_class: None,
-                error_text: None,
-                response_text: Some(truncate_chars(&response.content, 8_000)),
-                duration_ms,
-            },
-            Err(failure) => CallAudit {
-                status: "failed",
-                model: self.ai.model.clone(),
-                provider_request_id: None,
-                provider_http_status: failure.http_status,
-                input_tokens: None,
-                output_tokens: None,
-                total_tokens: None,
-                finish_reason: None,
-                failure_class: Some(failure.error.class.as_str()),
-                error_text: Some(failure.detail.clone()),
-                response_text: None,
-                duration_ms,
-            },
-        };
-        if inserted {
-            let _ = finalize_call(self.pool, &call_id, &audit).await;
-            let _ = link_attempt_call(
-                self.pool,
-                self.work_item_id,
-                self.attempt_no,
-                &call_id,
-                stage,
-                ordinal,
-            )
-            .await;
+                let audit = match &outcome {
+                    Ok(response) => CallAudit {
+                        status: "succeeded",
+                        model: response.model.clone(),
+                        provider_request_id: response.provider_request_id.clone(),
+                        provider_http_status: response.provider_http_status,
+                        input_tokens: response.input_tokens,
+                        output_tokens: response.output_tokens,
+                        total_tokens: response.total_tokens,
+                        finish_reason: response.finish_reason.clone(),
+                        failure_class: None,
+                        error_text: None,
+                        response_text: Some(truncate_chars(&response.content, 8_000)),
+                        duration_ms,
+                    },
+                    Err(failure) => CallAudit {
+                        status: "failed",
+                        model: model.clone(),
+                        provider_request_id: None,
+                        provider_http_status: failure.http_status,
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                        finish_reason: None,
+                        failure_class: Some(failure.error.class.as_str()),
+                        error_text: Some(failure.detail.clone()),
+                        response_text: None,
+                        duration_ms,
+                    },
+                };
+                if inserted {
+                    let _ = finalize_call(self.pool, &call_id, &audit, failed_attempts).await;
+                    let _ = link_attempt_call(
+                        self.pool,
+                        self.work_item_id,
+                        self.attempt_no,
+                        &call_id,
+                        stage,
+                        ordinal,
+                    )
+                    .await;
+                }
+
+                match outcome {
+                    Ok(response) => return Ok(response.content),
+                    Err(failure) => {
+                        let class = failure.error.class;
+                        failed_attempts += 1;
+                        last_failure = Some(failure.error);
+                        if class == crate::ai::LlmFailureClass::Configuration {
+                            record_model_failure(self.pool, model.as_str(), class).await;
+                            return Err(last_failure.take().expect("failure just recorded"));
+                        }
+                        if class == crate::ai::LlmFailureClass::EmptyContent {
+                            final_class = Some(class);
+                            break;
+                        }
+                        if model_attempt + 1 == ROUTE_ATTEMPTS_PER_MODEL || remaining == 0 {
+                            final_class = Some(class);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(class) = final_class {
+                record_model_failure(self.pool, model.as_str(), class).await;
+            }
+            if remaining == 0 {
+                break;
+            }
         }
-
-        outcome
-            .map(|response| response.content)
-            .map_err(|failure| failure.error)
+        Err(last_failure.unwrap_or_else(LlmFailure::transient))
     }
 
     async fn invoke(
         &self,
+        model: &str,
         system: &str,
         user: &str,
         max_tokens: u32,
@@ -3239,7 +3455,7 @@ impl AuditRecorder<'_> {
             .bearer_auth(&self.ai.api_key)
             .timeout(LLM_CALL_TIMEOUT)
             .json(&json!({
-                "model": self.ai.model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -3299,7 +3515,7 @@ impl AuditRecorder<'_> {
             model: body
                 .get("model")
                 .and_then(Value::as_str)
-                .unwrap_or(self.ai.model.as_str())
+                .unwrap_or(model)
                 .to_owned(),
             provider_request_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
             provider_http_status: Some(i64::from(status.as_u16())),
@@ -3406,10 +3622,15 @@ async fn mark_call_running(pool: &PgPool, call_id: &str) -> Result<(), sqlx::Err
     Ok(())
 }
 
-async fn finalize_call(pool: &PgPool, call_id: &str, audit: &CallAudit) -> Result<(), sqlx::Error> {
+async fn finalize_call(
+    pool: &PgPool,
+    call_id: &str,
+    audit: &CallAudit,
+    fallback_count: i64,
+) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE public.llm_calls SET status = $1, model = $2, final_model = $2, provider_request_id = $3, provider_http_status = $4, input_tokens = $5, output_tokens = $6, total_tokens = $7, finish_reason = $8, failure_class = $9, error_text = $10, response_text = $11, duration_ms = $12, fallback_count = 0, recovery_attempt_count = 0, finished_at = $13, updated_at = $13, runtime_owner_id = NULL, lease_heartbeat_at = NULL WHERE id = $14",
+        "UPDATE public.llm_calls SET status = $1, model = $2, final_model = $2, provider_request_id = $3, provider_http_status = $4, input_tokens = $5, output_tokens = $6, total_tokens = $7, finish_reason = $8, failure_class = $9, error_text = $10, response_text = $11, duration_ms = $12, fallback_count = $13, recovery_attempt_count = 0, finished_at = $14, updated_at = $14, runtime_owner_id = NULL, lease_heartbeat_at = NULL WHERE id = $15",
     )
     .bind(audit.status)
     .bind(&audit.model)
@@ -3423,6 +3644,7 @@ async fn finalize_call(pool: &PgPool, call_id: &str, audit: &CallAudit) -> Resul
     .bind(audit.error_text.as_deref())
     .bind(audit.response_text.as_deref())
     .bind(audit.duration_ms)
+    .bind(fallback_count)
     .bind(&now)
     .bind(call_id)
     .execute(pool)
@@ -3629,9 +3851,10 @@ fn db_failure(error: sqlx::Error) -> Response {
 mod tests {
     use super::{
         AUTO_RELEASE_TRANSLATION_CAP, AUTO_TRANSLATION_MAX_ATTEMPTS, AutoTranslationDecision,
-        AutomaticWorkItem, TargetKind, auto_translation_decision, automatic_retry_delay,
-        deduped_release_ids, enqueue_pending_translation_tasks, enqueue_release_translations,
-        insert_translation_request, release_has_translatable_content, start_attempt,
+        AutomaticWorkItem, ModelRouteHealth, TargetKind, auto_translation_decision,
+        automatic_retry_delay, deduped_release_ids, enqueue_pending_translation_tasks,
+        enqueue_release_translations, insert_translation_request, record_model_failure,
+        release_has_translatable_content, route_candidates, start_attempt,
     };
 
     #[test]
@@ -3951,6 +4174,121 @@ mod tests {
                 reset_work_item: true
             }
         );
+    }
+
+    #[test]
+    fn route_candidates_prefers_available_then_earliest_cooldown() {
+        let now = chrono::Utc::now();
+        let models = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let mut health = std::collections::HashMap::new();
+        health.insert(
+            "a".to_owned(),
+            ModelRouteHealth {
+                cooldown_until: Some(now + chrono::Duration::minutes(5)),
+                last_failure_class: Some("rate_limited".to_owned()),
+            },
+        );
+        health.insert(
+            "c".to_owned(),
+            ModelRouteHealth {
+                cooldown_until: Some(now + chrono::Duration::minutes(1)),
+                last_failure_class: Some("transient".to_owned()),
+            },
+        );
+        assert_eq!(
+            route_candidates(&models, &health, now),
+            vec!["b".to_owned(), "c".to_owned(), "a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn route_candidates_skips_credential_parked_models() {
+        let now = chrono::Utc::now();
+        let models = vec!["parked".to_owned(), "ready".to_owned()];
+        let mut health = std::collections::HashMap::new();
+        health.insert(
+            "parked".to_owned(),
+            ModelRouteHealth {
+                cooldown_until: Some(now + chrono::Duration::hours(1)),
+                last_failure_class: Some("configuration".to_owned()),
+            },
+        );
+        assert_eq!(
+            route_candidates(&models, &health, now),
+            vec!["ready".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_model_health_cools_after_two_failures() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_health_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count bigint NOT NULL DEFAULT 0, window_started_at timestamptz, cooldown_until timestamptz, last_failure_class text, last_failure_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            record_model_failure(
+                &pool,
+                "model-a",
+                crate::ai::LlmFailureClass::RateLimited,
+            )
+            .await;
+            record_model_failure(
+                &pool,
+                "model-a",
+                crate::ai::LlmFailureClass::RateLimited,
+            )
+            .await;
+            let (count, cooldown, class): (
+                i64,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT relevant_failure_count, cooldown_until, last_failure_class FROM public.llm_model_health WHERE model = 'model-a'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(count, 2);
+            assert!(cooldown.is_some());
+            assert_eq!(class.as_deref(), Some("rate_limited"));
+            record_model_failure(
+                &pool,
+                "model-b",
+                crate::ai::LlmFailureClass::Configuration,
+            )
+            .await;
+            let (parked_until, parked_class): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) = sqlx::query_as(
+                "SELECT cooldown_until, last_failure_class FROM public.llm_model_health WHERE model = 'model-b'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(parked_class.as_deref(), Some("configuration"));
+            assert!(
+                parked_until.expect("configuration failure parks the model")
+                    > chrono::Utc::now() + chrono::Duration::hours(23)
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
     }
 
     #[tokio::test]
