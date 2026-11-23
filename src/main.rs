@@ -5,6 +5,7 @@
 // than dead code to delete in the persistence cutover.
 #[allow(dead_code)]
 mod admin_ai_records;
+mod admin_job_groups;
 #[allow(dead_code)]
 mod admin_runtime;
 #[allow(dead_code)]

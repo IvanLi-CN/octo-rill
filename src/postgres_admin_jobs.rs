@@ -27,10 +27,9 @@ use tower_sessions::Session;
 use tracing::warn;
 
 use crate::{
+    admin_job_groups::{self, AdminJobTaskLane},
     jobs::{
-        SCHEDULED_TASK_TYPES, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        is_scheduled_task_type,
+        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_SYNC_SUBSCRIPTIONS,
     },
     postgres_server::{PostgresServerState, require_admin},
 };
@@ -73,6 +72,10 @@ fn require_admin_response(status: StatusCode) -> Response {
 
 // ---------------------------------------------------------------- overview
 
+fn legacy_task_types() -> Vec<&'static str> {
+    admin_job_groups::LEGACY_TASK_TYPES.to_vec()
+}
+
 pub(super) async fn overview(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -87,27 +90,35 @@ pub(super) async fn overview(
     // aggregate over `FILTER` clauses can never do.
     let counts = async {
         let queued = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM public.job_tasks WHERE status = 'queued'",
+            "SELECT COUNT(*) FROM public.job_tasks
+             WHERE status = 'queued' AND task_type <> ALL($1)",
         )
+        .bind(legacy_task_types())
         .fetch_one(pool)
         .await?;
         let running = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM public.job_tasks WHERE status = 'running'",
+            "SELECT COUNT(*) FROM public.job_tasks
+             WHERE status = 'running' AND task_type <> ALL($1)",
         )
+        .bind(legacy_task_types())
         .fetch_one(pool)
         .await?;
         let failed_24h = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM public.job_tasks
-             WHERE status = 'failed' AND finished_at IS NOT NULL AND finished_at >= $1",
+             WHERE status = 'failed' AND finished_at IS NOT NULL AND finished_at >= $1
+               AND task_type <> ALL($2)",
         )
         .bind(since)
+        .bind(legacy_task_types())
         .fetch_one(pool)
         .await?;
         let succeeded_24h = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM public.job_tasks
-             WHERE status = 'succeeded' AND finished_at IS NOT NULL AND finished_at >= $1",
+             WHERE status = 'succeeded' AND finished_at IS NOT NULL AND finished_at >= $1
+               AND task_type <> ALL($2)",
         )
         .bind(since)
+        .bind(legacy_task_types())
         .fetch_one(pool)
         .await?;
         let slots = sqlx::query_as::<_, (i64, i64)>(
@@ -175,6 +186,8 @@ struct RealtimeTaskRow {
 struct RealtimeTaskItem {
     id: String,
     task_type: String,
+    task_group: Option<String>,
+    legacy: bool,
     status: String,
     source: String,
     skipped: bool,
@@ -192,9 +205,14 @@ struct RealtimeTaskItem {
 
 impl From<RealtimeTaskRow> for RealtimeTaskItem {
     fn from(row: RealtimeTaskRow) -> Self {
+        let task_group =
+            admin_job_groups::group_for_task_type(&row.task_type).map(|group| group.key.to_owned());
+        let legacy = admin_job_groups::is_legacy_task_type(&row.task_type);
         Self {
             id: row.id,
             task_type: row.task_type,
+            task_group,
+            legacy,
             status: row.status,
             source: row.source,
             skipped: row.skipped,
@@ -305,38 +323,29 @@ fn push_task_filters(query: &mut QueryBuilder<'_, Postgres>, filters: &TaskFilte
             .push(" AND task_type <> ")
             .push_bind(filters.exclude_task_type.clone());
     }
-    let user_sync_task_types = [TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE];
-    match filters.task_group.as_str() {
+    if let Some(task_types) = task_group_task_types(&filters.task_group) {
+        push_in_list(query, " AND task_type IN ", task_types.into_iter());
+    }
+}
+
+/// Resolve a `task_group` query value to its task types.
+///
+/// Group keys come from [`admin_job_groups::ADMIN_JOB_TASK_GROUPS`]; the three
+/// lane names remain accepted because the job center list tabs still use them.
+/// `all`, an empty value and unknown values apply no filter.
+fn task_group_task_types(task_group: &str) -> Option<Vec<&'static str>> {
+    match task_group {
+        "" | "all" => None,
         "scheduled" => {
-            push_in_list(
-                query,
-                " AND task_type IN ",
-                SCHEDULED_TASK_TYPES
-                    .iter()
-                    .copied()
-                    .filter(|task_type| is_scheduled_task_type(task_type)),
-            );
-            push_in_list(
-                query,
-                " AND task_type NOT IN ",
-                user_sync_task_types.iter().copied(),
-            );
+            Some(admin_job_groups::lane_task_types(AdminJobTaskLane::Scheduled).collect())
         }
         "user_sync" => {
-            push_in_list(
-                query,
-                " AND task_type IN ",
-                user_sync_task_types.iter().copied(),
-            );
+            Some(admin_job_groups::lane_task_types(AdminJobTaskLane::UserSync).collect())
         }
-        "realtime" => {
-            push_in_list(
-                query,
-                " AND task_type NOT IN ",
-                SCHEDULED_TASK_TYPES.iter().copied(),
-            );
-        }
-        _ => {}
+        "realtime" => Some(admin_job_groups::lane_task_types(AdminJobTaskLane::Realtime).collect()),
+        "legacy" => Some(admin_job_groups::LEGACY_TASK_TYPES.to_vec()),
+        group_key => admin_job_groups::find_group(group_key)
+            .map(|group| group.task_types.iter().map(|spec| spec.task_type).collect()),
     }
 }
 
@@ -1024,6 +1033,8 @@ struct RealtimeTaskDetailRow {
 struct RealtimeTaskDetailItem {
     id: String,
     task_type: String,
+    task_group: Option<String>,
+    legacy: bool,
     status: String,
     source: String,
     requested_by: Option<String>,
@@ -1151,6 +1162,9 @@ async fn load_task_detail(
     Ok(Some(RealtimeTaskDetailResponse {
         task: RealtimeTaskDetailItem {
             id: row.id,
+            task_group: admin_job_groups::group_for_task_type(&row.task_type)
+                .map(|group| group.key.to_owned()),
+            legacy: admin_job_groups::is_legacy_task_type(&row.task_type),
             task_type: row.task_type,
             status: row.status,
             source: row.source,
@@ -1566,4 +1580,38 @@ async fn load_translation_batch(
         .fetch_all(pool)
         .await
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_admin_jobs_task_group_keys_derive_from_group_table() {
+        assert!(task_group_task_types("all").is_none());
+        assert!(task_group_task_types("").is_none());
+        assert!(task_group_task_types("unknown-group").is_none());
+
+        let user_sync = task_group_task_types("user_sync").expect("user_sync lane");
+        assert_eq!(user_sync, vec![crate::jobs::TASK_SYNC_STARRED]);
+
+        let sync = task_group_task_types("sync").expect("sync group");
+        assert!(sync.contains(&crate::jobs::TASK_SYNC_RELEASES));
+        assert!(!sync.contains(&crate::jobs::TASK_SYNC_SUBSCRIPTIONS));
+
+        let legacy = task_group_task_types("legacy").expect("legacy filter");
+        assert!(legacy.contains(&crate::jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!legacy.contains(&admin_job_groups::TASK_TRANSLATION_GENERATE));
+    }
+
+    #[test]
+    fn postgres_admin_jobs_runtime_groups_exclude_legacy_history() {
+        for task_type in admin_job_groups::runtime_task_types() {
+            assert!(!admin_job_groups::is_legacy_task_type(task_type));
+        }
+        assert!(
+            admin_job_groups::runtime_task_types()
+                .any(|task_type| task_type == admin_job_groups::TASK_TRANSLATION_GENERATE)
+        );
+    }
 }

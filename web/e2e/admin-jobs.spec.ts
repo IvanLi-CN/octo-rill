@@ -92,6 +92,8 @@ async function installAdminJobsMocks(
 		{
 			id: "task-failed-1",
 			task_type: "brief.daily_slot",
+			task_group: "briefs",
+			legacy: false,
 			status: "failed",
 			source: "scheduler",
 			requested_by: null,
@@ -105,9 +107,11 @@ async function installAdminJobsMocks(
 		},
 		{
 			id: "task-running-1",
-			task_type: "sync.releases",
+			task_type: "translation.generate",
+			task_group: "translation",
+			legacy: false,
 			status: "running",
-			source: "api.sync_releases",
+			source: "api.translate",
 			requested_by: CURRENT_USER_ID,
 			parent_task_id: null,
 			cancel_requested: false,
@@ -120,6 +124,8 @@ async function installAdminJobsMocks(
 		{
 			id: "task-translate-batch-1",
 			task_type: "translate.release.batch",
+			task_group: "translation",
+			legacy: false,
 			status: "succeeded",
 			source: "api.translate_releases_batch_stream",
 			requested_by: CURRENT_USER_ID,
@@ -134,6 +140,8 @@ async function installAdminJobsMocks(
 		{
 			id: "task-subscriptions-1",
 			task_type: "sync.subscriptions",
+			task_group: null,
+			legacy: true,
 			status: "succeeded",
 			source: "scheduler",
 			requested_by: null,
@@ -148,6 +156,8 @@ async function installAdminJobsMocks(
 		{
 			id: "task-subscriptions-skipped",
 			task_type: "sync.subscriptions",
+			task_group: null,
+			legacy: true,
 			status: "succeeded",
 			source: "scheduler",
 			requested_by: null,
@@ -162,6 +172,8 @@ async function installAdminJobsMocks(
 		{
 			id: "task-access-refresh-1",
 			task_type: "sync.access_refresh",
+			task_group: "sync",
+			legacy: false,
 			status: "succeeded",
 			source: "dashboard.access_refresh",
 			requested_by: CURRENT_USER_ID,
@@ -183,7 +195,7 @@ async function installAdminJobsMocks(
 			model: "gpt-4o-mini",
 			requested_by: CURRENT_USER_ID,
 			parent_task_id: "task-running-1",
-			parent_task_type: "sync.releases",
+			parent_task_type: "translation.generate",
 			max_tokens: 900,
 			attempt_count: 3,
 			scheduler_wait_ms: 1200,
@@ -1089,14 +1101,59 @@ async function installAdminJobsMocks(
 				if (taskType && task.task_type !== taskType) return false;
 				if (excludeTaskType && task.task_type === excludeTaskType) return false;
 				if (taskGroup === "scheduled") {
-					return ["brief.daily_slot", "sync.subscriptions"].includes(
-						task.task_type,
+					return Boolean(
+						{
+							"brief.daily_slot": true,
+							"brief.generate": true,
+							"sync.releases": true,
+							"sync.notifications": true,
+							"webhook.push.manage": true,
+							"retry.recent_failures": true,
+							"release.reading_backfill": true,
+						}[task.task_type],
 					);
 				}
 				if (taskGroup === "realtime") {
-					return !["brief.daily_slot", "sync.subscriptions"].includes(
-						task.task_type,
+					return !Boolean(
+						{
+							"brief.daily_slot": true,
+							"brief.generate": true,
+							"sync.releases": true,
+							"sync.notifications": true,
+							"webhook.push.manage": true,
+							"retry.recent_failures": true,
+							"release.reading_backfill": true,
+							"sync.starred": true,
+							"sync.subscriptions": true,
+							"summarize.release.smart.batch": true,
+							"release.evidence": true,
+							"sync.starred.delta": true,
+							"sync.starred.reconcile": true,
+							"brief.history_recompute": true,
+							"brief.refresh_content": true,
+							"webhook.push.audit": true,
+						}[task.task_type],
 					);
+				}
+				if (taskGroup === "user_sync") {
+					return task.task_type === "sync.starred";
+				}
+				if (taskGroup === "legacy") {
+					return Boolean(
+						{
+							"sync.subscriptions": true,
+							"summarize.release.smart.batch": true,
+							"release.evidence": true,
+							"sync.starred.delta": true,
+							"sync.starred.reconcile": true,
+							"brief.history_recompute": true,
+							"brief.refresh_content": true,
+							"webhook.push.audit": true,
+						}[task.task_type],
+					);
+				}
+				if (taskGroup !== "all") {
+					return task.task_group === taskGroup;
 				}
 				return true;
 			});
@@ -1143,7 +1200,7 @@ async function installAdminJobsMocks(
 				`data: ${JSON.stringify({
 					event_id: "evt-stream-9001",
 					task_id: "task-running-1",
-					task_type: "sync.releases",
+					task_type: "translation.generate",
 					status: "running",
 					event_type: "task.running",
 					created_at: "2026-02-26T01:00:05Z",
@@ -2334,7 +2391,7 @@ test("admin can manage jobs center", async ({ page }) => {
 		"监控系统内部任务，并支持重试与取消。",
 	);
 
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
 	await expect(page.getByText("sync.subscriptions")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
@@ -2395,30 +2452,11 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	await expect(
-		page.getByText("sync.subscriptions", { exact: true }).first(),
-	).toBeVisible();
-	await expect(
 		page.getByText("brief.daily_slot", { exact: true }).first(),
 	).toBeVisible();
-	const subscriptionTaskCard = page
-		.getByText("ID: task-subscriptions-1")
-		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
-	await expect(subscriptionTaskCard.getByText("订阅同步")).toBeVisible();
-	await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
 	await expect(
-		page.getByText("task-subscriptions-1", { exact: true }),
-	).toBeVisible();
-	await expect(page).toHaveURL(
-		/\/admin\/jobs\/tasks\/task-subscriptions-1\?from=scheduled$/,
-	);
-	await expect(page.getByText("Social 成功/总计")).toBeVisible();
-	await expect(page.getByText("9/11", { exact: true })).toBeVisible();
-	await expect(page.getByText("Inbox 成功/总计")).toBeVisible();
-	await expect(page.getByText("10/11", { exact: true })).toBeVisible();
-	await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
-	await expect(page.getByRole("link", { name: "下载日志" })).toBeVisible();
-	await page.getByRole("button", { name: "关闭", exact: true }).click();
-	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
+		page.getByText("sync.subscriptions", { exact: true }),
+	).toHaveCount(0);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 
 	await subscriptionsTab.click();
@@ -2432,6 +2470,9 @@ test("admin can manage jobs center", async ({ page }) => {
 		"href",
 		"/admin/jobs/subscriptions/task-subscriptions-1",
 	);
+	await expect(
+		subscriptionWorkflowCard.getByText("旧 SQLite 期"),
+	).toBeVisible();
 	await subscriptionWorkflowCard.click();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/subscriptions\/task-subscriptions-1$/,
@@ -4416,7 +4457,7 @@ test("admin keeps blocking loader before first realtime load completes", async (
 	await expect(page.getByText(/^SSE (已连接|重连中\.\.\.)$/)).toBeVisible();
 	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
 	await expect(page.getByText("暂无任务")).toHaveCount(0);
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 });
 
 test("admin ignores stale llm refresh errors after filter change", async ({
@@ -4500,13 +4541,13 @@ test("admin keeps realtime tasks visible while status filter refreshes", async (
 	});
 	await page.goto("/admin/jobs");
 
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	await expect(page.getByText("translate.release.batch")).toBeVisible();
 	await page.getByRole("combobox", { name: "实时异步任务状态筛选" }).click();
 	await page.getByRole("option", { name: "状态：运行中" }).click();
 
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	await expect(page.getByText("translate.release.batch")).toBeVisible();
 	const staleTaskCard = page
 		.getByText("ID: task-translate-batch-1")
@@ -4516,7 +4557,7 @@ test("admin keeps realtime tasks visible while status filter refreshes", async (
 	).toBeDisabled();
 
 	await page.waitForTimeout(700);
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	await expect(page.getByText("translate.release.batch")).toHaveCount(0);
 });
 
@@ -4553,12 +4594,12 @@ test("admin refresh keeps existing jobs and llm calls visible", async ({
 	});
 	await page.goto("/admin/jobs");
 
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 
 	await expect(refreshButton).toBeDisabled();
-	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translation.generate")).toBeVisible();
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
 
 	await page.getByRole("tab", { name: "LLM调度" }).click();

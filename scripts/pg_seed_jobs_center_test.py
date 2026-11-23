@@ -25,6 +25,8 @@ from pg_seed_common import psql
 TASK_FIELDS = {
     'id',
     'task_type',
+    'task_group',
+    'legacy',
     'status',
     'source',
     'skipped',
@@ -92,46 +94,63 @@ def main():
               (id, task_type, status, source, requested_by, payload_json, result_json,
                error_message, cancel_requested, created_at, started_at, finished_at, updated_at)
             VALUES
-              ('rt-1', 'translate.release.batch', 'succeeded', 'api.translate', NULL,
-               '{"release_ids":[1]}', '{"total":1}', NULL, 0,
+         			  ('rt-translate', 'translation.generate', 'succeeded', 'api.translate',
+			   'seed-user', '{"user_id":"seed-user"}', '{"lang":"zh"}', NULL, 0,
                now() - interval '60 minutes', now() - interval '59 minutes',
                now() - interval '59 minutes', now() - interval '59 minutes'),
-              ('rt-2', 'summarize.release.smart.batch', 'failed', 'scheduler', NULL,
-               '{}', NULL, 'summarize boom', 0,
+         			  ('rt-batch', 'translate.release.batch', 'succeeded', 'api.translate', NULL,
+			   '{"release_ids":[1]}', '{"items":[{"status":"ready"}]}', NULL, 0,
                now() - interval '50 minutes', now() - interval '49 minutes',
                now() - interval '49 minutes', now() - interval '49 minutes'),
-              ('rt-3', 'sync.notifications', 'running', 'api.sync', 'seed-user',
+         			  ('rt-repo', 'sync.repo_release', 'running', 'api.webhook', 'seed-user',
                '{}', NULL, NULL, 1,
                now() - interval '40 minutes', now() - interval '39 minutes',
                NULL, now() - interval '39 minutes'),
-              ('rt-old', 'translate.release.batch', 'succeeded', 'api.translate', NULL,
-               '{}', '{"total":1}', NULL, 0,
+         			  ('rt-notify', 'sync.notifications', 'running', 'scheduler', NULL,
+			   '{}', NULL, NULL, 0,
+			   now() - interval '35 minutes', now() - interval '34 minutes',
+			   NULL, now() - interval '34 minutes'),
+         			  ('rt-old', 'translation.generate', 'succeeded', 'api.translate', NULL,
+			   '{}', '{"lang":"zh"}', NULL, 0,
                now() - interval '48 hours', now() - interval '48 hours',
                now() - interval '48 hours', now() - interval '48 hours'),
-              ('sch-1', 'brief.daily_slot', 'succeeded', 'scheduler', NULL,
+         			  ('sch-brief-ok', 'brief.daily_slot', 'succeeded', 'scheduler', NULL,
                '{"hour_utc":6}', '{"generated":1}', NULL, 0,
                now() - interval '30 minutes', now() - interval '29 minutes',
                now() - interval '29 minutes', now() - interval '29 minutes'),
-              ('sch-2', 'brief.daily_slot', 'queued', 'scheduler', NULL,
+         			  ('sch-brief-queued', 'brief.daily_slot', 'queued', 'scheduler', NULL,
                '{"hour_utc":7}', NULL, NULL, 0,
                now() - interval '20 minutes', NULL, NULL,
                now() - interval '20 minutes'),
-              ('sch-3', 'retry.recent_failures', 'succeeded', 'scheduler', NULL,
+         			  ('sch-retry', 'retry.recent_failures', 'succeeded', 'scheduler', NULL,
                '{}', '{"retried":0}', NULL, 0,
                now() - interval '10 minutes', now() - interval '9 minutes',
                now() - interval '9 minutes', now() - interval '9 minutes'),
-              ('sch-4', 'webhook.push.audit', 'succeeded', 'scheduler', NULL,
-               '{}', '{"audited":0}', NULL, 0,
+         			  ('sch-webhook', 'webhook.push.manage', 'succeeded', 'scheduler', NULL,
+			   '{}', '{"managed":0}', NULL, 0,
                now() - interval '5 minutes', now() - interval '4 minutes',
                now() - interval '4 minutes', now() - interval '4 minutes'),
-              ('us-1', 'sync.starred.delta', 'succeeded', 'scheduler', 'seed-user',
-               '{"user_id":"seed-user"}', '{"skipped":false}', NULL, 0,
+         			  ('us-running', 'sync.starred', 'running', 'scheduler', 'seed-user',
+			   '{"user_id":"seed-user"}', NULL, NULL, 0,
                now() - interval '55 minutes', now() - interval '54 minutes',
-               now() - interval '54 minutes', now() - interval '54 minutes'),
-              ('us-2', 'sync.starred.reconcile', 'failed', 'scheduler', 'seed-user',
-               '{"user_id":"seed-user"}', NULL, 'reconcile boom', 0,
+			   NULL, now() - interval '54 minutes'),
+         			  ('us-failed', 'sync.starred', 'failed', 'scheduler', 'seed-user',
+			   '{"user_id":"seed-user"}', NULL, 'star boom', 0,
                now() - interval '45 minutes', now() - interval '44 minutes',
                now() - interval '44 minutes', now() - interval '44 minutes'),
+         			  -- Imported SQLite history: readable, legacy-marked, never current.
+         			  ('legacy-summarize', 'summarize.release.smart.batch', 'failed', 'scheduler', NULL,
+               '{}', NULL, 'summarize boom', 0,
+               now() - interval '50 minutes', now() - interval '49 minutes',
+               now() - interval '49 minutes', now() - interval '49 minutes'),
+         			  ('legacy-delta', 'sync.starred.delta', 'succeeded', 'scheduler', 'seed-user',
+               '{"user_id":"seed-user"}', '{"skipped":false}', NULL, 0,
+			   now() - interval '54 minutes', now() - interval '54 minutes',
+               now() - interval '54 minutes', now() - interval '54 minutes'),
+         			  ('legacy-audit', 'webhook.push.audit', 'succeeded', 'scheduler', NULL,
+               '{}', '{"audited":0}', NULL, 0,
+			   now() - interval '4 minutes', now() - interval '4 minutes',
+               now() - interval '4 minutes', now() - interval '4 minutes'),
               ('sub-1', 'sync.subscriptions', 'succeeded', 'scheduler', NULL,
                '{"trigger":"scheduler","schedule_key":"daily-06"}',
                '{"skipped":true,"skip_reason":"previous_run_active"}', NULL, 0,
@@ -264,10 +283,13 @@ def main():
                 'total_scheduled_slots',
             }, overview
             assert overview['queued'] == 1, overview
-            assert overview['running'] == 2, overview
-            assert overview['failed_24h'] == 3, overview
+            assert overview['queued'] == 1, overview
+            assert overview['running'] == 3, overview
+            # `legacy-summarize`, `legacy-delta` and `sub-2` failed inside 24h but
+            # are imported SQLite rows, so only `us-failed` counts.
+            assert overview['failed_24h'] == 1, overview
             # rt-old finished 48h ago and must stay outside the window.
-            assert overview['succeeded_24h'] == 6, overview
+            assert overview['succeeded_24h'] == 5, overview
             assert overview['enabled_scheduled_slots'] == 24, overview
             assert overview['total_scheduled_slots'] == 24, overview
 
@@ -279,58 +301,73 @@ def main():
             assert realtime_page['total'] == 4, realtime_page
             assert realtime_page['page'] == 1 and realtime_page['page_size'] == 2
             ids = [item['id'] for item in realtime_page['items']]
-            assert ids == ['rt-3', 'rt-2'], ids
+            assert ids == ['rt-repo', 'rt-batch'], ids
             item = realtime_page['items'][0]
             assert TASK_FIELDS <= set(item), item
             assert 'task_id' not in item, item
             assert item['status'] == 'running' and item['cancel_requested'] is True, item
             assert item['created_at'] and item['finished_at'] is None, item
+            assert item['task_type'] == 'sync.repo_release', item
+            assert item['task_group'] == 'sync' and item['legacy'] is False, item
             assert 'diagnostics' not in item, item
-            assert realtime_page['items'][1]['error_message'] == 'summarize boom'
+            assert realtime_page['items'][1]['task_group'] == 'translation', realtime_page
 
             code, second_page = realtime(
                 {'status': 'all', 'task_group': 'realtime', 'page': 2, 'page_size': 2}
             )
             assert code == 200, (code, second_page)
-            assert [entry['id'] for entry in second_page['items']] == ['rt-1', 'rt-old']
+            assert [entry['id'] for entry in second_page['items']] == ['rt-translate', 'rt-old']
             assert second_page['total'] == 4, second_page
 
             code, scheduled_page = realtime({'status': 'all', 'task_group': 'scheduled'})
             assert code == 200, (code, scheduled_page)
             scheduled_ids = [entry['id'] for entry in scheduled_page['items']]
-            # `sync.subscriptions` is a scheduled task type in the legacy
-            # contract, so it belongs to this group as well.
-            assert scheduled_page['total'] == 7, scheduled_page
+            # Legacy `sync.subscriptions` rows are history, not scheduled work.
+            assert scheduled_page['total'] == 5, scheduled_page
             assert scheduled_ids == [
-                'sch-4',
-                'sch-3',
-                'sub-3',
-                'sch-2',
-                'sub-2',
-                'sch-1',
-                'sub-1',
+                'sch-webhook',
+                'sch-retry',
+                'sch-brief-queued',
+                'sch-brief-ok',
+                'rt-notify',
             ], scheduled_ids
-            assert 'us-1' not in scheduled_ids
+            assert 'us-running' not in scheduled_ids
             scheduled_types = {entry['task_type'] for entry in scheduled_page['items']}
-            assert 'sync.starred.delta' not in scheduled_types, scheduled_types
+            assert 'sync.starred' not in scheduled_types, scheduled_types
+            assert 'sync.subscriptions' not in scheduled_types, scheduled_types
             scheduled_by_id = {entry['id']: entry for entry in scheduled_page['items']}
-            assert 'diagnostics' not in scheduled_by_id['sch-1'], scheduled_by_id['sch-1']
-            assert scheduled_by_id['sub-1']['diagnostics']['sync_subscriptions'][
-                'skipped'
-            ] is True
+            assert 'diagnostics' not in scheduled_by_id['sch-brief-ok'], scheduled_by_id
 
             code, user_sync_page = realtime({'status': 'all', 'task_group': 'user_sync'})
             assert code == 200, (code, user_sync_page)
             assert user_sync_page['total'] == 2, user_sync_page
             assert [entry['task_type'] for entry in user_sync_page['items']] == [
-                'sync.starred.reconcile',
-                'sync.starred.delta',
+                'sync.starred',
+                'sync.starred',
             ], user_sync_page
+            assert [entry['id'] for entry in user_sync_page['items']] == [
+                'us-failed',
+                'us-running',
+            ], user_sync_page
+            assert user_sync_page['items'][0]['error_message'] == 'star boom'
+
+            code, legacy_page = realtime({'status': 'all', 'task_group': 'legacy'})
+            assert code == 200, (code, legacy_page)
+            assert legacy_page['total'] == 6, legacy_page
+            assert all(entry['legacy'] is True for entry in legacy_page['items']), legacy_page
+            assert all(entry['task_group'] is None for entry in legacy_page['items']), legacy_page
+
+            code, sync_group_page = realtime({'status': 'all', 'task_group': 'sync'})
+            assert code == 200, (code, sync_group_page)
+            assert sync_group_page['total'] == 4, sync_group_page
+            assert all(
+                entry['task_group'] == 'sync' for entry in sync_group_page['items']
+            ), sync_group_page
 
             # ---- status / task_type / exclude filters --------------------------
-            code, failed_page = realtime({'status': 'failed', 'task_group': 'realtime'})
+            code, failed_page = realtime({'status': 'failed', 'task_group': 'user_sync'})
             assert code == 200 and failed_page['total'] == 1, failed_page
-            assert [entry['id'] for entry in failed_page['items']] == ['rt-2'], failed_page
+            assert [entry['id'] for entry in failed_page['items']] == ['us-failed'], failed_page
 
             code, type_page = realtime(
                 {'status': 'all', 'task_type': 'brief.daily_slot'}
@@ -343,7 +380,7 @@ def main():
             assert code == 200, excluded_page
             excluded_types = {entry['task_type'] for entry in excluded_page['items']}
             assert 'brief.daily_slot' not in excluded_types, excluded_page
-            assert excluded_page['total'] == 11, excluded_page
+            assert excluded_page['total'] == 15, excluded_page
 
             # ---- subscription tab and its diagnostics --------------------------
             code, subscription_page = realtime(
@@ -502,6 +539,7 @@ def main():
             task = detail['task']
             assert task['id'] == 'sub-1', task
             assert task['task_type'] == 'sync.subscriptions', task
+            assert task['task_group'] is None and task['legacy'] is True, task
             assert isinstance(task['payload_json'], str), task
             assert json.loads(task['payload_json'])['trigger'] == 'scheduler', task
             assert isinstance(task['result_json'], str), task
@@ -528,7 +566,10 @@ def main():
             assert detail['diagnostics']['business_outcome']['code'] == 'disabled'
 
             code, quiet_detail = request('/api/admin/jobs/realtime/rt-3')
+            code, quiet_detail = request('/api/admin/jobs/realtime/rt-notify')
             assert code == 200, (code, quiet_detail)
+            assert quiet_detail['task']['task_group'] == 'sync', quiet_detail
+            assert quiet_detail['task']['legacy'] is False, quiet_detail
             assert quiet_detail['events'] == [], quiet_detail
             assert quiet_detail['event_meta'] == {
                 'returned': 0,

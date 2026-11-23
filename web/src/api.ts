@@ -815,6 +815,8 @@ export type AdminDashboardBusinessCounts = {
 };
 export type AdminDashboardTaskStatusItem = {
 	task_type: string;
+	task_group: string;
+	task_group_label: string;
 	label: string;
 	queued: number;
 	running: number;
@@ -828,6 +830,8 @@ export type AdminDashboardTaskStatusItem = {
 };
 export type AdminDashboardTaskShareItem = {
 	task_type: string;
+	task_group: string;
+	task_group_label: string;
 	label: string;
 	total: number;
 	share_ratio: number;
@@ -844,14 +848,18 @@ export type AdminDashboardTrendPoint = {
 	translations_failed: number;
 	translations_partial: number;
 	translations_business_failed: number;
-	summaries_total: number;
-	summaries_failed: number;
-	summaries_partial: number;
-	summaries_business_failed: number;
+	sync_total: number;
+	sync_failed: number;
+	sync_partial: number;
+	sync_business_failed: number;
 	briefs_total: number;
 	briefs_failed: number;
 	briefs_partial: number;
 	briefs_business_failed: number;
+	operations_total: number;
+	operations_failed: number;
+	operations_partial: number;
+	operations_business_failed: number;
 };
 export type AdminDashboardWindowValue = "7d" | "30d";
 export type AdminDashboardLlmHealthBucket = {
@@ -869,8 +877,9 @@ export type AdminDashboardResponse = {
 		running_tasks: number;
 		ongoing_by_task: {
 			translations: number;
-			summaries: number;
+			sync: number;
 			briefs: number;
+			operations: number;
 		};
 	};
 	today_live: {
@@ -911,6 +920,8 @@ export type AdminDashboardResponse = {
 export type AdminRealtimeTaskItem = {
 	id: string;
 	task_type: string;
+	task_group: string | null;
+	legacy: boolean;
 	status: string;
 	source: string;
 	skipped?: boolean;
