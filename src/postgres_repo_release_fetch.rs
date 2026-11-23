@@ -960,6 +960,8 @@ async fn fetch_public(
 #[derive(Debug)]
 struct PageResponse {
     not_modified: bool,
+    /// GitHub refused the page because the endpoint caps its result set.
+    pagination_limit: bool,
     releases: Vec<Value>,
     etag: Option<String>,
     last_modified: Option<String>,
@@ -1034,6 +1036,7 @@ async fn request_page(
         if status == StatusCode::NOT_MODIFIED {
             return Ok(PageResponse {
                 not_modified: true,
+                pagination_limit: false,
                 releases: Vec::new(),
                 etag,
                 last_modified,
@@ -1041,6 +1044,27 @@ async fn request_page(
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            // GitHub caps some list endpoints at 1000 results and answers the
+            // next page with 422. That is the end of the repository's readable
+            // history, not a failed read: stop here and keep what was already
+            // fetched instead of discarding the whole snapshot.
+            if page > 1 && status == StatusCode::UNPROCESSABLE_ENTITY && is_pagination_limit(&body)
+            {
+                debug!(
+                    event = "upstream.call",
+                    operation = "repo_release_fetch",
+                    repo = request.repo_full_name,
+                    page,
+                    "GitHub release pagination reached its result cap"
+                );
+                return Ok(PageResponse {
+                    not_modified: false,
+                    pagination_limit: true,
+                    releases: Vec::new(),
+                    etag,
+                    last_modified,
+                });
+            }
             let failure = classify_http_error(status, &headers, &body);
             if retry_page(request, page, attempt, &failure).await {
                 continue;
@@ -1051,16 +1075,23 @@ async fn request_page(
             Ok(releases) => {
                 return Ok(PageResponse {
                     not_modified: false,
+                    pagination_limit: false,
                     releases,
                     etag,
                     last_modified,
                 });
             }
             Err(error) => {
+                // A malformed or truncated body is the proxy failure this
+                // retry exists for. `json()` reports serde failures as
+                // `is_decode()`, not `is_body()`, so both kinds must qualify.
                 let failure = RefreshFailure::new(
                     "decode_error",
                     format!("decode GitHub releases: {error}"),
-                    error.is_body() || error.is_connect() || error.is_timeout(),
+                    error.is_body()
+                        || error.is_decode()
+                        || error.is_connect()
+                        || error.is_timeout(),
                     None,
                 );
                 if retry_page(request, page, attempt, &failure).await {
@@ -1071,6 +1102,12 @@ async fn request_page(
         }
     }
     unreachable!("the last page attempt returns instead of exhausting the loop")
+}
+
+/// Whether a 422 body names GitHub's 1000-result pagination cap.
+fn is_pagination_limit(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("only the first 1000 results")
 }
 
 /// Wait out the retry backoff and report the retry. Returns `false` when the
@@ -1121,6 +1158,10 @@ async fn fetch_with_token(
         );
         let page_response =
             request_page(http, request, token, sync_state, budget, page, url.as_str()).await?;
+        if page_response.pagination_limit {
+            fetch.stopped_reason = "pagination_limit".to_owned();
+            return Ok(fetch);
+        }
         fetch.pages_fetched = page;
         if page == 1 {
             fetch.etag = page_response.etag;
@@ -1619,6 +1660,71 @@ mod tests {
         );
         assert_eq!(failure.reason_code, "repo_inaccessible");
         assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_json_success_body_is_retried_once() {
+        // The accelerator sometimes answers 200 with an HTML error page.
+        // reqwest reports the serde failure as `Kind::Decode`, which must
+        // still qualify as retryable.
+        let (base, server) = scripted_server(vec![
+            ("200 OK", "<html>proxy error</html>"),
+            ("200 OK", r#"[{"id":1,"tag_name":"v1"}]"#),
+        ])
+        .await;
+        let http = Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=1");
+        let page = request_page(&http, &fetch_request(), None, None, None, 1, &url)
+            .await
+            .expect("the retried body decodes");
+        assert_eq!(page.releases.len(), 1);
+        assert_eq!(server.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_result_cap_422_stops_pagination_without_failing() {
+        // GitHub caps some list endpoints at 1000 results; page 11 of a huge
+        // repository answers 422. The already fetched pages must be kept.
+        let body = r#"{"message":"Only the first 1000 results are available.","status":"422"}"#;
+        let (base, server) = scripted_server(vec![("422 Unprocessable Entity", body)]).await;
+        let http = Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=11");
+        let page = request_page(&http, &fetch_request(), None, None, None, 11, &url)
+            .await
+            .expect("the result cap is a normal stop");
+        assert!(page.pagination_limit);
+        assert!(page.releases.is_empty());
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_422_stays_a_failure() {
+        let (base, server) = scripted_server(vec![(
+            "422 Unprocessable Entity",
+            r#"{"message":"Validation Failed"}"#,
+        )])
+        .await;
+        let http = Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=2");
+        let failure = failure_of(
+            request_page(&http, &fetch_request(), None, None, None, 2, &url)
+                .await
+                .expect_err("a validation error is final"),
+        );
+        assert_eq!(failure.reason_code, "github_http_error");
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[test]
+    fn pagination_cap_detection_is_specific_to_the_github_message() {
+        assert!(is_pagination_limit(
+            r#"{"message":"Only the first 1000 results are available."}"#
+        ));
+        assert!(is_pagination_limit(
+            "ONLY THE FIRST 1000 RESULTS ARE AVAILABLE"
+        ));
+        assert!(!is_pagination_limit(r#"{"message":"Validation Failed"}"#));
+        assert!(!is_pagination_limit(""));
     }
 
     #[test]
