@@ -3940,6 +3940,8 @@ mod tests {
         start_attempt,
     };
 
+    type LlmCallAuditRow = (String, String, Option<String>, i64, Option<String>);
+
     #[test]
     fn automatic_retry_backs_off_and_stops_at_the_attempt_cap() {
         assert_eq!(
@@ -4572,7 +4574,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    #[allow(clippy::type_complexity)]
     async fn postgres_translate_complete_falls_back_after_429_and_audits_switch()
     -> anyhow::Result<()> {
         use axum::{Json, Router, http::StatusCode, routing::post};
@@ -4663,8 +4664,7 @@ mod tests {
                     "model-b".to_owned()
                 ]
             );
-            let rows: Vec<(String, String, Option<String>, i64, Option<String>)> =
-                sqlx::query_as(
+            let rows: Vec<LlmCallAuditRow> = sqlx::query_as(
                     "SELECT c.status, c.model, c.final_model, c.fallback_count, c.failure_class FROM public.llm_calls c JOIN public.translation_attempt_llm_calls l ON l.llm_call_id = c.id ORDER BY l.ordinal",
                 )
                 .fetch_all(&pool)

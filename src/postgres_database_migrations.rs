@@ -25,6 +25,15 @@ pub async fn run(pool: &PgPool) -> Result<()> {
 mod tests {
     use super::MIGRATOR;
 
+    type OptionalUtc = Option<chrono::DateTime<chrono::Utc>>;
+    type TimestampTriple = (OptionalUtc, OptionalUtc, OptionalUtc);
+    type TimestampRow = (
+        OptionalUtc,
+        OptionalUtc,
+        OptionalUtc,
+        chrono::DateTime<chrono::Utc>,
+    );
+
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
         assert_eq!(MIGRATOR.iter().count(), 21);
@@ -199,7 +208,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    #[allow(clippy::type_complexity)]
     async fn llm_model_health_timestamp_migration_normalizes_imported_text_columns()
     -> anyhow::Result<()> {
         use sqlx::PgPool;
@@ -239,12 +247,7 @@ mod tests {
                 .await?;
                 assert_eq!(data_type, "timestamp with time zone", "{column}");
             }
-            let (window, cooldown, last_failure, created): (
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                chrono::DateTime<chrono::Utc>,
-            ) = sqlx::query_as(
+            let (window, cooldown, last_failure, created): TimestampRow = sqlx::query_as(
                 "SELECT window_started_at, cooldown_until, last_failure_at, created_at FROM public.llm_model_health WHERE model = 'm'",
             )
             .fetch_one(&pool)
@@ -265,7 +268,7 @@ mod tests {
                 created,
                 "2026-11-20T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>()?
             );
-            let empty: (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+            let empty: TimestampTriple = sqlx::query_as(
                 "SELECT window_started_at, cooldown_until, last_failure_at FROM public.llm_model_health WHERE model = 'm-empty'",
             )
             .fetch_one(&pool)
