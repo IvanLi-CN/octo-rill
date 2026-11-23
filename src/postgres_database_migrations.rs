@@ -98,11 +98,13 @@ mod tests {
                 .sql
                 .contains("ALTER TABLE public.llm_model_health")
         );
+        assert!(health_timestamps.sql.contains("FOREACH target_column"));
         assert!(
             health_timestamps
                 .sql
-                .contains("ALTER COLUMN cooldown_until TYPE timestamptz")
+                .contains("ALTER COLUMN %I TYPE timestamptz")
         );
+        assert!(health_timestamps.sql.contains("RAISE EXCEPTION"));
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()
