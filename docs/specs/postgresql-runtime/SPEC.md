@@ -81,6 +81,16 @@
 - Inputs: 刷新插入的 Release ID、请求用户、AI provider 配置。
 - Outputs: `translation_work_items`/`translation_requests`/`job_tasks` 行与 `translations_enqueued` 计数。
 
+### REQ-PGR-010
+
+- 每个 `translation.generate` 内的 title/body chunk `AuditRecorder::complete` 逻辑调用 MUST 按 `admin_runtime_settings.llm_models_json` 的顺序选择候选，并读取 `llm_model_health`：存在 ready 候选时 MUST 只使用 ready 候选；全部可用候选都在冷却时 MUST 只探测 `cooldown_until` 最早到期的一个；凭证停放中的候选 MUST 被排除。全部候选都被停放时 MUST NOT 发起上游请求，返回 `configuration`。
+- `transient`/`rate_limited` 在同一候选最多尝试两次；`empty_content` 不重试同一候选，直接切换下一候选。单次 `complete` 的上游尝试总数 MUST NOT 超过 8；一个 `translation.generate` 任务包含多个 `complete` 时分别受该上限约束。
+- 模型在滚动 10 分钟窗口内累计 2 次相关失败后 MUST 进入 10 分钟冷却；窗口翻转 MUST NOT 清除仍在未来的 cooldown。HTTP 401/403 的凭证拒绝 MUST 停放 24 小时并继续尝试下一候选；其他 4xx（如 400/404/422）MUST NOT 写入健康冷却，直接切换下一候选。管理员保存 LLM 运行时配置 MUST 清除凭证停放。
+- `llm_calls` MUST 记录实际 `model`、`final_model` 与 `fallback_count`；`fallback_count` 表示本次逻辑调用已经切换的模型数量。
+- `AI_MODEL` 仅为成功读取 settings 行且持久化模型列表为空时的运行期 fallback，MUST NOT 覆盖非空列表。settings 行缺失、settings/health 读取或解析失败 MUST fail closed，不得静默回退到 `AI_MODEL` 或把缺失的 health 当作全部可用。
+- Inputs: 持久化模型列表、`llm_model_health`、provider 响应。
+- Outputs: 选中的模型、候选切换与冷却事实、可归因的 LLM 审计行。
+
 ## Verification
 
 ### VER-PGR-001
@@ -136,6 +146,12 @@
 - Method: `cargo test --locked --bin octo-rill postgres_translate`、`TEST_PG_TRANSLATE_URL=… cargo test --locked --bin octo-rill postgres_backlog -- --ignored`、`cargo test --locked --bin octo-rill postgres_tasks` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
 - covers: `REQ-PGR-009`
 - Pass condition: 批次上限与去重、超限候选写入积压、积压跨周期有界排空且幂等、可恢复失败按退避与次数上限自动重试、未到期与不可恢复失败不重试、空内容跳过、`ready` 与在途任务不重复排队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
+
+### VER-PGR-010
+
+- Method: `route_candidates_*` 单测覆盖 ready-only、单一最早冷却、凭证停放排除、归一化 health key 与清除停放后恢复；`credential_rejection_and_upstream_classes_are_distinct` 覆盖 429/401/500 分类；`postgres_translate_complete_routes_failures_and_audits_switch` 用本地 HTTP provider 验证 429 同模型重试、401/403 停放并继续、400/404/422 不写健康、审计字段、8 次上限与 malformed health fail closed；`postgres_model_health_cools_after_two_failures` 覆盖两次逻辑失败进入冷却、24 小时停放与窗口翻转保留 cooldown；`postgres_route_models_falls_back_only_when_persisted_list_is_empty` 覆盖空列表 fallback、settings 行缺失与读取/解析失败 fail closed；`clear_credential_park_cooldowns_clears_only_configuration_rows` 覆盖保存操作清除凭证停放；`llm_model_health_timestamp_migration_normalizes_imported_text_columns` 覆盖迁移 `0021` 的 all-text、mixed 与二次执行。
+- covers: `REQ-PGR-010`
+- Pass condition: 每个 `complete` 的候选顺序、ready-only/冷却/停放、8 次上限、`model`/`final_model`/`fallback_count` 审计、cooldown 保留、保存清除停放后恢复、迁移转换与 `AI_MODEL` 仅在成功读取的空列表时生效均符合。
 
 ## Related ADRs
 

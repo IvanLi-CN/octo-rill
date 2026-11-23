@@ -25,9 +25,18 @@ pub async fn run(pool: &PgPool) -> Result<()> {
 mod tests {
     use super::MIGRATOR;
 
+    type OptionalUtc = Option<chrono::DateTime<chrono::Utc>>;
+    type TimestampTriple = (OptionalUtc, OptionalUtc, OptionalUtc);
+    type TimestampRow = (
+        OptionalUtc,
+        OptionalUtc,
+        OptionalUtc,
+        chrono::DateTime<chrono::Utc>,
+    );
+
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 20);
+        assert_eq!(MIGRATOR.iter().count(), 21);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -79,6 +88,23 @@ mod tests {
                 .sql
                 .contains("DELETE FROM public.translation_attempt_events")
         );
+        let health_timestamps = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 21)
+            .expect("llm model health timestamp migration");
+        assert!(health_timestamps.sql.contains("llm_model_health"));
+        assert!(
+            health_timestamps
+                .sql
+                .contains("ALTER TABLE public.llm_model_health")
+        );
+        assert!(health_timestamps.sql.contains("FOREACH target_column"));
+        assert!(
+            health_timestamps
+                .sql
+                .contains("ALTER COLUMN %I TYPE timestamptz")
+        );
+        assert!(health_timestamps.sql.contains("RAISE EXCEPTION"));
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()
@@ -171,6 +197,148 @@ mod tests {
             .bind(crate::local_id::generate_local_id())
             .execute(&pool)
             .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn llm_model_health_timestamp_migration_normalizes_imported_text_columns()
+    -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("migration_health_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count integer NOT NULL DEFAULT 0, window_started_at text, cooldown_until text, last_failure_class text, last_failure_at text, created_at text NOT NULL, updated_at text NOT NULL);
+                INSERT INTO public.llm_model_health(model, relevant_failure_count, window_started_at, cooldown_until, last_failure_class, last_failure_at, created_at, updated_at) VALUES ('m', 2, '2026-11-21T08:36:41.688Z', '2026-11-21T08:46:41.688Z', 'rate_limited', '2026-11-21T08:36:41.688Z', '2026-11-20T00:00:00Z', '2026-11-21T08:36:41.688Z');
+                INSERT INTO public.llm_model_health(model, relevant_failure_count, window_started_at, cooldown_until, last_failure_class, last_failure_at, created_at, updated_at) VALUES ('m-empty', 0, '', '', NULL, '', '2026-11-20T00:00:00Z', '2026-11-20T00:00:00Z');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let migration = include_str!("../migrations_pg/0021_llm_model_health_timestamps.sql");
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            for column in [
+                "window_started_at",
+                "cooldown_until",
+                "last_failure_at",
+                "created_at",
+                "updated_at",
+            ] {
+                let data_type: String = sqlx::query_scalar(
+                    "SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='llm_model_health' AND column_name=$1",
+                )
+                .bind(column)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(data_type, "timestamp with time zone", "{column}");
+            }
+            let (window, cooldown, last_failure, created): TimestampRow = sqlx::query_as(
+                "SELECT window_started_at, cooldown_until, last_failure_at, created_at FROM public.llm_model_health WHERE model = 'm'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                window,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                cooldown,
+                Some("2026-11-21T08:46:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                last_failure,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                created,
+                "2026-11-20T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>()?
+            );
+            let empty: TimestampTriple = sqlx::query_as(
+                "SELECT window_started_at, cooldown_until, last_failure_at FROM public.llm_model_health WHERE model = 'm-empty'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(empty, (None, None, None));
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_model_health")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(count, 2);
+            sqlx::query("DROP TABLE public.llm_model_health")
+                .execute(&pool)
+                .await?;
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count integer NOT NULL DEFAULT 0, window_started_at text, cooldown_until timestamptz, last_failure_class text, last_failure_at text, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+                INSERT INTO public.llm_model_health(model, relevant_failure_count, window_started_at, cooldown_until, last_failure_class, last_failure_at, created_at, updated_at) VALUES ('mixed', 2, '2026-11-21T08:36:41.688Z', '2026-11-21T08:46:41.688Z', 'rate_limited', '2026-11-21T08:36:41.688Z', '2026-11-20T00:00:00Z', '2026-11-21T08:36:41.688Z');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            for column in [
+                "window_started_at",
+                "cooldown_until",
+                "last_failure_at",
+                "created_at",
+                "updated_at",
+            ] {
+                let data_type: String = sqlx::query_scalar(
+                    "SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='llm_model_health' AND column_name=$1",
+                )
+                .bind(column)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(data_type, "timestamp with time zone", "{column}");
+            }
+            let (window, cooldown, last_failure, created): TimestampRow = sqlx::query_as(
+                "SELECT window_started_at, cooldown_until, last_failure_at, created_at FROM public.llm_model_health WHERE model = 'mixed'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                window,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                cooldown,
+                Some("2026-11-21T08:46:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                last_failure,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                created,
+                "2026-11-20T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>()?
+            );
+            sqlx::query("DROP TABLE public.llm_model_health")
+                .execute(&pool)
+                .await?;
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            let absent: bool = sqlx::query_scalar(
+                "SELECT to_regclass('public.llm_model_health') IS NULL",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert!(absent);
             Ok::<_, anyhow::Error>(())
         }
         .await;

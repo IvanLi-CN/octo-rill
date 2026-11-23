@@ -80,7 +80,7 @@ If you want to test translation and daily briefs, also set:
 
 - `AI_API_KEY`
 - `AI_BASE_URL`
-- `AI_MODEL`
+- `AI_MODEL` (optional runtime fallback; defaults to `gpt-4o-mini` and is used only when the administrator-ordered model list is empty)
 
 Start the backend:
 
