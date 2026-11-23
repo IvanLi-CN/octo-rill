@@ -279,6 +279,64 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
             assert_eq!(count, 2);
+            sqlx::query("DROP TABLE public.llm_model_health")
+                .execute(&pool)
+                .await?;
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count integer NOT NULL DEFAULT 0, window_started_at text, cooldown_until timestamptz, last_failure_class text, last_failure_at text, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+                INSERT INTO public.llm_model_health(model, relevant_failure_count, window_started_at, cooldown_until, last_failure_class, last_failure_at, created_at, updated_at) VALUES ('mixed', 2, '2026-11-21T08:36:41.688Z', '2026-11-21T08:46:41.688Z', 'rate_limited', '2026-11-21T08:36:41.688Z', '2026-11-20T00:00:00Z', '2026-11-21T08:36:41.688Z');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            for column in [
+                "window_started_at",
+                "cooldown_until",
+                "last_failure_at",
+                "created_at",
+                "updated_at",
+            ] {
+                let data_type: String = sqlx::query_scalar(
+                    "SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='llm_model_health' AND column_name=$1",
+                )
+                .bind(column)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(data_type, "timestamp with time zone", "{column}");
+            }
+            let (window, cooldown, last_failure, created): TimestampRow = sqlx::query_as(
+                "SELECT window_started_at, cooldown_until, last_failure_at, created_at FROM public.llm_model_health WHERE model = 'mixed'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                window,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                cooldown,
+                Some("2026-11-21T08:46:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                last_failure,
+                Some("2026-11-21T08:36:41.688Z".parse::<chrono::DateTime<chrono::Utc>>()?)
+            );
+            assert_eq!(
+                created,
+                "2026-11-20T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>()?
+            );
+            sqlx::query("DROP TABLE public.llm_model_health")
+                .execute(&pool)
+                .await?;
+            sqlx::raw_sql(migration).execute(&pool).await?;
+            let absent: bool = sqlx::query_scalar(
+                "SELECT to_regclass('public.llm_model_health') IS NULL",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert!(absent);
             Ok::<_, anyhow::Error>(())
         }
         .await;

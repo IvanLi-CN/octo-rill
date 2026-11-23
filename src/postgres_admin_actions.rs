@@ -1714,7 +1714,8 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    async fn admin_save_clears_credential_park_cooldowns() -> anyhow::Result<()> {
+    async fn clear_credential_park_cooldowns_clears_only_configuration_rows() -> anyhow::Result<()>
+    {
         let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
         let admin = PgPool::connect(&admin_url).await?;
         let database = format!("admin_health_{}", crate::local_id::generate_local_id());

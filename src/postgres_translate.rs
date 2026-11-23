@@ -4378,6 +4378,24 @@ mod tests {
     }
 
     #[test]
+    fn route_candidates_treats_cleared_credential_park_as_ready() {
+        let now = chrono::Utc::now();
+        let models = vec!["cleared".to_owned()];
+        let mut health = std::collections::HashMap::new();
+        health.insert(
+            "cleared".to_owned(),
+            ModelRouteHealth {
+                cooldown_until: None,
+                last_failure_class: Some("configuration".to_owned()),
+            },
+        );
+        assert_eq!(
+            route_candidates(&models, &health, now),
+            vec!["cleared".to_owned()]
+        );
+    }
+
+    #[test]
     fn credential_rejection_and_upstream_classes_are_distinct() {
         assert!(is_credential_rejection(Some(401)));
         assert!(is_credential_rejection(Some(403)));
@@ -4622,8 +4640,10 @@ mod tests {
                     recorder.lock().await.push(model.clone());
                     let status = if model == "model-a" || handler_fail_all.load(Ordering::SeqCst) {
                         StatusCode::TOO_MANY_REQUESTS
-                    } else if model == "park-me" {
+                    } else if model == "park-401" {
                         StatusCode::UNAUTHORIZED
+                    } else if model == "park-403" {
+                        StatusCode::FORBIDDEN
                     } else if model == "bad-400" {
                         StatusCode::BAD_REQUEST
                     } else if model == "bad-404" {
@@ -4763,31 +4783,29 @@ mod tests {
             assert_eq!(f5_health, 0, "the ninth candidate is never attempted");
             fail_all.store(false, Ordering::SeqCst);
             sqlx::query(
-                "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"park-me\", \"after-park\"]' WHERE id = 1",
+                "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"park-401\", \"park-403\", \"after-park\"]' WHERE id = 1",
             )
             .execute(&pool)
             .await?;
             let content = audit.complete("body", "system", "user", 64).await?;
             assert_eq!(content, "ok");
             let observed_after_park = observed.lock().await.clone();
-            assert_eq!(observed_after_park.len(), 13);
+            assert_eq!(observed_after_park.len(), 14);
             assert_eq!(
                 observed_after_park[11..].to_vec(),
-                vec!["park-me".to_owned(), "after-park".to_owned()]
+                vec![
+                    "park-401".to_owned(),
+                    "park-403".to_owned(),
+                    "after-park".to_owned()
+                ]
             );
-            let (parked_until, parked_class): (
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<String>,
-            ) = sqlx::query_as(
-                "SELECT cooldown_until, last_failure_class FROM public.llm_model_health WHERE model = 'park-me'",
+            let parked_health: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.llm_model_health WHERE model IN ('park-401', 'park-403') AND last_failure_class = 'configuration' AND cooldown_until > $1",
             )
+            .bind(chrono::Utc::now() + chrono::Duration::hours(23))
             .fetch_one(&pool)
             .await?;
-            assert_eq!(parked_class.as_deref(), Some("configuration"));
-            assert!(
-                parked_until.expect("a credential rejection parks the model")
-                    > chrono::Utc::now() + chrono::Duration::hours(23)
-            );
+            assert_eq!(parked_health, 2);
             let after_park_health: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM public.llm_model_health WHERE model = 'after-park'",
             )
@@ -4800,7 +4818,7 @@ mod tests {
             .fetch_one(&pool)
             .await?;
             assert_eq!(last_row.0, "after-park");
-            assert_eq!(last_row.1, 1);
+            assert_eq!(last_row.1, 2);
             sqlx::query(
                 "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"bad-400\", \"bad-404\", \"bad-422\", \"after-bad\"]' WHERE id = 1",
             )
@@ -4809,9 +4827,9 @@ mod tests {
             let content = audit.complete("body", "system", "user", 64).await?;
             assert_eq!(content, "ok");
             let observed_after_bad = observed.lock().await.clone();
-            assert_eq!(observed_after_bad.len(), 17);
+            assert_eq!(observed_after_bad.len(), 18);
             assert_eq!(
-                observed_after_bad[13..].to_vec(),
+                observed_after_bad[14..].to_vec(),
                 vec![
                     "bad-400".to_owned(),
                     "bad-404".to_owned(),
@@ -4841,7 +4859,7 @@ mod tests {
             let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
                 .fetch_one(&pool)
                 .await?;
-            assert_eq!(calls, 17);
+            assert_eq!(calls, 18);
             sqlx::raw_sql(
                 "DROP TABLE public.llm_model_health; CREATE TABLE public.llm_model_health(model text PRIMARY KEY, cooldown_until text, last_failure_class text); INSERT INTO public.llm_model_health(model, cooldown_until, last_failure_class) VALUES ('broken', 'not-a-time', 'rate_limited');",
             )
@@ -4857,7 +4875,7 @@ mod tests {
             let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
                 .fetch_one(&pool)
                 .await?;
-            assert_eq!(calls, 17, "malformed health must not create a provider call");
+            assert_eq!(calls, 18, "malformed health must not create a provider call");
             Ok::<_, anyhow::Error>(())
         }
         .await;
