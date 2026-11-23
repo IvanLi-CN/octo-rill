@@ -46,7 +46,7 @@
 
 - 单仓 Release 刷新 MUST 共用一套判定：候选用户轮换仅在凭据/权限类失败时发生，公共仓库可在凭据耗尽后匿名读取，并发上限取自 `repo_release_worker_concurrency`；账号级任务 MUST NOT 因单仓不可读而整体失败。
 - 每个分页请求 MUST 至多发送两次（初次 + 一次重试），仅在 transport `network_error`、`timeout`、HTTP 5xx 与成功状态下的非 JSON 响应体（含 serde decode 失败）可重试；退避 MUST 为 300 ms。`repo_inaccessible`、`credentials_forbidden`、401/403/404/451、限流与 `deferred_budget` MUST NOT 重试。重试 MUST 重发同一页，MUST NOT 重复计页或追加部分解码结果。
-- GitHub 的 1000 条结果上限（后续页返回 422 `Only the first 1000 results are available.`）MUST 视为正常分页终止：保留已抓取结果并把 `stopped_reason` 记为 `pagination_limit`，MUST NOT 记为仓库失败；其它 422 仍按失败处理。
+- GitHub 的 1000 条结果上限（后续页返回 422 `Only the first 1000 results are available.`）MUST 视为正常分页终止：保留已抓取结果并把 `stopped_reason` 记为 `pagination_limit`，MUST NOT 记为仓库失败；其它 422 仍按失败处理。单页 MUST 请求 50 条（GitHub 上限为 100），20 页预算恰好覆盖 1000 条结果窗口，并避免超大单页响应被边缘层截断。
 - 账号级 `sync.releases` 的 `result_json` MUST 包含 `failed_count`、`deferred_count`、`failure_ratio`（0–1，两位小数）、`failure_reasons` 与 `degraded`；部分仓库失败时任务保持 `succeeded` 并标记 `degraded=true`，所有实际尝试均失败时任务 MUST 记为 `failed`。每个任务 MUST 只输出一条聚合告警，MUST NOT 逐仓库告警。
 - Inputs: 仓库、请求用户、连接凭据、usage 登记。
 - Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态、失败分类与账号级聚合摘要。
@@ -76,6 +76,8 @@
 - 自动排队 MUST 复用请求/工作项/任务三段式，并按 `(scope_user_id, kind, variant, entity_id, target_lang, source_hash)` 去重：结果已为 `ready` 的工作项 MUST NOT 再排队；同一工作项已有 `queued`/`running` 翻译任务时 MUST NOT 重复排队；无在途任务的终态工作项按授权重试语义重新入队。
 - 单次排队调用 MUST 最多为 25 个 Release 创建任务；其余可翻译候选 MUST 持久化为 `queued` 工作项，由后续周期排空，MUST NOT 因上限丢弃。排空同样每次最多 25 个，MUST 跳过已有 `queued`/`running` 任务的工作项，MUST NOT 重排 `failed` 或已完成的终态工作项。
 - 单个 Release 入队失败、积压写入失败或排空失败 MUST 只记录告警，MUST NOT 中断其余 Release 或刷新任务。两个执行器的 `result_json` MUST 报告 `translations_enqueued`（含同一次刷新排空的任务）。
+- 可恢复失败 MUST 由后续周期自动恢复：只有最后一次 `attempt_completed` 事件标记 `retry_eligible`、`next_retry_at` 已到期、且没有在途任务的工作项才会重排；退避按已尝试次数增长（第 1 次失败后 10 分钟，第 2 次后 1 小时），总尝试次数 MUST 不超过 3。不可恢复失败（`configuration`）、`missing` 与到达上限的项 MUST NOT 自动重试。
+- 每轮排空 MUST 先处理到期的自动重试，再用剩余额度处理积压，单轮总数不超过 25；重排 MUST 复用授权重试的重置语义。
 - Inputs: 刷新插入的 Release ID、请求用户、AI provider 配置。
 - Outputs: `translation_work_items`/`translation_requests`/`job_tasks` 行与 `translations_enqueued` 计数。
 
@@ -133,7 +135,7 @@
 
 - Method: `cargo test --locked --bin octo-rill postgres_translate`、`TEST_PG_TRANSLATE_URL=… cargo test --locked --bin octo-rill postgres_backlog -- --ignored`、`cargo test --locked --bin octo-rill postgres_tasks` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
 - covers: `REQ-PGR-009`
-- Pass condition: 批次上限与去重、超限候选写入积压、积压跨周期有界排空且幂等、空内容跳过、`ready` 与在途任务不重复排队、终态工作项重新入队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
+- Pass condition: 批次上限与去重、超限候选写入积压、积压跨周期有界排空且幂等、可恢复失败按退避与次数上限自动重试、未到期与不可恢复失败不重试、空内容跳过、`ready` 与在途任务不重复排队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
 
 ## Related ADRs
 

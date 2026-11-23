@@ -33,10 +33,17 @@ use tracing::{debug, warn};
 
 use crate::crypto::EncryptionKey;
 
-/// Releases requested per page; the GitHub maximum.
-pub(crate) const RELEASES_PER_PAGE: usize = 100;
-/// Page budget for one repository read, matching the legacy lane.
+/// Releases requested per page. GitHub allows 100, but the production
+/// accelerator times out on the resulting large bodies for huge repositories
+/// (a `openai/codex` page is ~50 MB at 100). Fifty keeps a page near 17 MB,
+/// and twenty pages still span GitHub's 1000-result window exactly.
+pub(crate) const RELEASES_PER_PAGE: usize = 50;
+/// Page budget for one repository read; `MAX_PAGES * RELEASES_PER_PAGE` equals
+/// the 1000-result limit GitHub exposes for list endpoints.
 pub(crate) const MAX_PAGES: usize = 20;
+/// GitHub list endpoints expose at most 1000 results; asking past that is a
+/// guaranteed 422, and some intermediaries turn it into an HTML page.
+const MAX_RELEASES_RESULTS: usize = 1_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Requests per page: the initial call plus one retry. One retry absorbs a
 /// single proxy hiccup; more attempts would multiply the cost of an upstream
@@ -1182,8 +1189,17 @@ async fn fetch_with_token(
             fetch.stopped_reason = "short_page".to_owned();
             return Ok(fetch);
         }
+        if reached_result_cap(page) {
+            fetch.stopped_reason = "pagination_limit".to_owned();
+            return Ok(fetch);
+        }
     }
     Ok(fetch)
+}
+
+/// Whether the next page would cross GitHub's 1000-result window.
+fn reached_result_cap(page: usize) -> bool {
+    page * RELEASES_PER_PAGE >= MAX_RELEASES_RESULTS
 }
 
 fn header_value(headers: &reqwest::header::HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -1683,13 +1699,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_result_cap_422_stops_pagination_without_failing() {
-        // GitHub caps some list endpoints at 1000 results; page 11 of a huge
-        // repository answers 422. The already fetched pages must be kept.
+        // GitHub caps some list endpoints at 1000 results; the page past the
+        // cap answers 422. The already fetched pages must be kept.
         let body = r#"{"message":"Only the first 1000 results are available.","status":"422"}"#;
         let (base, server) = scripted_server(vec![("422 Unprocessable Entity", body)]).await;
         let http = Client::builder().no_proxy().build().unwrap();
-        let url = format!("{base}/repos/seed/repo/releases?per_page=100&page=11");
-        let page = request_page(&http, &fetch_request(), None, None, None, 11, &url)
+        let url = format!("{base}/repos/seed/repo/releases?per_page=50&page=21");
+        let page = request_page(&http, &fetch_request(), None, None, None, 21, &url)
             .await
             .expect("the result cap is a normal stop");
         assert!(page.pagination_limit);
@@ -1725,6 +1741,14 @@ mod tests {
         ));
         assert!(!is_pagination_limit(r#"{"message":"Validation Failed"}"#));
         assert!(!is_pagination_limit(""));
+    }
+
+    #[test]
+    fn page_budget_stops_exactly_at_the_github_result_cap() {
+        assert_eq!(RELEASES_PER_PAGE, 50);
+        assert_eq!(MAX_PAGES * RELEASES_PER_PAGE, MAX_RELEASES_RESULTS);
+        assert!(!reached_result_cap(19));
+        assert!(reached_result_cap(20));
     }
 
     #[test]
