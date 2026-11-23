@@ -45,8 +45,10 @@
 ### REQ-PGR-005
 
 - 单仓 Release 刷新 MUST 共用一套判定：候选用户轮换仅在凭据/权限类失败时发生，公共仓库可在凭据耗尽后匿名读取，并发上限取自 `repo_release_worker_concurrency`；账号级任务 MUST NOT 因单仓不可读而整体失败。
+- 每个分页请求 MUST 至多发送两次（初次 + 一次重试），仅在 transport `network_error`、`timeout`、HTTP 5xx 与成功状态下的非 JSON 响应体可重试；退避 MUST 为 300 ms。`repo_inaccessible`、`credentials_forbidden`、401/403/404/451、限流与 `deferred_budget` MUST NOT 重试。重试 MUST 重发同一页，MUST NOT 重复计页或追加部分解码结果。
+- 账号级 `sync.releases` 的 `result_json` MUST 包含 `failed_count`、`deferred_count`、`failure_ratio`（0–1，两位小数）、`failure_reasons` 与 `degraded`；部分仓库失败时任务保持 `succeeded` 并标记 `degraded=true`，所有实际尝试均失败时任务 MUST 记为 `failed`。每个任务 MUST 只输出一条聚合告警，MUST NOT 逐仓库告警。
 - Inputs: 仓库、请求用户、连接凭据、usage 登记。
-- Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态与失败分类。
+- Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态、失败分类与账号级聚合摘要。
 
 ### REQ-PGR-006
 
@@ -66,6 +68,15 @@
 - 预算耗尽 MUST 返回独立延后结果：MUST NOT 记为失败、MUST NOT 写重试退避、MUST NOT 改写 `public_repo_release_usage` 状态；单仓任务与账号级任务都只延后该仓库并留待下一周期。候选轮换判定 MUST NOT 受预算影响。
 - Inputs: 匿名响应头、请求时刻、进程内共享预算。
 - Outputs: 允许或延后决定、`deferred_budget` 结果、预算余量与延后次数指标。
+
+### REQ-PGR-009
+
+- 账号级与单仓 Release 刷新 MUST 只为本次真正插入 `public.repo_releases` 的 Release 排队 `translation.generate` 工作；未配置 AI provider 时 MUST NOT 写入任何翻译行或任务。
+- 自动排队 MUST 复用请求/工作项/任务三段式，并按 `(scope_user_id, kind, variant, entity_id, target_lang, source_hash)` 去重：结果已为 `ready` 的工作项 MUST NOT 再排队；同一工作项已有 `queued`/`running` 翻译任务时 MUST NOT 重复排队；无在途任务的终态工作项按授权重试语义重新入队。
+- 单次排队调用 MUST 最多为 25 个 Release 创建任务；其余可翻译候选 MUST 持久化为 `queued` 工作项，由后续周期排空，MUST NOT 因上限丢弃。排空同样每次最多 25 个，MUST 跳过已有 `queued`/`running` 任务的工作项，MUST NOT 重排 `failed` 或已完成的终态工作项。
+- 单个 Release 入队失败、积压写入失败或排空失败 MUST 只记录告警，MUST NOT 中断其余 Release 或刷新任务。两个执行器的 `result_json` MUST 报告 `translations_enqueued`（含同一次刷新排空的任务）。
+- Inputs: 刷新插入的 Release ID、请求用户、AI provider 配置。
+- Outputs: `translation_work_items`/`translation_requests`/`job_tasks` 行与 `translations_enqueued` 计数。
 
 ## Verification
 
@@ -95,9 +106,9 @@
 
 ### VER-PGR-005
 
-- Method: `scripts/pg_seed_repo_release_fallback_test.py`。
+- Method: `scripts/pg_seed_repo_release_fallback_test.py` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
 - covers: `REQ-PGR-005`
-- Pass condition: 候选轮换、公共 fallback、失败分类、usage 状态、账号级韧性与在途并发上界全部通过。
+- Pass condition: 候选轮换、公共 fallback、失败分类、usage 状态、账号级韧性、在途并发上界、瞬时失败单次重试与页面不重复计数、`degraded`／全失败判定全部通过。
 
 ### VER-PGR-006
 
@@ -116,6 +127,12 @@
 - Method: `cargo test --locked --bin octo-rill postgres_repo_release` 与 `scripts/pg_seed_repo_release_anon_budget_test.py`。
 - covers: `REQ-PGR-008`
 - Pass condition: 多页匿名读取按页扣减、响应头校准剩余额度、预算耗尽时延后且 usage 状态与退避不变、零预算不再发请求全部通过。
+
+### VER-PGR-009
+
+- Method: `cargo test --locked --bin octo-rill postgres_translate`、`TEST_PG_TRANSLATE_URL=… cargo test --locked --bin octo-rill postgres_backlog -- --ignored`、`cargo test --locked --bin octo-rill postgres_tasks` 与 `cargo test --locked --bin octo-rill postgres_repo_release`。
+- covers: `REQ-PGR-009`
+- Pass condition: 批次上限与去重、超限候选写入积压、积压跨周期有界排空且幂等、空内容跳过、`ready` 与在途任务不重复排队、终态工作项重新入队、无 AI provider 时零写入、两执行器 `translations_enqueued` 计数全部通过。
 
 ## Related ADRs
 

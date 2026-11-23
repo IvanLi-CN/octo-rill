@@ -3,6 +3,8 @@
 //! Each executor owns one business vertical's upstream calls and PostgreSQL
 //! writes. Durable claim/finalize semantics remain in `postgres_worker`.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,7 +13,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::AiConfig,
@@ -41,6 +43,9 @@ pub struct ReleasesExecutor {
     pool: PgPool,
     http: Client,
     encryption_key: EncryptionKey,
+    /// Present only when automatic release translation can run; without it the
+    /// lane stores releases and queues no translation work.
+    ai: Option<AiConfig>,
     /// The process-wide unauthenticated read allowance, shared with the
     /// single-repository worker lane.
     budget: std::sync::Arc<AnonymousBudget>,
@@ -81,11 +86,17 @@ pub struct TranslationExecutor {
 }
 
 impl ReleasesExecutor {
-    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+    pub fn new(
+        pool: PgPool,
+        http: Client,
+        encryption_key: EncryptionKey,
+        ai: Option<AiConfig>,
+    ) -> Self {
         Self {
             pool,
             http,
             encryption_key,
+            ai,
             budget: shared_anonymous_budget(),
         }
     }
@@ -112,10 +123,15 @@ impl StarredExecutor {
 }
 
 impl CompositeSyncExecutor {
-    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+    pub fn new(
+        pool: PgPool,
+        http: Client,
+        encryption_key: EncryptionKey,
+        ai: Option<AiConfig>,
+    ) -> Self {
         Self {
             starred: StarredExecutor::new(pool.clone(), http.clone(), encryption_key.clone()),
-            releases: ReleasesExecutor::new(pool.clone(), http.clone(), encryption_key.clone()),
+            releases: ReleasesExecutor::new(pool.clone(), http.clone(), encryption_key.clone(), ai),
             notifications: NotificationsExecutor::new(pool, http, encryption_key),
         }
     }
@@ -1101,7 +1117,18 @@ impl TaskExecutor for ReleasesExecutor {
         .await
         .context("load PostgreSQL starred repositories")?;
         if repos.is_empty() {
-            return Ok(json!({"releases": 0, "repositories": 0, "user_id": user_id}).to_string());
+            return Ok(json!({
+                "releases": 0,
+                "repositories": 0,
+                "user_id": user_id,
+                "translations_enqueued": 0,
+                "failed_count": 0,
+                "deferred_count": 0,
+                "failure_ratio": 0.0,
+                "failure_reasons": {},
+                "degraded": false,
+            })
+            .to_string());
         }
         let now = Utc::now().to_rfc3339();
         let credentials = ReleaseCredentialCache::default();
@@ -1129,7 +1156,9 @@ impl TaskExecutor for ReleasesExecutor {
         let mut total = 0usize;
         let mut repositories = 0usize;
         let mut failed = Vec::new();
+        let mut failed_reason_codes = Vec::new();
         let mut deferred = Vec::new();
+        let mut new_release_ids = Vec::new();
         for outcome in outcomes {
             if let Some(deferral) = outcome.deferred {
                 deferred.push(json!({
@@ -1141,6 +1170,7 @@ impl TaskExecutor for ReleasesExecutor {
                 continue;
             }
             if let Some(failure) = outcome.failure {
+                failed_reason_codes.push(failure.reason_code);
                 failed.push(json!({
                     "repo_id": outcome.repo_id,
                     "repo_full_name": outcome.repo_full_name,
@@ -1150,15 +1180,187 @@ impl TaskExecutor for ReleasesExecutor {
             }
             repositories += 1;
             total += outcome.fetched;
+            new_release_ids.extend(outcome.new_release_ids);
         }
+        let summary = summarize_release_run(repositories, failed_reason_codes, deferred.len());
+        if summary.failed_count > 0 {
+            warn!(
+                event = "task.summary",
+                operation = "sync.releases",
+                user_id = user_id.as_str(),
+                repositories,
+                failed = summary.failed_count,
+                deferred = summary.deferred_count,
+                failure_ratio = summary.failure_ratio,
+                failure_reasons = summary.top_reasons(),
+                "account release sync finished with repository failures"
+            );
+        }
+        if summary.all_failed {
+            bail!(
+                "every repository whose read was attempted failed: {} failed ({}), {} deferred",
+                summary.failed_count,
+                summary.top_reasons(),
+                summary.deferred_count
+            );
+        }
+        let translations_enqueued = self.enqueue_translations(&user_id, &new_release_ids).await;
         Ok(json!({
             "releases": total,
             "repositories": repositories,
             "user_id": user_id,
             "failed_repositories": failed,
             "deferred_repositories": deferred,
+            "translations_enqueued": translations_enqueued,
+            "failed_count": summary.failed_count,
+            "deferred_count": summary.deferred_count,
+            "failure_ratio": summary.failure_ratio,
+            "failure_reasons": summary.failure_reasons,
+            "degraded": summary.degraded,
         })
         .to_string())
+    }
+}
+
+impl ReleasesExecutor {
+    /// Queue automatic release translation for the releases this sync inserted
+    /// and drain one bounded slice of the backlog the batch cap left behind.
+    ///
+    /// The sync already committed its repository writes, so a failure here is
+    /// reported and swallowed: the releases stay stored and the next sync of the
+    /// same repository is unaffected. Without a configured AI provider the lane
+    /// writes nothing.
+    async fn enqueue_translations(&self, user_id: &str, new_release_ids: &[i64]) -> usize {
+        if self.ai.is_none() {
+            return 0;
+        }
+        let mut enqueued = 0usize;
+        if !new_release_ids.is_empty() {
+            match crate::postgres_translate::enqueue_release_translations(
+                &self.pool,
+                user_id,
+                new_release_ids,
+                "sync.releases.auto_translate",
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(
+                            event = "translation.enqueue",
+                            operation = "sync.releases",
+                            user_id,
+                            translations_enqueued = count,
+                            "automatic release translation queued"
+                        );
+                    }
+                    enqueued = count;
+                }
+                Err(error) => warn!(
+                    event = "translation.enqueue",
+                    operation = "sync.releases",
+                    user_id,
+                    error = %error,
+                    "automatic release translation enqueue failed"
+                ),
+            }
+        }
+        match crate::postgres_translate::enqueue_pending_translation_tasks(
+            &self.pool,
+            user_id,
+            "sync.releases.translation_backlog",
+        )
+        .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    info!(
+                        event = "translation.enqueue",
+                        operation = "sync.releases",
+                        user_id,
+                        translations_drained = count,
+                        "automatic translation backlog drained"
+                    );
+                }
+                enqueued + count
+            }
+            Err(error) => {
+                warn!(
+                    event = "translation.enqueue",
+                    operation = "sync.releases",
+                    user_id,
+                    error = %error,
+                    "automatic translation backlog drain failed"
+                );
+                enqueued
+            }
+        }
+    }
+}
+
+/// Aggregated outcome of one account-wide release sync.
+///
+/// The per-repository warnings made a bad run log 100+ lines while the task
+/// still finished `succeeded`. The task now reports one summary line and states
+/// in its result whether it was degraded or failed outright.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReleaseRunSummary {
+    pub(crate) failed_count: usize,
+    pub(crate) deferred_count: usize,
+    /// Failed repositories over attempted repositories (succeeded + failed).
+    /// Deferrals never reached GitHub, so they are not attempts.
+    pub(crate) failure_ratio: f64,
+    /// Failure reason code → repository count.
+    pub(crate) failure_reasons: BTreeMap<&'static str, usize>,
+    /// At least one repository failed while others were read.
+    pub(crate) degraded: bool,
+    /// No repository could be read at all: the task must be recorded failed.
+    pub(crate) all_failed: bool,
+}
+
+impl ReleaseRunSummary {
+    /// `reason=count` pairs, most frequent first, bounded to one log line.
+    fn top_reasons(&self) -> String {
+        let mut rows: Vec<_> = self.failure_reasons.iter().collect();
+        rows.sort_by(|(left_code, left_count), (right_code, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_code.cmp(right_code))
+        });
+        rows.into_iter()
+            .take(5)
+            .map(|(code, count)| format!("{code}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Aggregate per-repository outcomes of one run. Pure so the degraded and
+/// all-failed decisions are testable without a database or network.
+pub(crate) fn summarize_release_run(
+    repositories: usize,
+    failures: impl IntoIterator<Item = &'static str>,
+    deferred_count: usize,
+) -> ReleaseRunSummary {
+    let mut failure_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut failed_count = 0usize;
+    for reason_code in failures {
+        failed_count += 1;
+        *failure_reasons.entry(reason_code).or_insert(0) += 1;
+    }
+    let attempted = repositories + failed_count;
+    let failure_ratio = if attempted == 0 {
+        0.0
+    } else {
+        ((failed_count as f64 / attempted as f64) * 100.0).round() / 100.0
+    };
+    ReleaseRunSummary {
+        failed_count,
+        deferred_count,
+        failure_ratio,
+        failure_reasons,
+        degraded: failed_count > 0 && repositories > 0,
+        all_failed: failed_count > 0 && repositories == 0,
     }
 }
 
@@ -1166,6 +1368,9 @@ struct AccountRepoOutcome {
     repo_id: i64,
     repo_full_name: String,
     fetched: usize,
+    /// Releases this refresh inserted into the shared cache; they are the only
+    /// ones automatic translation may queue.
+    new_release_ids: Vec<i64>,
     failure: Option<RefreshFailure>,
     /// Set when the anonymous budget could not pay for this repository.
     deferred: Option<BudgetDeferral>,
@@ -1188,6 +1393,7 @@ async fn fetch_one_account_repo(
             repo_id: repo.repo_id,
             repo_full_name: repo.full_name.clone(),
             fetched: 0,
+            new_release_ids: Vec::new(),
             failure,
             deferred,
         };
@@ -1220,7 +1426,7 @@ async fn fetch_one_account_repo(
             return skipped(Some(deferral), None);
         }
         Err(ReleaseFetchError::Failed(failure)) => {
-            warn!(
+            debug!(
                 event = "upstream.call",
                 operation = "sync.releases",
                 repo = repo.full_name,
@@ -1259,22 +1465,23 @@ async fn fetch_one_account_repo(
             repo_id: repo.repo_id,
             repo_full_name: repo.full_name.clone(),
             fetched: 0,
+            new_release_ids: Vec::new(),
             failure: None,
             deferred: None,
         };
     }
+    let mut new_release_ids = Vec::new();
     for release in &outcome.fetch.releases {
-        if let Err(failure) = upsert_release(&executor.pool, user_id, repo, release, now)
-            .await
-            .map_err(RefreshFailure::local)
-        {
-            return skipped(None, Some(failure));
+        match upsert_release(&executor.pool, user_id, repo, release, now).await {
+            Ok(upsert) => push_inserted_release(&mut new_release_ids, upsert),
+            Err(error) => return skipped(None, Some(RefreshFailure::local(error))),
         }
     }
     AccountRepoOutcome {
         repo_id: repo.repo_id,
         repo_full_name: repo.full_name.clone(),
         fetched: outcome.fetch.releases.len(),
+        new_release_ids,
         failure: None,
         deferred: None,
     }
@@ -1306,7 +1513,7 @@ async fn upsert_release(
     repo: &StarredRepoRow,
     release: &Value,
     now: &str,
-) -> Result<()> {
+) -> Result<ReleaseUpsert> {
     let release_id = release
         .get("id")
         .and_then(Value::as_i64)
@@ -1319,14 +1526,19 @@ async fn upsert_release(
         .unwrap_or(now);
     // Foreground release reads use this shared cache. Keep the source revision
     // separate from first detection, and never overwrite a newer webhook row.
-    sqlx::query(
+    //
+    // `xmax = 0` identifies the row this statement inserted; the conflict
+    // branch keeps the existing row. The revision guard can also skip the
+    // update entirely, which returns no row: that release already existed.
+    let inserted = sqlx::query_scalar::<_, bool>(
         r#"INSERT INTO public.repo_releases
         (id,repo_id,release_id,node_id,tag_name,name,body,html_url,published_at,created_at,is_prerelease,is_draft,updated_at,detected_at,react_plus1,react_laugh,react_heart,react_hooray,react_rocket,react_eyes)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
         ON CONFLICT(release_id) DO UPDATE SET
         repo_id=EXCLUDED.repo_id,node_id=EXCLUDED.node_id,tag_name=EXCLUDED.tag_name,name=EXCLUDED.name,body=EXCLUDED.body,html_url=EXCLUDED.html_url,published_at=EXCLUDED.published_at,created_at=EXCLUDED.created_at,is_prerelease=EXCLUDED.is_prerelease,is_draft=EXCLUDED.is_draft,updated_at=EXCLUDED.updated_at,
         react_plus1=EXCLUDED.react_plus1,react_laugh=EXCLUDED.react_laugh,react_heart=EXCLUDED.react_heart,react_hooray=EXCLUDED.react_hooray,react_rocket=EXCLUDED.react_rocket,react_eyes=EXCLUDED.react_eyes
-        WHERE repo_releases.updated_at=repo_releases.detected_at OR EXCLUDED.updated_at >= repo_releases.updated_at"#,
+        WHERE repo_releases.updated_at=repo_releases.detected_at OR EXCLUDED.updated_at >= repo_releases.updated_at
+        RETURNING (xmax = 0) AS inserted"#,
     )
     .bind(local_id::generate_local_id())
     .bind(repo.repo_id)
@@ -1348,10 +1560,27 @@ async fn upsert_release(
     .bind(reaction_count(release, "hooray"))
     .bind(reaction_count(release, "rocket"))
     .bind(reaction_count(release, "eyes"))
-    .execute(pool).await.context("upsert PostgreSQL shared release")?;
+    .fetch_optional(pool).await.context("upsert PostgreSQL shared release")?
+    .unwrap_or(false);
     let _ = user_id; // User visibility is represented by repository associations.
 
-    Ok(())
+    Ok(ReleaseUpsert {
+        release_id,
+        inserted,
+    })
+}
+
+/// Whether [`upsert_release`] created the shared row or found it existing.
+struct ReleaseUpsert {
+    release_id: i64,
+    inserted: bool,
+}
+
+/// Collect the release only when the shared cache did not already hold it.
+fn push_inserted_release(new_release_ids: &mut Vec<i64>, upsert: ReleaseUpsert) {
+    if upsert.inserted {
+        new_release_ids.push(upsert.release_id);
+    }
 }
 
 fn reaction_count(release: &Value, key: &str) -> i64 {
@@ -1746,8 +1975,49 @@ fn task_user_id(payload: &Value, task: &ClaimedTask) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimedTask, task_user_id};
+    use super::{
+        ClaimedTask, ReleaseUpsert, push_inserted_release, summarize_release_run, task_user_id,
+    };
     use serde_json::json;
+
+    #[test]
+    fn release_run_summary_marks_partial_failure_as_degraded() {
+        let summary = summarize_release_run(7, ["timeout", "timeout", "rate_limited"], 2);
+        assert_eq!(summary.failed_count, 3);
+        assert_eq!(summary.deferred_count, 2);
+        // 3 failures out of 10 attempted repositories (7 read + 3 failed);
+        // deferrals reached no upstream and do not dilute the ratio.
+        assert_eq!(summary.failure_ratio, 0.3);
+        assert!(summary.degraded);
+        assert!(!summary.all_failed);
+        assert_eq!(summary.top_reasons(), "timeout=2,rate_limited=1");
+    }
+
+    #[test]
+    fn release_run_summary_fails_the_task_when_nothing_was_read() {
+        let summary = summarize_release_run(0, ["network_error", "decode_error"], 0);
+        assert_eq!(summary.failed_count, 2);
+        assert_eq!(summary.failure_ratio, 1.0);
+        assert!(summary.all_failed);
+        assert!(!summary.degraded);
+        assert_eq!(summary.top_reasons(), "decode_error=1,network_error=1");
+    }
+
+    #[test]
+    fn release_run_summary_rounds_the_failure_ratio_and_ignores_deferrals() {
+        let summary = summarize_release_run(2, ["timeout"], 3);
+        assert_eq!(summary.failure_ratio, 0.33);
+        assert!(summary.degraded);
+        assert!(!summary.all_failed);
+
+        let deferred_only = summarize_release_run(0, [], 4);
+        assert_eq!(deferred_only.failed_count, 0);
+        assert_eq!(deferred_only.deferred_count, 4);
+        assert_eq!(deferred_only.failure_ratio, 0.0);
+        assert!(!deferred_only.degraded);
+        assert!(!deferred_only.all_failed);
+        assert_eq!(deferred_only.top_reasons(), "");
+    }
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
@@ -1786,13 +2056,20 @@ mod tests {
             assert_eq!(members,1);
             let repo=StarredRepoRow{repo_id:42,full_name:"seed/repo".to_owned()};
             let release=json!({"id":99,"tag_name":"v1","body":"current","html_url":"https://example.invalid/v1","updated_at":"2026-11-20T00:00:00Z","reactions":{"+1":2}});
-            upsert_release(&pool,"user-a",&repo,&release,"2026-11-21T00:00:00Z").await?;
+            let upsert=upsert_release(&pool,"user-a",&repo,&release,"2026-11-21T00:00:00Z").await?;
+            assert!(upsert.inserted,"first write of a release must report an insertion");assert_eq!(upsert.release_id,99);
             let initial:(String,String,String,i64)=sqlx::query_as("SELECT id,body,detected_at,react_plus1 FROM repo_releases WHERE release_id=99").fetch_one(&pool).await?;
             assert!(local_id::is_local_id(&initial.0));assert_eq!(initial.1,"current");assert_eq!(initial.3,2);
             let stale=json!({"id":99,"tag_name":"old","body":"stale","updated_at":"2026-11-19T00:00:00Z"});
-            upsert_release(&pool,"user-b",&repo,&stale,"2026-11-22T00:00:00Z").await?;
+            let upsert=upsert_release(&pool,"user-b",&repo,&stale,"2026-11-22T00:00:00Z").await?;
+            assert!(!upsert.inserted,"a guarded conflict must not report an insertion");
             let latest:(String,String,String)=sqlx::query_as("SELECT id,body,detected_at FROM repo_releases WHERE release_id=99").fetch_one(&pool).await?;
             assert_eq!((latest.0,latest.1,latest.2),(initial.0,"current".to_owned(),initial.2));
+            let updated=json!({"id":99,"tag_name":"v1","body":"newer","html_url":"https://example.invalid/v1","updated_at":"2026-11-21T06:00:00Z"});
+            let upsert=upsert_release(&pool,"user-a",&repo,&updated,"2026-11-23T00:00:00Z").await?;
+            assert!(!upsert.inserted,"an applied update is still an existing release");
+            let body:String=sqlx::query_scalar("SELECT body FROM repo_releases WHERE release_id=99").fetch_one(&pool).await?;
+            assert_eq!(body,"newer");
             let notification=json!({"id":"thread-1","unread":true,"repository":{"full_name":"seed/repo"},"subject":{"title":"hello","type":"Issue"},"url":"https://example.invalid/thread"});
             upsert_notification(&pool,"user-a",&notification).await?;
             upsert_notification(&pool,"user-b",&notification).await?;
@@ -1831,6 +2108,33 @@ mod tests {
         assert!(source.contains("decrypt_str"));
         assert!(source.contains("requested_by"));
         assert!(source.contains("page in 1..=20"));
+    }
+
+    #[test]
+    fn only_newly_inserted_releases_feed_automatic_translation() {
+        let mut ids = Vec::new();
+        push_inserted_release(
+            &mut ids,
+            ReleaseUpsert {
+                release_id: 11,
+                inserted: true,
+            },
+        );
+        push_inserted_release(
+            &mut ids,
+            ReleaseUpsert {
+                release_id: 12,
+                inserted: false,
+            },
+        );
+        push_inserted_release(
+            &mut ids,
+            ReleaseUpsert {
+                release_id: 13,
+                inserted: true,
+            },
+        );
+        assert_eq!(ids, vec![11, 13]);
     }
 
     #[test]

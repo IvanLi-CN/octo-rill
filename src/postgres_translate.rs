@@ -41,7 +41,7 @@ use sqlx::{PgPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     api::{TranslateBatchItem, TranslateBatchResponse, TranslateResponse},
@@ -57,6 +57,11 @@ const RELEASE_DETAIL_BATCH_MAX_ITEMS: usize = 20;
 const NOTIFICATION_BATCH_MAX_ITEMS: usize = 60;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
 const RELEASE_TITLE_MAX_TOKENS: u32 = 120;
+/// Upper bound on the releases one release-sync task hands to the automatic
+/// translation enqueue. A cold repository can add many releases at once and
+/// every queued work item becomes an LLM call, so the sync lane must not turn
+/// one GitHub refresh into an unbounded provider burst.
+const AUTO_RELEASE_TRANSLATION_CAP: usize = 25;
 const RELEASE_BODY_MAX_TOKENS: u32 = 4_000;
 const NOTIFICATION_MAX_TOKENS: u32 = 1_100;
 const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1608,6 +1613,435 @@ async fn begin_request(
     })
 }
 
+/// Queue the release-body translation of freshly stored releases.
+///
+/// A release sync only reports the releases it inserted, so this is the one
+/// place that turns a stored release into `translation.generate` work in the
+/// PostgreSQL runtime. Each release is enqueued in its own transaction with the
+/// same request/work-item/task shape as the HTTP translate handler:
+///
+/// - a work item keyed by [`dedupe_key`], so a second sync of the same source
+///   revision reuses it;
+/// - a work item whose result is already `ready` queues nothing;
+/// - a work item that already has a queued or running `translation.generate`
+///   task queues nothing (single flight);
+/// - a terminal work item without a live task is re-queued like an authorized
+///   retry, otherwise the new task would fail on its finished state.
+///
+/// At most [`AUTO_RELEASE_TRANSLATION_CAP`] releases get a task from one call.
+/// Every other translatable release still gets its work item, which
+/// [`enqueue_pending_translation_tasks`] drains on a later cycle, so a cold
+/// repository does not lose translations to the cap. A failure for one release
+/// is logged and never aborts the others or the calling sync task. Returns the
+/// number of tasks queued.
+pub(crate) async fn enqueue_release_translations(
+    pool: &PgPool,
+    user_id: &str,
+    release_ids: &[i64],
+    source: &str,
+) -> anyhow::Result<usize> {
+    let release_ids = deduped_release_ids(release_ids);
+    if release_ids.is_empty() {
+        return Ok(0);
+    }
+    let rows = sqlx::query(
+        "SELECT release_id, name, body FROM public.repo_releases WHERE release_id = ANY($1)",
+    )
+    .bind(&release_ids)
+    .fetch_all(pool)
+    .await
+    .context("load release content for automatic translation")?;
+    let mut translatable = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let release_id: i64 = row.try_get("release_id")?;
+        let name: Option<String> = row.try_get("name")?;
+        let body: Option<String> = row.try_get("body")?;
+        if release_has_translatable_content(name.as_deref(), body.as_deref()) {
+            translatable.insert(release_id);
+        }
+    }
+    // Preserve the caller's order so repeated syncs enqueue deterministically.
+    let entities = release_ids
+        .iter()
+        .filter(|release_id| translatable.contains(release_id))
+        .map(i64::to_string)
+        .collect::<Vec<_>>();
+    if entities.is_empty() {
+        return Ok(0);
+    }
+    let targets = load_targets(pool, user_id, TargetKind::ReleaseDetail, source, &entities)
+        .await
+        .context("load PostgreSQL release translation targets")?;
+    let mut queued = 0usize;
+    let mut backlog = Vec::new();
+    for entity_id in &entities {
+        // The release row exists, but this user may no longer see it: the
+        // translation read path applies the same visibility filter, so queueing
+        // would only produce a guaranteed `missing` attempt.
+        let Some(target) = targets.get(entity_id) else {
+            continue;
+        };
+        if queued < AUTO_RELEASE_TRANSLATION_CAP {
+            match enqueue_one_release_translation(pool, user_id, target, source).await {
+                Ok(true) => queued += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    event = "translation.enqueue",
+                    user_id,
+                    release_id = entity_id.as_str(),
+                    source,
+                    error = %error,
+                    "automatic release translation could not be enqueued"
+                ),
+            }
+        } else {
+            backlog.push(target);
+        }
+    }
+    if !backlog.is_empty() {
+        let deferred = backlog.len();
+        match persist_release_translation_backlog(pool, user_id, &backlog).await {
+            Ok(persisted) => info!(
+                event = "translation.enqueue",
+                user_id,
+                source,
+                deferred = persisted,
+                "automatic release translation deferred to the backlog"
+            ),
+            Err(error) => warn!(
+                event = "translation.enqueue",
+                user_id,
+                source,
+                deferred,
+                error = %error,
+                "automatic release translation backlog could not be persisted"
+            ),
+        }
+    }
+    Ok(queued)
+}
+
+/// Deduplicate the caller's release ids while keeping the caller's order.
+fn deduped_release_ids(release_ids: &[i64]) -> Vec<i64> {
+    let mut seen = HashSet::with_capacity(release_ids.len());
+    release_ids
+        .iter()
+        .copied()
+        .filter(|release_id| seen.insert(*release_id))
+        .collect()
+}
+
+/// A release with neither a name nor a body has nothing to translate. The
+/// title falls back to the tag name at read time, which would name a target but
+/// still send an empty body to the provider.
+fn release_has_translatable_content(name: Option<&str>, body: Option<&str>) -> bool {
+    let filled = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    filled(name) || filled(body)
+}
+
+/// What the automatic enqueue does with an existing work item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoTranslationDecision {
+    /// The work item already holds a translation for this source revision.
+    SkipReady,
+    /// A `translation.generate` task for the work item is queued or running.
+    SkipInFlight,
+    /// Queue a task; `reset_work_item` re-queues a terminal work item first.
+    Enqueue { reset_work_item: bool },
+}
+
+fn auto_translation_decision(
+    work_status: &str,
+    result_status: Option<&str>,
+    task_in_flight: bool,
+) -> AutoTranslationDecision {
+    if result_status == Some("ready") {
+        return AutoTranslationDecision::SkipReady;
+    }
+    if task_in_flight {
+        return AutoTranslationDecision::SkipInFlight;
+    }
+    AutoTranslationDecision::Enqueue {
+        // `translate_work_item_for_task` only accepts `queued` and `running`
+        // work items; every other status is terminal for this source hash.
+        reset_work_item: !matches!(work_status, "queued" | "running"),
+    }
+}
+
+/// The persisted columns a queued release translation needs to become a task.
+struct AutomaticWorkItem {
+    id: String,
+    status: String,
+    result_status: Option<String>,
+    source_hash: String,
+    source_blocks_json: String,
+    target_slots_json: String,
+}
+
+/// Upsert the dedupe-keyed work item for one release target.
+///
+/// The conflict branch only extends `updated_at`: the existing row keeps its
+/// status, result and frozen source snapshot, so a repeat sync cannot rewind a
+/// running or finished translation.
+async fn upsert_translation_work_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    target: &Target,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<AutomaticWorkItem> {
+    let key = dedupe_key(user_id, target);
+    let source_blocks_json = serde_json::to_string(&target.source_blocks)
+        .context("serialize automatic translation source blocks")?;
+    let target_slots_json = serde_json::to_string(&target.target_slots)
+        .context("serialize automatic translation target slots")?;
+    let (id, status, result_status) = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default',$8,$9,$10,0,$11,'queued',$12,$12) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id, status, result_status",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&key)
+    .bind(user_id)
+    .bind(target.kind.work_kind())
+    .bind(target.kind.work_variant())
+    .bind(&target.entity_id)
+    .bind(TARGET_LANG)
+    .bind(&target.source_hash)
+    .bind(&source_blocks_json)
+    .bind(&target_slots_json)
+    .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await
+    .context("upsert automatic release translation work item")?;
+    Ok(AutomaticWorkItem {
+        id,
+        status,
+        result_status,
+        source_hash: target.source_hash.clone(),
+        source_blocks_json,
+        target_slots_json,
+    })
+}
+
+/// Enqueue one release body translation. `Ok(false)` means the existing work
+/// item or task already covers it, so no task was written.
+async fn enqueue_one_release_translation(
+    pool: &PgPool,
+    user_id: &str,
+    target: &Target,
+    source: &str,
+) -> anyhow::Result<bool> {
+    let now = Utc::now();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin automatic release translation enqueue")?;
+    let work_item = upsert_translation_work_item(&mut tx, user_id, target, now).await?;
+    let task_in_flight = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM public.job_tasks WHERE task_type = 'translation.generate' AND status IN ('queued', 'running') AND pg_input_is_valid(payload_json, 'jsonb') AND payload_json::jsonb ->> 'work_item_id' = $1)",
+    )
+    .bind(&work_item.id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("check in-flight automatic release translation task")?;
+    let decision = auto_translation_decision(
+        &work_item.status,
+        work_item.result_status.as_deref(),
+        task_in_flight,
+    );
+    let AutoTranslationDecision::Enqueue { reset_work_item } = decision else {
+        tx.rollback()
+            .await
+            .context("roll back skipped automatic translation enqueue")?;
+        return Ok(false);
+    };
+    if reset_work_item {
+        sqlx::query(
+            "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2",
+        )
+        .bind(now)
+        .bind(&work_item.id)
+        .execute(&mut *tx)
+        .await
+        .context("requeue automatic release translation work item")?;
+    }
+    insert_translation_request(
+        &mut tx,
+        user_id,
+        source,
+        &target.entity_id,
+        TargetKind::ReleaseDetail,
+        &work_item,
+        now,
+    )
+    .await?;
+    insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
+    tx.commit()
+        .await
+        .context("commit automatic release translation enqueue")?;
+    Ok(true)
+}
+
+/// Persist work items only, without a task, for releases the batch cap left out.
+///
+/// The drain turns them into tasks on a later cycle, so the sync never queues an
+/// unbounded provider burst and no release is dropped.
+async fn persist_release_translation_backlog(
+    pool: &PgPool,
+    user_id: &str,
+    targets: &[&Target],
+) -> anyhow::Result<usize> {
+    let now = Utc::now();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin automatic release translation backlog")?;
+    for target in targets {
+        upsert_translation_work_item(&mut tx, user_id, target, now).await?;
+    }
+    tx.commit()
+        .await
+        .context("commit automatic release translation backlog")?;
+    Ok(targets.len())
+}
+
+async fn insert_translation_request(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    source: &str,
+    entity_id: &str,
+    kind: TargetKind,
+    work_item: &AutomaticWorkItem,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,'async','postgres','system',$2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'queued',$13,$13)",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(source)
+    .bind(kind.request_kind())
+    .bind(kind.request_variant())
+    .bind(entity_id)
+    .bind(TARGET_LANG)
+    .bind(TRANSLATION_MAX_WAIT_MS)
+    .bind(&work_item.source_hash)
+    .bind(&work_item.source_blocks_json)
+    .bind(&work_item.target_slots_json)
+    .bind(&work_item.id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .context("insert automatic release translation request")?;
+    Ok(())
+}
+
+async fn insert_translation_task(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    source: &str,
+    work_item_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', $2, $3, $4, $5, $5)",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(source)
+    .bind(user_id)
+    .bind(json!({"work_item_id": work_item_id}).to_string())
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .context("insert automatic release translation task")?;
+    Ok(())
+}
+
+/// Queue `translation.generate` tasks for release work items the batch cap left
+/// queued.
+///
+/// One call turns at most [`AUTO_RELEASE_TRANSLATION_CAP`] orphaned work items
+/// into tasks, and the account release sync runs on the scheduler interval, so
+/// a large cold start drains over several cycles instead of flooding the single
+/// PostgreSQL task worker. Work items with a queued or running task are skipped
+/// (single flight), and failed or finished work items never match.
+pub(crate) async fn enqueue_pending_translation_tasks(
+    pool: &PgPool,
+    user_id: &str,
+    source: &str,
+) -> anyhow::Result<usize> {
+    let now = Utc::now();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin automatic translation backlog drain")?;
+    // `FOR UPDATE SKIP LOCKED` makes two concurrent lanes for the same user skip
+    // each other's rows instead of queueing the same work item twice.
+    let rows = sqlx::query(
+        r#"
+        SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
+        FROM public.translation_work_items AS wi
+        WHERE wi.scope_user_id = $1
+          AND wi.status = 'queued'
+          AND wi.result_status IS NULL
+          AND wi.kind = 'release_detail'
+          AND wi.variant = 'detail'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.job_tasks AS task
+            WHERE task.task_type = 'translation.generate'
+              AND task.status IN ('queued', 'running')
+              AND pg_input_is_valid(task.payload_json, 'jsonb')
+              AND task.payload_json::jsonb ->> 'work_item_id' = wi.id
+          )
+        ORDER BY wi.created_at ASC, wi.id ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(user_id)
+    .bind(i64::try_from(AUTO_RELEASE_TRANSLATION_CAP).unwrap_or(i64::MAX))
+    .fetch_all(&mut *tx)
+    .await
+    .context("select automatic translation backlog")?;
+    let mut queued = 0usize;
+    for row in rows {
+        let work_item = AutomaticWorkItem {
+            id: row.try_get("id")?,
+            status: "queued".to_owned(),
+            result_status: None,
+            source_hash: row.try_get("source_hash")?,
+            source_blocks_json: row.try_get("source_blocks_json")?,
+            target_slots_json: row.try_get("target_slots_json")?,
+        };
+        // The stored deadline bounded the original request wait; a backlog item
+        // is drained later, so extend it before the task becomes claimable.
+        sqlx::query(
+            "UPDATE public.translation_work_items SET deadline_at = $1, updated_at = $1 WHERE id = $2",
+        )
+        .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
+        .bind(&work_item.id)
+        .execute(&mut *tx)
+        .await
+        .context("refresh automatic translation backlog deadline")?;
+        insert_translation_request(
+            &mut tx,
+            user_id,
+            source,
+            row.try_get::<String, _>("entity_id")?.as_str(),
+            TargetKind::ReleaseDetail,
+            &work_item,
+            now,
+        )
+        .await?;
+        insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
+        queued += 1;
+    }
+    tx.commit()
+        .await
+        .context("commit automatic translation backlog drain")?;
+    Ok(queued)
+}
+
 /// Open the next attempt on an existing work item.
 ///
 /// Shared by [`begin_request`] (new work item) and
@@ -3045,4 +3479,159 @@ fn db_failure(error: sqlx::Error) -> Response {
         Json(json!({"code": "database_error"})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AUTO_RELEASE_TRANSLATION_CAP, AutoTranslationDecision, auto_translation_decision,
+        deduped_release_ids, enqueue_pending_translation_tasks, enqueue_release_translations,
+        release_has_translatable_content,
+    };
+
+    #[test]
+    fn automatic_enqueue_deduplicates_release_ids_in_caller_order() {
+        assert_eq!(deduped_release_ids(&[9, 9, 7, 9]), vec![9, 7]);
+        assert_eq!(deduped_release_ids(&[]), Vec::<i64>::new());
+        // The backlog keeps every id; only the task batch is capped.
+        let ids = (1..=40).collect::<Vec<i64>>();
+        assert_eq!(deduped_release_ids(&ids), ids);
+        assert_eq!(AUTO_RELEASE_TRANSLATION_CAP, 25);
+    }
+
+    #[test]
+    fn automatic_enqueue_skips_releases_without_translatable_content() {
+        assert!(!release_has_translatable_content(None, None));
+        assert!(!release_has_translatable_content(Some(""), Some("  \n")));
+        assert!(release_has_translatable_content(Some("v1.2.0"), None));
+        assert!(release_has_translatable_content(None, Some("## Notes")));
+    }
+
+    #[test]
+    fn automatic_enqueue_skips_ready_work_items_and_live_tasks() {
+        assert_eq!(
+            auto_translation_decision("completed", Some("ready"), false),
+            AutoTranslationDecision::SkipReady
+        );
+        // A live task wins even when the work item row was not marked ready.
+        assert_eq!(
+            auto_translation_decision("running", Some("error"), true),
+            AutoTranslationDecision::SkipInFlight
+        );
+        assert_eq!(
+            auto_translation_decision("queued", None, true),
+            AutoTranslationDecision::SkipInFlight
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_backlog_drains_every_release_across_bounded_cycles() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_backlog_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE repo_releases(id text PRIMARY KEY,repo_id bigint,release_id bigint UNIQUE,node_id text,tag_name text,name text,body text,html_url text,published_at text,created_at text,is_prerelease bigint,is_draft bigint,updated_at text,detected_at text,react_plus1 bigint,react_laugh bigint,react_heart bigint,react_hooray bigint,react_rocket bigint,react_eyes bigint);
+                CREATE TABLE user_release_visible_repos(user_id text,repo_id bigint,full_name text);
+                CREATE TABLE briefs(id text PRIMARY KEY,user_id text);
+                CREATE TABLE brief_release_memberships(brief_id text,release_id bigint);
+                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at timestamptz NOT NULL,status text NOT NULL,batch_id text,result_status text,title_zh text,summary_md text,body_md text,error_text text,cache_hit boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
+                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,title_zh text,summary_md text,body_md text,error_text text,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
+                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query("INSERT INTO user_release_visible_repos(user_id,repo_id,full_name) VALUES('user-a',7,'owner/repo')")
+                .execute(&pool)
+                .await?;
+            let mut ids = Vec::new();
+            for release_id in 1000_i64..1030 {
+                ids.push(release_id);
+                sqlx::query("INSERT INTO repo_releases(id,repo_id,release_id,tag_name,name,body,html_url,updated_at,detected_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)")
+                    .bind(format!("rel-{release_id}"))
+                    .bind(7_i64)
+                    .bind(release_id)
+                    .bind(format!("v{release_id}"))
+                    .bind(format!("Release {release_id}"))
+                    .bind(format!("Notes {release_id}"))
+                    .bind(format!("https://example.invalid/{release_id}"))
+                    .bind("2026-11-20T00:00:00Z")
+                    .execute(&pool)
+                    .await?;
+            }
+            let queued = enqueue_release_translations(&pool, "user-a", &ids, "test.auto").await?;
+            assert_eq!(queued, AUTO_RELEASE_TRANSLATION_CAP);
+            let work_items: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items WHERE scope_user_id='user-a'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(work_items, 30, "every release keeps a work item");
+            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(tasks, 25, "one call queues at most the batch cap");
+            let drained = enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?;
+            assert_eq!(drained, 5);
+            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(tasks, 30);
+            assert_eq!(
+                enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?,
+                0,
+                "a drained backlog is idempotent"
+            );
+            assert_eq!(
+                enqueue_release_translations(&pool, "user-a", &ids, "test.auto").await?,
+                0,
+                "live tasks are not queued twice"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    #[test]
+    fn automatic_enqueue_requeues_only_terminal_work_items() {
+        assert_eq!(
+            auto_translation_decision("queued", None, false),
+            AutoTranslationDecision::Enqueue {
+                reset_work_item: false
+            }
+        );
+        assert_eq!(
+            auto_translation_decision("running", None, false),
+            AutoTranslationDecision::Enqueue {
+                reset_work_item: false
+            }
+        );
+        assert_eq!(
+            auto_translation_decision("failed", Some("error"), false),
+            AutoTranslationDecision::Enqueue {
+                reset_work_item: true
+            }
+        );
+        assert_eq!(
+            auto_translation_decision("completed", Some("missing"), false),
+            AutoTranslationDecision::Enqueue {
+                reset_work_item: true
+            }
+        );
+    }
 }

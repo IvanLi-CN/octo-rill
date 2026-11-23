@@ -20,6 +20,7 @@ use sqlx::{FromRow, PgPool};
 use tracing::{info, warn};
 
 use crate::{
+    config::AiConfig,
     crypto::EncryptionKey,
     local_id,
     postgres_jobs::ClaimedTask,
@@ -47,17 +48,26 @@ pub struct RepoReleaseRefreshExecutor {
     pool: PgPool,
     http: Client,
     encryption_key: EncryptionKey,
+    /// Present only when automatic release translation can run; without it the
+    /// refresh stores releases and queues no translation work.
+    ai: Option<AiConfig>,
     /// The process-wide unauthenticated read allowance, shared with the
     /// account lane.
     budget: std::sync::Arc<AnonymousBudget>,
 }
 
 impl RepoReleaseRefreshExecutor {
-    pub fn new(pool: PgPool, http: Client, encryption_key: EncryptionKey) -> Self {
+    pub fn new(
+        pool: PgPool,
+        http: Client,
+        encryption_key: EncryptionKey,
+        ai: Option<AiConfig>,
+    ) -> Self {
         Self {
             pool,
             http,
             encryption_key,
+            ai,
             budget: shared_anonymous_budget(),
         }
     }
@@ -178,7 +188,11 @@ struct RefreshStats {
 }
 
 impl RefreshStats {
-    fn into_result_json(self, payload: &RepoReleaseTaskPayload) -> String {
+    fn into_result_json(
+        self,
+        payload: &RepoReleaseTaskPayload,
+        translations_enqueued: usize,
+    ) -> String {
         let content_pending = !self.new_release_ids.is_empty();
         json!({
             "task": TASK_TYPE,
@@ -197,6 +211,7 @@ impl RefreshStats {
             "unchanged_count": self.unchanged_count,
             "new_release_ids": self.new_release_ids,
             "content_pending": content_pending,
+            "translations_enqueued": translations_enqueued,
             "via": self.via.map(FetchVia::as_str),
         })
         .to_string()
@@ -254,7 +269,8 @@ impl TaskExecutor for RepoReleaseRefreshExecutor {
                     not_modified = stats.not_modified,
                     "single-repository release refresh completed"
                 );
-                Ok(stats.into_result_json(&payload))
+                let translations_enqueued = self.enqueue_translations(&payload, &stats).await;
+                Ok(stats.into_result_json(&payload, translations_enqueued))
             }
             Err(ReleaseFetchError::Deferred(deferral)) => {
                 if let Err(persist_error) = self.record_deferred(&payload, &lease, deferral).await {
@@ -306,6 +322,89 @@ impl TaskExecutor for RepoReleaseRefreshExecutor {
 }
 
 impl RepoReleaseRefreshExecutor {
+    /// Queue automatic release translation for the releases this refresh
+    /// inserted and drain one bounded slice of the backlog the batch cap left
+    /// behind. `content_pending` keeps describing the stored new ids; the
+    /// enqueue only turns them into `translation.generate` tasks.
+    ///
+    /// The refresh already committed before this runs, so a failure is reported
+    /// and swallowed instead of failing the sync task. Without a configured AI
+    /// provider the lane writes nothing.
+    async fn enqueue_translations(
+        &self,
+        payload: &RepoReleaseTaskPayload,
+        stats: &RefreshStats,
+    ) -> usize {
+        if self.ai.is_none() {
+            return 0;
+        }
+        let mut enqueued = 0usize;
+        if !stats.new_release_ids.is_empty() {
+            match crate::postgres_translate::enqueue_release_translations(
+                &self.pool,
+                &payload.user_id,
+                &stats.new_release_ids,
+                "sync.repo_release.auto_translate",
+            )
+            .await
+            {
+                Ok(count) => {
+                    info!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        translations_enqueued = count,
+                        "automatic release translation queued"
+                    );
+                    enqueued = count;
+                }
+                Err(error) => {
+                    warn!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        error = %error,
+                        "automatic release translation enqueue failed"
+                    );
+                }
+            }
+        }
+        match crate::postgres_translate::enqueue_pending_translation_tasks(
+            &self.pool,
+            &payload.user_id,
+            "sync.repo_release.translation_backlog",
+        )
+        .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    info!(
+                        event = "translation.enqueue",
+                        operation = TASK_TYPE,
+                        user_id = payload.user_id,
+                        repo_id = payload.repo_id,
+                        translations_drained = count,
+                        "automatic translation backlog drained"
+                    );
+                }
+                enqueued + count
+            }
+            Err(error) => {
+                warn!(
+                    event = "translation.enqueue",
+                    operation = TASK_TYPE,
+                    user_id = payload.user_id,
+                    repo_id = payload.repo_id,
+                    error = %error,
+                    "automatic translation backlog drain failed"
+                );
+                enqueued
+            }
+        }
+    }
+
     /// Upsert the shared work item and this task's watcher row.
     ///
     /// The `(task_id, work_item_id)` watcher row is the durable link between the
@@ -1180,15 +1279,37 @@ mod tests {
             ..RefreshStats::default()
         };
         let result: Value =
-            serde_json::from_str(&stats.into_result_json(&payload)).expect("result json");
+            serde_json::from_str(&stats.into_result_json(&payload, 1)).expect("result json");
         assert_eq!(result["task"], TASK_TYPE);
         assert_eq!(result["repo_id"], 4242);
         assert_eq!(result["content_pending"], true);
         assert_eq!(result["new_release_ids"], json!([9001]));
+        assert_eq!(result["translations_enqueued"], 1);
         assert_eq!(result["via"], "candidate");
         // The rotated account is a service-side fact: the requester may not
         // learn which other account's connection was used.
         assert!(result.get("candidate_user_id").is_none(), "{result}");
+    }
+
+    #[test]
+    fn refresh_stats_report_no_enqueued_translations_without_new_releases() {
+        let payload = RepoReleaseTaskPayload {
+            user_id: "user-a".to_owned(),
+            repo_id: 4242,
+            repo_full_name: "owner/repo".to_owned(),
+            reason: "webhook_release".to_owned(),
+            delivery_id: None,
+        };
+        let stats = RefreshStats {
+            work_item_id: "work-1".to_owned(),
+            not_modified: true,
+            ..RefreshStats::default()
+        };
+        let result: Value =
+            serde_json::from_str(&stats.into_result_json(&payload, 0)).expect("result json");
+        assert_eq!(result["content_pending"], false);
+        assert_eq!(result["new_release_ids"], json!([]));
+        assert_eq!(result["translations_enqueued"], 0);
     }
 
     #[test]
