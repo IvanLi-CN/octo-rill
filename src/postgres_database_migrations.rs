@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 18);
+        assert_eq!(MIGRATOR.iter().count(), 19);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -48,6 +48,13 @@ mod tests {
             .expect("translation audit migration");
         assert!(audit.sql.contains("translation_attempt_events"));
         assert!(audit.sql.contains("llm_recovery_flags"));
+        let audit_ids = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 19)
+            .expect("translation audit id compatibility migration");
+        assert!(audit_ids.sql.contains("translation_attempt_events"));
+        assert!(audit_ids.sql.contains("translation_attempt_llm_calls"));
+        assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()
             .find(|migration| migration.version == 9)
@@ -75,5 +82,78 @@ mod tests {
         ] {
             assert!(baseline.sql.contains(table), "baseline missing {table}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn translation_audit_id_migration_normalizes_imported_bigint_ids() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("migration_ids_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE translation_attempt_events(id bigint PRIMARY KEY,work_item_id text NOT NULL);
+                CREATE TABLE translation_attempt_llm_calls(id bigint PRIMARY KEY,work_item_id text NOT NULL);
+                INSERT INTO translation_attempt_events(id,work_item_id) VALUES(1,'work-a');
+                INSERT INTO translation_attempt_llm_calls(id,work_item_id) VALUES(1,'work-a');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::raw_sql(include_str!(
+                "../migrations_pg/0019_translation_audit_id_compatibility.sql"
+            ))
+            .execute(&pool)
+            .await?;
+            for table in ["translation_attempt_events", "translation_attempt_llm_calls"] {
+                let data_type: String = sqlx::query_scalar(
+                    "SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name='id'",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(data_type, "text", "{table}.id must be text");
+            }
+            let event_id: String = sqlx::query_scalar(
+                "SELECT id FROM translation_attempt_events WHERE work_item_id='work-a'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(event_id, "1");
+            let call_id: String = sqlx::query_scalar(
+                "SELECT id FROM translation_attempt_llm_calls WHERE work_item_id='work-a'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(call_id, "1");
+            sqlx::query(
+                "INSERT INTO translation_attempt_events(id,work_item_id) VALUES($1,'work-b')",
+            )
+            .bind(crate::local_id::generate_local_id())
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO translation_attempt_llm_calls(id,work_item_id) VALUES($1,'work-b')",
+            )
+            .bind(crate::local_id::generate_local_id())
+            .execute(&pool)
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
     }
 }

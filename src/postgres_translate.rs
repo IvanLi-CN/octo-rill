@@ -2013,7 +2013,11 @@ pub(crate) async fn enqueue_pending_translation_tasks(
         SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
         FROM public.translation_work_items AS wi
         JOIN LATERAL (
-          SELECT event.retry_eligible, event.next_retry_at
+          SELECT event.retry_eligible,
+                 CASE
+                   WHEN pg_input_is_valid(event.next_retry_at::text, 'timestamptz')
+                   THEN event.next_retry_at::text::timestamptz
+                 END AS next_retry_at
           FROM public.translation_attempt_events AS event
           WHERE event.work_item_id = wi.id
             AND event.event_type = 'attempt_completed'
@@ -2025,7 +2029,7 @@ pub(crate) async fn enqueue_pending_translation_tasks(
           AND wi.variant = 'detail'
           AND wi.status = 'failed'
           AND wi.result_status = 'error'
-          AND last.retry_eligible
+          AND last.retry_eligible <> 0
           AND last.next_retry_at IS NOT NULL
           AND last.next_retry_at <= $2
           AND NOT EXISTS (
@@ -2187,7 +2191,7 @@ async fn start_attempt(
     now: chrono::DateTime<Utc>,
 ) -> Result<i32, sqlx::Error> {
     let attempt_no = sqlx::query_scalar::<_, i32>(
-        "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM public.translation_attempt_events WHERE work_item_id = $1",
+        "SELECT (COALESCE(MAX(attempt_no), 0) + 1)::integer FROM public.translation_attempt_events WHERE work_item_id = $1",
     )
     .bind(work_item_id)
     .fetch_one(&mut **tx)
@@ -3625,9 +3629,9 @@ fn db_failure(error: sqlx::Error) -> Response {
 mod tests {
     use super::{
         AUTO_RELEASE_TRANSLATION_CAP, AUTO_TRANSLATION_MAX_ATTEMPTS, AutoTranslationDecision,
-        auto_translation_decision, automatic_retry_delay, deduped_release_ids,
+        TargetKind, auto_translation_decision, automatic_retry_delay, deduped_release_ids,
         enqueue_pending_translation_tasks, enqueue_release_translations,
-        release_has_translatable_content,
+        release_has_translatable_content, start_attempt,
     };
 
     #[test]
@@ -3694,10 +3698,10 @@ mod tests {
         let result = async {
             sqlx::raw_sql(
                 r#"
-                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at timestamptz NOT NULL,status text NOT NULL,result_status text,error_text text,created_at timestamptz NOT NULL,finished_at timestamptz,updated_at timestamptz NOT NULL);
-                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no integer NOT NULL,event_type text NOT NULL,retry_eligible boolean NOT NULL DEFAULT false,next_retry_at timestamptz,created_at timestamptz NOT NULL);
-                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
-                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
+                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at text NOT NULL,status text NOT NULL,result_status text,error_text text,created_at text NOT NULL,finished_at text,updated_at text NOT NULL);
+                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no bigint NOT NULL,event_type text NOT NULL,retry_eligible bigint NOT NULL DEFAULT 0,next_retry_at text,created_at text NOT NULL);
+                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,created_at text NOT NULL,updated_at text NOT NULL);
+                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at text NOT NULL,updated_at text NOT NULL);
                 "#,
             )
             .execute(&pool)
@@ -3714,7 +3718,7 @@ mod tests {
                 sqlx::query("INSERT INTO translation_attempt_events(id,work_item_id,attempt_no,event_type,retry_eligible,next_retry_at,created_at) VALUES($1,$2,1,'attempt_completed',$3,$4,$5)")
                     .bind(format!("event-{work_item_id}"))
                     .bind(work_item_id)
-                    .bind(eligible)
+                    .bind(if eligible { 1_i64 } else { 0_i64 })
                     .bind(now + chrono::Duration::minutes(due_minutes))
                     .bind(now - chrono::Duration::minutes(5))
                     .execute(&pool)
@@ -3777,10 +3781,10 @@ mod tests {
                 CREATE TABLE user_release_visible_repos(user_id text,repo_id bigint,full_name text);
                 CREATE TABLE briefs(id text PRIMARY KEY,user_id text);
                 CREATE TABLE brief_release_memberships(brief_id text,release_id bigint);
-                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at timestamptz NOT NULL,status text NOT NULL,batch_id text,result_status text,title_zh text,summary_md text,body_md text,error_text text,cache_hit boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
-                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,title_zh text,summary_md text,body_md text,error_text text,created_at timestamptz NOT NULL,started_at timestamptz,finished_at timestamptz,updated_at timestamptz NOT NULL);
-                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no integer NOT NULL,event_type text NOT NULL,retry_eligible boolean NOT NULL DEFAULT false,next_retry_at timestamptz,created_at timestamptz NOT NULL);
-                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at timestamptz NOT NULL,updated_at timestamptz NOT NULL);
+                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at text NOT NULL,status text NOT NULL,batch_id text,result_status text,title_zh text,summary_md text,body_md text,error_text text,cache_hit bigint NOT NULL DEFAULT 0,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL);
+                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,title_zh text,summary_md text,body_md text,error_text text,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL);
+                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no bigint NOT NULL,event_type text NOT NULL,retry_eligible bigint NOT NULL DEFAULT 0,next_retry_at text,created_at text NOT NULL);
+                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at text NOT NULL,updated_at text NOT NULL);
                 "#,
             )
             .execute(&pool)
@@ -3830,6 +3834,86 @@ mod tests {
                 0,
                 "live tasks are not queued twice"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_start_attempt_accepts_imported_text_timestamps_and_bigint_attempt_no()
+    -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_attempt_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE translation_work_items(id text PRIMARY KEY,status text NOT NULL,started_at text,updated_at text NOT NULL);
+                CREATE TABLE translation_requests(id text PRIMARY KEY,status text NOT NULL,started_at text,updated_at text NOT NULL);
+                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,request_id text,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,attempt_no bigint NOT NULL,trigger text NOT NULL,event_type text NOT NULL,result_status text,error_code text,error_summary text,failure_class text,retry_eligible bigint NOT NULL DEFAULT 0,next_retry_at text,llm_call_ids_json text NOT NULL DEFAULT '[]',created_at text NOT NULL,UNIQUE(work_item_id,attempt_no,event_type));
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let now = chrono::Utc::now();
+            sqlx::query(
+                "INSERT INTO translation_work_items(id,status,started_at,updated_at) VALUES('work-a','queued',NULL,$1)",
+            )
+            .bind(now)
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO translation_requests(id,status,started_at,updated_at) VALUES('request-a','queued',NULL,$1)",
+            )
+            .bind(now)
+            .execute(&pool)
+            .await?;
+            let mut tx = pool.begin().await?;
+            let attempt_no = start_attempt(
+                &mut tx,
+                "work-a",
+                Some("request-a"),
+                "user-a",
+                TargetKind::ReleaseDetail,
+                "release-a",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            assert_eq!(attempt_no, 1);
+            let events: Vec<(String, String)> = sqlx::query_as(
+                "SELECT event_type,id FROM translation_attempt_events WHERE work_item_id='work-a' ORDER BY event_type",
+            )
+            .fetch_all(&pool)
+            .await?;
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].0, "attempt_queued");
+            assert_eq!(events[1].0, "attempt_started");
+            assert!(events.iter().all(|(_, id)| !id.is_empty()));
+            let work_status: String =
+                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='work-a'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(work_status, "running");
+            let request_status: String =
+                sqlx::query_scalar("SELECT status FROM translation_requests WHERE id='request-a'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(request_status, "running");
             Ok::<_, anyhow::Error>(())
         }
         .await;
