@@ -15,7 +15,7 @@
 - Release 源修订修复：`src/bin/octo-rill-migrate.rs`（`repair-release-revisions --repo-id N` 或 `--release-id N`，默认 dry-run），从 GitHub 强制覆盖写回内容与 `updated_at`，绕过 revision guard；仅用于修复被表情计数刷新等非内容写入推进的修订号。
 - `REQ-PGR-003`: `migrations_pg/0010`–`0017`；`0015_application_tables.sql` 提供 59 表 + 3 视图，`0016_normalize_flag_columns.sql` 归一导入库的布尔列。
 - `REQ-PGR-004`: `src/postgres_jobs.rs`、`src/postgres_worker.rs`、`src/postgres_scheduler.rs`、`src/postgres_runtime_owner.rs`。
-- `REQ-PGR-005`: `src/postgres_repo_release_fetch.rs`（共享判定、`RefreshFailure::retries_request` 与 `request_page` 有界重试、422 结果上限 `pagination_limit` 正常终止）、`src/postgres_repo_release_worker.rs`（单仓任务）、`src/postgres_tasks.rs::ReleasesExecutor`（账号级有界并发、`summarize_release_run` 聚合摘要与单条告警）。
+- `REQ-PGR-005`: `src/postgres_repo_release_fetch.rs`（共享判定、`RefreshFailure::retries_request` 与 `request_page` 有界重试、单页 50 条与 20 页预算恰好覆盖 1000 条结果上限、422 结果上限 `pagination_limit` 正常终止）、`src/postgres_repo_release_worker.rs`（单仓任务）、`src/postgres_tasks.rs::ReleasesExecutor`（账号级有界并发、`summarize_release_run` 聚合摘要与单条告警）。
 - `REQ-PGR-006`: `src/postgres_content_overlay.rs`。
 - `REQ-PGR-007`: `仓库外运维记录`。
 - `REQ-PGR-008`: `src/postgres_repo_release_fetch.rs::AnonymousBudget`（进程级共享预算，两个执行器共用 `shared_anonymous_budget()`）、`BudgetDeferral`/`ReleaseFetchError::Deferred`、`src/metrics.rs` 的 `anonymous_github_budget_remaining` 与 `anonymous_github_deferrals`。

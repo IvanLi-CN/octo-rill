@@ -46,7 +46,7 @@
 
 - 单仓 Release 刷新 MUST 共用一套判定：候选用户轮换仅在凭据/权限类失败时发生，公共仓库可在凭据耗尽后匿名读取，并发上限取自 `repo_release_worker_concurrency`；账号级任务 MUST NOT 因单仓不可读而整体失败。
 - 每个分页请求 MUST 至多发送两次（初次 + 一次重试），仅在 transport `network_error`、`timeout`、HTTP 5xx 与成功状态下的非 JSON 响应体（含 serde decode 失败）可重试；退避 MUST 为 300 ms。`repo_inaccessible`、`credentials_forbidden`、401/403/404/451、限流与 `deferred_budget` MUST NOT 重试。重试 MUST 重发同一页，MUST NOT 重复计页或追加部分解码结果。
-- GitHub 的 1000 条结果上限（后续页返回 422 `Only the first 1000 results are available.`）MUST 视为正常分页终止：保留已抓取结果并把 `stopped_reason` 记为 `pagination_limit`，MUST NOT 记为仓库失败；其它 422 仍按失败处理。
+- GitHub 的 1000 条结果上限（后续页返回 422 `Only the first 1000 results are available.`）MUST 视为正常分页终止：保留已抓取结果并把 `stopped_reason` 记为 `pagination_limit`，MUST NOT 记为仓库失败；其它 422 仍按失败处理。单页 MUST 请求 50 条（GitHub 上限为 100），20 页预算恰好覆盖 1000 条结果窗口，并避免超大单页响应被边缘层截断。
 - 账号级 `sync.releases` 的 `result_json` MUST 包含 `failed_count`、`deferred_count`、`failure_ratio`（0–1，两位小数）、`failure_reasons` 与 `degraded`；部分仓库失败时任务保持 `succeeded` 并标记 `degraded=true`，所有实际尝试均失败时任务 MUST 记为 `failed`。每个任务 MUST 只输出一条聚合告警，MUST NOT 逐仓库告警。
 - Inputs: 仓库、请求用户、连接凭据、usage 登记。
 - Outputs: Release 快照、`via` 记录（轮换到的账号身份只进服务端日志）、usage 状态、失败分类与账号级聚合摘要。
