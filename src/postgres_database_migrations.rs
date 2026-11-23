@@ -54,6 +54,21 @@ mod tests {
             .expect("translation audit id compatibility migration");
         assert!(audit_ids.sql.contains("translation_attempt_events"));
         assert!(audit_ids.sql.contains("translation_attempt_llm_calls"));
+        let attempt_unique = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20)
+            .expect("translation attempt unique migration");
+        assert!(attempt_unique.sql.contains("translation_attempt_events"));
+        assert!(
+            attempt_unique
+                .sql
+                .contains("work_item_id, attempt_no, event_type")
+        );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("CREATE UNIQUE INDEX IF NOT EXISTS")
+        );
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()
