@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 19);
+        assert_eq!(MIGRATOR.iter().count(), 20);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -54,6 +54,31 @@ mod tests {
             .expect("translation audit id compatibility migration");
         assert!(audit_ids.sql.contains("translation_attempt_events"));
         assert!(audit_ids.sql.contains("translation_attempt_llm_calls"));
+        let attempt_unique = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20)
+            .expect("translation attempt unique migration");
+        assert!(attempt_unique.sql.contains("translation_attempt_events"));
+        assert!(
+            attempt_unique
+                .sql
+                .contains("work_item_id, attempt_no, event_type")
+        );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("CREATE UNIQUE INDEX IF NOT EXISTS")
+        );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("translation_attempt_events_work_item_id_attempt_no_event_ty_key")
+        );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("DELETE FROM public.translation_attempt_events")
+        );
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()
