@@ -19,7 +19,7 @@
 - `REQ-PGR-006`: `src/postgres_content_overlay.rs`。
 - `REQ-PGR-007`: `仓库外运维记录`。
 - `REQ-PGR-008`: `src/postgres_repo_release_fetch.rs::AnonymousBudget`（进程级共享预算，两个执行器共用 `shared_anonymous_budget()`）、`BudgetDeferral`/`ReleaseFetchError::Deferred`、`src/metrics.rs` 的 `anonymous_github_budget_remaining` 与 `anonymous_github_deferrals`。
-- `REQ-PGR-009`: `src/postgres_translate.rs::enqueue_release_translations`（自动排队、去重与单飞判定）、`enqueue_pending_translation_tasks`（每轮最多 25 个的积压排空）；调用方为 `src/postgres_tasks.rs::ReleasesExecutor` 与 `src/postgres_repo_release_worker.rs::RepoReleaseRefreshExecutor`，两者仅在配置 AI provider 时排队并在每次刷新后排空一节积压。数据库回归为 `postgres_backlog_drains_every_release_across_bounded_cycles`（`TEST_PG_TRANSLATE_URL`）。
+- `REQ-PGR-009`: `src/postgres_translate.rs::enqueue_release_translations`（自动排队、去重与单飞判定）、`enqueue_pending_translation_tasks`（每轮最多 25 个：先到期自动重试，再补积压）、`automatic_retry_delay`（10 分钟/1 小时退避，最多 3 次尝试）与 `finish_request` 的 `next_retry_at` 调度；调用方为 `src/postgres_tasks.rs::ReleasesExecutor` 与 `src/postgres_repo_release_worker.rs::RepoReleaseRefreshExecutor`，两者仅在配置 AI provider 时排队并在每次刷新后排空一节积压。数据库回归为 `postgres_backlog_drains_every_release_across_bounded_cycles` 与 `postgres_backlog_retries_only_due_recoverable_failures`（`TEST_PG_TRANSLATE_URL`）。
 
 ## Coverage / rollout summary
 
