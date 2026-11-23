@@ -25,6 +25,7 @@ use sqlx::PgPool;
 use tower_sessions::Session;
 use tracing::warn;
 
+use crate::admin_job_groups;
 use crate::jobs;
 use crate::postgres_scheduler::{
     AdminDashboardTaskCounts, load_admin_dashboard_task_counts, local_day_bounds_utc,
@@ -33,11 +34,6 @@ use crate::postgres_server::{PostgresServerState, require_admin};
 
 const ADMIN_DASHBOARD_DEFAULT_WINDOW_DAYS: i64 = 7;
 const ADMIN_DASHBOARD_WINDOW_OPTIONS: [(&str, i64); 2] = [("7d", 7), ("30d", 30)];
-const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
-    (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
-    (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
-    (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
-];
 
 // ---------------------------------------------------------------------------
 // Wire types (legacy response parity)
@@ -74,8 +70,9 @@ struct AdminDashboardSummary {
 #[derive(Debug, Serialize)]
 struct AdminDashboardOngoingTaskBreakdown {
     translations: i64,
-    summaries: i64,
+    sync: i64,
     briefs: i64,
+    operations: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +123,8 @@ impl AdminDashboardBusinessCounts {
 #[derive(Debug, Serialize, Clone)]
 struct AdminDashboardTaskStatusItem {
     task_type: String,
+    task_group: String,
+    task_group_label: String,
     label: String,
     queued: i64,
     running: i64,
@@ -141,6 +140,8 @@ struct AdminDashboardTaskStatusItem {
 #[derive(Debug, Serialize)]
 struct AdminDashboardTaskShareItem {
     task_type: String,
+    task_group: String,
+    task_group_label: String,
     label: String,
     total: i64,
     share_ratio: f64,
@@ -159,14 +160,18 @@ struct AdminDashboardTrendPoint {
     translations_failed: i64,
     translations_partial: i64,
     translations_business_failed: i64,
-    summaries_total: i64,
-    summaries_failed: i64,
-    summaries_partial: i64,
-    summaries_business_failed: i64,
+    sync_total: i64,
+    sync_failed: i64,
+    sync_partial: i64,
+    sync_business_failed: i64,
     briefs_total: i64,
     briefs_failed: i64,
     briefs_partial: i64,
     briefs_business_failed: i64,
+    operations_total: i64,
+    operations_failed: i64,
+    operations_partial: i64,
+    operations_business_failed: i64,
 }
 
 impl AdminDashboardTrendPoint {
@@ -180,63 +185,103 @@ impl AdminDashboardTrendPoint {
             translations_failed: 0,
             translations_partial: 0,
             translations_business_failed: 0,
-            summaries_total: 0,
-            summaries_failed: 0,
-            summaries_partial: 0,
-            summaries_business_failed: 0,
+            sync_total: 0,
+            sync_failed: 0,
+            sync_partial: 0,
+            sync_business_failed: 0,
             briefs_total: 0,
             briefs_failed: 0,
             briefs_partial: 0,
             briefs_business_failed: 0,
+            operations_total: 0,
+            operations_failed: 0,
+            operations_partial: 0,
+            operations_business_failed: 0,
         }
     }
 
     fn apply(&mut self, row: &AdminDashboardRollupRow) {
-        match row.task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => {
-                self.translations_total = row.total_tasks();
-                self.translations_failed = row.failed_count;
-                self.translations_partial = row.business_partial_count;
-                self.translations_business_failed = row.business_failed_count;
-            }
-            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
-                self.summaries_total = row.total_tasks();
-                self.summaries_failed = row.failed_count;
-                self.summaries_partial = row.business_partial_count;
-                self.summaries_business_failed = row.business_failed_count;
-            }
-            jobs::TASK_BRIEF_DAILY_SLOT => {
-                self.briefs_total = row.total_tasks();
-                self.briefs_failed = row.failed_count;
-                self.briefs_partial = row.business_partial_count;
-                self.briefs_business_failed = row.business_failed_count;
-            }
-            _ => {}
-        }
+        let Some(group) = admin_job_groups::group_for_task_type(&row.task_type) else {
+            return;
+        };
+        self.apply_group_counts(
+            group.key,
+            row.total_tasks(),
+            row.failed_count,
+            row.business_partial_count,
+            row.business_failed_count,
+        );
     }
 
     fn apply_status_item(&mut self, item: &AdminDashboardTaskStatusItem) {
-        match item.task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => {
-                self.translations_total = item.total;
-                self.translations_failed = item.failed;
-                self.translations_partial = item.business_counts.partial;
-                self.translations_business_failed = item.business_counts.failed;
-            }
-            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
-                self.summaries_total = item.total;
-                self.summaries_failed = item.failed;
-                self.summaries_partial = item.business_counts.partial;
-                self.summaries_business_failed = item.business_counts.failed;
-            }
-            jobs::TASK_BRIEF_DAILY_SLOT => {
-                self.briefs_total = item.total;
-                self.briefs_failed = item.failed;
-                self.briefs_partial = item.business_counts.partial;
-                self.briefs_business_failed = item.business_counts.failed;
-            }
-            _ => {}
-        }
+        self.apply_group_counts(
+            &item.task_group,
+            item.total,
+            item.failed,
+            item.business_counts.partial,
+            item.business_counts.failed,
+        );
+    }
+
+    fn apply_group_counts(
+        &mut self,
+        group: &str,
+        total: i64,
+        failed: i64,
+        partial: i64,
+        business_failed: i64,
+    ) {
+        let (total_field, failed_field, partial_field, business_failed_field) = match group {
+            "translation" => (
+                &mut self.translations_total,
+                &mut self.translations_failed,
+                &mut self.translations_partial,
+                &mut self.translations_business_failed,
+            ),
+            "sync" => (
+                &mut self.sync_total,
+                &mut self.sync_failed,
+                &mut self.sync_partial,
+                &mut self.sync_business_failed,
+            ),
+            "briefs" => (
+                &mut self.briefs_total,
+                &mut self.briefs_failed,
+                &mut self.briefs_partial,
+                &mut self.briefs_business_failed,
+            ),
+            "operations" => (
+                &mut self.operations_total,
+                &mut self.operations_failed,
+                &mut self.operations_partial,
+                &mut self.operations_business_failed,
+            ),
+            _ => return,
+        };
+        *total_field += total;
+        *failed_field += failed;
+        *partial_field += partial;
+        *business_failed_field += business_failed;
+    }
+
+    /// Realtime status items replace the pre-aggregated rollup for today.
+    fn reset_task_groups(&mut self) {
+        self.translations_total = 0;
+        self.translations_failed = 0;
+        self.translations_partial = 0;
+        self.translations_business_failed = 0;
+        self.sync_total = 0;
+        self.sync_failed = 0;
+        self.sync_partial = 0;
+        self.sync_business_failed = 0;
+        self.briefs_total = 0;
+        self.briefs_failed = 0;
+        self.briefs_partial = 0;
+        self.briefs_business_failed = 0;
+        self.operations_total = 0;
+        self.operations_failed = 0;
+        self.operations_partial = 0;
+        self.operations_business_failed = 0;
     }
 }
 
@@ -385,6 +430,7 @@ async fn build_dashboard(
         .or_insert_with(|| AdminDashboardTrendPoint::empty(&today_value));
     today_point.total_users = today_live.total_users;
     today_point.active_users = today_live.active_users;
+    today_point.reset_task_groups();
     for item in &status_breakdown.items {
         today_point.apply_status_item(item);
     }
@@ -402,6 +448,8 @@ async fn build_dashboard(
             };
             AdminDashboardTaskShareItem {
                 task_type: item.task_type.clone(),
+                task_group: item.task_group.clone(),
+                task_group_label: item.task_group_label.clone(),
                 label: item.label.clone(),
                 total: item.total,
                 share_ratio,
@@ -518,13 +566,25 @@ async fn load_today_live_snapshot(
     let queued_tasks = count_live_tasks_by_status(pool, jobs::STATUS_QUEUED).await?;
     let running_tasks = count_live_tasks_by_status(pool, jobs::STATUS_RUNNING).await?;
     let ongoing_by_task = load_ongoing_counts(pool).await?;
-    let ongoing_tasks_total =
-        ongoing_by_task.translations + ongoing_by_task.summaries + ongoing_by_task.briefs;
+    let ongoing_tasks_total = ongoing_by_task.translations
+        + ongoing_by_task.sync
+        + ongoing_by_task.briefs
+        + ongoing_by_task.operations;
 
-    let mut items = Vec::with_capacity(ADMIN_DASHBOARD_TASK_TYPES.len());
-    for (task_type, label) in ADMIN_DASHBOARD_TASK_TYPES {
-        let counts = load_admin_dashboard_task_counts(pool, task_type, start_at, now_utc).await?;
-        items.push(build_status_item(task_type, label, &counts));
+    let specs = admin_job_groups::runtime_task_specs().collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let counts =
+            load_admin_dashboard_task_counts(pool, spec.task_type, start_at, now_utc).await?;
+        let Some(group) = admin_job_groups::group_for_task_type(spec.task_type) else {
+            continue;
+        };
+        items.push(build_status_item(
+            spec.task_type,
+            spec.label,
+            group,
+            &counts,
+        ));
     }
 
     let queued_total = items.iter().map(|item| item.queued).sum::<i64>();
@@ -569,6 +629,7 @@ async fn load_today_live_snapshot(
 fn build_status_item(
     task_type: &str,
     label: &str,
+    group: &admin_job_groups::AdminJobTaskGroup,
     counts: &AdminDashboardTaskCounts,
 ) -> AdminDashboardTaskStatusItem {
     let total = counts.queued + counts.running + counts.succeeded + counts.failed + counts.canceled;
@@ -586,6 +647,8 @@ fn build_status_item(
     };
     AdminDashboardTaskStatusItem {
         task_type: task_type.to_owned(),
+        task_group: group.key.to_owned(),
+        task_group_label: group.label.to_owned(),
         label: label.to_owned(),
         queued: counts.queued,
         running: counts.running,
@@ -626,14 +689,19 @@ async fn load_ongoing_counts(pool: &PgPool) -> anyhow::Result<AdminDashboardOngo
     .await?;
     let mut breakdown = AdminDashboardOngoingTaskBreakdown {
         translations: 0,
-        summaries: 0,
+        sync: 0,
         briefs: 0,
+        operations: 0,
     };
     for (task_type, total) in rows {
-        match task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => breakdown.translations = total,
-            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => breakdown.summaries = total,
-            jobs::TASK_BRIEF_DAILY_SLOT => breakdown.briefs = total,
+        let Some(group) = admin_job_groups::group_for_task_type(&task_type) else {
+            continue;
+        };
+        match group.key {
+            "translation" => breakdown.translations += total,
+            "sync" => breakdown.sync += total,
+            "briefs" => breakdown.briefs += total,
+            "operations" => breakdown.operations += total,
             _ => {}
         }
     }
@@ -641,10 +709,7 @@ async fn load_ongoing_counts(pool: &PgPool) -> anyhow::Result<AdminDashboardOngo
 }
 
 fn admin_dashboard_task_types() -> Vec<&'static str> {
-    ADMIN_DASHBOARD_TASK_TYPES
-        .iter()
-        .map(|(task_type, _)| *task_type)
-        .collect()
+    admin_job_groups::runtime_task_types().collect()
 }
 
 async fn load_llm_health(
@@ -726,4 +791,74 @@ async fn load_llm_health(
         top_failure_reasons,
         top_failure_sources,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs;
+
+    fn status_item(
+        task_type: &str,
+        task_group: &str,
+        total: i64,
+        failed: i64,
+    ) -> AdminDashboardTaskStatusItem {
+        AdminDashboardTaskStatusItem {
+            task_type: task_type.to_owned(),
+            task_group: task_group.to_owned(),
+            task_group_label: String::new(),
+            label: String::new(),
+            queued: 0,
+            running: 0,
+            succeeded: total - failed,
+            failed,
+            canceled: 0,
+            business_counts: AdminDashboardBusinessCounts::default(),
+            total,
+            success_rate: 0.0,
+            business_success_rate: 0.0,
+        }
+    }
+
+    #[test]
+    fn postgres_admin_dashboard_rollup_types_match_runtime_groups() {
+        let task_types = admin_dashboard_task_types();
+        assert!(task_types.contains(&admin_job_groups::TASK_TRANSLATION_GENERATE));
+        assert!(task_types.contains(&jobs::TASK_BRIEF_DAILY_SLOT));
+        assert!(!task_types.contains(&jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!task_types.contains(&jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH));
+        assert_eq!(
+            task_types.len(),
+            admin_job_groups::runtime_task_specs().count()
+        );
+    }
+
+    #[test]
+    fn postgres_admin_dashboard_trend_sums_task_types_per_group() {
+        let mut point = AdminDashboardTrendPoint::empty("2026-11-22");
+        point.apply_status_item(&status_item(
+            admin_job_groups::TASK_TRANSLATION_GENERATE,
+            "translation",
+            3,
+            1,
+        ));
+        point.apply_status_item(&status_item(
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            "translation",
+            2,
+            0,
+        ));
+        point.apply_status_item(&status_item(jobs::TASK_SYNC_RELEASES, "sync", 4, 2));
+        assert_eq!(point.translations_total, 5);
+        assert_eq!(point.translations_failed, 1);
+        assert_eq!(point.sync_total, 4);
+        assert_eq!(point.sync_failed, 2);
+        assert_eq!(point.briefs_total, 0);
+        assert_eq!(point.operations_total, 0);
+
+        point.reset_task_groups();
+        assert_eq!(point.translations_total, 0);
+        assert_eq!(point.sync_total, 0);
+    }
 }
