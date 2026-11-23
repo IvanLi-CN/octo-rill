@@ -16,13 +16,14 @@ ADR 0023 将 PostgreSQL 定为运行时持久化权威。切换后，读路径�
 
 ## Decision
 
-选择第 3 条：在 PostgreSQL 运行时实现原生的 admission、claim/lease、provider 调用、输出契约与投影发布，覆盖 Release 翻译、Release 润色/阅读、公告与通知；`content_*` schema、身份模型与读投影继续沿用既有契约，不新增读分支。
+选择第 3 条：在 PostgreSQL 运行时实现原生的 admission、claim/lease、provider 调用、输出契约与投影发布，覆盖 Release 翻译、Release 润色/阅读、公告与通知；`content_*` schema 与身份模型继续沿用既有契约。Release 与公告读侧复用 `postgres_content_overlay` 投影，不新增读分支；通知当前不由该 overlay 读取，其请求/读取适配属于本主题。
 
 ## Consequences
 
 - 运行时只有一套权威写入者；SQLite 不再接收新的内容处理写。
 - 必须按分片交付：过渡修复、共享契约抽取、admission、worker、生产入口、pipeline 覆盖、退役 legacy 自动入队。
-- 既有 `content_current_result_projections` 与身份表可直接复用，读侧无需改动。
+- 既有 `content_current_result_projections` 与身份表可直接复用；Release 与公告读侧无需改动，通知读取路径需随流水线适配。
+- 本决策取代 `docs/specs/postgresql-runtime/HISTORY.md` 中“旧内容处理流水线不恢复”的结论，并修订 `REQ-PGR-009` 的自动入队退役边界。
 - provider 调用与审计逻辑从 `postgres_translate` 复用，降低第二套实现漂移的风险。
 - 迁移期间 `translation.generate` 仍需修复导入库唯一约束，避免任务中心继续产生伪失败。
 

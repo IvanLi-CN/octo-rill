@@ -69,6 +69,16 @@ mod tests {
                 .sql
                 .contains("CREATE UNIQUE INDEX IF NOT EXISTS")
         );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("translation_attempt_events_work_item_id_attempt_no_event_ty_key")
+        );
+        assert!(
+            attempt_unique
+                .sql
+                .contains("DELETE FROM public.translation_attempt_events")
+        );
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()

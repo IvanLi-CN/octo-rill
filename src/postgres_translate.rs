@@ -3980,25 +3980,35 @@ mod tests {
                 source_blocks_json: "[]".to_owned(),
                 target_slots_json: "[]".to_owned(),
             };
-            for _ in 0..2 {
-                let mut tx = pool.begin().await?;
-                insert_translation_request(
-                    &mut tx,
-                    "user-a",
-                    "test.auto",
-                    "1000",
-                    TargetKind::ReleaseDetail,
-                    &work,
-                    chrono::Utc::now(),
-                )
-                .await?;
-                sqlx::query(
-                    "UPDATE translation_requests SET status='failed', result_status='error', error_text='boom', started_at='x', finished_at='y'",
-                )
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-            }
+            let mut tx = pool.begin().await?;
+            insert_translation_request(
+                &mut tx,
+                "user-a",
+                "test.auto",
+                "1000",
+                TargetKind::ReleaseDetail,
+                &work,
+                chrono::Utc::now(),
+            )
+            .await?;
+            tx.commit().await?;
+            sqlx::query(
+                "UPDATE translation_requests SET status='failed', result_status='error', error_text='boom', started_at='x', finished_at='y'",
+            )
+            .execute(&pool)
+            .await?;
+            let mut tx = pool.begin().await?;
+            insert_translation_request(
+                &mut tx,
+                "user-a",
+                "test.auto",
+                "1000",
+                TargetKind::ReleaseDetail,
+                &work,
+                chrono::Utc::now(),
+            )
+            .await?;
+            tx.commit().await?;
             let (count, status, result_status, error_text, work_item_id): (
                 i64,
                 String,
