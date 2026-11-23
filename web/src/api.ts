@@ -495,6 +495,9 @@ export type AdminWebhookPushRuntimeConfigResponse = {
 };
 export type SyncAutoFetchTaskItem = {
 	id: string;
+	task_type: string;
+	task_group: string;
+	legacy: boolean;
 	status: string;
 	source: string;
 	skipped?: boolean;

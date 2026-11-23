@@ -322,7 +322,10 @@ function SyncTaskDurationButton(props: {
 			aria-label={`查看定时拉取任务 ${task.id} 详情`}
 		>
 			<span className="min-w-0">
-				<span className="block truncate font-mono text-[11px] text-muted-foreground">
+				<span className="block text-xs font-medium">
+					{taskTypeLabel(task.task_type)}
+				</span>
+				<span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
 					{task.id}
 				</span>
 				<span className="mt-1 block text-xs text-muted-foreground">
@@ -8618,7 +8621,7 @@ export function JobManagement({
 						<div className="space-y-3">
 							<div className="flex items-center justify-between gap-3">
 								<div className="flex items-center gap-1">
-									<p className="text-sm font-medium">最近三次链路用时</p>
+									<p className="text-sm font-medium">最近五次同步用时</p>
 									<Tooltip
 										open={
 											syncSettingsHelpTooltip === "duration" ? true : undefined
@@ -8641,18 +8644,21 @@ export function JobManagement({
 											side="top"
 											sideOffset={4}
 										>
-											用时从定时触发开始，直到同步、润色和翻译子任务全部完成；点击记录可打开任务详情。
+											用时从定时触发开始，直到 Release
+											与通知同步完成；点击记录可打开任务详情。
 										</TooltipContent>
 									</Tooltip>
 								</div>
-								<Badge variant="outline">sync.subscriptions</Badge>
+								<Badge variant="outline">
+									sync.releases · sync.notifications
+								</Badge>
 							</div>
 							{syncRuntimeConfigLoading && !syncRuntimeConfig ? (
 								<LoadingMessage>正在加载同步记录...</LoadingMessage>
 							) : !syncRuntimeConfig ||
 								syncRuntimeConfig.recent_sync_tasks.length === 0 ? (
 								<p className="rounded-lg border bg-card/70 px-3 py-4 text-sm text-muted-foreground">
-									暂无定时拉取记录。
+									暂无同步记录。
 								</p>
 							) : (
 								<div className="space-y-2">

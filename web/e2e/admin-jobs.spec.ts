@@ -411,9 +411,6 @@ async function installAdminJobsMocks(
 			buckets,
 		};
 	};
-	const syncSubscriptionChainFinishedAt: Record<string, string> = {
-		"task-subscriptions-1": "2026-02-26T14:50:30Z",
-	};
 	let syncRuntimeConfig = {
 		sync_auto_fetch_interval_minutes: 10,
 		retry_recent_failures_interval_minutes: 10,
@@ -421,23 +418,21 @@ async function installAdminJobsMocks(
 		repo_refresh_system_budget_per_window: 1000,
 		dashboard_release_freshness_profile: "balanced",
 		daily_brief_schedule_local_time: "06:00",
-		recent_sync_tasks: tasks
-			.filter((task) => task.task_type === "sync.subscriptions")
-			.filter((task) => task.id !== "task-subscriptions-skipped")
-			.slice(0, 3)
-			.map((task) => ({
-				id: task.id,
-				status: task.status,
-				source: task.source,
-				skipped: task.id === "task-subscriptions-skipped",
-				duration_ms: syncSubscriptionChainFinishedAt[task.id]
-					? new Date(syncSubscriptionChainFinishedAt[task.id]).getTime() -
-						new Date(task.created_at).getTime()
-					: null,
-				created_at: task.created_at,
-				started_at: task.started_at,
-				finished_at: syncSubscriptionChainFinishedAt[task.id] ?? null,
-			})),
+		recent_sync_tasks: [
+			{
+				id: "task-sync-releases",
+				task_type: "sync.releases",
+				task_group: "sync",
+				legacy: false,
+				status: "succeeded",
+				source: "scheduler",
+				skipped: false,
+				duration_ms: 70_123,
+				created_at: "2026-02-26T14:30:00Z",
+				started_at: "2026-02-26T14:30:02Z",
+				finished_at: "2026-02-26T14:31:12Z",
+			},
+		],
 	};
 	let webhookPushRuntimeConfig = {
 		audit_interval_days: 7,
@@ -2704,6 +2699,11 @@ test("admin subscription number drafts recover from invalid values", async ({
 	await dialog.getByRole("button", { name: "取消" }).click();
 	await settingsButton.click();
 	await expect(budgetInput).toHaveValue("1000");
+	const syncTaskButton = dialog
+		.getByRole("button", { name: /查看定时拉取任务/ })
+		.first();
+	await expect(syncTaskButton.getByText("同步 Release")).toBeVisible();
+	await expect(dialog.getByText("sync.subscriptions")).toHaveCount(0);
 
 	await concurrencyInput.fill("");
 	await budgetInput.fill("");
