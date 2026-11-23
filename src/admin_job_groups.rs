@@ -226,6 +226,20 @@ pub(crate) fn lane_task_types(lane: AdminJobTaskLane) -> impl Iterator<Item = &'
         .map(|spec| spec.task_type)
 }
 
+/// Task types of one group that the periodic lanes dispatch.
+pub(crate) fn scheduled_group_task_types(group_key: &str) -> Vec<&'static str> {
+    find_group(group_key)
+        .map(|group| {
+            group
+                .task_types
+                .iter()
+                .filter(|spec| spec.lane == AdminJobTaskLane::Scheduled)
+                .map(|spec| spec.task_type)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn is_legacy_task_type(task_type: &str) -> bool {
     LEGACY_TASK_TYPES.contains(&task_type)
 }
@@ -309,5 +323,17 @@ mod tests {
             scheduled.len() + user_sync.len() + realtime.len(),
             runtime_task_specs().count()
         );
+    }
+
+    #[test]
+    fn scheduled_sync_lane_uses_current_release_and_notification_types() {
+        let sync = scheduled_group_task_types("sync");
+        assert_eq!(
+            sync,
+            vec![jobs::TASK_SYNC_RELEASES, jobs::TASK_SYNC_NOTIFICATIONS]
+        );
+        assert!(!sync.contains(&jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!sync.contains(&jobs::TASK_SYNC_STARRED));
+        assert!(scheduled_group_task_types("unknown").is_empty());
     }
 }

@@ -4397,7 +4397,15 @@ async fn pg_sync_runtime_config(
 ) -> Result<serde_json::Value, sqlx::Error> {
     use sqlx::Row;
     let settings=sqlx::query_scalar::<_,serde_json::Value>("SELECT jsonb_build_object('sync_auto_fetch_interval_minutes',sync_auto_fetch_interval_minutes,'sync_auto_fetch_effective_at',sync_auto_fetch_effective_at,'star_sync_delta_interval_minutes',star_sync_delta_interval_minutes,'star_sync_full_sweep_interval_minutes',star_sync_full_sweep_interval_minutes,'retry_recent_failures_interval_minutes',retry_recent_failures_interval_minutes,'repo_release_worker_concurrency',repo_release_worker_concurrency,'repo_refresh_system_budget_per_window',repo_refresh_system_budget_per_window,'dashboard_release_freshness_profile',dashboard_release_freshness_profile,'daily_brief_schedule_local_time',daily_brief_schedule_local_time) FROM public.admin_runtime_settings WHERE id=1").fetch_one(&state.runtime.pool).await?;
-    let delta=sqlx::query_scalar::<_,Option<String>>("SELECT MAX(finished_at)::text FROM public.job_tasks WHERE task_type='sync.starred.delta' AND status='succeeded'").fetch_one(&state.runtime.pool).await?;
+    let sync_task_types = crate::admin_job_groups::scheduled_group_task_types("sync");
+    let delta = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(finished_at)::text
+         FROM public.job_tasks
+         WHERE task_type = $1 AND status = 'succeeded'",
+    )
+    .bind(crate::jobs::TASK_SYNC_STARRED)
+    .fetch_one(&state.runtime.pool)
+    .await?;
     let full = sqlx::query_scalar::<_, Option<String>>(
         "SELECT MAX(completed_at)::text FROM public.star_sync_epochs WHERE status='succeeded'",
     )
@@ -4405,7 +4413,38 @@ async fn pg_sync_runtime_config(
     .await?;
     let epochs=sqlx::query("SELECT github_connection_id,processed_pages,processed_items,total_count_at_start,next_slice_not_before FROM public.star_sync_epochs WHERE status IN ('queued','running') ORDER BY created_at,id").fetch_all(&state.runtime.pool).await?;
     let epochs=epochs.into_iter().map(|r|{let items=r.get::<i64,_>("processed_items").max(0);let total=r.get::<Option<i64>,_>("total_count_at_start");json!({"github_connection_id":r.get::<String,_>("github_connection_id"),"processed_pages":r.get::<i64,_>("processed_pages").max(0),"processed_items":items,"total_count_at_start":total,"completion_percent":total.filter(|v|*v>0).map(|v|(items as f64/v as f64*100.0).min(100.0)),"next_slice_not_before":r.get::<Option<String>,_>("next_slice_not_before")})}).collect::<Vec<_>>();
-    let tasks=sqlx::query_scalar::<_,serde_json::Value>(r#"WITH roots AS(SELECT id,status,source,created_at,started_at,finished_at FROM public.job_tasks WHERE task_type='sync.subscriptions' AND CASE WHEN pg_input_is_valid(result_json,'jsonb') THEN COALESCE((result_json::jsonb->>'skipped'),'false') NOT IN ('true','1') ELSE true END ORDER BY created_at DESC,id DESC LIMIT 3),chain AS(SELECT id AS root_id,finished_at FROM roots UNION ALL SELECT t.parent_task_id,t.finished_at FROM public.job_tasks t JOIN roots r ON r.id=t.parent_task_id WHERE t.task_type IN ('translate.release.batch','summarize.release.smart.batch')),rollup AS(SELECT root_id,MAX(finished_at) AS finished_at,COUNT(*) FILTER(WHERE finished_at IS NULL) AS unfinished FROM chain GROUP BY root_id) SELECT jsonb_build_object('id',r.id,'status',r.status,'source',r.source,'skipped',false,'duration_ms',CASE WHEN c.unfinished=0 THEN (EXTRACT(EPOCH FROM(c.finished_at-r.created_at))*1000)::bigint ELSE NULL END,'created_at',r.created_at::text,'started_at',r.started_at::text,'finished_at',CASE WHEN c.unfinished=0 THEN c.finished_at::text ELSE NULL END) FROM roots r JOIN rollup c ON c.root_id=r.id ORDER BY r.created_at DESC,r.id DESC"#).fetch_all(&state.runtime.pool).await?;
+    let tasks = sqlx::query_scalar::<_, serde_json::Value>(
+        r#"
+        SELECT jsonb_build_object(
+          'id', id,
+          'task_type', task_type,
+          'task_group', 'sync',
+          'legacy', false,
+          'status', status,
+          'source', source,
+          'skipped', CASE
+            WHEN pg_input_is_valid(result_json, 'jsonb')
+             AND jsonb_typeof(result_json::jsonb -> 'skipped') = 'boolean'
+            THEN (result_json::jsonb -> 'skipped')::boolean
+            ELSE FALSE
+          END,
+          'duration_ms', CASE
+            WHEN finished_at IS NOT NULL
+            THEN (EXTRACT(EPOCH FROM (finished_at - created_at)) * 1000)::bigint
+          END,
+          'created_at', created_at::text,
+          'started_at', started_at::text,
+          'finished_at', finished_at::text
+        )
+        FROM public.job_tasks
+        WHERE task_type = ANY($1)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 5
+        "#,
+    )
+    .bind(&sync_task_types)
+    .fetch_all(&state.runtime.pool)
+    .await?;
     let mut body = settings;
     body["star_sync"] = json!({"last_delta_completed_at":delta,"last_full_sweep_completed_at":full,"active_epochs":epochs});
     body["recent_sync_tasks"] = json!(tasks);

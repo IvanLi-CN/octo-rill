@@ -2160,6 +2160,9 @@ function buildAdminJobs(): DemoJobsModel {
 			recent_sync_tasks: [
 				{
 					id: "task-sync-releases",
+					task_type: "sync.releases",
+					task_group: "sync",
+					legacy: false,
 					status: "succeeded",
 					source: "manual",
 					skipped: false,
