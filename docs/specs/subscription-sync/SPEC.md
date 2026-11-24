@@ -137,6 +137,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 - 列表展示 `sync.releases` 与 `sync.notifications` 任务，按 payload `schedule_key` 聚合成一轮运行，展示轮次状态、用户数、Release 仓库/拉取数、通知数与失败摘要。
 - 手工触发且没有 `schedule_key` 的任务单独成一轮，同样进入连续列表。
 - 导入的 `sync.subscriptions` 记录规范化为同一轮运行形状，与 PostgreSQL 记录在同一列表按时间连续排序；不得按迁移时期拆分为独立视图。
+- 导入记录的用户数优先取 `collect.total_users`，旧记录回退到 `star` / `social` / `notifications` 的 `total_users`，均缺失时为 `0`。
 - 轮次中的每个任务可以打开通用任务详情抽屉；不再要求该任务属于 `sync.subscriptions` 类型。
 - `sync.subscriptions` 记录的任务行仍可打开工作流详情页以查看阶段诊断。
 - 列表页和详情页共享设置入口，设置项包括：
