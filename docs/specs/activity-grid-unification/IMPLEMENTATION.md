@@ -20,7 +20,7 @@
 | REQ-ACTIVITY-GRID-009 | route-state stability and independent detail reads | implemented |
 | REQ-ACTIVITY-GRID-010 | collection and LLM behavior-preservation coverage | implemented |
 | REQ-ACTIVITY-GRID-011 | Demo Inspector Data case control, delayed loading and state-scoped caches | implemented |
-| REQ-ACTIVITY-GRID-012 | delayed hover dismissal, pointer-receiving preview, pinned close control and time-scoped preview title | implemented |
+|REQ-ACTIVITY-GRID-012|delayed hover dismissal, gap retention, nearest-cell preview, pointer-transparent hover preview, pinned close control, portaled menu clicks and time-scoped preview title|implemented|
 
 ## Verification Coverage
 
