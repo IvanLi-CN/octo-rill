@@ -1265,7 +1265,7 @@ impl ReleasesExecutor {
                 ),
             }
         }
-        match crate::postgres_translate::enqueue_pending_translation_tasks(
+        let total = match crate::postgres_translate::enqueue_pending_translation_tasks(
             &self.pool,
             user_id,
             "sync.releases.translation_backlog",
@@ -1294,7 +1294,25 @@ impl ReleasesExecutor {
                 );
                 enqueued
             }
+        };
+        if let Some(ai) = self.ai.as_ref()
+            && !new_release_ids.is_empty()
+            && let Err(error) = crate::postgres_content::admit_release_polish(
+                &self.pool,
+                new_release_ids,
+                ai.model.as_str(),
+            )
+            .await
+        {
+            warn!(
+                event = "content.polish.enqueue",
+                operation = "sync.releases",
+                user_id,
+                error = %error,
+                "global polishing admission failed"
+            );
         }
+        total
     }
 }
 

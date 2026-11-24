@@ -1750,7 +1750,9 @@ enum AutoTranslationDecision {
     SkipReady,
     /// A `translation.generate` task for the work item is queued or running.
     SkipInFlight,
-    /// Queue a task; `reset_work_item` re-queues a terminal work item first.
+    /// The work item is terminal; only the scheduled retry lane may reopen it.
+    SkipTerminal,
+    /// Queue an already-admitted queued work item.
     Enqueue { reset_work_item: bool },
 }
 
@@ -1762,13 +1764,14 @@ fn auto_translation_decision(
     if result_status == Some("ready") {
         return AutoTranslationDecision::SkipReady;
     }
-    if task_in_flight {
+    if task_in_flight || work_status == "running" {
         return AutoTranslationDecision::SkipInFlight;
     }
+    if work_status != "queued" {
+        return AutoTranslationDecision::SkipTerminal;
+    }
     AutoTranslationDecision::Enqueue {
-        // `translate_work_item_for_task` only accepts `queued` and `running`
-        // work items; every other status is terminal for this source hash.
-        reset_work_item: !matches!(work_status, "queued" | "running"),
+        reset_work_item: false,
     }
 }
 
@@ -2526,6 +2529,68 @@ async fn finish_request(
     Ok(())
 }
 
+/// Close request rows whose work item already reached a terminal state.
+///
+/// A `translation_requests` row is only a view of its work item. An automatic
+/// enqueue that re-created a request for a terminal work item, or a lost
+/// finalization, leaves that view at `queued`/`running` after the work item is
+/// `completed`/`failed`. Those rows can never be claimed, yet they inflate the
+/// queue counters and the admin request list.
+///
+/// This repair is idempotent, performs no provider call, never rewrites attempt
+/// or LLM history, and skips any work item that still has a queued or running
+/// `translation.generate` task.
+pub(crate) async fn reconcile_terminal_translation_requests(pool: &PgPool) -> anyhow::Result<u64> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE public.translation_requests AS request
+        SET status = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN 'completed'
+                ELSE 'failed'
+            END,
+            result_status = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN 'ready'
+                WHEN work.result_status = 'ready' THEN 'error'
+                ELSE COALESCE(work.result_status, 'error')
+            END,
+            title_zh = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.title_zh
+                ELSE request.title_zh
+            END,
+            summary_md = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.summary_md
+                ELSE request.summary_md
+            END,
+            body_md = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.body_md
+                ELSE request.body_md
+            END,
+            error_text = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN NULL
+                ELSE COALESCE(work.error_text, 'translation work reached a terminal state')
+            END,
+            finished_at = COALESCE(request.finished_at, now()),
+            updated_at = now()
+        FROM public.translation_work_items AS work
+        WHERE request.work_item_id = work.id
+          AND request.status IN ('queued', 'running')
+          AND work.status IN ('completed', 'failed')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.job_tasks AS task
+            WHERE task.task_type = 'translation.generate'
+              AND task.status IN ('queued', 'running')
+              AND pg_input_is_valid(task.payload_json, 'jsonb')
+              AND task.payload_json::jsonb ->> 'work_item_id' = work.id
+          )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("reconcile terminal PostgreSQL translation requests")?;
+    Ok(updated.rows_affected())
+}
+
 /// Source blocks persisted on the work item when it was enqueued.
 ///
 /// The persisted `source_blocks_json` is either the bare block array or a
@@ -3042,9 +3107,9 @@ fn parse_json_translation(raw: &str) -> (Option<String>, Option<String>) {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct LlmFailure {
-    class: crate::ai::LlmFailureClass,
-    message: String,
+pub(crate) struct LlmFailure {
+    pub(crate) class: crate::ai::LlmFailureClass,
+    pub(crate) message: String,
 }
 
 impl LlmFailure {
@@ -3245,6 +3310,14 @@ async fn record_model_failure(pool: &PgPool, model: &str, class: crate::ai::LlmF
 
 async fn park_model(pool: &PgPool, model: &str) {
     record_model_health(pool, model, crate::ai::LlmFailureClass::Configuration, true).await;
+}
+
+/// Read the administrator-ordered model list for a caller outside this module.
+pub(crate) async fn route_models_for_runtime(
+    pool: &PgPool,
+    fallback_model: &str,
+) -> Result<Vec<String>, LlmFailure> {
+    route_models(pool, fallback_model).await
 }
 
 async fn record_model_health(
@@ -3801,6 +3874,386 @@ async fn link_attempt_call(
     Ok(())
 }
 
+/// One logical provider completion with its persisted audit identity.
+///
+/// Shared by the PostgreSQL translation path and the global content worker so
+/// both route models, record `llm_calls` facts and honour model health through
+/// the same code instead of a second drifting implementation.
+pub(crate) struct AuditedCompletion {
+    pub content: String,
+    pub call_id: Option<String>,
+    pub model: String,
+    pub provider_request_id: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub finish_reason: Option<String>,
+    /// Provider requests issued by this call, so a follow-up call can continue
+    /// the admission ordinal sequence instead of colliding with it.
+    pub attempts_used: i64,
+}
+
+/// Why one audited completion did not produce content.
+///
+/// Keeping lease loss separate from a provider verdict prevents the worker from
+/// recording a provider failure (and spending retry budget) on work another
+/// runtime now owns.
+#[derive(Debug)]
+pub(crate) enum CompletionFailure {
+    Provider(LlmFailure),
+    LeaseLost,
+}
+
+impl CompletionFailure {
+    fn from_admission(error: anyhow::Error) -> Self {
+        Self::Provider(LlmFailure {
+            class: crate::ai::LlmFailureClass::Transient,
+            message: format!("provider admission failed: {error}"),
+        })
+    }
+}
+
+impl std::fmt::Display for CompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(failure) => formatter.write_str(&failure.message),
+            Self::LeaseLost => formatter.write_str("content work lease is no longer owned"),
+        }
+    }
+}
+
+impl std::error::Error for CompletionFailure {}
+
+/// Provider admission boundary for a content work attempt.
+///
+/// Every provider request must renew the live lease and append an admission
+/// fact before the upstream call, so an expired or stolen claim cannot issue a
+/// new request and the audit graph stays attributable.
+pub(crate) struct ContentProviderAdmission<'a> {
+    pub pool: &'a PgPool,
+    pub work_item_id: &'a str,
+    pub attempt_event_id: &'a str,
+    pub attempt_no: i64,
+    pub lease_owner: &'a str,
+    pub source_hash: &'a str,
+    pub source_revision_json: &'a str,
+    /// First ordinal this admission sequence may use. A second provider call
+    /// inside the same attempt (length recovery) continues after the first.
+    pub call_ordinal_base: i64,
+}
+
+impl ContentProviderAdmission<'_> {
+    pub(crate) async fn admit(
+        &self,
+        call_ordinal: i64,
+        relation_role: &str,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let renewed = sqlx::query_scalar::<_, String>(
+            "UPDATE public.content_work_items SET lease_expires_at = now() + interval '300 seconds', updated_at = now() WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() RETURNING id",
+        )
+        .bind(self.work_item_id)
+        .bind(i32::try_from(self.attempt_no).unwrap_or(i32::MAX))
+        .bind(self.lease_owner)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if renewed.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO public.content_attempt_provider_admissions (id, attempt_event_id, work_item_id, attempt_no, call_ordinal, relation_role, source_hash, source_revision_json, admitted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) ON CONFLICT (attempt_event_id, call_ordinal) DO NOTHING",
+        )
+        .bind(local_id::generate_local_id())
+        .bind(self.attempt_event_id)
+        .bind(self.work_item_id)
+        .bind(self.attempt_no)
+        .bind(call_ordinal)
+        .bind(relation_role)
+        .bind(self.source_hash)
+        .bind(self.source_revision_json)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+/// Run one routed completion and persist every attempt in `llm_calls`.
+///
+/// Unlike [`AuditRecorder::complete`] this does not link the call into
+/// `translation_attempt_llm_calls`; the global content worker owns its own
+/// `content_attempt_llm_calls` link so the two work models stay separate.
+/// `content_attempt_llm_calls` link so the two work models stay separate.
+///
+/// Inputs for one audited completion request.
+pub(crate) struct CompletionRequest<'a> {
+    pub source: &'a str,
+    pub requested_by: Option<&'a str>,
+    pub parent_task: Option<(&'a str, &'a str)>,
+    pub system: &'a str,
+    pub user: &'a str,
+    pub max_tokens: u32,
+}
+
+pub(crate) async fn complete_with_audit(
+    pool: &PgPool,
+    http: &Client,
+    ai: &AiConfig,
+    request: CompletionRequest<'_>,
+    admission: Option<&ContentProviderAdmission<'_>>,
+) -> Result<AuditedCompletion, CompletionFailure> {
+    let CompletionRequest {
+        source,
+        requested_by,
+        parent_task: parent,
+        system,
+        user,
+        max_tokens,
+    } = request;
+    let models = route_models(pool, ai.model.as_str())
+        .await
+        .map_err(CompletionFailure::Provider)?;
+    let health = load_route_health(pool)
+        .await
+        .map_err(CompletionFailure::Provider)?;
+    let candidates = route_candidates(&models, &health, Utc::now());
+    if candidates.is_empty() {
+        return Err(CompletionFailure::Provider(LlmFailure::configuration()));
+    }
+    let parent_task_id = parent.map(|(task_id, _)| task_id);
+    let parent_task_type = parent.map(|(_, task_type)| task_type);
+    let mut remaining = ROUTE_MAX_UPSTREAM_ATTEMPTS;
+    let mut last_failure: Option<LlmFailure> = None;
+    let mut call_ordinal = 0_i64;
+    for (candidate_index, model) in candidates.into_iter().enumerate() {
+        // The configured primary keeps its role even when health filtering
+        // promotes another model to the first candidate position.
+        let role = if models.first() == Some(&model) {
+            "primary"
+        } else {
+            "fallback"
+        };
+        let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
+        let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
+        for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            if let Some(admission) = admission {
+                let ordinal = admission.call_ordinal_base + call_ordinal;
+                if !admission
+                    .admit(ordinal, role)
+                    .await
+                    .map_err(CompletionFailure::from_admission)?
+                {
+                    return Err(CompletionFailure::LeaseLost);
+                }
+                call_ordinal += 1;
+            }
+            let call_id = local_id::generate_local_id();
+            let prompt_text = truncate_chars(&format!("{system}\n\n{user}"), 8_000);
+            let inserted = insert_call(
+                pool,
+                &call_id,
+                source,
+                model.as_str(),
+                requested_by.unwrap_or(""),
+                parent_task_id,
+                parent_task_type,
+                max_tokens,
+                &prompt_text,
+                &json!([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ])
+                .to_string(),
+            )
+            .await;
+            if inserted {
+                let _ = mark_call_running(pool, &call_id).await;
+            }
+            let started = std::time::Instant::now();
+            let outcome = invoke_model(http, ai, model.as_str(), system, user, max_tokens).await;
+            let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let audit = match &outcome {
+                Ok(response) => CallAudit {
+                    status: "succeeded",
+                    model: response.model.clone(),
+                    provider_request_id: response.provider_request_id.clone(),
+                    provider_http_status: response.provider_http_status,
+                    input_tokens: response.input_tokens,
+                    output_tokens: response.output_tokens,
+                    total_tokens: response.total_tokens,
+                    finish_reason: response.finish_reason.clone(),
+                    failure_class: None,
+                    error_text: None,
+                    response_text: Some(truncate_chars(&response.content, 8_000)),
+                    duration_ms,
+                },
+                Err(failure) => CallAudit {
+                    status: "failed",
+                    model: model.clone(),
+                    provider_request_id: None,
+                    provider_http_status: failure.http_status,
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    finish_reason: None,
+                    failure_class: Some(failure.error.class.as_str()),
+                    error_text: Some(failure.detail.clone()),
+                    response_text: None,
+                    duration_ms,
+                },
+            };
+            if inserted {
+                let _ = finalize_call(pool, &call_id, &audit, fallback_count).await;
+            }
+            match outcome {
+                Ok(response) => {
+                    return Ok(AuditedCompletion {
+                        content: response.content,
+                        call_id: inserted.then_some(call_id),
+                        model: response.model,
+                        provider_request_id: response.provider_request_id,
+                        input_tokens: response.input_tokens,
+                        output_tokens: response.output_tokens,
+                        duration_ms: Some(duration_ms),
+                        finish_reason: response.finish_reason,
+                        attempts_used: call_ordinal,
+                    });
+                }
+                Err(failure) => {
+                    let class = failure.error.class;
+                    let http_status = failure.http_status;
+                    last_failure = Some(failure.error);
+                    if class == crate::ai::LlmFailureClass::Configuration {
+                        if is_credential_rejection(http_status) {
+                            park_model(pool, model.as_str()).await;
+                        }
+                        break;
+                    }
+                    if class == crate::ai::LlmFailureClass::EmptyContent {
+                        retry_class = Some(class);
+                        break;
+                    }
+                    if model_attempt + 1 == ROUTE_ATTEMPTS_PER_MODEL || remaining == 0 {
+                        retry_class = Some(class);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(class) = retry_class {
+            record_model_failure(pool, model.as_str(), class).await;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    Err(CompletionFailure::Provider(
+        last_failure.unwrap_or_else(LlmFailure::transient),
+    ))
+}
+
+async fn invoke_model(
+    http: &Client,
+    ai: &AiConfig,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<CallResponse, CallFailure> {
+    let endpoint = ai
+        .base_url
+        .join("chat/completions")
+        .map_err(|_| CallFailure {
+            error: LlmFailure::configuration(),
+            detail: "invalid AI base URL".to_owned(),
+            http_status: None,
+        })?;
+    let response = http
+        .post(endpoint)
+        .bearer_auth(&ai.api_key)
+        .timeout(LLM_CALL_TIMEOUT)
+        .json(&json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": false,
+        }))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(CallFailure {
+                error: LlmFailure::transient(),
+                detail: truncate_chars(&error.to_string(), 200),
+                http_status: None,
+            });
+        }
+    };
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = body_text.trim();
+        let detail = if detail.is_empty() {
+            format!("upstream status {}", status.as_u16())
+        } else {
+            truncate_chars(detail, 200)
+        };
+        let class = classify_upstream_failure(status.as_u16(), detail.as_str());
+        return Err(CallFailure {
+            error: LlmFailure {
+                class,
+                message: class.safe_message().to_owned(),
+            },
+            detail,
+            http_status: Some(i64::from(status.as_u16())),
+        });
+    }
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let content = match content {
+        Some(content) if !content.trim().is_empty() => content,
+        _ => {
+            return Err(CallFailure {
+                error: LlmFailure::empty_content(),
+                detail: "ai response missing content".to_owned(),
+                http_status: Some(i64::from(status.as_u16())),
+            });
+        }
+    };
+    Ok(CallResponse {
+        content,
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(model)
+            .to_owned(),
+        provider_request_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
+        provider_http_status: Some(i64::from(status.as_u16())),
+        input_tokens: body.pointer("/usage/prompt_tokens").and_then(Value::as_i64),
+        output_tokens: body
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_i64),
+        total_tokens: body.pointer("/usage/total_tokens").and_then(Value::as_i64),
+        finish_reason: body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 fn truncate_chars(raw: &str, max_chars: usize) -> String {
     if raw.chars().count() <= max_chars {
         return raw.to_owned();
@@ -4247,21 +4700,15 @@ mod tests {
         );
         assert_eq!(
             auto_translation_decision("running", None, false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: false
-            }
+            AutoTranslationDecision::SkipInFlight
         );
         assert_eq!(
             auto_translation_decision("failed", Some("error"), false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: true
-            }
+            AutoTranslationDecision::SkipTerminal
         );
         assert_eq!(
             auto_translation_decision("completed", Some("missing"), false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: true
-            }
+            AutoTranslationDecision::SkipTerminal
         );
     }
 
@@ -4960,6 +5407,87 @@ mod tests {
             assert_eq!(result_status, None);
             assert_eq!(error_text, None);
             assert_eq!(work_item_id.as_deref(), Some("work-a"));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_reconciliation_closes_only_terminal_requests() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!(
+            "translate_reconcile_{}",
+            crate::local_id::generate_local_id()
+        );
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.translation_work_items(id text PRIMARY KEY, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text);
+                CREATE TABLE public.translation_requests(id text PRIMARY KEY, work_item_id text, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text, finished_at timestamptz, updated_at timestamptz NOT NULL);
+                CREATE TABLE public.job_tasks(id text PRIMARY KEY, task_type text NOT NULL, status text NOT NULL, payload_json text NOT NULL);
+                INSERT INTO public.translation_work_items(id,status,result_status,title_zh,summary_md,body_md,error_text) VALUES
+                  ('wf','failed','error',NULL,NULL,NULL,'LLM upstream rate limited'),
+                  ('wc','completed','ready','标题','- 变更','- 变更',NULL),
+                  ('wq','queued',NULL,NULL,NULL,NULL,NULL),
+                  ('wl','failed','error',NULL,NULL,NULL,'LLM upstream rate limited'),
+                  ('wr','failed','error',NULL,NULL,NULL,'AI response missing content');
+                INSERT INTO public.translation_requests(id,work_item_id,status,updated_at) VALUES
+                  ('rf','wf','queued',now()),
+                  ('rc','wc','queued',now()),
+                  ('rq','wq','queued',now()),
+                  ('rl','wl','queued',now()),
+                  ('rr','wr','running',now());
+                INSERT INTO public.job_tasks(id,task_type,status,payload_json) VALUES
+                  ('task-l','translation.generate','queued','{"work_item_id":"wl"}');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let closed = super::reconcile_terminal_translation_requests(&pool).await?;
+            assert_eq!(closed, 3, "failed, completed and orphaned-running rows");
+            let status = |id: &'static str| {
+                let pool = pool.clone();
+                async move {
+                    let row: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                        "SELECT status, result_status, title_zh, error_text FROM public.translation_requests WHERE id=$1",
+                    )
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?;
+                    Ok::<_, sqlx::Error>(row)
+                }
+            };
+            let failed = status("rf").await?;
+            assert_eq!(failed.0, "failed");
+            assert_eq!(failed.1.as_deref(), Some("error"));
+            assert_eq!(failed.3.as_deref(), Some("LLM upstream rate limited"));
+            let completed = status("rc").await?;
+            assert_eq!(completed.0, "completed");
+            assert_eq!(completed.1.as_deref(), Some("ready"));
+            assert_eq!(completed.2.as_deref(), Some("标题"));
+            assert_eq!(completed.3, None);
+            let orphaned_running = status("rr").await?;
+            assert_eq!(orphaned_running.0, "failed");
+            let still_queued = status("rq").await?;
+            assert_eq!(still_queued.0, "queued", "active work stays queued");
+            let with_live_task = status("rl").await?;
+            assert_eq!(with_live_task.0, "queued", "a live task keeps the request active");
+            let second = super::reconcile_terminal_translation_requests(&pool).await?;
+            assert_eq!(second, 0, "reconciliation is idempotent");
             Ok::<_, anyhow::Error>(())
         }
         .await;

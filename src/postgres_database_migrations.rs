@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 21);
+        assert_eq!(MIGRATOR.iter().count(), 22);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -105,6 +105,23 @@ mod tests {
                 .contains("ALTER COLUMN %I TYPE timestamptz")
         );
         assert!(health_timestamps.sql.contains("RAISE EXCEPTION"));
+        let content_evidence = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 22)
+            .expect("content evidence column migration");
+        assert!(content_evidence.sql.contains("evidence_status"));
+        assert!(
+            content_evidence
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS evidence_status text")
+        );
+        assert!(content_evidence.sql.contains("SET DEFAULT 'not_required'"));
+        assert!(content_evidence.sql.contains("SET NOT NULL"));
+        assert!(
+            content_evidence
+                .sql
+                .contains("WHERE evidence_status IS NULL")
+        );
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()

@@ -49,6 +49,7 @@ mod postgres_admin_dashboard;
 mod postgres_admin_jobs;
 mod postgres_admin_llm;
 mod postgres_auth_ext;
+mod postgres_content;
 mod postgres_content_overlay;
 mod postgres_dashboard;
 mod postgres_database_migrations;

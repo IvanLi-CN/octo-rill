@@ -49,6 +49,7 @@ pub(crate) const LANE_RECENT_FAILURES: &str = "recent_failures";
 pub(crate) const LANE_WEBHOOK_PUSH: &str = "webhook_push";
 pub(crate) const LANE_ACCOUNT_PAUSE: &str = "account_pause";
 pub(crate) const LANE_ADMIN_ROLLUP: &str = "admin_rollup";
+pub(crate) const LANE_TRANSLATION_RECONCILE: &str = "translation_reconcile";
 
 const DAILY_BRIEF_INTERVAL: Duration = Duration::from_secs(45);
 const SUBSCRIPTION_INTERVAL: Duration = Duration::from_secs(20);
@@ -57,6 +58,7 @@ const RECENT_FAILURES_INTERVAL: Duration = Duration::from_secs(20);
 const WEBHOOK_PUSH_INTERVAL: Duration = Duration::from_secs(60);
 const ACCOUNT_PAUSE_INTERVAL: Duration = Duration::from_secs(45);
 const ADMIN_ROLLUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const TRANSLATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
 const STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX: &str = "sync.starred.delta";
@@ -176,10 +178,18 @@ pub(crate) fn spawn(state: PostgresServerState, shutdown: watch::Receiver<bool>)
     spawn_lane!(
         LANE_ADMIN_ROLLUP,
         ADMIN_ROLLUP_INTERVAL,
+        pool.clone(),
+        defaults.clone(),
+        shutdown.clone(),
+        lane_admin_rollup
+    );
+    spawn_lane!(
+        LANE_TRANSLATION_RECONCILE,
+        TRANSLATION_RECONCILE_INTERVAL,
         pool,
         defaults,
         shutdown,
-        lane_admin_rollup
+        lane_translation_reconcile
     );
 }
 
@@ -220,6 +230,7 @@ pub(crate) async fn run_lane_once(
         LANE_WEBHOOK_PUSH => lane_webhook_push(pool, defaults, now).await,
         LANE_ACCOUNT_PAUSE => lane_account_pause(pool, defaults, now).await,
         LANE_ADMIN_ROLLUP => lane_admin_rollup(pool, defaults, now).await,
+        LANE_TRANSLATION_RECONCILE => lane_translation_reconcile(pool, defaults, now).await,
         other => Err(anyhow!("unknown PostgreSQL scheduler lane {other}")),
     }
 }
@@ -289,6 +300,22 @@ async fn lane_admin_rollup(
         now,
     )
     .await
+}
+
+async fn lane_translation_reconcile(
+    pool: &PgPool,
+    _defaults: &SchedulerDefaults,
+    _now: DateTime<Utc>,
+) -> Result<usize> {
+    let closed = crate::postgres_translate::reconcile_terminal_translation_requests(pool).await?;
+    if closed > 0 {
+        tracing::info!(
+            lane = LANE_TRANSLATION_RECONCILE,
+            closed_requests = closed,
+            "closed translation requests whose work item was already terminal"
+        );
+    }
+    Ok(usize::try_from(closed).unwrap_or(usize::MAX))
 }
 
 // ---------------------------------------------------------------------------
