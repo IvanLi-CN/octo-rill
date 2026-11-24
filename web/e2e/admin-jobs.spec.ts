@@ -3956,8 +3956,11 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await latestCell.click();
 	const summary = page.getByTestId("llm-activity-summary");
 	await expect(
-		page.getByRole("dialog", { name: /gpt-4o-mini.*调用摘要/ }),
+		page.getByRole("dialog", { name: /起 1 小时的调用摘要$/ }),
 	).toBeVisible();
+	await expect(
+		summary.locator("#activity-grid-preview-title"),
+	).not.toContainText("gpt-");
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
 	await latestCell.press("ArrowLeft");
@@ -4246,8 +4249,54 @@ test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
 		),
 	).toBe(false);
 
+	// 悬停预览不接收指针：穿过浮窗落到页面上仍按离开网格处理。
+	await expect(summary).toHaveAttribute("role", "tooltip");
 	await page.mouse.move((summaryBox?.x ?? 0) + 12, (summaryBox?.y ?? 0) + 12);
+	await expect(summary).toHaveCount(0, { timeout: 3_000 });
+});
+
+test("admin llm activity keeps the preview across cell gaps", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	const cell = cells.nth(20);
+	await cell.hover();
+	const summary = page.getByTestId("llm-activity-summary");
 	await expect(summary).toBeVisible();
+	const title = await summary
+		.locator("#activity-grid-preview-title")
+		.textContent();
+	const box = await cell.boundingBox();
+	expect(box).not.toBeNull();
+
+	// 2px 格子间隙仍属于网格：预览保持同一格数据，不得关闭或跳格。
+	await page.mouse.move(
+		(box?.x ?? 0) + (box?.width ?? 0) + 1,
+		(box?.y ?? 0) + (box?.height ?? 0) / 2,
+	);
+	await page.waitForTimeout(300);
+	await expect(summary).toBeVisible();
+	await expect(summary.locator("#activity-grid-preview-title")).toHaveText(
+		title ?? "",
+	);
+
+	// 从网格外直接落进间隙：按最近格子显示，而不是保持空白。
+	await page.mouse.move(4, 4);
+	await expect(summary).toHaveCount(0, { timeout: 3_000 });
+	await page.mouse.move(
+		(box?.x ?? 0) + (box?.width ?? 0) + 1,
+		(box?.y ?? 0) + (box?.height ?? 0) / 2,
+	);
+	await expect(summary).toBeVisible();
+	await expect(summary.locator("#activity-grid-preview-title")).toHaveText(
+		title ?? "",
+	);
 });
 
 test("admin llm activity reanchors a pinned tooltip after activity refresh", async ({
@@ -4276,6 +4325,8 @@ test("admin llm activity reanchors a pinned tooltip after activity refresh", asy
 	const pinnedLabel = await pinnedCell.getAttribute("aria-label");
 	expect(pinnedLabel).not.toBeNull();
 	await pinnedCell.click();
+	// 固定后把指针移出网格：预览应回到被固定的格子，而不是残留的悬浮格子。
+	await page.mouse.move(4, 4);
 
 	const summary = page.getByTestId("llm-activity-summary");
 	await expect(summary).toBeVisible();

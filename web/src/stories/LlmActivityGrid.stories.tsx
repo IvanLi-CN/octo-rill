@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -50,7 +50,7 @@ const fixture = activityFixture();
 const meta = {
 	title: "Admin/LlmActivityGrid",
 	component: LlmActivityGrid,
-	tags: ["autodocs"],
+	tags: ["autodocs", "admin-collection-activity"],
 	parameters: {
 		layout: "padded",
 		docs: {
@@ -102,6 +102,27 @@ export const Default: Story = {
 		const firstCell = canvas.getAllByRole("button", {
 			name: /gpt-5-mini/,
 		})[0];
+		await userEvent.hover(firstCell);
+		const hovered = body.getByTestId("llm-activity-summary");
+		await expect(hovered).toBeVisible();
+		await expect(hovered).toHaveAttribute("role", "tooltip");
+		const title = canvasElement.ownerDocument.getElementById(
+			"activity-grid-preview-title",
+		);
+		await expect(title).toHaveTextContent(/.+ 起 1 小时的调用摘要$/);
+		await expect(title).not.toHaveTextContent(/gpt-/);
+		await userEvent.unhover(firstCell);
+		await waitFor(() =>
+			expect(body.queryByTestId("llm-activity-summary")).toBeNull(),
+		);
+		await userEvent.click(firstCell);
+		const pinned = body.getByTestId("llm-activity-summary");
+		await expect(pinned).toBeVisible();
+		await expect(pinned).toHaveAttribute("role", "dialog");
+		await userEvent.click(body.getByRole("button", { name: "关闭预览" }));
+		await waitFor(() =>
+			expect(body.queryByTestId("llm-activity-summary")).toBeNull(),
+		);
 		await userEvent.click(firstCell);
 		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{ArrowLeft}");
