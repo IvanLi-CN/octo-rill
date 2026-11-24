@@ -2550,6 +2550,7 @@ pub(crate) async fn reconcile_terminal_translation_requests(pool: &PgPool) -> an
             END,
             result_status = CASE
                 WHEN work.status = 'completed' AND work.result_status = 'ready' THEN 'ready'
+                WHEN work.result_status = 'ready' THEN 'error'
                 ELSE COALESCE(work.result_status, 'error')
             END,
             title_zh = CASE
@@ -3315,10 +3316,8 @@ async fn park_model(pool: &PgPool, model: &str) {
 pub(crate) async fn route_models_for_runtime(
     pool: &PgPool,
     fallback_model: &str,
-) -> anyhow::Result<Vec<String>> {
-    route_models(pool, fallback_model)
-        .await
-        .map_err(|failure| anyhow!(failure.message))
+) -> Result<Vec<String>, LlmFailure> {
+    route_models(pool, fallback_model).await
 }
 
 async fn record_model_health(
@@ -3889,7 +3888,41 @@ pub(crate) struct AuditedCompletion {
     pub output_tokens: Option<i64>,
     pub duration_ms: Option<i64>,
     pub finish_reason: Option<String>,
+    /// Provider requests issued by this call, so a follow-up call can continue
+    /// the admission ordinal sequence instead of colliding with it.
+    pub attempts_used: i64,
 }
+
+/// Why one audited completion did not produce content.
+///
+/// Keeping lease loss separate from a provider verdict prevents the worker from
+/// recording a provider failure (and spending retry budget) on work another
+/// runtime now owns.
+#[derive(Debug)]
+pub(crate) enum CompletionFailure {
+    Provider(LlmFailure),
+    LeaseLost,
+}
+
+impl CompletionFailure {
+    fn from_admission(error: anyhow::Error) -> Self {
+        Self::Provider(LlmFailure {
+            class: crate::ai::LlmFailureClass::Transient,
+            message: format!("provider admission failed: {error}"),
+        })
+    }
+}
+
+impl std::fmt::Display for CompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(failure) => formatter.write_str(&failure.message),
+            Self::LeaseLost => formatter.write_str("content work lease is no longer owned"),
+        }
+    }
+}
+
+impl std::error::Error for CompletionFailure {}
 
 /// Provider admission boundary for a content work attempt.
 ///
@@ -3904,6 +3937,9 @@ pub(crate) struct ContentProviderAdmission<'a> {
     pub lease_owner: &'a str,
     pub source_hash: &'a str,
     pub source_revision_json: &'a str,
+    /// First ordinal this admission sequence may use. A second provider call
+    /// inside the same attempt (length recovery) continues after the first.
+    pub call_ordinal_base: i64,
 }
 
 impl ContentProviderAdmission<'_> {
@@ -3966,7 +4002,7 @@ pub(crate) async fn complete_with_audit(
     ai: &AiConfig,
     request: CompletionRequest<'_>,
     admission: Option<&ContentProviderAdmission<'_>>,
-) -> Result<AuditedCompletion, LlmFailure> {
+) -> Result<AuditedCompletion, CompletionFailure> {
     let CompletionRequest {
         source,
         requested_by,
@@ -3975,32 +4011,29 @@ pub(crate) async fn complete_with_audit(
         user,
         max_tokens,
     } = request;
-    let models = route_models(pool, ai.model.as_str()).await?;
-    let health = load_route_health(pool).await?;
+    let models = route_models(pool, ai.model.as_str())
+        .await
+        .map_err(CompletionFailure::Provider)?;
+    let health = load_route_health(pool)
+        .await
+        .map_err(CompletionFailure::Provider)?;
     let candidates = route_candidates(&models, &health, Utc::now());
     if candidates.is_empty() {
-        return Err(LlmFailure::configuration());
+        return Err(CompletionFailure::Provider(LlmFailure::configuration()));
     }
     let parent_task_id = parent.map(|(task_id, _)| task_id);
     let parent_task_type = parent.map(|(_, task_type)| task_type);
     let mut remaining = ROUTE_MAX_UPSTREAM_ATTEMPTS;
     let mut last_failure: Option<LlmFailure> = None;
-    for (ordinal, (candidate_index, model)) in candidates.into_iter().enumerate().enumerate() {
-        let ordinal = i64::try_from(ordinal).unwrap_or(i64::MAX);
-        if let Some(admission) = admission {
-            let role = if candidate_index > 0 {
-                "fallback"
-            } else {
-                "primary"
-            };
-            if !admission
-                .admit(ordinal, role)
-                .await
-                .map_err(|_| LlmFailure::transient())?
-            {
-                return Err(LlmFailure::transient());
-            }
-        }
+    let mut call_ordinal = 0_i64;
+    for (candidate_index, model) in candidates.into_iter().enumerate() {
+        // The configured primary keeps its role even when health filtering
+        // promotes another model to the first candidate position.
+        let role = if models.first() == Some(&model) {
+            "primary"
+        } else {
+            "fallback"
+        };
         let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
         let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
         for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
@@ -4008,6 +4041,17 @@ pub(crate) async fn complete_with_audit(
                 break;
             }
             remaining -= 1;
+            if let Some(admission) = admission {
+                let ordinal = admission.call_ordinal_base + call_ordinal;
+                if !admission
+                    .admit(ordinal, role)
+                    .await
+                    .map_err(CompletionFailure::from_admission)?
+                {
+                    return Err(CompletionFailure::LeaseLost);
+                }
+                call_ordinal += 1;
+            }
             let call_id = local_id::generate_local_id();
             let prompt_text = truncate_chars(&format!("{system}\n\n{user}"), 8_000);
             let inserted = insert_call(
@@ -4077,6 +4121,7 @@ pub(crate) async fn complete_with_audit(
                         output_tokens: response.output_tokens,
                         duration_ms: Some(duration_ms),
                         finish_reason: response.finish_reason,
+                        attempts_used: call_ordinal,
                     });
                 }
                 Err(failure) => {
@@ -4107,7 +4152,9 @@ pub(crate) async fn complete_with_audit(
             break;
         }
     }
-    Err(last_failure.unwrap_or_else(LlmFailure::transient))
+    Err(CompletionFailure::Provider(
+        last_failure.unwrap_or_else(LlmFailure::transient),
+    ))
 }
 
 async fn invoke_model(

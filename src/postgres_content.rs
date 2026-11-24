@@ -111,7 +111,9 @@ fn source_revision_json(raw_snapshot: &str) -> String {
 /// route snapshot the attempt is bound to, and only then makes it visible as
 /// `running`.
 async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>> {
-    let route_models = postgres_translate::route_models_for_runtime(pool, fallback_model).await?;
+    let route_models = postgres_translate::route_models_for_runtime(pool, fallback_model)
+        .await
+        .map_err(|failure| anyhow::anyhow!("{}: {}", failure.class.as_str(), failure.message))?;
     if route_models.is_empty() {
         return Ok(None);
     }
@@ -146,7 +148,7 @@ async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>
         return Ok(None);
     };
     let attempt_count: i32 = sqlx::query_scalar(
-        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', updated_at = now() WHERE id = $1 RETURNING attempt_count",
+        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', next_retry_at = NULL, retry_after_at = NULL, updated_at = now() WHERE id = $1 RETURNING attempt_count",
     )
     .bind(&work.id)
     .bind(LEASE_OWNER)
@@ -234,7 +236,7 @@ async fn publish_ready(
     };
     let mut tx = pool.begin().await.context("begin content publish")?;
     let owned = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now()",
+        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() FOR UPDATE",
     )
     .bind(&work.id)
     .bind(work.attempt_count)
@@ -378,7 +380,7 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
     let blocked = failure.class == "configuration";
     let mut tx = pool.begin().await.context("begin content failure")?;
     let owned = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3",
+        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() FOR UPDATE",
     )
     .bind(&work.id)
     .bind(work.attempt_count)
@@ -402,7 +404,16 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
     .bind(next_retry)
     .execute(&mut *tx)
     .await?;
-    let status = if blocked { "blocked_config" } else { "failed" };
+    // A retryable failure returns to `queued` with a future `next_retry_at`:
+    // the claim filter already honours that timestamp, so the retry chain does
+    // not depend on a second sweep and a lost sweep cannot strand the item.
+    let status = if blocked {
+        "blocked_config"
+    } else if next_retry.is_some() {
+        "queued"
+    } else {
+        "failed"
+    };
     sqlx::query(
         "UPDATE public.content_work_items SET status = $2, failure_class = $3, next_retry_at = $4, retry_expires_at = COALESCE(retry_expires_at, $5), retry_after_at = $4, finished_at = $6, lease_owner = NULL, lease_expires_at = NULL, updated_at = $6 WHERE id = $1",
     )
@@ -428,8 +439,24 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
 /// Run one claimed work item end to end.
 async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Claim) -> Result<()> {
     let work = &claim.work;
-    let snapshot = serde_json::from_str::<SourceSnapshot>(&work.source_snapshot_json)
-        .context("invalid global source snapshot")?;
+    // A malformed snapshot is a content failure, not an infrastructure error:
+    // leaving the claim running would requeue the same poison row forever.
+    let snapshot = match serde_json::from_str::<SourceSnapshot>(&work.source_snapshot_json) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return publish_failure(
+                pool,
+                claim,
+                FailureOutcome {
+                    // A malformed snapshot is deterministic: retrying it would
+                    // only re-parse the same bytes.
+                    class: "invalid_source_snapshot".to_owned(),
+                    summary: Some(format!("invalid global source snapshot: {error}")),
+                },
+            )
+            .await;
+        }
+    };
     let (system, user) = content_processing::build_prompt(&snapshot, &work.pipeline);
     let source = format!(
         "content_processing.global.{}.stage.content_output.role.primary",
@@ -444,6 +471,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
         lease_owner: LEASE_OWNER,
         source_hash: &work.source_hash,
         source_revision_json: &source_revision,
+        call_ordinal_base: 0,
     };
     let mut completion = match postgres_translate::complete_with_audit(
         pool,
@@ -462,7 +490,8 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
     .await
     {
         Ok(completion) => completion,
-        Err(failure) => {
+        Err(postgres_translate::CompletionFailure::LeaseLost) => return Ok(()),
+        Err(postgres_translate::CompletionFailure::Provider(failure)) => {
             return publish_failure(
                 pool,
                 claim,
@@ -476,6 +505,16 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
     };
 
     if completion.finish_reason.as_deref() == Some("length") {
+        let recovery_admission = ContentProviderAdmission {
+            pool,
+            work_item_id: &work.id,
+            attempt_event_id: &claim.attempt_event_id,
+            attempt_no: i64::from(work.attempt_count),
+            lease_owner: LEASE_OWNER,
+            source_hash: &work.source_hash,
+            source_revision_json: &source_revision,
+            call_ordinal_base: completion.attempts_used,
+        };
         completion = match postgres_translate::complete_with_audit(
             pool,
             http,
@@ -488,12 +527,13 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                 user: &user,
                 max_tokens: LENGTH_RECOVERY_MAX_TOKENS,
             },
-            Some(&admission),
+            Some(&recovery_admission),
         )
         .await
         {
             Ok(completion) => completion,
-            Err(failure) => {
+            Err(postgres_translate::CompletionFailure::LeaseLost) => return Ok(()),
+            Err(postgres_translate::CompletionFailure::Provider(failure)) => {
                 return publish_failure(
                     pool,
                     claim,
@@ -542,7 +582,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
 /// Requeue work whose worker lease expired without a terminal attempt.
 pub(crate) async fn recover_expired_leases(pool: &PgPool) -> Result<u64> {
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = now() + interval '60 seconds', retry_expires_at = COALESCE(retry_expires_at, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now() ORDER BY lease_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+        "UPDATE public.content_work_items SET status = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at <= now() THEN 'failed' ELSE 'queued' END, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at <= now() THEN NULL ELSE now() + interval '60 seconds' END, retry_expires_at = COALESCE(retry_expires_at, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now() ORDER BY lease_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
     )
     .bind(RECOVERY_BATCH)
     .fetch_all(pool)
@@ -568,6 +608,45 @@ pub(crate) async fn recover_expired_leases(pool: &PgPool) -> Result<u64> {
     Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
 }
 
+/// Requeue configuration-blocked work after the model route changes.
+///
+/// `blocked_config` is terminal for the claim filter and counts as active work
+/// for producers, so without this sweep a repaired configuration would never
+/// resume the work it blocked.
+pub(crate) async fn unblock_reconfigured_work(pool: &PgPool, fallback_model: &str) -> Result<u64> {
+    let Ok(models) = postgres_translate::route_models_for_runtime(pool, fallback_model).await
+    else {
+        return Ok(0);
+    };
+    if models.is_empty() {
+        return Ok(0);
+    }
+    let fingerprint = configuration_fingerprint(&models);
+    let rows = sqlx::query_as::<_, (String, i32)>(
+        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+    )
+    .bind(&fingerprint)
+    .bind(RECOVERY_BATCH)
+    .fetch_all(pool)
+    .await
+    .context("unblock reconfigured content work")?;
+    for (id, attempt_count) in &rows {
+        sqlx::query(
+            "INSERT INTO public.content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) VALUES ($1, $2, $3, 'automatic_recovery', 'attempt_queued', 'queued', 1, now()) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
+        )
+        .bind(local_id::generate_local_id())
+        .bind(id)
+        .bind(i64::from(*attempt_count) + 1)
+        .execute(pool)
+        .await
+        .context("record unblocked content work")?;
+    }
+    if !rows.is_empty() {
+        info!(unblocked = rows.len(), "resumed reconfigured content work");
+    }
+    Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+}
+
 async fn run_loop(
     pool: PgPool,
     http: Client,
@@ -578,14 +657,19 @@ async fn run_loop(
     recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     return;
                 }
             }
             _ = recovery.tick() => {
                 if let Err(error) = recover_expired_leases(&pool).await {
                     warn!(%error, "content worker lease recovery failed");
+                }
+                if let Err(error) =
+                    unblock_reconfigured_work(&pool, ai_config.model.as_str()).await
+                {
+                    warn!(%error, "content worker configuration recovery failed");
                 }
             }
             _ = tokio::time::sleep(POLL_INTERVAL) => {
@@ -634,7 +718,10 @@ pub(crate) async fn admit_release_polish(
     }
     let fingerprint = configuration_fingerprint(&route_models);
     let mut admitted = 0usize;
-    for release_id in release_ids.iter().take(POLISH_ADMISSION_CAP) {
+    for release_id in release_ids {
+        if admitted >= POLISH_ADMISSION_CAP {
+            break;
+        }
         let Ok(Some(row)) = sqlx::query(
             "SELECT repo_id, html_url, tag_name, name, body, updated_at, detected_at FROM public.repo_releases WHERE release_id = $1",
         )
@@ -773,6 +860,30 @@ pub(crate) async fn admit_release_polish(
         .execute(pool)
         .await
         .context("admit release polishing work")?;
+        if inserted.rows_affected() == 0 {
+            // A terminal row for the same source hash cannot be re-admitted,
+            // and the unique conflict is the only signal. Surface it instead of
+            // letting the release look silently polished.
+            let terminal: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' AND variant = 'smart' AND target_lang = $2 AND protocol_version = $3 AND source_hash = $4 AND model_profile = 'postgres-default' LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(TARGET_LANG)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&source_hash)
+            .fetch_optional(pool)
+            .await?;
+            if matches!(
+                terminal.as_deref(),
+                Some("failed" | "cancelled" | "superseded")
+            ) {
+                tracing::debug!(
+                    release_id = %release_id,
+                    status = terminal.as_deref().unwrap_or_default(),
+                    "release polishing work stayed terminal; not re-admitted"
+                );
+            }
+        }
         admitted += usize::try_from(inserted.rows_affected()).unwrap_or(0);
     }
     if admitted > 0 {
@@ -803,17 +914,26 @@ mod tests {
 
         let app = Router::new().route(
             "/chat/completions",
-            post(|Json(payload): Json<Value>| async move {
-                let model = payload["model"].as_str().unwrap_or_default().to_owned();
-                Json(json!({
-                    "id": "provider-call-1",
-                    "model": model,
-                    "choices": [{
-                        "message": {"content": "{\"title_zh\":\"é¡¹ç›® v1 å‘å¸ƒ\",\"summary_md\":\"- æ–°å¢žäº†å¹¶å‘Œå¤„ç†\"}"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}
-                }))
+            post({
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                move |Json(payload): Json<Value>| {
+                    let calls = calls.clone();
+                    async move {
+                        let model = payload["model"].as_str().unwrap_or_default().to_owned();
+                        let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Request 2 is the length-recovery fixture: truncate once.
+                        let finish_reason = if index == 1 { "length" } else { "stop" };
+                        Json(json!({
+                            "id": format!("provider-call-{index}"),
+                            "model": model,
+                            "choices": [{
+                                "message": {"content": "{\"title_zh\":\"é¡¹ç›® v1 å‘å¸ƒ\",\"summary_md\":\"- æ–°å¢žäº†å¹¶å‘Œå¤„ç†\"}"},
+                                "finish_reason": finish_reason
+                            }],
+                            "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}
+                        }))
+                    }
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -911,6 +1031,69 @@ mod tests {
             .fetch_one(&pool)
             .await?;
             assert_eq!(linked, 1);
+
+            // A malformed snapshot must end in a recorded content failure, not a
+            // permanently running claim that recovery requeues forever.
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('poison-work', 'release', '43', 'polishing', 'smart', 'zh-CN', 'poison', $1, 'postgres-default', 'not-json', 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+            )
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .execute(&pool)
+            .await?;
+            let poison = claim_next(&pool, "m1")
+                .await?
+                .expect("poison work is claimable");
+            execute(&pool, &http, &ai, &poison).await?;
+            let (poison_status, poison_class): (String, Option<String>) = sqlx::query_as(
+                "SELECT status, failure_class FROM public.content_work_items WHERE id = 'poison-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(poison_status, "failed");
+            assert_eq!(poison_class.as_deref(), Some("invalid_source_snapshot"));
+            let poison_completed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_attempt_events WHERE work_item_id = 'poison-work' AND event_type = 'attempt_completed'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(poison_completed, 1);
+
+            // The length-recovery call must append its own admission instead of
+            // colliding with the primary call's ordinal.
+            let sd = serde_json::to_string(&json!({
+                "source_blocks": [
+                    {"slot": "metadata", "text": "acme/demo\nv1"},
+                    {"slot": "title", "text": "v1"},
+                    {"slot": "body_markdown", "text": "Release notes body"}
+                ],
+                "target_slots": ["title_zh", "summary_md"]
+            }))?;
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('length-work', 'release', '44', 'polishing', 'smart', 'zh-CN', 'length', $1, 'postgres-default', $2, 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+            )
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&sd)
+            .execute(&pool)
+            .await?;
+            let length_work = claim_next(&pool, "m1")
+                .await?
+                .expect("length work is claimable");
+            execute(&pool, &http, &ai, &length_work).await?;
+            let length_status: String = sqlx::query_scalar(
+                "SELECT status FROM public.content_work_items WHERE id = 'length-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(length_status, "ready");
+            let length_admissions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_attempt_provider_admissions WHERE work_item_id = 'length-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                length_admissions, 2,
+                "primary and length-recovery requests both need an admission fact"
+            );
 
             let next = claim_next(&pool, "m1").await?;
             assert!(next.is_none(), "a ready work item is not claimable again");

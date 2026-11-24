@@ -110,7 +110,18 @@ mod tests {
             .find(|migration| migration.version == 22)
             .expect("content evidence column migration");
         assert!(content_evidence.sql.contains("evidence_status"));
-        assert!(content_evidence.sql.contains("ADD COLUMN IF NOT EXISTS"));
+        assert!(
+            content_evidence
+                .sql
+                .contains("ADD COLUMN IF NOT EXISTS evidence_status text")
+        );
+        assert!(content_evidence.sql.contains("SET DEFAULT 'not_required'"));
+        assert!(content_evidence.sql.contains("SET NOT NULL"));
+        assert!(
+            content_evidence
+                .sql
+                .contains("WHERE evidence_status IS NULL")
+        );
         assert!(audit_ids.sql.contains("ALTER COLUMN id TYPE text"));
         let brief = MIGRATOR
             .iter()

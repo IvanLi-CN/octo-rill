@@ -73,14 +73,24 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
 
     // Close request rows whose work item is already terminal. A previous
     // runtime could leave those rows at `queued` after the work item failed or
-    // completed, so the queue counters reported work nothing could claim.
-    match crate::postgres_translate::reconcile_terminal_translation_requests(&runtime.pool).await {
-        Ok(closed) if closed > 0 => info!(
-            closed_requests = closed,
-            "closed stale translation requests at startup"
-        ),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "startup translation request reconciliation failed"),
+    // completed, so the queue counters reported work nothing could claim. The
+    // reconciliation lane runs this on enabled deployments immediately; the
+    // startup pass exists for a scheduler-disabled boot and therefore honours
+    // the same escape hatch.
+    if !matches!(
+        std::env::var("OCTORILL_PG_SCHEDULER_ENABLED").as_deref(),
+        Ok("0")
+    ) {
+        match crate::postgres_translate::reconcile_terminal_translation_requests(&runtime.pool)
+            .await
+        {
+            Ok(closed) if closed > 0 => info!(
+                closed_requests = closed,
+                "closed stale translation requests at startup"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "startup translation request reconciliation failed"),
+        }
     }
 
     // GitHub answers 301 for renamed repositories and organisations. The
