@@ -2569,7 +2569,7 @@ pub(crate) async fn reconcile_terminal_translation_requests(pool: &PgPool) -> an
                 WHEN work.status = 'completed' AND work.result_status = 'ready' THEN NULL
                 ELSE COALESCE(work.error_text, 'translation work reached a terminal state')
             END,
-            finished_at = COALESCE(request.finished_at, now()),
+            finished_at = COALESCE(request.finished_at::timestamptz, now()),
             updated_at = now()
         FROM public.translation_work_items AS work
         WHERE request.work_item_id = work.id
@@ -3950,7 +3950,7 @@ impl ContentProviderAdmission<'_> {
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
         let renewed = sqlx::query_scalar::<_, String>(
-            "UPDATE public.content_work_items SET lease_expires_at = now() + interval '300 seconds', updated_at = now() WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() RETURNING id",
+            "UPDATE public.content_work_items SET lease_expires_at = now() + interval '300 seconds', updated_at = now() WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at::timestamptz > now() RETURNING id",
         )
         .bind(self.work_item_id)
         .bind(i32::try_from(self.attempt_no).unwrap_or(i32::MAX))
@@ -5488,6 +5488,31 @@ mod tests {
             assert_eq!(with_live_task.0, "queued", "a live task keeps the request active");
             let second = super::reconcile_terminal_translation_requests(&pool).await?;
             assert_eq!(second, 0, "reconciliation is idempotent");
+
+            // Imported production tables store these columns as text; the repair
+            // must still match and write typed values.
+            sqlx::raw_sql(
+                r#"
+                ALTER TABLE public.translation_requests
+                    ALTER COLUMN finished_at TYPE text USING finished_at::text,
+                    ALTER COLUMN updated_at TYPE text USING updated_at::text;
+                INSERT INTO public.translation_work_items(id,status,result_status,error_text)
+                  VALUES ('wtext','failed','error','provider exploded');
+                INSERT INTO public.translation_requests(id,work_item_id,status,updated_at)
+                  VALUES ('rtext','wtext','queued', now()::text);
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let closed_text = super::reconcile_terminal_translation_requests(&pool).await?;
+            assert_eq!(closed_text, 1, "text-schema request is closed too");
+            let text_row: (String, Option<String>) = sqlx::query_as(
+                "SELECT status, error_text FROM public.translation_requests WHERE id='rtext'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(text_row.0, "failed");
+            assert_eq!(text_row.1.as_deref(), Some("provider exploded"));
             Ok::<_, anyhow::Error>(())
         }
         .await;
