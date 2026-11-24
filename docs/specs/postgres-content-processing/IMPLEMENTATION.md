@@ -16,7 +16,7 @@
   - `REQ-PGCP-003`: 待实现，复用 `postgres_translate` 的 provider 客户端与审计写法。
   - `REQ-PGCP-004`: 待实现，复用 `llm_model_health`、`llm_recovery_flags` 与既有退避常量。
   - `REQ-PGCP-005`: 待实现；`postgres_content_overlay` 已覆盖 Release/公告的 translation/polishing 投影；通知当前走翻译请求/读取链路，其适配属于本主题。
-  - `REQ-PGCP-006`: 待实现；当前生产仍有 `translation.generate` 独自运行。
+  - `REQ-PGCP-006`: 待实现；当前生产仍有 `translation.generate` 独自运行。第 1.5 分片已确保终态工作不会被自动入队重新排队，读投影的 PostgreSQL 生产者仍缺位。
   - `REQ-PGCP-007`: 读接口已存在；待新写入后验证。
   - `REQ-PGCP-008`: 待实现。
   - `REQ-PGCP-009`: 待实现。
@@ -25,6 +25,7 @@
 
 ## Coverage / rollout summary
 
+- 2026-11-24 第 1.5 分片：终端请求对账。新增 `postgres_translate::reconcile_terminal_translation_requests`，在启动时与 60 秒调度 lane 中把 `translation_requests` 的 `queued`/`running` 视图按工作项真实终态收敛（`completed` 复制结果，否则 `failed` 保留错误分类），不调用 provider、不重写尝试/LLM 审计、跳过仍有排队或运行任务的 work item；同时自动入队拒绝把终态 work item 重新排回队列，避免产生新的陈旧请求。
 - 2026-11-23 完成只读诊断：PostgreSQL 运行时无内容处理 producer/worker；`translation.generate` 因导入库缺少 `translation_attempt_events` 唯一约束而全部失败。
 - 2026-11-23 第 1 分片交付：`migrations_pg/0020_translation_attempt_unique.sql`（导入快照去重 + 唯一索引）与 `insert_translation_request` 幂等重排队；PR #411。
 - 分片计划：

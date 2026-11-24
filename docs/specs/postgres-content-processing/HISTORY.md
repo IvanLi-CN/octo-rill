@@ -16,7 +16,7 @@
 
 ## Related Changes
 
-- None
+- 2026-11-24：新增终端请求对账（启动时 + 60 秒调度 lane）与自动入队终态拦截，修复 `translation_requests` 停留在 `queued`/`running` 而工作项已终态的状态漂移；对账不调用 provider、不改写尝试与 LLM 审计。
 
 ## References
 

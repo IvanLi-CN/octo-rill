@@ -71,6 +71,18 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     let owner_id: Arc<str> = local_id::generate_local_id().into();
     postgres_runtime_owner::register(&runtime.pool, &owner_id, Utc::now()).await?;
 
+    // Close request rows whose work item is already terminal. A previous
+    // runtime could leave those rows at `queued` after the work item failed or
+    // completed, so the queue counters reported work nothing could claim.
+    match crate::postgres_translate::reconcile_terminal_translation_requests(&runtime.pool).await {
+        Ok(closed) if closed > 0 => info!(
+            closed_requests = closed,
+            "closed stale translation requests at startup"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "startup translation request reconciliation failed"),
+    }
+
     // GitHub answers 301 for renamed repositories and organisations. The
     // legacy client followed those redirects; refusing them turned every
     // renamed repository into a permanent `github_http_error`.

@@ -1750,7 +1750,9 @@ enum AutoTranslationDecision {
     SkipReady,
     /// A `translation.generate` task for the work item is queued or running.
     SkipInFlight,
-    /// Queue a task; `reset_work_item` re-queues a terminal work item first.
+    /// The work item is terminal; only the scheduled retry lane may reopen it.
+    SkipTerminal,
+    /// Queue an already-admitted queued work item.
     Enqueue { reset_work_item: bool },
 }
 
@@ -1762,13 +1764,14 @@ fn auto_translation_decision(
     if result_status == Some("ready") {
         return AutoTranslationDecision::SkipReady;
     }
-    if task_in_flight {
+    if task_in_flight || work_status == "running" {
         return AutoTranslationDecision::SkipInFlight;
     }
+    if work_status != "queued" {
+        return AutoTranslationDecision::SkipTerminal;
+    }
     AutoTranslationDecision::Enqueue {
-        // `translate_work_item_for_task` only accepts `queued` and `running`
-        // work items; every other status is terminal for this source hash.
-        reset_work_item: !matches!(work_status, "queued" | "running"),
+        reset_work_item: false,
     }
 }
 
@@ -2524,6 +2527,67 @@ async fn finish_request(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Close request rows whose work item already reached a terminal state.
+///
+/// A `translation_requests` row is only a view of its work item. An automatic
+/// enqueue that re-created a request for a terminal work item, or a lost
+/// finalization, leaves that view at `queued`/`running` after the work item is
+/// `completed`/`failed`. Those rows can never be claimed, yet they inflate the
+/// queue counters and the admin request list.
+///
+/// This repair is idempotent, performs no provider call, never rewrites attempt
+/// or LLM history, and skips any work item that still has a queued or running
+/// `translation.generate` task.
+pub(crate) async fn reconcile_terminal_translation_requests(pool: &PgPool) -> anyhow::Result<u64> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE public.translation_requests AS request
+        SET status = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN 'completed'
+                ELSE 'failed'
+            END,
+            result_status = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN 'ready'
+                ELSE COALESCE(work.result_status, 'error')
+            END,
+            title_zh = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.title_zh
+                ELSE request.title_zh
+            END,
+            summary_md = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.summary_md
+                ELSE request.summary_md
+            END,
+            body_md = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN work.body_md
+                ELSE request.body_md
+            END,
+            error_text = CASE
+                WHEN work.status = 'completed' AND work.result_status = 'ready' THEN NULL
+                ELSE COALESCE(work.error_text, 'translation work reached a terminal state')
+            END,
+            finished_at = COALESCE(request.finished_at, now()),
+            updated_at = now()
+        FROM public.translation_work_items AS work
+        WHERE request.work_item_id = work.id
+          AND request.status IN ('queued', 'running')
+          AND work.status IN ('completed', 'failed')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.job_tasks AS task
+            WHERE task.task_type = 'translation.generate'
+              AND task.status IN ('queued', 'running')
+              AND pg_input_is_valid(task.payload_json, 'jsonb')
+              AND task.payload_json::jsonb ->> 'work_item_id' = work.id
+          )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("reconcile terminal PostgreSQL translation requests")?;
+    Ok(updated.rows_affected())
 }
 
 /// Source blocks persisted on the work item when it was enqueued.
@@ -4247,21 +4311,15 @@ mod tests {
         );
         assert_eq!(
             auto_translation_decision("running", None, false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: false
-            }
+            AutoTranslationDecision::SkipInFlight
         );
         assert_eq!(
             auto_translation_decision("failed", Some("error"), false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: true
-            }
+            AutoTranslationDecision::SkipTerminal
         );
         assert_eq!(
             auto_translation_decision("completed", Some("missing"), false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: true
-            }
+            AutoTranslationDecision::SkipTerminal
         );
     }
 
@@ -4960,6 +5018,87 @@ mod tests {
             assert_eq!(result_status, None);
             assert_eq!(error_text, None);
             assert_eq!(work_item_id.as_deref(), Some("work-a"));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_reconciliation_closes_only_terminal_requests() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!(
+            "translate_reconcile_{}",
+            crate::local_id::generate_local_id()
+        );
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.translation_work_items(id text PRIMARY KEY, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text);
+                CREATE TABLE public.translation_requests(id text PRIMARY KEY, work_item_id text, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text, finished_at timestamptz, updated_at timestamptz NOT NULL);
+                CREATE TABLE public.job_tasks(id text PRIMARY KEY, task_type text NOT NULL, status text NOT NULL, payload_json text NOT NULL);
+                INSERT INTO public.translation_work_items(id,status,result_status,title_zh,summary_md,body_md,error_text) VALUES
+                  ('wf','failed','error',NULL,NULL,NULL,'LLM upstream rate limited'),
+                  ('wc','completed','ready','标题','- 变更','- 变更',NULL),
+                  ('wq','queued',NULL,NULL,NULL,NULL,NULL),
+                  ('wl','failed','error',NULL,NULL,NULL,'LLM upstream rate limited'),
+                  ('wr','failed','error',NULL,NULL,NULL,'AI response missing content');
+                INSERT INTO public.translation_requests(id,work_item_id,status,updated_at) VALUES
+                  ('rf','wf','queued',now()),
+                  ('rc','wc','queued',now()),
+                  ('rq','wq','queued',now()),
+                  ('rl','wl','queued',now()),
+                  ('rr','wr','running',now());
+                INSERT INTO public.job_tasks(id,task_type,status,payload_json) VALUES
+                  ('task-l','translation.generate','queued','{"work_item_id":"wl"}');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let closed = super::reconcile_terminal_translation_requests(&pool).await?;
+            assert_eq!(closed, 3, "failed, completed and orphaned-running rows");
+            let status = |id: &'static str| {
+                let pool = pool.clone();
+                async move {
+                    let row: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                        "SELECT status, result_status, title_zh, error_text FROM public.translation_requests WHERE id=$1",
+                    )
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?;
+                    Ok::<_, sqlx::Error>(row)
+                }
+            };
+            let failed = status("rf").await?;
+            assert_eq!(failed.0, "failed");
+            assert_eq!(failed.1.as_deref(), Some("error"));
+            assert_eq!(failed.3.as_deref(), Some("LLM upstream rate limited"));
+            let completed = status("rc").await?;
+            assert_eq!(completed.0, "completed");
+            assert_eq!(completed.1.as_deref(), Some("ready"));
+            assert_eq!(completed.2.as_deref(), Some("标题"));
+            assert_eq!(completed.3, None);
+            let orphaned_running = status("rr").await?;
+            assert_eq!(orphaned_running.0, "failed");
+            let still_queued = status("rq").await?;
+            assert_eq!(still_queued.0, "queued", "active work stays queued");
+            let with_live_task = status("rl").await?;
+            assert_eq!(with_live_task.0, "queued", "a live task keeps the request active");
+            let second = super::reconcile_terminal_translation_requests(&pool).await?;
+            assert_eq!(second, 0, "reconciliation is idempotent");
             Ok::<_, anyhow::Error>(())
         }
         .await;
