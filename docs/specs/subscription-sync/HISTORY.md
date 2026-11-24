@@ -3,10 +3,11 @@
 ## 生命周期
 
 - Lifecycle: active
-- Last: 2026-09-23
+- Last: 2026-11-24
 
 ## 历史摘要
 
+- 2026-11-24: `/admin/jobs/subscriptions` 收敛为单一订阅同步运行列表：`sync.releases` + `sync.notifications` 按 payload `schedule_key` 聚合，导入的 `sync.subscriptions` 记录规范化为同一形状并与当前记录连续排序；不提供按迁移时期拆分的视图。
 - 2026-10-25: Follow-up candidate preserves the structured `ApiError` identity in Social content-processing adapters, restoring `sqlite_write_retryable` to `sqlite_write_backpressure` warning/recoverable metadata without changing the `social_sync_failed` event type or current-round failed accounting.
 - 2026-10-25: PR #340 executable candidate `6efe5732` preserves retryable versus fatal Social source classification when persistence fails after a partial snapshot and keeps terminal 401/404/451 non-retryable even with rate-limit metadata; focused regressions cover both combined-error classes and terminal HTTP headers.
 - 2026-10-25: PR #340 executable candidate `97843ed6` fixes access-refresh Social progress/log classification so retryable completed source degradation is warning/recoverable with the next-run retry hint, while non-retryable upstream failures remain error/non-recoverable; a production-shaped dependency regression covers Notifications continuation.

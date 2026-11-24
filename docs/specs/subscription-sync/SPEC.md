@@ -35,8 +35,8 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - 挂到共享 repo release queue
   - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
-- Admin Jobs 允许管理员在“订阅同步设置”中配置 Release 全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时；该间隔同时是 Release 治理预算窗口长度。Star cadence 由独立 topic 配置。
-- Admin Jobs 提供订阅同步专用视图和详情入口，支持查看所有 `sync.subscriptions` 运行，不论来自定时、手动还是重试。
+- Admin Jobs 允许管理员在“订阅同步设置”中配置 Release 全局自动获取间隔，并展示最近五次同步任务（`sync.releases` / `sync.notifications`）用时；该间隔同时是 Release 治理预算窗口长度。Star cadence 由独立 topic 配置。
+- Admin Jobs 提供订阅同步专用视图和详情入口，按 `schedule_key` 展示分组的 `sync.releases` / `sync.notifications` 运行，并规范化导入的 `sync.subscriptions` 记录，不论来自定时、手动还是重试。
 - Release 阶段支持运行时调整共享 repo release worker 数量；该设置只影响吞吐，不降低调度频率。
 - Release 抓取使用 GitHub conditional request 复用 `ETag` / `Last-Modified`，未变化仓库可以快速完成 watcher，而不是下载完整 release 列表。
 - GitHub `ReleaseEvent` 只作为快速发现信号，用于把命中 repo 提升为高优先级 release demand；可靠性仍由全量可见 repo 校验兜底。
@@ -94,6 +94,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 | `GET /api/me` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
 | `GET /api/tasks/{task_id}/events` | HTTP API / SSE | external | New | `./contracts/http-apis.md` | backend | web |
 | `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` | HTTP API | external | New | `./contracts/http-apis.md` | backend | admin web |
+| `GET /api/admin/jobs/subscriptions/runs` | HTTP API | external | New | `./contracts/http-apis.md` | backend | admin web |
 | `POST /api/sync/all` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web |
 | `POST /api/sync/releases` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
 | `sync.access_refresh` | Job task | internal | New | `./contracts/http-apis.md` | backend | api / web |
@@ -116,13 +117,13 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 - “订阅同步设置”是 `sync_auto_fetch_interval_minutes` 的唯一编辑入口，允许保存 `1-120` 分钟；“任务间隔设置”只读展示当前值、下次生效时间并跳转到该入口。
 - 该配置保存在 `admin_runtime_settings`，仅影响全局 `sync.subscriptions` 定时拉取，不影响账号访问状态。
 - 保存后持久化 `sync_auto_fetch_effective_at`，取严格大于保存时刻的下一个 UTC epoch 对齐边界；边界前不得入队或补跑，边界后才按新间隔触发。
-- 同一区域展示最近三次全局 `sync.subscriptions` 任务：
-  - 来源为 `job_tasks.task_type = sync.subscriptions`
-  - 排除 `result_json.skipped = true` 的跳过记录
+- 同一区域展示最近五次同步任务（`sync.releases` / `sync.notifications`）：
+  - 来源为 `job_tasks` 中的同步任务类型
   - 不按用户过滤
-  - 显示任务状态、链路完成时间、链路用时
-  - 链路用时从根 `sync.subscriptions` 创建时间开始，到根任务及其直接触发的 `translate.release.batch` / `summarize.release.smart.batch` 子任务全部完成时结束
-- 点击任一用时项打开对应的订阅同步详情页面，页面展示该任务详情、阶段摘要和最近事件。
+  - 显示任务状态、完成时间与用时
+  - 跳过记录同样展示并标记为“已跳过”
+  - 用时从任务 `created_at` 开始，到任务 `finished_at` 结束
+- 点击任一用时项打开通用任务详情抽屉。
 - `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
 - 每次 PATCH 对所有已提供的运行时设置执行一次 foreground `BEGIN IMMEDIATE` SQLite 写事务；成功时原子提交，失败时不得部分应用，省略字段保持原值。
 - 成功响应中的设置字段来自该事务内捕获的同一提交快照，必须包含本次 PATCH 的值及对应 `sync_auto_fetch_effective_at`，不得混入并发 PATCH 的后续值。
@@ -133,12 +134,16 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 ### Admin Jobs 订阅同步视图
 
 - `/admin/jobs/subscriptions` 是订阅同步专用入口。
-- 列表只展示 `task_type = sync.subscriptions` 的任务，覆盖定时、手动、重试来源。
+- 列表展示 `sync.releases` 与 `sync.notifications` 任务，按 payload `schedule_key` 聚合成一轮运行，展示轮次状态、用户数、Release 仓库/拉取数、通知数与失败摘要。
+- 手工触发且没有 `schedule_key` 的任务单独成一轮，同样进入连续列表。
+- 导入的 `sync.subscriptions` 记录规范化为同一轮运行形状，与 PostgreSQL 记录在同一列表按时间连续排序；不得按迁移时期拆分为独立视图。
+- 轮次中的每个任务可以打开通用任务详情抽屉；不再要求该任务属于 `sync.subscriptions` 类型。
+- `sync.subscriptions` 记录的任务行仍可打开工作流详情页以查看阶段诊断。
 - 列表页和详情页共享设置入口，设置项包括：
   - 全局自动获取间隔与 Release 治理预算窗口；
   - Release worker 数量。
   - Star delta interval 与 full-sweep completion target；这两项仅控制独立 Star Sync Coordinator，详情见 [star-sync-reconciliation](../star-sync-reconciliation/SPEC.md)。
-- 详情按工作流阶段展示：
+- `sync.subscriptions` 记录的详情按工作流阶段展示：
   - repo collect；
   - Release queue；
   - social；
@@ -289,9 +294,9 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When 原任务存在失败或未完成的 `repo_release_watchers`
   Then 新任务只处理这些 watcher 对应的 work item，不产生新的候选仓库选择。
 
-- Given 系统已有最近三次 `sync.subscriptions` 历史
+- Given 系统已有最近五次同步任务（`sync.releases` / `sync.notifications`）历史
   When 打开 Admin Jobs 定时任务页
-  Then 页面展示最近三次非跳过链路用时；点击用时项会打开对应的订阅同步详情页面。
+  Then 页面展示最近五次任务用时，跳过记录标记为“已跳过”；点击用时项会打开对应的任务详情。
 
 - Given 用户已经有旧缓存 Release
   When 用户点击 Sync 后 task 还未进入 `running`
@@ -389,7 +394,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 
 - Given 某轮 `sync.subscriptions` 因上一轮仍在执行而被跳过
   When 管理员打开该任务详情
-  Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时也不展示该跳过记录。
+  Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时仍展示该记录并标记为“已跳过”。
 
 - Given 管理员打开运行中的 `/admin/jobs/subscriptions/{task_id}`
   When 该任务已经发出 `collect`、`repo_collect` 或 `release_summary` 事件但 `result_json` 仍为空
@@ -654,6 +659,40 @@ state=subscription-number-invalid-drafts
 evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法草稿，保存时显示字段级错误，滑块可恢复合法并发值，控件布局稳定。
 
 ![Subscription settings invalid drafts](./assets/admin-jobs-subscription-settings-invalid-draft.png)
+
+source_type=ui_demo
+target_program=mock-only
+capture_scope=page
+requested_viewport=1440x1200
+viewport_strategy=ui-demo-source
+margin_policy=trim_only
+evidence_surface=page
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running / Subscription Runs
+state=unified-subscription-run-history
+evidence_note=验证订阅同步列表把 PostgreSQL 分组运行、手工运行与导入记录放在同一条连续时间线中，不出现按迁移时期拆分的视图或时期标签；当前任务打开通用任务详情抽屉，导入记录打开原工作流详情。
+
+![统一订阅同步运行列表](./assets/admin-subscription-runs-unified.png)
+
+![同步 Release 任务详情抽屉](./assets/admin-subscription-run-task-drawer.png)
+
+![导入轮次的工作流详情](./assets/admin-subscription-imported-run-detail.png)
+
+source_type=ui_demo
+target_program=mock-only
+capture_scope=page
+requested_viewport=393x852
+viewport_strategy=ui-demo-source
+margin_policy=trim_only
+evidence_surface=page
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running / Subscription Runs Mobile
+state=unified-subscription-run-history-mobile
+evidence_note=验证统一订阅同步运行列表在移动端保持可读的任务行与操作按钮。
+
+![统一订阅同步运行列表（移动端）](./assets/admin-subscription-runs-unified-mobile.png)
 
 ## Related ADRs
 

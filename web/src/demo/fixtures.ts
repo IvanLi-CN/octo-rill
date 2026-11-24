@@ -5,6 +5,7 @@ import type {
 	AdminLlmActivityResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
+	AdminSubscriptionRunItem,
 	AdminTaskDiagnostics,
 	AdminTranslationAttemptEvent,
 	AdminTranslationBatchDetailResponse,
@@ -1895,9 +1896,93 @@ function buildAdminJobs(): DemoJobsModel {
 		},
 	];
 
-	const subscriptionRuns = realtimeTasks.filter(
-		(item) => item.task_type === "sync.subscriptions",
-	);
+	const subscriptionRuns: AdminSubscriptionRunItem[] = [
+		{
+			schedule_key: "interval:10:1795485000",
+			created_at: "2026-07-08T08:40:00+08:00",
+			finished_at: "2026-07-08T08:43:12+08:00",
+			status: "succeeded",
+			users: 2,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 402,
+				releases: 1500,
+				failed_repositories: 0,
+				degraded_tasks: 0,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 14,
+			},
+			tasks: [
+				{
+					id: "task-starred-delta-0840",
+					task_type: "sync.notifications",
+					status: "succeeded",
+					user_id: USER_ID,
+					created_at: "2026-07-08T08:40:00+08:00",
+					finished_at: "2026-07-08T08:40:05+08:00",
+					error_message: null,
+					notifications: 14,
+				},
+				{
+					id: "task-sync-releases",
+					task_type: "sync.releases",
+					status: "succeeded",
+					user_id: ADMIN_USER_ID,
+					created_at: "2026-07-08T08:42:00+08:00",
+					finished_at: "2026-07-08T08:43:12+08:00",
+					error_message: null,
+					repositories: 402,
+					releases: 1500,
+				},
+			],
+		},
+		{
+			schedule_key: "interval:10:1795484400",
+			created_at: "2026-07-08T08:20:00+08:00",
+			finished_at: "2026-07-08T08:22:00+08:00",
+			status: "partial",
+			users: 28,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 88,
+				releases: 140,
+				failed_repositories: 2,
+				degraded_tasks: 1,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 41,
+			},
+			tasks: [
+				{
+					id: "task-sync-subscriptions-history",
+					task_type: "sync.subscriptions",
+					status: "succeeded",
+					user_id: null,
+					created_at: "2026-07-08T08:20:00+08:00",
+					finished_at: "2026-07-08T08:22:00+08:00",
+					error_message: null,
+					repositories: 88,
+					releases: 140,
+					notifications: 41,
+				},
+			],
+		},
+	];
 
 	const currentLlmCalls: AdminLlmCallItem[] = [
 		{
@@ -2091,6 +2176,73 @@ function buildAdminJobs(): DemoJobsModel {
 				truncated: false,
 			},
 			diagnostics: null,
+		},
+		"task-sync-releases": {
+			task: {
+				...realtimeTasks[1],
+				source: "scheduler",
+				payload_json: JSON.stringify({
+					user_id: ADMIN_USER_ID,
+					trigger: "schedule",
+					schedule_key: "interval:10:1795485000",
+					interval_minutes: 10,
+				}),
+				result_json: JSON.stringify({
+					user_id: ADMIN_USER_ID,
+					releases: 1500,
+					repositories: 402,
+					failed_count: 0,
+					degraded: false,
+					failure_reasons: {},
+					translations_enqueued: 0,
+				}),
+			},
+			events: [],
+			event_meta: {
+				returned: 0,
+				total: 0,
+				limit: 50,
+				truncated: false,
+			},
+			diagnostics: null,
+		},
+		"task-sync-subscriptions-history": {
+			task: {
+				id: "task-sync-subscriptions-history",
+				task_type: "sync.subscriptions",
+				task_group: null,
+				legacy: true,
+				status: "succeeded",
+				source: "scheduler",
+				requested_by: null,
+				parent_task_id: null,
+				cancel_requested: false,
+				error_message: null,
+				created_at: "2026-07-08T08:20:00+08:00",
+				started_at: "2026-07-08T08:20:02+08:00",
+				finished_at: "2026-07-08T08:22:00+08:00",
+				updated_at: "2026-07-08T08:22:00+08:00",
+				payload_json: JSON.stringify({
+					trigger: "schedule",
+					schedule_key: "interval:10:1795484400",
+				}),
+				result_json: JSON.stringify({
+					collect: { total_users: 28 },
+					release: { succeeded_repos: 88, failed_repos: 2 },
+					social: { failed_users: 0 },
+					notifications: { failed_users: 0, notifications: 41 },
+					releases_written: 140,
+					critical_events: 0,
+				}),
+			},
+			events: [],
+			event_meta: {
+				returned: 0,
+				total: 0,
+				limit: 50,
+				truncated: false,
+			},
+			diagnostics: buildTaskDiagnostics(),
 		},
 		"task-sync-subscriptions": {
 			task: {

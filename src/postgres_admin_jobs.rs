@@ -6,7 +6,12 @@
 //! contract, and `/api/admin/jobs/events` is a real SSE stream. This module
 //! implements the same contract directly against the PostgreSQL pool.
 
-use std::{collections::HashMap, convert::Infallible, path::Path, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    convert::Infallible,
+    path::Path,
+    time::Duration,
+};
 
 use async_stream::stream;
 use axum::{
@@ -29,7 +34,8 @@ use tracing::warn;
 use crate::{
     admin_job_groups::{self, AdminJobTaskLane},
     jobs::{
-        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_SYNC_SUBSCRIPTIONS,
+        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
+        TASK_SYNC_SUBSCRIPTIONS,
     },
     postgres_server::{PostgresServerState, require_admin},
 };
@@ -360,6 +366,433 @@ fn push_in_list<'a>(
         separated.push_bind(value.to_owned());
     }
     separated.push_unseparated(")");
+}
+
+// ----------------------------------------------------- subscription run view
+
+/// Task types the PostgreSQL subscription lane writes per user.
+///
+/// The admin view groups these by `schedule_key`, keeps keyless (manual) tasks
+/// as standalone runs, and normalizes imported `sync.subscriptions` rows into
+/// the same run shape so the history never splits by migration era.
+const SUBSCRIPTION_RUN_TASK_TYPES: [&str; 2] = [
+    crate::jobs::TASK_SYNC_RELEASES,
+    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+];
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SubscriptionRunsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SubscriptionRunTaskItem {
+    id: String,
+    task_type: String,
+    status: String,
+    user_id: Option<String>,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repositories: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notifications: Option<i64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct SubscriptionRunReleaseStats {
+    tasks: i64,
+    succeeded: i64,
+    failed: i64,
+    running: i64,
+    repositories: i64,
+    releases: i64,
+    failed_repositories: i64,
+    degraded_tasks: i64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct SubscriptionRunNotificationStats {
+    tasks: i64,
+    succeeded: i64,
+    failed: i64,
+    running: i64,
+    notifications: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscriptionRunItem {
+    schedule_key: String,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+    status: &'static str,
+    users: i64,
+    releases: SubscriptionRunReleaseStats,
+    notifications: SubscriptionRunNotificationStats,
+    tasks: Vec<SubscriptionRunTaskItem>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SubscriptionRunTaskRow {
+    id: String,
+    task_type: String,
+    status: String,
+    schedule_key: Option<String>,
+    payload_json: Option<String>,
+    result_json: Option<String>,
+    error_message: Option<String>,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+pub(super) async fn subscription_runs(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Query(query): Query<SubscriptionRunsQuery>,
+) -> Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return require_admin_response(status);
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query
+        .page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let Some(offset) = page
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(page_size))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code": "bad_request", "message": "page is too large"})),
+        )
+            .into_response();
+    };
+    match load_subscription_runs(&state.runtime.pool, page_size, offset).await {
+        Ok((items, total)) => Json(json!({
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }))
+        .into_response(),
+        Err(error) => database_error(error, "admin subscription runs"),
+    }
+}
+
+async fn load_subscription_runs(
+    pool: &PgPool,
+    page_size: i64,
+    offset: i64,
+) -> Result<(Vec<SubscriptionRunItem>, i64), sqlx::Error> {
+    let task_types = SUBSCRIPTION_RUN_TASK_TYPES.to_vec();
+    let imported_task_type = crate::jobs::TASK_SYNC_SUBSCRIPTIONS;
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT \
+             (SELECT COUNT(DISTINCT CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                 THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END) \
+              FROM public.job_tasks WHERE task_type = ANY($1)) \
+           + (SELECT COUNT(*) FROM public.job_tasks WHERE task_type = ANY($1) \
+                AND (CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                      THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END) IS NULL) \
+           + (SELECT COUNT(*) FROM public.job_tasks WHERE task_type = $2)",
+    )
+    .bind(&task_types)
+    .bind(imported_task_type)
+    .fetch_one(pool)
+    .await?;
+    let keys = sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+      		"SELECT run_key, run_kind, run_created_at FROM ( \
+       					 SELECT 'key'::text AS run_kind, schedule_key AS run_key, MIN(created_at) AS run_created_at \
+             FROM ( \
+                 SELECT CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                     THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END \
+                     AS schedule_key, created_at \
+                 FROM public.job_tasks WHERE task_type = ANY($1) \
+             ) lane WHERE schedule_key IS NOT NULL \
+             GROUP BY schedule_key \
+             UNION ALL \
+         			 SELECT 'task'::text AS run_kind, id AS run_key, created_at AS run_created_at \
+             FROM public.job_tasks WHERE task_type = ANY($1) \
+               AND (CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                     THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END) IS NULL \
+             UNION ALL \
+         			 SELECT 'task'::text AS run_kind, id AS run_key, created_at AS run_created_at \
+             FROM public.job_tasks WHERE task_type = $2 \
+         ) runs ORDER BY run_created_at DESC, run_key DESC \
+         LIMIT $3 OFFSET $4",
+    )
+    .bind(&task_types)
+    .bind(imported_task_type)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    if keys.is_empty() {
+        return Ok((Vec::new(), total));
+    }
+    let key_list = keys
+        .iter()
+        .map(|(run_key, _, _)| run_key.clone())
+        .collect::<Vec<_>>();
+    let rows = sqlx::query_as::<_, SubscriptionRunTaskRow>(
+        "SELECT id, task_type, status, error_message, created_at, finished_at, payload_json, \
+             result_json, \
+             CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                 THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END AS schedule_key \
+         FROM public.job_tasks WHERE \
+           (task_type = ANY($1) \
+             AND CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                   THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END = ANY($2)) \
+           OR (task_type = ANY($1) \
+             AND (CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
+                   THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END) IS NULL \
+             AND id = ANY($2)) \
+           OR (task_type = $3 AND id = ANY($2)) \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&task_types)
+    .bind(&key_list)
+    .bind(imported_task_type)
+    .fetch_all(pool)
+    .await?;
+    let mut by_key: HashMap<String, Vec<SubscriptionRunTaskRow>> = HashMap::new();
+    for row in rows {
+        let key = if row.task_type == imported_task_type || row.schedule_key.is_none() {
+            format!("task:{}", row.id)
+        } else {
+            format!("key:{}", row.schedule_key.clone().unwrap_or_default())
+        };
+        by_key.entry(key).or_default().push(row);
+    }
+    let items = keys
+        .into_iter()
+        .filter_map(|(run_key, run_kind, created_at)| {
+            let mut rows = by_key.remove(&format!("{run_kind}:{run_key}"))?;
+            if rows
+                .first()
+                .map(|row| row.task_type == imported_task_type)
+                .unwrap_or(false)
+            {
+                Some(summarize_imported_subscription_run(
+                    run_key,
+                    created_at,
+                    rows.remove(0),
+                ))
+            } else {
+                Some(summarize_subscription_run(run_key, created_at, rows))
+            }
+        })
+        .collect();
+    Ok((items, total))
+}
+
+fn subscription_task_failed(status: &str) -> bool {
+    matches!(status, STATUS_FAILED | STATUS_CANCELED | "cancelled")
+}
+
+fn summarize_subscription_run(
+    schedule_key: String,
+    created_at: DateTime<Utc>,
+    rows: Vec<SubscriptionRunTaskRow>,
+) -> SubscriptionRunItem {
+    let mut releases = SubscriptionRunReleaseStats::default();
+    let mut notifications = SubscriptionRunNotificationStats::default();
+    let mut users = BTreeSet::new();
+    let mut tasks = Vec::with_capacity(rows.len());
+    let mut finished_at: Option<DateTime<Utc>> = None;
+    for row in rows {
+        let payload = parse_json(row.payload_json.as_deref());
+        let payload_object = payload.as_ref().and_then(Value::as_object);
+        let result = parse_json(row.result_json.as_deref());
+        let result_object = result.as_ref().and_then(Value::as_object);
+        let user_id = json_get_string(payload_object, "user_id")
+            .or_else(|| json_get_string(result_object, "user_id"));
+        if let Some(user_id) = user_id.as_deref() {
+            users.insert(user_id.to_owned());
+        }
+        let succeeded = row.status == STATUS_SUCCEEDED;
+        let failed = subscription_task_failed(row.status.as_str());
+        let running = matches!(row.status.as_str(), STATUS_QUEUED | STATUS_RUNNING);
+        let mut task_repositories = None;
+        let mut task_releases = None;
+        let mut task_notifications = None;
+        if let Some(value) = row.finished_at {
+            finished_at = Some(finished_at.map_or(value, |current| current.max(value)));
+        }
+        if row.task_type == crate::jobs::TASK_SYNC_RELEASES {
+            releases.tasks += 1;
+            if succeeded {
+                let repositories = json_get_i64(result_object, "repositories").unwrap_or(0);
+                let release_count = json_get_i64(result_object, "releases").unwrap_or(0);
+                releases.succeeded += 1;
+                releases.repositories += repositories;
+                releases.releases += release_count;
+                releases.failed_repositories +=
+                    json_get_i64(result_object, "failed_count").unwrap_or(0);
+                if json_get_bool(result_object, "degraded").unwrap_or(false) {
+                    releases.degraded_tasks += 1;
+                }
+                task_repositories = Some(repositories);
+                task_releases = Some(release_count);
+            } else if failed {
+                releases.failed += 1;
+            } else if running {
+                releases.running += 1;
+            }
+        } else {
+            notifications.tasks += 1;
+            if succeeded {
+                let count = json_get_i64(result_object, "notifications").unwrap_or(0);
+                notifications.succeeded += 1;
+                notifications.notifications += count;
+                task_notifications = Some(count);
+            } else if failed {
+                notifications.failed += 1;
+            } else if running {
+                notifications.running += 1;
+            }
+        }
+        tasks.push(SubscriptionRunTaskItem {
+            id: row.id,
+            task_type: row.task_type,
+            status: row.status,
+            user_id,
+            created_at: row.created_at,
+            finished_at: row.finished_at,
+            error_message: row.error_message,
+            repositories: task_repositories,
+            releases: task_releases,
+            notifications: task_notifications,
+        });
+    }
+    let status = subscription_run_status(&tasks);
+    SubscriptionRunItem {
+        schedule_key,
+        created_at,
+        finished_at: if matches!(status, STATUS_QUEUED | STATUS_RUNNING) {
+            None
+        } else {
+            finished_at
+        },
+        status,
+        users: i64::try_from(users.len()).unwrap_or(i64::MAX),
+        releases,
+        notifications,
+        tasks,
+    }
+}
+
+/// Normalize one imported `sync.subscriptions` row into the same run shape.
+///
+/// The SQLite-era executor aggregated every user into one task, so the row is
+/// its own run. Mapping it here keeps `/admin/jobs/subscriptions` one continuous
+/// history instead of splitting the dataset by migration era.
+fn summarize_imported_subscription_run(
+    run_key: String,
+    created_at: DateTime<Utc>,
+    row: SubscriptionRunTaskRow,
+) -> SubscriptionRunItem {
+    let payload = parse_json(row.payload_json.as_deref());
+    let payload_object = payload.as_ref().and_then(Value::as_object);
+    let result = parse_json(row.result_json.as_deref());
+    let result_object = result.as_ref().and_then(Value::as_object);
+    let collect = json_get_object(result_object, "collect");
+    let release = json_get_object(result_object, "release");
+    let social = json_get_object(result_object, "social");
+    let notifications = json_get_object(result_object, "notifications");
+    let skipped = json_get_bool(result_object, "skipped").unwrap_or(false);
+    let repositories = json_get_i64(release, "succeeded_repos").unwrap_or(0);
+    let failed_repositories = json_get_i64(release, "failed_repos").unwrap_or(0);
+    let releases_written = json_get_i64(result_object, "releases_written").unwrap_or(0);
+    let notification_count = json_get_i64(notifications, "notifications").unwrap_or(0);
+    let critical_events = json_get_i64(result_object, "critical_events").unwrap_or(0);
+    let social_failed = json_get_i64(social, "failed_users").unwrap_or(0);
+    let notifications_failed = json_get_i64(notifications, "failed_users").unwrap_or(0);
+    let failed = subscription_task_failed(row.status.as_str());
+    let status = if skipped {
+        "skipped"
+    } else if row.status == STATUS_RUNNING {
+        STATUS_RUNNING
+    } else if row.status == STATUS_QUEUED {
+        STATUS_QUEUED
+    } else if failed {
+        STATUS_FAILED
+    } else if critical_events > 0
+        || failed_repositories > 0
+        || social_failed > 0
+        || notifications_failed > 0
+    {
+        "partial"
+    } else {
+        STATUS_SUCCEEDED
+    };
+    let succeeded = i64::from(matches!(status, STATUS_SUCCEEDED | "partial" | "skipped"));
+    let failed_task = i64::from(status == STATUS_FAILED);
+    let running = i64::from(matches!(status, STATUS_QUEUED | STATUS_RUNNING));
+    let user_id = json_get_string(payload_object, "user_id")
+        .or_else(|| json_get_string(result_object, "user_id"));
+    let schedule_key = json_get_string(payload_object, "schedule_key").unwrap_or(run_key);
+    SubscriptionRunItem {
+        schedule_key,
+        created_at,
+        finished_at: row.finished_at,
+        status,
+        users: json_get_i64(collect, "total_users").unwrap_or(0),
+        releases: SubscriptionRunReleaseStats {
+            tasks: 1,
+            succeeded,
+            failed: failed_task,
+            running,
+            repositories,
+            releases: releases_written,
+            failed_repositories,
+            degraded_tasks: i64::from(failed_repositories > 0),
+        },
+        notifications: SubscriptionRunNotificationStats {
+            tasks: 1,
+            succeeded,
+            failed: failed_task,
+            running,
+            notifications: notification_count,
+        },
+        tasks: vec![SubscriptionRunTaskItem {
+            id: row.id,
+            task_type: row.task_type,
+            status: row.status,
+            user_id,
+            created_at: row.created_at,
+            finished_at: row.finished_at,
+            error_message: row.error_message,
+            repositories: Some(repositories),
+            releases: Some(releases_written),
+            notifications: Some(notification_count),
+        }],
+    }
+}
+
+fn subscription_run_status(tasks: &[SubscriptionRunTaskItem]) -> &'static str {
+    if tasks.iter().any(|task| task.status == STATUS_RUNNING) {
+        return STATUS_RUNNING;
+    }
+    if tasks.iter().any(|task| task.status == STATUS_QUEUED) {
+        return STATUS_QUEUED;
+    }
+    let failed = tasks
+        .iter()
+        .filter(|task| subscription_task_failed(task.status.as_str()))
+        .count();
+    if !tasks.is_empty() && failed == tasks.len() {
+        return STATUS_FAILED;
+    }
+    if failed > 0 {
+        return "partial";
+    }
+    STATUS_SUCCEEDED
 }
 
 // --------------------------------------------------- subscription diagnostics
@@ -1613,5 +2046,214 @@ mod tests {
             admin_job_groups::runtime_task_types()
                 .any(|task_type| task_type == admin_job_groups::TASK_TRANSLATION_GENERATE)
         );
+    }
+
+    fn run_task_row(
+        id: &str,
+        task_type: &str,
+        status: &str,
+        payload: &str,
+        result: Option<&str>,
+        created_at: DateTime<Utc>,
+        finished_at: Option<DateTime<Utc>>,
+    ) -> SubscriptionRunTaskRow {
+        SubscriptionRunTaskRow {
+            id: id.to_owned(),
+            task_type: task_type.to_owned(),
+            status: status.to_owned(),
+            schedule_key: Some("interval:10:1795485000".to_owned()),
+            payload_json: Some(payload.to_owned()),
+            result_json: result.map(ToOwned::to_owned),
+            error_message: None,
+            created_at,
+            finished_at,
+        }
+    }
+
+    fn run_timestamp(minute: u32) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&format!("2026-11-24T01:{minute:02}:00Z"))
+            .expect("timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn subscription_run_groups_release_and_notification_totals_per_schedule_key() {
+        let created = run_timestamp(50);
+        let run = summarize_subscription_run(
+            "interval:10:1795485000".to_owned(),
+            created,
+            vec![
+                run_task_row(
+                    "release-a",
+                    crate::jobs::TASK_SYNC_RELEASES,
+                    STATUS_SUCCEEDED,
+                    r#"{"user_id":"user-a"}"#,
+                    Some(
+                        r#"{"repositories":433,"releases":13317,"failed_count":1,"degraded":true,"user_id":"user-a"}"#,
+                    ),
+                    created,
+                    Some(run_timestamp(54)),
+                ),
+                run_task_row(
+                    "notifications-a",
+                    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+                    STATUS_SUCCEEDED,
+                    r#"{"user_id":"user-a"}"#,
+                    Some(r#"{"notifications":139,"user_id":"user-a"}"#),
+                    created,
+                    Some(run_timestamp(53)),
+                ),
+                run_task_row(
+                    "release-b",
+                    crate::jobs::TASK_SYNC_RELEASES,
+                    STATUS_FAILED,
+                    r#"{"user_id":"user-b"}"#,
+                    None,
+                    created,
+                    Some(run_timestamp(52)),
+                ),
+            ],
+        );
+        assert_eq!(run.status, "partial");
+        assert_eq!(run.users, 2);
+        assert_eq!(run.releases.tasks, 2);
+        assert_eq!(run.releases.succeeded, 1);
+        assert_eq!(run.releases.failed, 1);
+        assert_eq!(run.releases.repositories, 433);
+        assert_eq!(run.releases.releases, 13317);
+        assert_eq!(run.releases.failed_repositories, 1);
+        assert_eq!(run.releases.degraded_tasks, 1);
+        assert_eq!(run.notifications.tasks, 1);
+        assert_eq!(run.notifications.notifications, 139);
+        assert_eq!(run.finished_at, Some(run_timestamp(54)));
+    }
+
+    #[test]
+    fn subscription_run_status_prefers_pending_work_over_failures() {
+        let mut queued = run_task_row(
+            "release-a",
+            crate::jobs::TASK_SYNC_RELEASES,
+            STATUS_QUEUED,
+            r#"{"user_id":"user-a"}"#,
+            None,
+            run_timestamp(50),
+            None,
+        );
+        let failed = run_task_row(
+            "release-b",
+            crate::jobs::TASK_SYNC_RELEASES,
+            STATUS_FAILED,
+            r#"{"user_id":"user-b"}"#,
+            None,
+            run_timestamp(50),
+            Some(run_timestamp(51)),
+        );
+        let run = summarize_subscription_run(
+            "interval:10:1795485000".to_owned(),
+            run_timestamp(50),
+            vec![queued.clone(), failed.clone()],
+        );
+        assert_eq!(run.status, STATUS_QUEUED);
+        assert_eq!(run.finished_at, None);
+
+        queued.status = STATUS_RUNNING.to_owned();
+        let run = summarize_subscription_run(
+            "interval:10:1795485000".to_owned(),
+            run_timestamp(50),
+            vec![queued, failed],
+        );
+        assert_eq!(run.status, STATUS_RUNNING);
+        assert_eq!(run.finished_at, None);
+    }
+
+    #[test]
+    fn subscription_run_status_reports_all_failed_runs() {
+        let run = summarize_subscription_run(
+            "interval:10:1795485000".to_owned(),
+            run_timestamp(50),
+            vec![
+                run_task_row(
+                    "release-a",
+                    crate::jobs::TASK_SYNC_RELEASES,
+                    STATUS_FAILED,
+                    r#"{"user_id":"user-a"}"#,
+                    None,
+                    run_timestamp(50),
+                    Some(run_timestamp(51)),
+                ),
+                run_task_row(
+                    "notifications-a",
+                    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+                    "cancelled",
+                    r#"{"user_id":"user-a"}"#,
+                    None,
+                    run_timestamp(50),
+                    Some(run_timestamp(51)),
+                ),
+            ],
+        );
+        assert_eq!(run.status, STATUS_FAILED);
+    }
+
+    #[test]
+    fn imported_subscription_run_maps_into_the_same_run_shape() {
+        let created = run_timestamp(30);
+        let run = summarize_imported_subscription_run(
+            "sub-1".to_owned(),
+            created,
+            SubscriptionRunTaskRow {
+                id: "sub-1".to_owned(),
+                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                status: STATUS_SUCCEEDED.to_owned(),
+                schedule_key: Some("daily-06".to_owned()),
+                payload_json: Some(
+                    r#"{"trigger":"schedule","schedule_key":"daily-06"}"#.to_owned(),
+                ),
+                result_json: Some(
+                    r#"{"collect":{"total_users":7},"release":{"succeeded_repos":3,"failed_repos":1},"social":{"failed_users":0},"notifications":{"failed_users":0,"notifications":12},"releases_written":30,"critical_events":1}"#
+                        .to_owned(),
+                ),
+                error_message: None,
+                created_at: created,
+                finished_at: Some(run_timestamp(31)),
+            },
+        );
+        assert_eq!(run.schedule_key, "daily-06");
+        assert_eq!(run.status, "partial");
+        assert_eq!(run.users, 7);
+        assert_eq!(run.releases.repositories, 3);
+        assert_eq!(run.releases.releases, 30);
+        assert_eq!(run.releases.failed_repositories, 1);
+        assert_eq!(run.releases.degraded_tasks, 1);
+        assert_eq!(run.notifications.notifications, 12);
+        assert_eq!(run.tasks[0].task_type, crate::jobs::TASK_SYNC_SUBSCRIPTIONS);
+        assert_eq!(run.tasks[0].repositories, Some(3));
+        assert_eq!(run.finished_at, Some(run_timestamp(31)));
+    }
+
+    #[test]
+    fn imported_skipped_subscription_run_keeps_skipped_status() {
+        let created = run_timestamp(20);
+        let run = summarize_imported_subscription_run(
+            "sub-skipped".to_owned(),
+            created,
+            SubscriptionRunTaskRow {
+                id: "sub-skipped".to_owned(),
+                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                status: STATUS_SUCCEEDED.to_owned(),
+                schedule_key: None,
+                payload_json: Some(
+                    r#"{"trigger":"schedule","schedule_key":"daily-07"}"#.to_owned(),
+                ),
+                result_json: Some(
+                    r#"{"skipped":true,"skip_reason":"previous_run_active"}"#.to_owned(),
+                ),
+                error_message: None,
+                created_at: created,
+                finished_at: Some(created),
+            },
+        );
+        assert_eq!(run.status, "skipped");
+        assert_eq!(run.schedule_key, "daily-07");
     }
 }

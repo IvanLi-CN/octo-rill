@@ -53,6 +53,7 @@ import {
 	type AdminBusinessOutcome,
 	type AdminRealtimeTaskDetailResponse,
 	type AdminRealtimeTaskItem,
+	type AdminSubscriptionRunItem,
 	type AdminTaskEventItem,
 	type AdminTranslationBatchDetailResponse,
 	type AdminTranslationStreamEvent,
@@ -77,6 +78,7 @@ import {
 	apiGetAdminJobsOverview,
 	apiGetAdminRealtimeTaskDetail,
 	apiGetAdminRealtimeTasks,
+	apiGetAdminSubscriptionRuns,
 	apiGetAdminTranslationBatchDetail,
 	apiGetAdminTranslationBatches,
 	apiGetAdminTranslationAttemptEvents,
@@ -855,6 +857,8 @@ function taskStatusLabel(status: string) {
 			return "失败";
 		case "canceled":
 			return "已取消";
+		case "cancelled":
+			return "已取消";
 		case "skipped":
 			return "已跳过";
 		default:
@@ -955,6 +959,13 @@ function taskStatusTone(status: string): TaskStatusTone {
 				dotClass: "bg-red-500",
 			};
 		case "canceled":
+			return {
+				cardAccentClass: "border-slate-500/45",
+				badgeClass:
+					"border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100",
+				dotClass: "bg-slate-500",
+			};
+		case "cancelled":
 			return {
 				cardAccentClass: "border-slate-500/45",
 				badgeClass:
@@ -1527,6 +1538,7 @@ type RealtimeStatusFilter =
 const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
 const TASK_PAGE_SIZE = 20;
+const SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT = 5;
 const USER_SYNC_TASK_TYPES: Record<string, true> = {
 	"sync.starred": true,
 };
@@ -3646,19 +3658,6 @@ function subscriptionStageStatusLabel(stage: SubscriptionWorkflowStage) {
 	return "等待";
 }
 
-function subscriptionStageCompactLabel(stage: SubscriptionWorkflowStage) {
-	switch (stage.id) {
-		case "repo":
-			return "Repo";
-		case "release":
-			return "Release";
-		case "notifications":
-			return "Inbox";
-		default:
-			return stage.label;
-	}
-}
-
 function subscriptionStagePending(stage: SubscriptionWorkflowStage) {
 	return Math.max(0, stage.total - stage.succeeded - stage.failed);
 }
@@ -3725,44 +3724,18 @@ function subscriptionBusinessStatusTone(status: string): TaskStatusTone {
 	return taskStatusTone(status);
 }
 
-function subscriptionIssueSummary(
-	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
-	stages: SubscriptionWorkflowStage[],
-) {
-	if (!diagnostics) return "列表诊断未加载，无法判断业务完成度。";
-	if (diagnostics.skipped) {
-		return diagnostics.skip_reason === "previous_run_active"
-			? "上一轮仍在执行，本轮未开始业务同步。"
-			: `本轮已跳过：${diagnostics.skip_reason ?? "未提供原因"}`;
+function subscriptionRunTaskSummary(
+	task: AdminSubscriptionRunItem["tasks"][number],
+): string | null {
+	if (
+		task.task_type === "sync.releases" ||
+		task.task_type === "sync.subscriptions"
+	) {
+		if (task.repositories == null && task.releases == null) return null;
+		return `仓库 ${formatCount(task.repositories)} · Release ${formatCount(task.releases)}`;
 	}
-	const parts = stages.flatMap((stage) => {
-		const pending = subscriptionStagePending(stage);
-		const stageParts = [];
-		if (stage.failed > 0) {
-			stageParts.push(`${stage.label} 失败 ${formatCount(stage.failed)}`);
-		}
-		if (pending > 0) {
-			stageParts.push(`${stage.label} 剩余 ${formatCount(pending)}`);
-		}
-		return stageParts;
-	});
-	if (diagnostics.critical_events > 0) {
-		parts.push(`关键事件 ${formatCount(diagnostics.critical_events)}`);
-	}
-	return parts.length > 0 ? parts.join(" · ") : "全阶段已完成且无失败。";
-}
-
-function subscriptionRecentEventSummary(
-	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
-) {
-	const event = diagnostics?.recent_events.find(
-		(item) => item.severity === "error" || item.severity === "warning",
-	);
-	if (!event) return null;
-	const target = event.repo_full_name ?? event.user_id ?? null;
-	return [event.stage, event.event_type, target, event.message]
-		.filter(Boolean)
-		.join(" · ");
+	if (task.notifications == null) return null;
+	return `通知 ${formatCount(task.notifications)}`;
 }
 
 function buildSubscriptionWorkflowStages(
@@ -4301,7 +4274,7 @@ export function JobManagement({
 	const [userSyncRunsLoadPhase, setUserSyncRunsLoadPhase] =
 		useState<ListLoadPhase>("idle");
 	const [subscriptionRuns, setSubscriptionRuns] = useState<
-		AdminRealtimeTaskItem[]
+		AdminSubscriptionRunItem[]
 	>([]);
 	const [subscriptionRunTotal, setSubscriptionRunTotal] = useState(0);
 	const [subscriptionRunPage, setSubscriptionRunPage] = useState(1);
@@ -5025,11 +4998,9 @@ export function JobManagement({
 			);
 			try {
 				const params = new URLSearchParams();
-				params.set("status", "all");
-				params.set("task_type", "sync.subscriptions");
 				params.set("page", String(subscriptionRunPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
-				const res = await apiGetAdminRealtimeTasks(params);
+				const res = await apiGetAdminSubscriptionRuns(params);
 				if (requestId !== subscriptionRunsRequestIdRef.current) {
 					return;
 				}
@@ -6215,12 +6186,33 @@ export function JobManagement({
 		[navigateAdminJobsRoute, tab, translationView],
 	);
 
+	const onOpenSubscriptionRunTask = useCallback(
+		(taskId: string) => {
+			setError(null);
+			setLlmDetail(null);
+			navigateAdminJobsRoute({
+				primaryTab: "subscriptions",
+				translationView,
+				taskDrawerRoute: { taskId, llmCallId: null },
+				drawerFromTab: "subscriptions",
+				subscriptionDetailTaskId: null,
+			});
+		},
+		[navigateAdminJobsRoute, translationView],
+	);
+
 	const onOpenSyncTaskDetailFromSettings = useCallback(
 		(taskId: string) => {
 			setSubscriptionSyncSettingsDialogOpen(false);
-			window.setTimeout(() => onOpenTaskDetail(taskId), 150);
+			window.setTimeout(() => {
+				if (tab === "subscriptions") {
+					onOpenSubscriptionRunTask(taskId);
+					return;
+				}
+				onOpenTaskDetail(taskId);
+			}, 150);
 		},
-		[onOpenTaskDetail],
+		[onOpenSubscriptionRunTask, onOpenTaskDetail, tab],
 	);
 
 	const onBackToSubscriptionRuns = useCallback(() => {
@@ -6358,8 +6350,6 @@ export function JobManagement({
 	const openLlmDetailTone = llmDetail ? taskStatusTone(llmDetail.status) : null;
 	const cancelRequestedBadgeClass =
 		"border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
-	const legacyTaskBadgeClass =
-		"border-stone-300 bg-stone-100 text-stone-700 dark:border-stone-500/60 dark:bg-stone-500/20 dark:text-stone-200";
 
 	return (
 		<div className="space-y-4">
@@ -7165,16 +7155,18 @@ export function JobManagement({
 								<div className="space-y-1.5">
 									<CardTitle>订阅同步</CardTitle>
 								</div>
-								<Button
-									type="button"
-									variant="outline"
-									size="icon"
-									aria-label="打开订阅同步设置"
-									onClick={openSubscriptionSyncSettingsDialog}
-									disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
-								>
-									<Settings2 />
-								</Button>
+								<div className="flex items-center gap-2">
+									<Button
+										type="button"
+										variant="outline"
+										size="icon"
+										aria-label="打开订阅同步设置"
+										onClick={openSubscriptionSyncSettingsDialog}
+										disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+									>
+										<Settings2 />
+									</Button>
+								</div>
 							</CardHeader>
 							<CardContent className="space-y-4 px-0 pb-0 pt-0 sm:px-6 sm:pb-6">
 								<div
@@ -7280,225 +7272,201 @@ export function JobManagement({
 										<CardListSkeleton count={3} itemClassName="h-48" />
 									) : subscriptionListSurface.state === "empty" ? (
 										<ListEmptyState
-											title="暂无订阅同步任务"
-											description="当前还没有可展示的订阅同步工作流记录。"
+											title="暂无订阅同步运行记录"
+											description="调度器还没有产生订阅同步运行。"
 										/>
 									) : (
-										<div className="space-y-2">
-											{subscriptionRuns.map((task) => {
-												const taskDiagnostics =
-													task.diagnostics ??
-													(task.id === activeTaskDetail?.task.id
-														? activeTaskDetail?.diagnostics
-														: null);
-												const diagnostics =
-													taskDiagnostics?.sync_subscriptions ?? null;
-												const businessOutcome =
-													taskDiagnostics?.business_outcome ?? null;
-												const stages =
-													buildSubscriptionWorkflowStages(diagnostics);
-												const displayStatus = subscriptionBusinessStatus(
-													task,
-													diagnostics,
-													businessOutcome,
-													stages,
-												);
-												const tone =
-													subscriptionBusinessStatusTone(displayStatus);
-												const issueSummary = subscriptionIssueSummary(
-													diagnostics,
-													stages,
-												);
-												const compactTaskId = task.id.startsWith(
-													"task-subscription-",
-												)
-													? `#${task.id.slice("task-subscription-".length)}`
-													: `...${task.id.slice(-8)}`;
-												const recentEventSummary =
-													subscriptionRecentEventSummary(diagnostics);
-												const hasIssue = displayStatus !== "succeeded";
-												const detailHref = buildAdminJobsRouteUrl({
-													primaryTab: "subscriptions",
-													translationView,
-													taskDrawerRoute: null,
-													drawerFromTab: null,
-													subscriptionDetailTaskId: task.id,
-												});
+										<div
+											className="space-y-2"
+											data-testid="subscription-run-list"
+										>
+											{subscriptionRuns.map((run) => {
+												const failedTasks = run.tasks.filter(
+													(task) =>
+														task.status === "failed" ||
+														task.status === "canceled" ||
+														task.status === "cancelled",
+												).length;
+												const failureSummary = [
+													run.releases.failed_repositories > 0
+														? `Release 仓库失败 ${formatCount(run.releases.failed_repositories)}`
+														: null,
+													run.releases.degraded_tasks > 0
+														? `降级任务 ${formatCount(run.releases.degraded_tasks)}`
+														: null,
+													run.notifications.failed > 0
+														? `通知任务失败 ${formatCount(run.notifications.failed)}`
+														: null,
+												]
+													.filter((part): part is string => Boolean(part))
+													.join(" · ");
 												return (
-													<a
-														key={task.id}
-														aria-label={`打开订阅同步工作流 ${task.id}`}
-														className="block cursor-pointer border-b border-border/70 bg-transparent py-2 transition-colors duration-200 last:border-b-0 hover:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:px-1"
-														data-task-id={task.id}
-														data-testid="subscription-workflow-card"
-														href={detailHref}
-														onClick={(event) => {
-															if (
-																event.defaultPrevented ||
-																event.button !== 0 ||
-																event.metaKey ||
-																event.altKey ||
-																event.ctrlKey ||
-																event.shiftKey
-															) {
-																return;
-															}
-															event.preventDefault();
-															onOpenTaskDetail(task.id);
-														}}
+													<div
+														key={run.tasks[0]?.id ?? run.schedule_key}
+														className="overflow-hidden rounded-lg border bg-card/70"
+														data-testid="subscription-run-card"
+														data-schedule-key={run.schedule_key}
 													>
-														<div className="grid gap-1 sm:gap-1.5">
-															<div className="flex items-start justify-between gap-2 border-b pb-1.5 sm:gap-3 sm:pb-2">
-																<div className="flex min-w-0 flex-wrap items-center gap-2">
-																	<p className="shrink-0 font-medium text-[13px] sm:text-sm">
-																		订阅同步工作流
-																	</p>
-																	<StatusBadge
-																		label={subscriptionBusinessStatusLabel(
-																			displayStatus,
-																		)}
-																		tone={tone}
-																	/>
-																	{task.legacy ? (
-																		<FlagBadge
-																			label="旧 SQLite 期"
-																			className={legacyTaskBadgeClass}
-																		/>
-																	) : null}
-																	<span className="hidden rounded-md border bg-background px-1.5 py-0.5 font-mono text-[11px] sm:inline">
-																		{sourceLabel(task.source)}
-																	</span>
-																	{diagnostics ? (
-																		<span
-																			className="text-[11px] text-muted-foreground"
-																			data-testid="subscription-workflow-user-scope"
-																		>
-																			用户范围{" "}
-																			{formatCount(
-																				diagnostics.collect.total_users,
-																			)}
-																		</span>
-																	) : null}
-																</div>
-																<div className="min-w-0 shrink text-right">
-																	<p
-																		className="truncate font-mono text-[11px] text-muted-foreground"
-																		title={`ID: ${task.id}`}
-																	>
-																		<span className="sm:hidden">
-																			ID: {compactTaskId}
-																		</span>
-																		<span className="hidden sm:inline">
-																			ID: {task.id}
-																		</span>
-																	</p>
-																	<div className="mt-1 hidden grid-cols-3 gap-1 text-[11px] text-muted-foreground sm:grid">
-																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
-																			创建 {formatLocalHm(task.created_at)}
-																		</span>
-																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
-																			开始 {formatLocalHm(task.started_at)}
-																		</span>
-																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
-																			完成 {formatLocalHm(task.finished_at)}
-																		</span>
-																	</div>
-																	<p className="mt-1 text-[11px] text-muted-foreground sm:hidden">
-																		{formatLocalHm(
-																			task.finished_at ?? task.created_at,
-																		)}
-																	</p>
-																</div>
+														<div className="flex flex-wrap items-start justify-between gap-2 border-b px-3 py-2.5">
+															<div className="flex min-w-0 flex-wrap items-center gap-2">
+																<p className="font-medium text-sm">订阅同步</p>
+																<StatusBadge
+																	label={subscriptionBusinessStatusLabel(
+																		run.status,
+																	)}
+																	tone={subscriptionBusinessStatusTone(
+																		run.status,
+																	)}
+																/>
+																<span className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11px]">
+																	创建 {formatLocalHm(run.created_at)}
+																</span>
+																<span className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11px]">
+																	完成 {formatLocalHm(run.finished_at)}
+																</span>
 															</div>
-															{diagnostics ? (
-																<div className="overflow-x-auto">
-																	<div
-																		className="grid grid-cols-4 gap-px bg-border/70 text-[10px] sm:min-w-[672px] sm:grid-cols-[repeat(var(--subscription-stage-columns),minmax(0,1fr))] sm:text-[11px]"
-																		data-testid="subscription-workflow-stage-grid"
-																		style={
-																			{
-																				"--subscription-stage-columns":
-																					stages.length,
-																			} as React.CSSProperties
-																		}
-																	>
-																		{stages.map((stage) => {
-																			const pending =
-																				subscriptionStagePending(stage);
-																			const stageTone =
-																				subscriptionStageTone(stage);
-																			const compactLabel =
-																				subscriptionStageCompactLabel(stage);
-																			return (
-																				<div
-																					key={stage.id}
-																					className="grid min-h-10 min-w-0 grid-rows-[auto_1fr] gap-0.5 overflow-hidden bg-background/70 px-1.5 py-1 sm:min-h-12 sm:gap-1 sm:px-2 sm:py-1.5"
-																				>
-																					<div className="flex min-w-0 items-center justify-between gap-1">
-																						<div className="flex min-w-0 items-center gap-1.5">
-																							<span
-																								className={`size-1.5 shrink-0 rounded-full ${stageTone.dotClass}`}
-																							/>
-																							<span
-																								className="truncate font-medium"
-																								title={stage.label}
-																							>
-																								{compactLabel}
-																							</span>
-																						</div>
-																						<span className="hidden text-muted-foreground sm:inline">
-																							{stage.skipped ? "跳过" : ""}
-																						</span>
-																					</div>
-																					<div className="flex min-w-0 flex-col items-start gap-0 sm:flex-row sm:items-end sm:justify-between sm:gap-2">
-																						<span className="min-w-0 truncate font-mono font-semibold text-foreground">
-																							{stage.skipped
-																								? "skip"
-																								: `${formatCount(stage.done)}/${formatCount(stage.total)}`}
-																						</span>
-																						<span className="font-mono text-[9px] text-muted-foreground sm:hidden">
-																							F{formatCount(stage.failed)}/R
-																							{formatCount(pending)}
-																						</span>
-																						<span className="hidden font-mono text-[10px] text-muted-foreground sm:inline">
-																							F{formatCount(stage.failed)} · R
-																							{formatCount(pending)}
-																						</span>
-																					</div>
-																				</div>
-																			);
-																		})}
-																	</div>
-																</div>
-															) : (
-																<div className="rounded-lg border border-amber-500/35 bg-amber-500/5 px-3 py-2 text-sm">
-																	<p className="font-medium">诊断未加载</p>
-																</div>
-															)}
-															{hasIssue || recentEventSummary ? (
-																<p className="mt-1 line-clamp-1 text-[11px] text-muted-foreground sm:hidden">
-																	<span className="font-medium text-foreground">
-																		异常焦点：
-																	</span>
-																	{issueSummary}
-																	{recentEventSummary
-																		? ` · 最近事件：${recentEventSummary}`
-																		: ""}
+															<div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+																<span>用户 {formatCount(run.users)}</span>
+																<span>
+																	任务 {formatCount(run.tasks.length)}
+																</span>
+															</div>
+														</div>
+														<div className="grid grid-cols-2 gap-px bg-border/70 sm:grid-cols-4">
+															<div className="bg-background/70 px-2 py-1.5">
+																<p className="text-[10px] text-muted-foreground">
+																	Release 仓库
 																</p>
-															) : null}
-															{hasIssue || recentEventSummary ? (
-																<p className="mt-1.5 hidden truncate text-xs text-muted-foreground sm:block">
-																	<span className="font-medium text-foreground">
-																		异常焦点：
-																	</span>
-																	{issueSummary}
-																	{recentEventSummary
-																		? ` · 最近事件：${recentEventSummary}`
-																		: ""}
+																<p className="font-mono text-sm font-semibold">
+																	{formatCount(run.releases.repositories)}
+																</p>
+															</div>
+															<div className="bg-background/70 px-2 py-1.5">
+																<p className="text-[10px] text-muted-foreground">
+																	Release 拉取
+																</p>
+																<p className="font-mono text-sm font-semibold">
+																	{formatCount(run.releases.releases)}
+																</p>
+															</div>
+															<div className="bg-background/70 px-2 py-1.5">
+																<p className="text-[10px] text-muted-foreground">
+																	通知
+																</p>
+																<p className="font-mono text-sm font-semibold">
+																	{formatCount(run.notifications.notifications)}
+																</p>
+															</div>
+															<div className="bg-background/70 px-2 py-1.5">
+																<p className="text-[10px] text-muted-foreground">
+																	失败任务
+																</p>
+																<p className="font-mono text-sm font-semibold">
+																	{formatCount(failedTasks)}
+																</p>
+															</div>
+														</div>
+														{failureSummary ? (
+															<p className="border-t px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-200">
+																{failureSummary}
+															</p>
+														) : null}
+														<div className="divide-y border-t">
+															{run.tasks
+																.slice(0, SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT)
+																.map((task) => (
+																	<div
+																		key={task.id}
+																		className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+																		data-testid="subscription-run-task"
+																		data-task-id={task.id}
+																	>
+																		<div className="min-w-0">
+																			<div className="flex flex-wrap items-center gap-2">
+																				<p className="text-sm font-medium">
+																					{taskTypeLabel(task.task_type)}
+																				</p>
+																				<span className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+																					#{task.user_id ?? "-"}
+																				</span>
+																				<StatusBadge
+																					label={taskStatusLabel(task.status)}
+																					tone={taskStatusTone(task.status)}
+																				/>
+																			</div>
+																			{subscriptionRunTaskSummary(task) ? (
+																				<p className="mt-1 text-[11px] text-muted-foreground">
+																					{subscriptionRunTaskSummary(task)}
+																				</p>
+																			) : null}
+																			{task.error_message ? (
+																				<p className="mt-1 line-clamp-2 text-[11px] text-destructive">
+																					{task.error_message}
+																				</p>
+																			) : null}
+																		</div>
+																		<Button asChild variant="outline" size="sm">
+																			{task.task_type ===
+																			"sync.subscriptions" ? (
+																				<a
+																					href={`/admin/jobs/subscriptions/${task.id}`}
+																					aria-label={`查看任务详情 ${task.id}`}
+																					onClick={(event) => {
+																						if (
+																							event.button !== 0 ||
+																							event.metaKey ||
+																							event.ctrlKey ||
+																							event.shiftKey ||
+																							event.altKey
+																						) {
+																							return;
+																						}
+																						event.preventDefault();
+																						onOpenTaskDetail(task.id);
+																					}}
+																				>
+																					详情
+																				</a>
+																			) : (
+																				<a
+																					href={`/admin/jobs/tasks/${task.id}?from=subscriptions`}
+																					aria-label={`查看任务详情 ${task.id}`}
+																					onClick={(event) => {
+																						if (
+																							event.button !== 0 ||
+																							event.metaKey ||
+																							event.ctrlKey ||
+																							event.shiftKey ||
+																							event.altKey
+																						) {
+																							return;
+																						}
+																						event.preventDefault();
+																						onOpenSubscriptionRunTask(task.id);
+																					}}
+																				>
+																					详情
+																				</a>
+																			)}
+																		</Button>
+																	</div>
+																))}
+															{run.tasks.length >
+															SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT ? (
+																<p
+																	className="px-3 py-2 text-[11px] text-muted-foreground"
+																	data-testid="subscription-run-task-overflow"
+																>
+																	其余{" "}
+																	{formatCount(
+																		run.tasks.length -
+																			SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT,
+																	)}{" "}
+																	个任务请在任务列表中查看
 																</p>
 															) : null}
 														</div>
-													</a>
+													</div>
 												);
 											})}
 										</div>
@@ -9176,12 +9144,6 @@ export function JobManagement({
 												label={taskStatusLabel(activeTaskDetail.task.status)}
 												tone={activeDetailTone}
 											/>
-											{activeTaskDetail.task.legacy ? (
-												<FlagBadge
-													label="旧 SQLite 期"
-													className={legacyTaskBadgeClass}
-												/>
-											) : null}
 											{activeTaskDetail.task.cancel_requested ? (
 												<FlagBadge
 													label="已请求取消"

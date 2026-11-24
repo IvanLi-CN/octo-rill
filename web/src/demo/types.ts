@@ -7,6 +7,7 @@ import type {
 	AdminLlmSchedulerStatusResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
+	AdminSubscriptionRunItem,
 	AdminSyncRuntimeConfigResponse,
 	AdminTranslationAttemptEvent,
 	AdminTranslationBatchDetailResponse,
@@ -132,7 +133,7 @@ export type DemoJobsModel = {
 	overview: AdminJobsOverviewResponse;
 	realtimeTasks: AdminRealtimeTaskItem[];
 	scheduledRuns: AdminRealtimeTaskItem[];
-	subscriptionRuns: AdminRealtimeTaskItem[];
+	subscriptionRuns: AdminSubscriptionRunItem[];
 	syncRuntimeConfig: AdminSyncRuntimeConfigResponse;
 	webhookPushRuntimeConfig: AdminWebhookPushRuntimeConfigResponse;
 	llmStatus: AdminLlmSchedulerStatusResponse;

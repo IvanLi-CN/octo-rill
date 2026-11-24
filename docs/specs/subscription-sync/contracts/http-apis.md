@@ -61,9 +61,8 @@ Notes:
 - `retry_recent_failures_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `10`.
 - `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots only; it does not change `sync.subscriptions` scheduler cadence.
-- `recent_sync_tasks` returns the newest three `sync.subscriptions` tasks.
-- `duration_ms` is the chain duration from the root `sync.subscriptions.created_at` to the latest finished time among the root task and direct child `translate.release.batch` / `summarize.release.smart.batch` tasks.
-- `finished_at` is the same chain completion time; `duration_ms` and `finished_at` are `null` until the root and those direct child tasks all have `finished_at`.
+- `recent_sync_tasks` returns the newest five tasks in the current sync group (`sync.releases` and `sync.notifications` under the PostgreSQL runtime; `sync.subscriptions` in imported history is excluded). Skipped tasks are included and expose `skipped: true` so the settings list can label them.
+- `duration_ms` is `finished_at - created_at` for each listed task and `null` while the task has no `finished_at`.
 
 ## `PATCH /api/admin/jobs/sync/runtime-config`
 
@@ -97,16 +96,33 @@ Behavior:
 Behavior:
 
 - Admin only.
-- Returns the existing paginated task list shape, filtered to `sync.subscriptions`.
-- Used by `/admin/jobs/subscriptions` to show all subscription sync runs regardless of scheduler/manual/retry source.
+- Returns the existing paginated task list shape, filtered to `sync.subscriptions`; the PostgreSQL runtime never writes this task type.
+- Task-detail and direct history reads may use this filter; the subscription list itself uses `GET /api/admin/jobs/subscriptions/runs`.
+
+## `GET /api/admin/jobs/subscriptions/runs`
+
+Behavior:
+
+- Admin only.
+- Groups `sync.releases` and `sync.notifications` by the payload `schedule_key` into one item per scheduler run.
+- A task without `schedule_key` (manual trigger) is its own item, keyed by task id.
+- Normalizes imported `sync.subscriptions` rows into the same item shape and orders them together with the grouped runs, so the response is one continuous history rather than separate migration-era lists.
+- Accepts `page` and `page_size` (`1-100`, default `20`) and returns `items`, `page`, `page_size`, `total`. Out-of-range values are clamped and the clamped values are echoed; an overflowing `page` returns `400` with `{"code":"bad_request"}`.
+- Runs are ordered newest first by `created_at`, tie-broken by the run key (`schedule_key`, keyless task id, or imported task id) descending.
+- Each item exposes `schedule_key`, `created_at`, `finished_at`, `status`, `users`, `releases`, `notifications`, and the grouped task rows.
+- `created_at` is the earliest task `created_at`. `finished_at` is the latest task `finished_at` and is `null` while the run is `queued` or `running`.
+- `status` for a grouped `sync.releases` / `sync.notifications` run is `running` while any task runs, `queued` while none run and at least one task is queued, `failed` when every task failed or was cancelled, `partial` when only some failed or were cancelled, otherwise `succeeded`.
+- `status` for an imported `sync.subscriptions` row additionally yields `skipped` when `result_json.skipped=true`; otherwise it is `partial` when the task succeeded but `critical_events > 0`, `release.failed_repos > 0`, `social.failed_users > 0`, or `notifications.failed_users > 0`, and `failed` / `running` / `queued` follow the task status. Thus `partial` is not limited to task-level failures.
+- `releases` aggregates `tasks`, `succeeded`, `failed`, `running`, `repositories`, `releases`, `failed_repositories`, and `degraded_tasks`; `notifications` aggregates `tasks`, `succeeded`, `failed`, `running`, and `notifications`. Grouped-run counters only accumulate from succeeded tasks; imported rows read the counters from `result_json` and always expose them. Imported `succeeded` and `skipped` rows both count in `succeeded`; an imported run reports `degraded_tasks=1` when `release.failed_repos > 0`.
+- Task rows expose `id`, `task_type`, `status`, `user_id`, timestamps, and `error_message`; `user_id` is `null` for imported rows and `error_message` is nullable. Grouped-run task rows expose the per-task `repositories` / `releases` / `notifications` counters only when the task succeeded; imported task rows always expose them.
 
 ## `/admin/jobs/subscriptions`
 
 Route behavior:
 
 - Admin-only SPA route.
-- Shows `sync.subscriptions` runs as a workflow list.
-- Links each run to `/admin/jobs/subscriptions/{task_id}`.
+- Shows one continuous run history from `GET /api/admin/jobs/subscriptions/runs`, including normalized imported `sync.subscriptions` rows.
+- `sync.releases` / `sync.notifications` task rows open the shared task detail drawer (`/admin/jobs/tasks/{task_id}?from=subscriptions`); `sync.subscriptions` task rows open `/admin/jobs/subscriptions/{task_id}`.
 - Shares `GET/PATCH /api/admin/jobs/sync/runtime-config` with the scheduled tab for the settings button.
 - The shared settings dialog makes `sync.subscriptions` interval/budget the only editable subscription controls; the scheduled task dialog shows a read-only summary and link, while `retry.recent_failures` remains separately editable.
 
@@ -114,7 +130,7 @@ Route behavior:
 
 Route behavior:
 
-- Admin-only SPA route.
+- Admin-only SPA route for an imported `sync.subscriptions` task.
 - Uses `GET /api/admin/jobs/realtime/{task_id}` for the workflow detail data.
 - Renders a full-page workflow view with stage progress, worker/work-item summaries, failure causes, recent events, related child/LLM work, and the same runtime settings entry as the list page.
 

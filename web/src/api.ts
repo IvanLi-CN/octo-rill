@@ -944,6 +944,58 @@ export type AdminRealtimeTasksResponse = {
 	page_size: number;
 	total: number;
 };
+export type AdminSubscriptionRunStatus =
+	| "queued"
+	| "running"
+	| "succeeded"
+	| "partial"
+	| "skipped"
+	| "failed";
+export type AdminSubscriptionRunTaskItem = {
+	id: string;
+	task_type: string;
+	status: string;
+	user_id: string | null;
+	created_at: string;
+	finished_at: string | null;
+	error_message: string | null;
+	repositories?: number;
+	releases?: number;
+	notifications?: number;
+};
+export type AdminSubscriptionRunReleaseStats = {
+	tasks: number;
+	succeeded: number;
+	failed: number;
+	running: number;
+	repositories: number;
+	releases: number;
+	failed_repositories: number;
+	degraded_tasks: number;
+};
+export type AdminSubscriptionRunNotificationStats = {
+	tasks: number;
+	succeeded: number;
+	failed: number;
+	running: number;
+	notifications: number;
+};
+export type AdminSubscriptionRunItem = {
+	schedule_key: string;
+	created_at: string;
+	finished_at: string | null;
+	status: AdminSubscriptionRunStatus;
+	users: number;
+	releases: AdminSubscriptionRunReleaseStats;
+	notifications: AdminSubscriptionRunNotificationStats;
+	tasks: AdminSubscriptionRunTaskItem[];
+};
+export type AdminSubscriptionRunsResponse = {
+	items: AdminSubscriptionRunItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
 export type AdminTaskEventItem = {
 	id: string;
 	event_type: string;
@@ -1543,6 +1595,13 @@ export async function apiGetAdminRealtimeTasks(
 ): Promise<AdminRealtimeTasksResponse> {
 	return apiGet<AdminRealtimeTasksResponse>(
 		`/api/admin/jobs/realtime?${params.toString()}`,
+	);
+}
+export async function apiGetAdminSubscriptionRuns(
+	params: URLSearchParams,
+): Promise<AdminSubscriptionRunsResponse> {
+	return apiGet<AdminSubscriptionRunsResponse>(
+		`/api/admin/jobs/subscriptions/runs?${params.toString()}`,
 	);
 }
 export async function apiGetAdminRealtimeTaskDetail(
