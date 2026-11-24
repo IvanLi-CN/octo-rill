@@ -702,6 +702,7 @@ fn summarize_imported_subscription_run(
     let result = parse_json(row.result_json.as_deref());
     let result_object = result.as_ref().and_then(Value::as_object);
     let collect = json_get_object(result_object, "collect");
+    let star = json_get_object(result_object, "star");
     let release = json_get_object(result_object, "release");
     let social = json_get_object(result_object, "social");
     let notifications = json_get_object(result_object, "notifications");
@@ -742,7 +743,11 @@ fn summarize_imported_subscription_run(
         created_at,
         finished_at: row.finished_at,
         status,
-        users: json_get_i64(collect, "total_users").unwrap_or(0),
+        users: json_get_i64(collect, "total_users")
+            .or_else(|| json_get_i64(star, "total_users"))
+            .or_else(|| json_get_i64(social, "total_users"))
+            .or_else(|| json_get_i64(notifications, "total_users"))
+            .unwrap_or(0),
         releases: SubscriptionRunReleaseStats {
             tasks: 1,
             succeeded,
@@ -2255,5 +2260,34 @@ mod tests {
         );
         assert_eq!(run.status, "skipped");
         assert_eq!(run.schedule_key, "daily-07");
+    }
+
+    #[test]
+    fn imported_legacy_subscription_run_falls_back_to_star_users() {
+        let created = run_timestamp(40);
+        let run = summarize_imported_subscription_run(
+            "sub-legacy".to_owned(),
+            created,
+            SubscriptionRunTaskRow {
+                id: "sub-legacy".to_owned(),
+                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                status: STATUS_SUCCEEDED.to_owned(),
+                schedule_key: Some("2026-03-08T11:30".to_owned()),
+                payload_json: Some(
+                    r#"{"trigger":"schedule","schedule_key":"2026-03-08T11:30"}"#.to_owned(),
+                ),
+                result_json: Some(
+                    r#"{"star":{"total_users":1,"succeeded_users":1,"failed_users":0,"total_repos":201},"release":{"succeeded_repos":201,"failed_repos":0},"releases_written":21961,"critical_events":0}"#
+                        .to_owned(),
+                ),
+                error_message: None,
+                created_at: created,
+                finished_at: Some(run_timestamp(41)),
+            },
+        );
+        assert_eq!(run.status, "succeeded");
+        assert_eq!(run.users, 1);
+        assert_eq!(run.releases.repositories, 201);
+        assert_eq!(run.releases.releases, 21961);
     }
 }
