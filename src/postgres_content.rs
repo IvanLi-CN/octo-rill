@@ -129,7 +129,8 @@ async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>
     let row = sqlx::query_as::<_, ClaimedWork>(
         r#"
         SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant,
-               target_lang, source_hash, protocol_version, source_snapshot_json, attempt_count
+               target_lang, source_hash, protocol_version, source_snapshot_json,
+               attempt_count::integer AS attempt_count
         FROM public.content_work_items
         WHERE status = 'queued'
           AND evidence_status IN ('not_required', 'ready')
@@ -148,7 +149,7 @@ async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>
         return Ok(None);
     };
     let attempt_count: i32 = sqlx::query_scalar(
-        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', next_retry_at = NULL, retry_after_at = NULL, updated_at = now() WHERE id = $1 RETURNING attempt_count",
+        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', next_retry_at = NULL, retry_after_at = NULL, updated_at = now() WHERE id = $1 RETURNING attempt_count::integer AS attempt_count",
     )
     .bind(&work.id)
     .bind(LEASE_OWNER)
@@ -582,7 +583,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
 /// Requeue work whose worker lease expired without a terminal attempt.
 pub(crate) async fn recover_expired_leases(pool: &PgPool) -> Result<u64> {
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN 'failed' ELSE 'queued' END, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN NULL ELSE now() + interval '60 seconds' END, retry_expires_at = COALESCE(retry_expires_at::timestamptz, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at::timestamptz <= now() ORDER BY lease_expires_at::timestamptz LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+        "UPDATE public.content_work_items SET status = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN 'failed' ELSE 'queued' END, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN NULL ELSE now() + interval '60 seconds' END, retry_expires_at = COALESCE(retry_expires_at::timestamptz, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at::timestamptz <= now() ORDER BY lease_expires_at::timestamptz LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count::integer AS attempt_count",
     )
     .bind(RECOVERY_BATCH)
     .fetch_all(pool)
@@ -623,7 +624,7 @@ pub(crate) async fn unblock_reconfigured_work(pool: &PgPool, fallback_model: &st
     }
     let fingerprint = configuration_fingerprint(&models);
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count::integer AS attempt_count",
     )
     .bind(&fingerprint)
     .bind(RECOVERY_BATCH)
@@ -1056,7 +1057,8 @@ mod tests {
                 ALTER TABLE public.content_work_items
                     ALTER COLUMN cache_hit DROP DEFAULT,
                     ALTER COLUMN cache_hit TYPE bigint USING cache_hit::int::bigint,
-                    ALTER COLUMN cache_hit SET DEFAULT 0;
+                    ALTER COLUMN cache_hit SET DEFAULT 0,
+                    ALTER COLUMN attempt_count TYPE bigint USING attempt_count::bigint;
                 INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
                   VALUES (46, 7, 'https://github.com/acme/demo/releases/tag/v2', 'v2', 'v2', 'Second notes', '2026-11-24T01:00:00Z');
                 "#,
