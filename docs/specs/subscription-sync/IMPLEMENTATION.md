@@ -9,6 +9,7 @@
 
 ## 当前状态
 
+- The admin subscription view reads `GET /api/admin/jobs/subscriptions/runs`, which groups per-user `sync.releases` / `sync.notifications` tasks by payload `schedule_key` and normalizes imported `sync.subscriptions` rows into the same run shape, producing one continuous history with no migration-era split.
 - Follow-up candidate preserves typed `ApiError` across Social content-processing adapters, so foreground `sqlite_write_retryable` failures are classified as recoverable SQLite backpressure while genuine upstream failures retain their non-recoverable classification.
 - PR #340 executable candidate `6efe5732` preserves retryable-versus-fatal source classification when Social persistence fails after a partial snapshot and gives terminal 401/404/451 statuses precedence over rate-limit metadata; focused regressions cover both combined-error classes and terminal HTTP headers.
 - PR #340 executable candidate `97843ed6` makes access-refresh progress/log metadata use the shared Social classifier: retryable completed source degradation is warning/recoverable with `next_sync_subscriptions_run`, while non-retryable upstream errors remain error/non-recoverable; the Notifications continuation regression covers the production-shaped dependency path.

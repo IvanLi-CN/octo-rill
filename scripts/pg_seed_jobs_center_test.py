@@ -474,6 +474,122 @@ def main():
             assert running_subscriptions['releases_written'] == 30, running_subscriptions
             assert running_subscriptions['recent_events'] == [], running_subscriptions
 
+            # ---- current subscription lane runs ---------------------------------
+            # The PostgreSQL scheduler writes per-user `sync.releases` and
+            # `sync.notifications` rows. `/admin/jobs/subscriptions` groups them
+            # by `schedule_key` instead of querying the retired
+            # `sync.subscriptions` type.
+            sql(
+                """
+                INSERT INTO public.job_tasks
+                  (id, task_type, status, source, payload_json, result_json,
+                   error_message, cancel_requested, created_at, started_at,
+                   finished_at, updated_at)
+                VALUES
+                  ('sub-run-release', 'sync.releases', 'succeeded', 'scheduler',
+                   '{"trigger":"schedule","schedule_key":"interval:10:1795485000",'
+                   '"interval_minutes":10,"user_id":"seed-user"}',
+                   '{"user_id":"seed-user","repositories":4,"releases":12,'
+                   '"failed_count":1,"degraded":true}', NULL, 0,
+                   now() - interval '3 minutes', now() - interval '3 minutes',
+                   now() - interval '2 minutes', now() - interval '2 minutes'),
+                  ('sub-run-notify', 'sync.notifications', 'failed', 'scheduler',
+                   '{"trigger":"schedule","schedule_key":"interval:10:1795485000",'
+                   '"interval_minutes":10,"user_id":"seed-user"}',
+                   NULL, 'notifications boom', 0,
+                   now() - interval '3 minutes', now() - interval '3 minutes',
+                   now() - interval '2 minutes', now() - interval '2 minutes'),
+                  ('sub-run-manual', 'sync.notifications', 'succeeded',
+                   'api.sync.notifications', '{"user_id":"seed-user"}',
+                   '{"notifications":3,"user_id":"seed-user"}', NULL, 0,
+                   now() - interval '4 minutes', now() - interval '4 minutes',
+                   now() - interval '3 minutes', now() - interval '3 minutes')
+                """,
+                url,
+            )
+            code, run_page = request(
+                '/api/admin/jobs/subscriptions/runs?page=1&page_size=10'
+            )
+            assert code == 200, (code, run_page)
+            # One grouped PostgreSQL run, the keyless `rt-notify` run, one
+            # manual run and the three imported `sync.subscriptions` rows, all
+            # in one continuous history.
+            assert run_page['total'] == 6, run_page
+            run = run_page['items'][0]
+            assert run['schedule_key'] == 'interval:10:1795485000', run
+            assert run['status'] == 'partial', run
+            assert run['users'] == 1, run
+            assert run['releases'] == {
+                'tasks': 1,
+                'succeeded': 1,
+                'failed': 0,
+                'running': 0,
+                'repositories': 4,
+                'releases': 12,
+                'failed_repositories': 1,
+                'degraded_tasks': 1,
+            }, run['releases']
+            assert run['notifications'] == {
+                'tasks': 1,
+                'succeeded': 0,
+                'failed': 1,
+                'running': 0,
+                'notifications': 0,
+            }, run['notifications']
+            assert [task['id'] for task in run['tasks']] == [
+                'sub-run-notify',
+                'sub-run-release',
+            ], run['tasks']
+            assert run['tasks'][1]['repositories'] == 4, run['tasks'][1]
+            assert run['tasks'][1]['releases'] == 12, run['tasks'][1]
+            assert run['tasks'][0]['error_message'] == 'notifications boom', run['tasks'][0]
+            assert run['finished_at'] is not None, run
+            by_task_id = {
+                item['tasks'][0]['id']: item
+                for item in run_page['items']
+                if item['tasks'][0]['task_type'] == 'sync.subscriptions'
+            }
+            assert set(by_task_id) == {'sub-1', 'sub-2', 'sub-3'}, sorted(by_task_id)
+            skipped_run = by_task_id['sub-1']
+            assert skipped_run['status'] == 'skipped', skipped_run
+            assert skipped_run['schedule_key'] == 'daily-06', skipped_run
+            assert skipped_run['tasks'][0]['task_type'] == 'sync.subscriptions', skipped_run
+            assert skipped_run['releases']['repositories'] == 0, skipped_run
+            failed_run = by_task_id['sub-2']
+            assert failed_run['status'] == 'failed', failed_run
+            assert failed_run['tasks'][0]['error_message'] == 'subscription boom', failed_run
+            assert failed_run['releases']['repositories'] == 1, failed_run
+            assert failed_run['releases']['failed_repositories'] == 1, failed_run
+            running_run = by_task_id['sub-3']
+            assert running_run['status'] == 'running', running_run
+            assert running_run['finished_at'] is None, running_run
+            manual_run = next(
+                item
+                for item in run_page['items']
+                if item['tasks'][0]['id'] == 'sub-run-manual'
+            )
+            assert manual_run['status'] == 'succeeded', manual_run
+            assert manual_run['users'] == 1, manual_run
+            assert manual_run['schedule_key'] == 'sub-run-manual', manual_run
+            assert manual_run['notifications']['notifications'] == 3, manual_run
+            rt_run = next(
+                item
+                for item in run_page['items']
+                if item['tasks'][0]['id'] == 'rt-notify'
+            )
+            assert rt_run['status'] == 'running', rt_run
+            assert rt_run['schedule_key'] == 'rt-notify', rt_run
+            code, empty_page = request(
+                '/api/admin/jobs/subscriptions/runs?page=2&page_size=10'
+            )
+            assert code == 200 and empty_page['items'] == [], empty_page
+            assert empty_page['total'] == 6, empty_page
+            sql(
+                "DELETE FROM public.job_tasks "
+                "WHERE id IN ('sub-run-release', 'sub-run-notify', 'sub-run-manual')",
+                url,
+            )
+
             # ---- migration read plans ------------------------------------------
             indexes = set(
                 sql(

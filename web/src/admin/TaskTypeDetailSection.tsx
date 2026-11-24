@@ -466,7 +466,8 @@ function buildTaskDetailPageModel(
 			};
 		}
 		case "sync.releases": {
-			const syncedRepos = readNumber(result, "repos");
+			const syncedRepos =
+				readNumber(result, "repositories") ?? readNumber(result, "repos");
 			const syncedReleases = readNumber(result, "releases");
 			return {
 				pageTitle: "同步 Release 详情页",

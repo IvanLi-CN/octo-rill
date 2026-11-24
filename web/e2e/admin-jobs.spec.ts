@@ -187,6 +187,164 @@ async function installAdminJobsMocks(
 		},
 	];
 
+	const subscriptionRunItems = [
+		{
+			schedule_key: "interval:10:1795485000",
+			created_at: "2026-02-26T14:50:00Z",
+			finished_at: "2026-02-26T14:54:10Z",
+			status: "succeeded",
+			users: 2,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 402,
+				releases: 1500,
+				failed_repositories: 0,
+				degraded_tasks: 0,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 139,
+			},
+			tasks: [
+				{
+					id: "task-sync-releases-1",
+					task_type: "sync.releases",
+					status: "succeeded",
+					user_id: CURRENT_USER_ID,
+					created_at: "2026-02-26T14:50:00Z",
+					finished_at: "2026-02-26T14:54:10Z",
+					error_message: null,
+					repositories: 402,
+					releases: 1500,
+				},
+				{
+					id: "task-sync-notifications-1",
+					task_type: "sync.notifications",
+					status: "succeeded",
+					user_id: RECENT_EVENT_USER_ID,
+					created_at: "2026-02-26T14:50:00Z",
+					finished_at: "2026-02-26T14:52:00Z",
+					error_message: null,
+					notifications: 139,
+				},
+			],
+		},
+		{
+			schedule_key: "interval:10:1795484400",
+			created_at: "2026-02-26T14:40:00Z",
+			finished_at: "2026-02-26T14:44:00Z",
+			status: "partial",
+			users: 1,
+			releases: {
+				tasks: 1,
+				succeeded: 0,
+				failed: 1,
+				running: 0,
+				repositories: 0,
+				releases: 0,
+				failed_repositories: 3,
+				degraded_tasks: 0,
+			},
+			notifications: {
+				tasks: 0,
+				succeeded: 0,
+				failed: 0,
+				running: 0,
+				notifications: 0,
+			},
+			tasks: [
+				{
+					id: "task-sync-releases-2",
+					task_type: "sync.releases",
+					status: "failed",
+					user_id: CURRENT_USER_ID,
+					created_at: "2026-02-26T14:40:00Z",
+					finished_at: "2026-02-26T14:44:00Z",
+					error_message: "every repository whose read was attempted failed",
+				},
+			],
+		},
+		{
+			schedule_key: "2026-02-26T14:30",
+			created_at: "2026-02-26T14:30:00Z",
+			finished_at: "2026-02-26T14:38:10Z",
+			status: "partial",
+			users: 12,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 11,
+				releases: 24,
+				failed_repositories: 1,
+				degraded_tasks: 1,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 192,
+			},
+			tasks: [
+				{
+					id: "task-subscriptions-1",
+					task_type: "sync.subscriptions",
+					status: "succeeded",
+					user_id: null,
+					created_at: "2026-02-26T14:30:00Z",
+					finished_at: "2026-02-26T14:38:10Z",
+					error_message: null,
+					repositories: 11,
+					releases: 24,
+					notifications: 192,
+				},
+			],
+		},
+		{
+			schedule_key: "2026-02-26T14:40",
+			created_at: "2026-02-26T14:40:00Z",
+			finished_at: "2026-02-26T14:40:01Z",
+			status: "skipped",
+			users: 0,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 0,
+				releases: 0,
+				failed_repositories: 0,
+				degraded_tasks: 0,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 0,
+			},
+			tasks: [
+				{
+					id: "task-subscriptions-skipped",
+					task_type: "sync.subscriptions",
+					status: "succeeded",
+					user_id: null,
+					created_at: "2026-02-26T14:40:00Z",
+					finished_at: "2026-02-26T14:40:01Z",
+					error_message: null,
+				},
+			],
+		},
+	];
+
 	const llmCalls = [
 		{
 			id: "llm-call-1",
@@ -1109,26 +1267,24 @@ async function installAdminJobsMocks(
 					);
 				}
 				if (taskGroup === "realtime") {
-					return !Boolean(
-						{
-							"brief.daily_slot": true,
-							"brief.generate": true,
-							"sync.releases": true,
-							"sync.notifications": true,
-							"webhook.push.manage": true,
-							"retry.recent_failures": true,
-							"release.reading_backfill": true,
-							"sync.starred": true,
-							"sync.subscriptions": true,
-							"summarize.release.smart.batch": true,
-							"release.evidence": true,
-							"sync.starred.delta": true,
-							"sync.starred.reconcile": true,
-							"brief.history_recompute": true,
-							"brief.refresh_content": true,
-							"webhook.push.audit": true,
-						}[task.task_type],
-					);
+					return !{
+						"brief.daily_slot": true,
+						"brief.generate": true,
+						"sync.releases": true,
+						"sync.notifications": true,
+						"webhook.push.manage": true,
+						"retry.recent_failures": true,
+						"release.reading_backfill": true,
+						"sync.starred": true,
+						"sync.subscriptions": true,
+						"summarize.release.smart.batch": true,
+						"release.evidence": true,
+						"sync.starred.delta": true,
+						"sync.starred.reconcile": true,
+						"brief.history_recompute": true,
+						"brief.refresh_content": true,
+						"webhook.push.audit": true,
+					}[task.task_type];
 				}
 				if (taskGroup === "user_sync") {
 					return task.task_type === "sync.starred";
@@ -1160,6 +1316,21 @@ async function installAdminJobsMocks(
 				page: 1,
 				page_size: 20,
 				total: filtered.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/subscriptions/runs"
+		) {
+			const page = Number(url.searchParams.get("page") ?? "1");
+			const pageSize = Number(url.searchParams.get("page_size") ?? "20");
+			const start = (page - 1) * pageSize;
+			return json(route, {
+				items: subscriptionRunItems.slice(start, start + pageSize),
+				page,
+				page_size: pageSize,
+				total: subscriptionRunItems.length,
 			});
 		}
 
@@ -1382,6 +1553,121 @@ async function installAdminJobsMocks(
 			!pathname.endsWith("/log")
 		) {
 			const taskId = pathname.split("/").at(-1) ?? "";
+			if (taskId === "task-sync-releases-1") {
+				return json(route, {
+					task: {
+						id: taskId,
+						task_type: "sync.releases",
+						task_group: "sync",
+						legacy: false,
+						status: "succeeded",
+						source: "scheduler",
+						requested_by: null,
+						parent_task_id: null,
+						cancel_requested: false,
+						error_message: null,
+						created_at: "2026-02-26T14:50:00Z",
+						started_at: "2026-02-26T14:50:01Z",
+						finished_at: "2026-02-26T14:54:10Z",
+						updated_at: "2026-02-26T14:54:10Z",
+						payload_json: JSON.stringify({
+							user_id: CURRENT_USER_ID,
+							trigger: "schedule",
+							schedule_key: "interval:10:1795485000",
+							interval_minutes: 10,
+						}),
+						result_json: JSON.stringify({
+							releases: 1500,
+							repositories: 402,
+							user_id: CURRENT_USER_ID,
+							failed_count: 0,
+							degraded: false,
+							failure_reasons: {},
+							translations_enqueued: 0,
+						}),
+					},
+					events: [],
+					event_meta: {
+						returned: 0,
+						total: 0,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: null,
+				});
+			}
+			if (taskId === "task-sync-notifications-1") {
+				return json(route, {
+					task: {
+						id: taskId,
+						task_type: "sync.notifications",
+						task_group: "sync",
+						legacy: false,
+						status: "succeeded",
+						source: "scheduler",
+						requested_by: null,
+						parent_task_id: null,
+						cancel_requested: false,
+						error_message: null,
+						created_at: "2026-02-26T14:50:00Z",
+						started_at: "2026-02-26T14:50:01Z",
+						finished_at: "2026-02-26T14:52:00Z",
+						updated_at: "2026-02-26T14:52:00Z",
+						payload_json: JSON.stringify({
+							user_id: RECENT_EVENT_USER_ID,
+							trigger: "schedule",
+							schedule_key: "interval:10:1795485000",
+							interval_minutes: 10,
+						}),
+						result_json: JSON.stringify({
+							notifications: 139,
+							user_id: RECENT_EVENT_USER_ID,
+						}),
+					},
+					events: [],
+					event_meta: {
+						returned: 0,
+						total: 0,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: null,
+				});
+			}
+			if (taskId === "task-sync-releases-2") {
+				return json(route, {
+					task: {
+						id: taskId,
+						task_type: "sync.releases",
+						task_group: "sync",
+						legacy: false,
+						status: "failed",
+						source: "scheduler",
+						requested_by: null,
+						parent_task_id: null,
+						cancel_requested: false,
+						error_message: "every repository whose read was attempted failed",
+						created_at: "2026-02-26T14:40:00Z",
+						started_at: "2026-02-26T14:40:01Z",
+						finished_at: "2026-02-26T14:44:00Z",
+						updated_at: "2026-02-26T14:44:00Z",
+						payload_json: JSON.stringify({
+							user_id: CURRENT_USER_ID,
+							trigger: "schedule",
+							schedule_key: "interval:10:1795484400",
+						}),
+						result_json: null,
+					},
+					events: [],
+					event_meta: {
+						returned: 0,
+						total: 0,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: null,
+				});
+			}
 			const task = tasks.find((item) => item.id === taskId);
 			if (!task) {
 				return json(
@@ -2457,18 +2743,41 @@ test("admin can manage jobs center", async ({ page }) => {
 	await subscriptionsTab.click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
 	await expect(subscriptionsTab).toHaveAttribute("aria-selected", "true");
-	const subscriptionWorkflowCard = page
-		.getByText("ID: task-subscriptions-1")
-		.locator("xpath=ancestor::a[@data-testid='subscription-workflow-card'][1]");
-	await expect(subscriptionWorkflowCard).toBeVisible();
-	await expect(subscriptionWorkflowCard).toHaveAttribute(
-		"href",
-		"/admin/jobs/subscriptions/task-subscriptions-1",
+	const currentSubscriptionRun = page.locator(
+		'[data-testid="subscription-run-card"][data-schedule-key="interval:10:1795485000"]',
+	);
+	await expect(currentSubscriptionRun).toBeVisible();
+	await expect(page.getByText("旧 SQLite 期")).toHaveCount(0);
+	await expect(
+		currentSubscriptionRun.getByText("订阅同步", { exact: true }),
+	).toBeVisible();
+	const releaseRunTask = currentSubscriptionRun.locator(
+		'[data-testid="subscription-run-task"][data-task-id="task-sync-releases-1"]',
 	);
 	await expect(
-		subscriptionWorkflowCard.getByText("旧 SQLite 期"),
+		releaseRunTask.getByText("仓库 402 · Release 1,500"),
 	).toBeVisible();
-	await subscriptionWorkflowCard.click();
+	await releaseRunTask
+		.getByRole("button", { name: "查看任务详情 task-sync-releases-1" })
+		.click();
+	await expect(taskSheet).toBeVisible();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-sync-releases-1\?from=subscriptions$/,
+	);
+	await expect(taskSheet.getByText("覆盖仓库数")).toBeVisible();
+	await expect(taskSheet.getByText("402", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
+	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
+
+	const legacyRunTask = page.locator(
+		'[data-testid="subscription-run-task"][data-task-id="task-subscriptions-1"]',
+	);
+	await expect(legacyRunTask).toBeVisible();
+	await expect(legacyRunTask.getByText("仓库 11 · Release 24")).toBeVisible();
+	await legacyRunTask
+		.getByRole("button", { name: "查看任务详情 task-subscriptions-1" })
+		.click();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/subscriptions\/task-subscriptions-1$/,
 	);
@@ -2729,91 +3038,6 @@ test("admin subscription number drafts recover from invalid values", async ({
 		repo_release_worker_concurrency: 10,
 		repo_refresh_system_budget_per_window: 1500,
 	});
-});
-
-test("subscription workflow cards keep a neutral frame without extra left-edge decoration", async ({
-	page,
-}) => {
-	await installAdminJobsMocks(page);
-
-	await page.goto("/admin/jobs/subscriptions");
-
-	const taskIds = ["task-subscriptions-1", "task-subscriptions-skipped"];
-	const cards = taskIds.map((taskId) =>
-		page.locator(
-			`[data-testid="subscription-workflow-card"][data-task-id="${taskId}"]`,
-		),
-	);
-	for (const card of cards) {
-		await expect(card).toBeVisible();
-	}
-
-	const frameStyles = await Promise.all(
-		cards.map((card) =>
-			card.evaluate((element) => {
-				const style = getComputedStyle(element);
-				return {
-					borderLeftColor: style.borderLeftColor,
-					borderLeftWidth: style.borderLeftWidth,
-					borderRightColor: style.borderRightColor,
-					borderRightWidth: style.borderRightWidth,
-					borderTopColor: style.borderTopColor,
-					borderTopWidth: style.borderTopWidth,
-					borderRadius: style.borderRadius,
-				};
-			}),
-		),
-	);
-	expect(
-		new Set(frameStyles.map((styles) => styles.borderLeftColor)).size,
-	).toBe(1);
-	for (const styles of frameStyles) {
-		expect(styles.borderTopColor).toBe(styles.borderLeftColor);
-		expect(styles.borderRightColor).toBe(styles.borderLeftColor);
-		expect(styles.borderTopWidth).toBe("0px");
-		expect(styles.borderLeftWidth).toBe("0px");
-		expect(styles.borderRightWidth).toBe("0px");
-		expect(styles.borderRadius).toBe("0px");
-	}
-	for (const card of cards) {
-		await expect(
-			card.getByTestId("subscription-workflow-card-accent"),
-		).toHaveCount(0);
-		const stageGrid = card.getByTestId("subscription-workflow-stage-grid");
-		if ((await stageGrid.count()) > 0) {
-			const stageGridStyles = await stageGrid.evaluate((element) => {
-				const style = getComputedStyle(element);
-				return {
-					borderLeftWidth: style.borderLeftWidth,
-					borderRightWidth: style.borderRightWidth,
-					borderTopWidth: style.borderTopWidth,
-					borderRadius: style.borderRadius,
-				};
-			});
-			expect(stageGridStyles.borderLeftWidth).toBe("0px");
-			expect(stageGridStyles.borderRightWidth).toBe("0px");
-			expect(stageGridStyles.borderTopWidth).toBe("0px");
-			expect(stageGridStyles.borderRadius).toBe("0px");
-		}
-		const issueSummaryBorderWidths = await card.evaluate((element) => {
-			return Array.from(element.querySelectorAll("p"))
-				.filter((node) => node.textContent?.includes("异常焦点"))
-				.map((node) => {
-					const style = getComputedStyle(node);
-					return {
-						borderLeftWidth: style.borderLeftWidth,
-						borderTopWidth: style.borderTopWidth,
-					};
-				});
-		});
-		expect(issueSummaryBorderWidths.length).toBeGreaterThan(0);
-		expect(
-			issueSummaryBorderWidths.every(
-				(widths) =>
-					widths.borderLeftWidth === "0px" && widths.borderTopWidth === "0px",
-			),
-		).toBe(true);
-	}
 });
 
 test("admin jobs tabs are URL-driven and support deep links plus history", async ({
@@ -4953,14 +5177,13 @@ test("skipped subscription workflow renders skipped semantics", async ({
 	await page.goto("/admin/jobs/subscriptions");
 
 	const skippedWorkflowCard = page
-		.getByText("ID: task-subscriptions-skipped")
-		.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
-	await expect(
-		skippedWorkflowCard.locator("[data-slot='badge']").getByText("已跳过"),
-	).toBeVisible();
-	await expect(
-		skippedWorkflowCard.locator("[data-slot='badge']").getByText("成功"),
-	).toHaveCount(0);
+		.locator('[data-testid="subscription-run-card"]')
+		.filter({
+			has: page.locator('[data-task-id="task-subscriptions-skipped"]'),
+		});
+	await expect(skippedWorkflowCard).toBeVisible();
+	await expect(skippedWorkflowCard.getByText("已跳过")).toBeVisible();
+	await expect(skippedWorkflowCard.getByText("旧 SQLite 期")).toHaveCount(0);
 
 	await page.goto("/admin/jobs/subscriptions/task-subscriptions-skipped");
 

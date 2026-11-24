@@ -61,9 +61,8 @@ Notes:
 - `retry_recent_failures_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `10`.
 - `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots only; it does not change `sync.subscriptions` scheduler cadence.
-- `recent_sync_tasks` returns the newest three `sync.subscriptions` tasks.
-- `duration_ms` is the chain duration from the root `sync.subscriptions.created_at` to the latest finished time among the root task and direct child `translate.release.batch` / `summarize.release.smart.batch` tasks.
-- `finished_at` is the same chain completion time; `duration_ms` and `finished_at` are `null` until the root and those direct child tasks all have `finished_at`.
+- `recent_sync_tasks` returns the newest five tasks in the current sync group (`sync.releases` and `sync.notifications` under the PostgreSQL runtime; `sync.subscriptions` in imported history is excluded).
+- `duration_ms` is `finished_at - created_at` for each listed task and `null` while the task has no `finished_at`.
 
 ## `PATCH /api/admin/jobs/sync/runtime-config`
 
@@ -97,16 +96,30 @@ Behavior:
 Behavior:
 
 - Admin only.
-- Returns the existing paginated task list shape, filtered to `sync.subscriptions`.
-- Used by `/admin/jobs/subscriptions` to show all subscription sync runs regardless of scheduler/manual/retry source.
+- Returns the existing paginated task list shape, filtered to `sync.subscriptions`; the PostgreSQL runtime never writes this task type.
+- Task-detail and direct history reads may use this filter; the subscription list itself uses `GET /api/admin/jobs/subscriptions/runs`.
+
+## `GET /api/admin/jobs/subscriptions/runs`
+
+Behavior:
+
+- Admin only.
+- Groups `sync.releases` and `sync.notifications` by the payload `schedule_key` into one item per scheduler run.
+- A task without `schedule_key` (manual trigger) is its own item, keyed by task id.
+- Normalizes imported `sync.subscriptions` rows into the same item shape and orders them together with the grouped runs, so the response is one continuous history rather than separate migration-era lists.
+- Accepts `page` and `page_size` (`1-100`, default `20`) and returns `items`, `page`, `page_size`, `total`.
+- Each item exposes `schedule_key`, `created_at`, `finished_at`, `status`, `users`, `releases`, `notifications`, and the grouped task rows.
+- `status` is `running` while any task runs, `queued` while none run and any task is queued, `failed` when every terminal task failed or was cancelled, `partial` when only some failed, `skipped` for an imported run whose result is skipped, otherwise `succeeded`.
+- `releases` aggregates `tasks`, `succeeded`, `failed`, `running`, `repositories`, `releases`, `failed_repositories`, and `degraded_tasks`; `notifications` aggregates `tasks`, `succeeded`, `failed`, `running`, and `notifications`.
+- Task rows expose `id`, `task_type`, `status`, `user_id`, timestamps, `error_message`, and the per-task `repositories` / `releases` / `notifications` counters when the task succeeded.
 
 ## `/admin/jobs/subscriptions`
 
 Route behavior:
 
 - Admin-only SPA route.
-- Shows `sync.subscriptions` runs as a workflow list.
-- Links each run to `/admin/jobs/subscriptions/{task_id}`.
+- Shows one continuous run history from `GET /api/admin/jobs/subscriptions/runs`, including normalized imported `sync.subscriptions` rows.
+- `sync.releases` / `sync.notifications` task rows open the shared task detail drawer (`/admin/jobs/tasks/{task_id}?from=subscriptions`); `sync.subscriptions` task rows open `/admin/jobs/subscriptions/{task_id}`.
 - Shares `GET/PATCH /api/admin/jobs/sync/runtime-config` with the scheduled tab for the settings button.
 - The shared settings dialog makes `sync.subscriptions` interval/budget the only editable subscription controls; the scheduled task dialog shows a read-only summary and link, while `retry.recent_failures` remains separately editable.
 
@@ -114,7 +127,7 @@ Route behavior:
 
 Route behavior:
 
-- Admin-only SPA route.
+- Admin-only SPA route for an imported `sync.subscriptions` task.
 - Uses `GET /api/admin/jobs/realtime/{task_id}` for the workflow detail data.
 - Renders a full-page workflow view with stage progress, worker/work-item summaries, failure causes, recent events, related child/LLM work, and the same runtime settings entry as the list page.
 

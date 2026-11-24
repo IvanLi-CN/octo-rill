@@ -422,6 +422,10 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             "/api/admin/jobs/realtime",
             get(crate::postgres_admin_jobs::realtime_tasks),
         )
+        .route(
+            "/api/admin/jobs/subscriptions/runs",
+            get(crate::postgres_admin_jobs::subscription_runs),
+        )
         .route("/api/public/metrics/v1/octo-rill", get(public_metrics))
         .route("/api/reaction-token/status", get(reaction_token_status))
         .route(

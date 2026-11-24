@@ -2254,7 +2254,6 @@ function updateAdminTask(
 			...model.adminJobs,
 			realtimeTasks: apply(model.adminJobs.realtimeTasks),
 			scheduledRuns: apply(model.adminJobs.scheduledRuns),
-			subscriptionRuns: apply(model.adminJobs.subscriptionRuns),
 			taskDetails: taskDetail
 				? {
 						...model.adminJobs.taskDetails,
@@ -3310,6 +3309,21 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(filterTasks(allAdminTasks(currentModel()), url.searchParams));
+	}),
+	http.get("/api/admin/jobs/subscriptions/runs", async ({ request }) => {
+		const url = new URL(request.url);
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const page = Number(url.searchParams.get("page") ?? "1");
+		const pageSize = Number(url.searchParams.get("page_size") ?? "20");
+		const runs = currentModel().adminJobs.subscriptionRuns;
+		const start = (page - 1) * pageSize;
+		return json({
+			items: runs.slice(start, start + pageSize),
+			page,
+			page_size: pageSize,
+			total: runs.length,
+		});
 	}),
 	http.get("/api/admin/jobs/realtime/:taskId", async ({ params, request }) => {
 		const network = await applyNetworkProfile(request);
