@@ -129,12 +129,13 @@ async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>
     let row = sqlx::query_as::<_, ClaimedWork>(
         r#"
         SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant,
-               target_lang, source_hash, protocol_version, source_snapshot_json, attempt_count
+               target_lang, source_hash, protocol_version, source_snapshot_json,
+               attempt_count::integer AS attempt_count
         FROM public.content_work_items
         WHERE status = 'queued'
           AND evidence_status IN ('not_required', 'ready')
-          AND (next_retry_at IS NULL OR next_retry_at <= now())
-          AND (retry_expires_at IS NULL OR retry_expires_at > now())
+          AND (next_retry_at IS NULL OR next_retry_at::timestamptz <= now())
+          AND (retry_expires_at IS NULL OR retry_expires_at::timestamptz > now())
         ORDER BY priority DESC, created_at ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -148,7 +149,7 @@ async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>
         return Ok(None);
     };
     let attempt_count: i32 = sqlx::query_scalar(
-        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', next_retry_at = NULL, retry_after_at = NULL, updated_at = now() WHERE id = $1 RETURNING attempt_count",
+        "UPDATE public.content_work_items SET status = 'running', attempt_count = attempt_count + 1, started_at = now(), lease_owner = $2, lease_expires_at = now() + interval '300 seconds', next_retry_at = NULL, retry_after_at = NULL, updated_at = now() WHERE id = $1 RETURNING attempt_count::integer AS attempt_count",
     )
     .bind(&work.id)
     .bind(LEASE_OWNER)
@@ -212,7 +213,7 @@ fn next_retry_at(
 
 async fn read_retry_expires(pool: &PgPool, work_item_id: &str) -> Option<DateTime<Utc>> {
     sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT retry_expires_at FROM public.content_work_items WHERE id = $1",
+        "SELECT retry_expires_at::timestamptz FROM public.content_work_items WHERE id = $1",
     )
     .bind(work_item_id)
     .fetch_optional(pool)
@@ -236,7 +237,7 @@ async fn publish_ready(
     };
     let mut tx = pool.begin().await.context("begin content publish")?;
     let owned = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() FOR UPDATE",
+        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at::timestamptz > now() FOR UPDATE",
     )
     .bind(&work.id)
     .bind(work.attempt_count)
@@ -380,7 +381,7 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
     let blocked = failure.class == "configuration";
     let mut tx = pool.begin().await.context("begin content failure")?;
     let owned = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at > now() FOR UPDATE",
+        "SELECT id FROM public.content_work_items WHERE id = $1 AND status = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_expires_at::timestamptz > now() FOR UPDATE",
     )
     .bind(&work.id)
     .bind(work.attempt_count)
@@ -415,7 +416,7 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
         "failed"
     };
     sqlx::query(
-        "UPDATE public.content_work_items SET status = $2, failure_class = $3, next_retry_at = $4, retry_expires_at = COALESCE(retry_expires_at, $5), retry_after_at = $4, finished_at = $6, lease_owner = NULL, lease_expires_at = NULL, updated_at = $6 WHERE id = $1",
+        "UPDATE public.content_work_items SET status = $2, failure_class = $3, next_retry_at = $4, retry_expires_at = COALESCE(retry_expires_at::timestamptz, $5), retry_after_at = $4, finished_at = $6, lease_owner = NULL, lease_expires_at = NULL, updated_at = $6 WHERE id = $1",
     )
     .bind(&work.id)
     .bind(status)
@@ -582,7 +583,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
 /// Requeue work whose worker lease expired without a terminal attempt.
 pub(crate) async fn recover_expired_leases(pool: &PgPool) -> Result<u64> {
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at <= now() THEN 'failed' ELSE 'queued' END, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at <= now() THEN NULL ELSE now() + interval '60 seconds' END, retry_expires_at = COALESCE(retry_expires_at, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now() ORDER BY lease_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+        "UPDATE public.content_work_items SET status = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN 'failed' ELSE 'queued' END, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = CASE WHEN retry_expires_at IS NOT NULL AND retry_expires_at::timestamptz <= now() THEN NULL ELSE now() + interval '60 seconds' END, retry_expires_at = COALESCE(retry_expires_at::timestamptz, now() + interval '24 hours'), retry_after_at = now() + interval '60 seconds', updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at::timestamptz <= now() ORDER BY lease_expires_at::timestamptz LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count::integer AS attempt_count",
     )
     .bind(RECOVERY_BATCH)
     .fetch_all(pool)
@@ -623,7 +624,7 @@ pub(crate) async fn unblock_reconfigured_work(pool: &PgPool, fallback_model: &st
     }
     let fingerprint = configuration_fingerprint(&models);
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count",
+        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count::integer AS attempt_count",
     )
     .bind(&fingerprint)
     .bind(RECOVERY_BATCH)
@@ -847,7 +848,10 @@ pub(crate) async fn admit_release_polish(
             "evidence_status": "not_required",
         }))?;
         let inserted = sqlx::query(
-            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', $3, $4, $5, 'postgres-default', $6, $7, 'queued', 0, false, $8, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
+            // `cache_hit` stays out of the insert: the migrated schema declares
+            // it boolean, the imported one bigint, and both default to a falsy
+            // value, so only the column default is portable.
+            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', $3, $4, $5, 'postgres-default', $6, $7, 'queued', 0, $8, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
         )
         .bind(local_id::generate_local_id())
         .bind(release_id.to_string())
@@ -1032,10 +1036,71 @@ mod tests {
             .await?;
             assert_eq!(linked, 1);
 
+            // Production databases imported from SQLite carry these columns as
+            // text; every comparison must cast so the same SQL works on both
+            // the migrated schema and the imported one.
+            sqlx::raw_sql(
+                r#"
+                ALTER TABLE public.content_work_items
+                    ALTER COLUMN created_at TYPE text USING created_at::text,
+                    ALTER COLUMN updated_at TYPE text USING updated_at::text,
+                    ALTER COLUMN started_at TYPE text USING started_at::text,
+                    ALTER COLUMN finished_at TYPE text USING finished_at::text,
+                    ALTER COLUMN lease_expires_at TYPE text USING lease_expires_at::text,
+                    ALTER COLUMN next_retry_at TYPE text USING next_retry_at::text,
+                    ALTER COLUMN retry_expires_at TYPE text USING retry_expires_at::text,
+                    ALTER COLUMN retry_after_at TYPE text USING retry_after_at::text,
+                    ALTER COLUMN cancelled_at TYPE text USING cancelled_at::text;
+                ALTER TABLE public.content_result_projections
+                    ALTER COLUMN published_at TYPE text USING published_at::text,
+                    ALTER COLUMN updated_at TYPE text USING updated_at::text;
+                ALTER TABLE public.content_work_items
+                    ALTER COLUMN cache_hit DROP DEFAULT,
+                    ALTER COLUMN cache_hit TYPE bigint USING cache_hit::int::bigint,
+                    ALTER COLUMN cache_hit SET DEFAULT 0,
+                    ALTER COLUMN attempt_count TYPE bigint USING attempt_count::bigint;
+                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
+                  VALUES (46, 7, 'https://github.com/acme/demo/releases/tag/v2', 'v2', 'v2', 'Second notes', '2026-11-24T01:00:00Z');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+            let admitted_text = admit_release_polish(&pool, &[46], "m1").await?;
+            assert_eq!(
+                admitted_text, 1,
+                "admission tolerates the imported bigint cache_hit column"
+            );
+            sqlx::query(
+                "DELETE FROM public.content_work_items WHERE canonical_resource_id = '46'",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, lease_owner, lease_expires_at, created_at, updated_at) VALUES ('expired-work', 'release', '45', 'polishing', 'smart', 'zh-CN', 'expired', $1, 'postgres-default', '{}', 'fingerprint', 'running', 0, DEFAULT, 0, 1, 'not_required', 'dead-worker', (now() - interval '5 minutes')::text, (now() - interval '10 minutes')::text, (now() - interval '10 minutes')::text)",
+            )
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .execute(&pool)
+            .await?;
+            let recovered = recover_expired_leases(&pool).await?;
+            assert_eq!(recovered, 1, "the expired text-schema lease is recovered");
+            let (expired_status, expired_next): (String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT status, next_retry_at FROM public.content_work_items WHERE id = 'expired-work'",
+                )
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(expired_status, "queued");
+            assert!(expired_next.is_some());
+            sqlx::query(
+                "UPDATE public.content_work_items SET status = 'superseded' WHERE id = 'expired-work'",
+            )
+            .execute(&pool)
+            .await?;
+
             // A malformed snapshot must end in a recorded content failure, not a
             // permanently running claim that recovery requeues forever.
             sqlx::query(
-                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('poison-work', 'release', '43', 'polishing', 'smart', 'zh-CN', 'poison', $1, 'postgres-default', 'not-json', 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('poison-work', 'release', '43', 'polishing', 'smart', 'zh-CN', 'poison', $1, 'postgres-default', 'not-json', 'fingerprint', 'queued', 0, DEFAULT, 0, 0, 'not_required', now(), now())",
             )
             .bind(GLOBAL_PROTOCOL_VERSION)
             .execute(&pool)
@@ -1069,7 +1134,7 @@ mod tests {
                 "target_slots": ["title_zh", "summary_md"]
             }))?;
             sqlx::query(
-                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('length-work', 'release', '44', 'polishing', 'smart', 'zh-CN', 'length', $1, 'postgres-default', $2, 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('length-work', 'release', '44', 'polishing', 'smart', 'zh-CN', 'length', $1, 'postgres-default', $2, 'fingerprint', 'queued', 0, DEFAULT, 0, 0, 'not_required', now(), now())",
             )
             .bind(GLOBAL_PROTOCOL_VERSION)
             .bind(&sd)
