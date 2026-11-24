@@ -239,7 +239,7 @@ async function installAdminJobsMocks(
 			schedule_key: "interval:10:1795484400",
 			created_at: "2026-02-26T14:40:00Z",
 			finished_at: "2026-02-26T14:44:00Z",
-			status: "partial",
+			status: "failed",
 			users: 1,
 			releases: {
 				tasks: 1,
@@ -248,7 +248,7 @@ async function installAdminJobsMocks(
 				running: 0,
 				repositories: 0,
 				releases: 0,
-				failed_repositories: 3,
+				failed_repositories: 0,
 				degraded_tasks: 0,
 			},
 			notifications: {
@@ -267,6 +267,41 @@ async function installAdminJobsMocks(
 					created_at: "2026-02-26T14:40:00Z",
 					finished_at: "2026-02-26T14:44:00Z",
 					error_message: "every repository whose read was attempted failed",
+				},
+			],
+		},
+		{
+			schedule_key: "2026-02-26T14:40",
+			created_at: "2026-02-26T14:40:00Z",
+			finished_at: "2026-02-26T14:40:01Z",
+			status: "skipped",
+			users: 0,
+			releases: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				repositories: 0,
+				releases: 0,
+				failed_repositories: 0,
+				degraded_tasks: 0,
+			},
+			notifications: {
+				tasks: 1,
+				succeeded: 1,
+				failed: 0,
+				running: 0,
+				notifications: 0,
+			},
+			tasks: [
+				{
+					id: "task-subscriptions-skipped",
+					task_type: "sync.subscriptions",
+					status: "succeeded",
+					user_id: null,
+					created_at: "2026-02-26T14:40:00Z",
+					finished_at: "2026-02-26T14:40:01Z",
+					error_message: null,
 				},
 			],
 		},
@@ -305,41 +340,6 @@ async function installAdminJobsMocks(
 					repositories: 11,
 					releases: 24,
 					notifications: 192,
-				},
-			],
-		},
-		{
-			schedule_key: "2026-02-26T14:40",
-			created_at: "2026-02-26T14:40:00Z",
-			finished_at: "2026-02-26T14:40:01Z",
-			status: "skipped",
-			users: 0,
-			releases: {
-				tasks: 1,
-				succeeded: 1,
-				failed: 0,
-				running: 0,
-				repositories: 0,
-				releases: 0,
-				failed_repositories: 0,
-				degraded_tasks: 0,
-			},
-			notifications: {
-				tasks: 1,
-				succeeded: 1,
-				failed: 0,
-				running: 0,
-				notifications: 0,
-			},
-			tasks: [
-				{
-					id: "task-subscriptions-skipped",
-					task_type: "sync.subscriptions",
-					status: "succeeded",
-					user_id: null,
-					created_at: "2026-02-26T14:40:00Z",
-					finished_at: "2026-02-26T14:40:01Z",
-					error_message: null,
 				},
 			],
 		},
@@ -2743,6 +2743,21 @@ test("admin can manage jobs center", async ({ page }) => {
 	await subscriptionsTab.click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
 	await expect(subscriptionsTab).toHaveAttribute("aria-selected", "true");
+	const subscriptionRunList = page.getByTestId("subscription-run-list");
+	await expect(
+		subscriptionRunList.locator('[data-testid="subscription-run-card"]'),
+	).toHaveCount(4);
+	const subscriptionRunKeys = await subscriptionRunList
+		.locator('[data-testid="subscription-run-card"]')
+		.evaluateAll((cards) =>
+			cards.map((card) => card.getAttribute("data-schedule-key")),
+		);
+	expect(subscriptionRunKeys).toEqual([
+		"interval:10:1795485000",
+		"interval:10:1795484400",
+		"2026-02-26T14:40",
+		"2026-02-26T14:30",
+	]);
 	const currentSubscriptionRun = page.locator(
 		'[data-testid="subscription-run-card"][data-schedule-key="interval:10:1795485000"]',
 	);
@@ -2757,8 +2772,16 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		releaseRunTask.getByText("仓库 402 · Release 1,500"),
 	).toBeVisible();
+	await expect(
+		releaseRunTask.getByRole("link", {
+			name: "查看任务详情 task-sync-releases-1",
+		}),
+	).toHaveAttribute(
+		"href",
+		"/admin/jobs/tasks/task-sync-releases-1?from=subscriptions",
+	);
 	await releaseRunTask
-		.getByRole("button", { name: "查看任务详情 task-sync-releases-1" })
+		.getByRole("link", { name: "查看任务详情 task-sync-releases-1" })
 		.click();
 	await expect(taskSheet).toBeVisible();
 	await expect(page).toHaveURL(
@@ -2770,13 +2793,32 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
 
+	const notificationRunTask = currentSubscriptionRun.locator(
+		'[data-testid="subscription-run-task"][data-task-id="task-sync-notifications-1"]',
+	);
+	await notificationRunTask
+		.getByRole("link", { name: "查看任务详情 task-sync-notifications-1" })
+		.click();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-sync-notifications-1\?from=subscriptions$/,
+	);
+	await expect(taskSheet).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
+	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
+
 	const legacyRunTask = page.locator(
 		'[data-testid="subscription-run-task"][data-task-id="task-subscriptions-1"]',
 	);
 	await expect(legacyRunTask).toBeVisible();
 	await expect(legacyRunTask.getByText("仓库 11 · Release 24")).toBeVisible();
+	await expect(
+		legacyRunTask.getByRole("link", {
+			name: "查看任务详情 task-subscriptions-1",
+		}),
+	).toHaveAttribute("href", "/admin/jobs/subscriptions/task-subscriptions-1");
 	await legacyRunTask
-		.getByRole("button", { name: "查看任务详情 task-subscriptions-1" })
+		.getByRole("link", { name: "查看任务详情 task-subscriptions-1" })
 		.click();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/subscriptions\/task-subscriptions-1$/,

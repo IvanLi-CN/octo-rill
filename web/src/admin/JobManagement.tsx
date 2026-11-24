@@ -1538,6 +1538,7 @@ type RealtimeStatusFilter =
 const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
 const TASK_PAGE_SIZE = 20;
+const SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT = 5;
 const USER_SYNC_TASK_TYPES: Record<string, true> = {
 	"sync.starred": true,
 };
@@ -3725,13 +3726,15 @@ function subscriptionBusinessStatusTone(status: string): TaskStatusTone {
 
 function subscriptionRunTaskSummary(
 	task: AdminSubscriptionRunItem["tasks"][number],
-) {
+): string | null {
 	if (
 		task.task_type === "sync.releases" ||
 		task.task_type === "sync.subscriptions"
 	) {
+		if (task.repositories == null && task.releases == null) return null;
 		return `仓库 ${formatCount(task.repositories)} · Release ${formatCount(task.releases)}`;
 	}
+	if (task.notifications == null) return null;
 	return `通知 ${formatCount(task.notifications)}`;
 }
 
@@ -7284,10 +7287,19 @@ export function JobManagement({
 														task.status === "canceled" ||
 														task.status === "cancelled",
 												).length;
-												const showFailureSummary =
-													failedTasks > 0 ||
-													run.releases.failed_repositories > 0 ||
-													run.releases.degraded_tasks > 0;
+												const failureSummary = [
+													run.releases.failed_repositories > 0
+														? `Release 仓库失败 ${formatCount(run.releases.failed_repositories)}`
+														: null,
+													run.releases.degraded_tasks > 0
+														? `降级任务 ${formatCount(run.releases.degraded_tasks)}`
+														: null,
+													run.notifications.failed > 0
+														? `通知任务失败 ${formatCount(run.notifications.failed)}`
+														: null,
+												]
+													.filter((part): part is string => Boolean(part))
+													.join(" · ");
 												return (
 													<div
 														key={run.tasks[0]?.id ?? run.schedule_key}
@@ -7354,63 +7366,105 @@ export function JobManagement({
 																</p>
 															</div>
 														</div>
-														{showFailureSummary ? (
+														{failureSummary ? (
 															<p className="border-t px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-200">
-																Release 仓库失败{" "}
-																{formatCount(run.releases.failed_repositories)}·
-																降级任务{" "}
-																{formatCount(run.releases.degraded_tasks)}
+																{failureSummary}
 															</p>
 														) : null}
 														<div className="divide-y border-t">
-															{run.tasks.map((task) => (
-																<div
-																	key={task.id}
-																	className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
-																	data-testid="subscription-run-task"
-																	data-task-id={task.id}
-																>
-																	<div className="min-w-0">
-																		<div className="flex flex-wrap items-center gap-2">
-																			<p className="text-sm font-medium">
-																				{taskTypeLabel(task.task_type)}
-																			</p>
-																			<span className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
-																				#{task.user_id ?? "-"}
-																			</span>
-																			<StatusBadge
-																				label={taskStatusLabel(task.status)}
-																				tone={taskStatusTone(task.status)}
-																			/>
-																		</div>
-																		<p className="mt-1 text-[11px] text-muted-foreground">
-																			{subscriptionRunTaskSummary(task)}
-																		</p>
-																		{task.error_message ? (
-																			<p className="mt-1 line-clamp-2 text-[11px] text-destructive">
-																				{task.error_message}
-																			</p>
-																		) : null}
-																	</div>
-																	<Button
-																		type="button"
-																		variant="outline"
-																		size="sm"
-																		aria-label={`查看任务详情 ${task.id}`}
-																		onClick={() => {
-																			if (
-																				task.task_type === "sync.subscriptions"
-																			) {
-																				onOpenTaskDetail(task.id);
-																				return;
-																			}
-																			onOpenSubscriptionRunTask(task.id);
-																		}}
+															{run.tasks
+																.slice(0, SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT)
+																.map((task) => (
+																	<div
+																		key={task.id}
+																		className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+																		data-testid="subscription-run-task"
+																		data-task-id={task.id}
 																	>
-																		详情
-																	</Button>
-																</div>
-															))}
+																		<div className="min-w-0">
+																			<div className="flex flex-wrap items-center gap-2">
+																				<p className="text-sm font-medium">
+																					{taskTypeLabel(task.task_type)}
+																				</p>
+																				<span className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+																					#{task.user_id ?? "-"}
+																				</span>
+																				<StatusBadge
+																					label={taskStatusLabel(task.status)}
+																					tone={taskStatusTone(task.status)}
+																				/>
+																			</div>
+																			{subscriptionRunTaskSummary(task) ? (
+																				<p className="mt-1 text-[11px] text-muted-foreground">
+																					{subscriptionRunTaskSummary(task)}
+																				</p>
+																			) : null}
+																			{task.error_message ? (
+																				<p className="mt-1 line-clamp-2 text-[11px] text-destructive">
+																					{task.error_message}
+																				</p>
+																			) : null}
+																		</div>
+																		<Button asChild variant="outline" size="sm">
+																			{task.task_type ===
+																			"sync.subscriptions" ? (
+																				<a
+																					href={`/admin/jobs/subscriptions/${task.id}`}
+																					aria-label={`查看任务详情 ${task.id}`}
+																					onClick={(event) => {
+																						if (
+																							event.button !== 0 ||
+																							event.metaKey ||
+																							event.ctrlKey ||
+																							event.shiftKey ||
+																							event.altKey
+																						) {
+																							return;
+																						}
+																						event.preventDefault();
+																						onOpenTaskDetail(task.id);
+																					}}
+																				>
+																					详情
+																				</a>
+																			) : (
+																				<a
+																					href={`/admin/jobs/tasks/${task.id}?from=subscriptions`}
+																					aria-label={`查看任务详情 ${task.id}`}
+																					onClick={(event) => {
+																						if (
+																							event.button !== 0 ||
+																							event.metaKey ||
+																							event.ctrlKey ||
+																							event.shiftKey ||
+																							event.altKey
+																						) {
+																							return;
+																						}
+																						event.preventDefault();
+																						onOpenSubscriptionRunTask(task.id);
+																					}}
+																				>
+																					详情
+																				</a>
+																			)}
+																		</Button>
+																	</div>
+																))}
+															{run.tasks.length >
+															SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT ? (
+																<p
+																	className="px-3 py-2 text-[11px] text-muted-foreground"
+																	data-testid="subscription-run-task-overflow"
+																>
+																	其余{" "}
+																	{formatCount(
+																		run.tasks.length -
+																			SUBSCRIPTION_RUN_TASK_PREVIEW_LIMIT,
+																	)}{" "}
+																	个任务请在任务列表中查看
+																</p>
+															) : null}
 														</div>
 													</div>
 												);

@@ -35,8 +35,8 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - 挂到共享 repo release queue
   - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
-- Admin Jobs 允许管理员在“订阅同步设置”中配置 Release 全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时；该间隔同时是 Release 治理预算窗口长度。Star cadence 由独立 topic 配置。
-- Admin Jobs 提供订阅同步专用视图和详情入口，支持查看所有 `sync.subscriptions` 运行，不论来自定时、手动还是重试。
+- Admin Jobs 允许管理员在“订阅同步设置”中配置 Release 全局自动获取间隔，并展示最近五次同步任务（`sync.releases` / `sync.notifications`）用时；该间隔同时是 Release 治理预算窗口长度。Star cadence 由独立 topic 配置。
+- Admin Jobs 提供订阅同步专用视图和详情入口，按 `schedule_key` 展示分组的 `sync.releases` / `sync.notifications` 运行，并规范化导入的 `sync.subscriptions` 记录，不论来自定时、手动还是重试。
 - Release 阶段支持运行时调整共享 repo release worker 数量；该设置只影响吞吐，不降低调度频率。
 - Release 抓取使用 GitHub conditional request 复用 `ETag` / `Last-Modified`，未变化仓库可以快速完成 watcher，而不是下载完整 release 列表。
 - GitHub `ReleaseEvent` 只作为快速发现信号，用于把命中 repo 提升为高优先级 release demand；可靠性仍由全量可见 repo 校验兜底。
@@ -121,6 +121,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   - 来源为 `job_tasks` 中的同步任务类型
   - 不按用户过滤
   - 显示任务状态、完成时间与用时
+  - 跳过记录同样展示并标记为“已跳过”
   - 用时从任务 `created_at` 开始，到任务 `finished_at` 结束
 - 点击任一用时项打开通用任务详情抽屉。
 - `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
@@ -293,9 +294,9 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
   When 原任务存在失败或未完成的 `repo_release_watchers`
   Then 新任务只处理这些 watcher 对应的 work item，不产生新的候选仓库选择。
 
-- Given 系统已有最近三次 `sync.subscriptions` 历史
+- Given 系统已有最近五次同步任务（`sync.releases` / `sync.notifications`）历史
   When 打开 Admin Jobs 定时任务页
-  Then 页面展示最近三次非跳过链路用时；点击用时项会打开对应的订阅同步详情页面。
+  Then 页面展示最近五次任务用时，跳过记录标记为“已跳过”；点击用时项会打开对应的任务详情。
 
 - Given 用户已经有旧缓存 Release
   When 用户点击 Sync 后 task 还未进入 `running`
@@ -393,7 +394,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 
 - Given 某轮 `sync.subscriptions` 因上一轮仍在执行而被跳过
   When 管理员打开该任务详情
-  Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时也不展示该跳过记录。
+  Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时仍展示该记录并标记为“已跳过”。
 
 - Given 管理员打开运行中的 `/admin/jobs/subscriptions/{task_id}`
   When 该任务已经发出 `collect`、`repo_collect` 或 `release_summary` 事件但 `result_json` 仍为空

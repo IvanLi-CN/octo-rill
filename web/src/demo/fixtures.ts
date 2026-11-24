@@ -1900,7 +1900,7 @@ function buildAdminJobs(): DemoJobsModel {
 		{
 			schedule_key: "interval:10:1795485000",
 			created_at: "2026-07-08T08:40:00+08:00",
-			finished_at: "2026-07-08T08:45:00+08:00",
+			finished_at: "2026-07-08T08:43:12+08:00",
 			status: "succeeded",
 			users: 2,
 			releases: {
@@ -1922,6 +1922,16 @@ function buildAdminJobs(): DemoJobsModel {
 			},
 			tasks: [
 				{
+					id: "task-starred-delta-0840",
+					task_type: "sync.notifications",
+					status: "succeeded",
+					user_id: USER_ID,
+					created_at: "2026-07-08T08:40:00+08:00",
+					finished_at: "2026-07-08T08:40:05+08:00",
+					error_message: null,
+					notifications: 14,
+				},
+				{
 					id: "task-sync-releases",
 					task_type: "sync.releases",
 					status: "succeeded",
@@ -1931,16 +1941,6 @@ function buildAdminJobs(): DemoJobsModel {
 					error_message: null,
 					repositories: 402,
 					releases: 1500,
-				},
-				{
-					id: "task-starred-delta-0840",
-					task_type: "sync.notifications",
-					status: "succeeded",
-					user_id: USER_ID,
-					created_at: "2026-07-08T08:40:00+08:00",
-					finished_at: "2026-07-08T08:40:05+08:00",
-					error_message: null,
-					notifications: 14,
 				},
 			],
 		},

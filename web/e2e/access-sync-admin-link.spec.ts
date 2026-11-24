@@ -240,10 +240,15 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/subscriptions/runs"
 		) {
+			const page = Math.max(1, Number(searchParams.get("page") ?? "1") || 1);
+			const pageSize = Math.max(
+				1,
+				Math.min(100, Number(searchParams.get("page_size") ?? "20") || 20),
+			);
 			return json(route, {
 				items: [],
-				page: 1,
-				page_size: 20,
+				page,
+				page_size: pageSize,
 				total: 0,
 			});
 		}

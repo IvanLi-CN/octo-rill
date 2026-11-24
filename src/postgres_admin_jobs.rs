@@ -505,9 +505,9 @@ async fn load_subscription_runs(
     .bind(imported_task_type)
     .fetch_one(pool)
     .await?;
-    let keys = sqlx::query_as::<_, (String, DateTime<Utc>)>(
-        "SELECT run_key, run_created_at FROM ( \
-             SELECT schedule_key AS run_key, MIN(created_at) AS run_created_at \
+    let keys = sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+      		"SELECT run_key, run_kind, run_created_at FROM ( \
+       					 SELECT 'key'::text AS run_kind, schedule_key AS run_key, MIN(created_at) AS run_created_at \
              FROM ( \
                  SELECT CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
                      THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END \
@@ -516,12 +516,12 @@ async fn load_subscription_runs(
              ) lane WHERE schedule_key IS NOT NULL \
              GROUP BY schedule_key \
              UNION ALL \
-             SELECT id AS run_key, created_at AS run_created_at \
+         			 SELECT 'task'::text AS run_kind, id AS run_key, created_at AS run_created_at \
              FROM public.job_tasks WHERE task_type = ANY($1) \
                AND (CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
                      THEN NULLIF(payload_json::jsonb ->> 'schedule_key', '') END) IS NULL \
              UNION ALL \
-             SELECT id AS run_key, created_at AS run_created_at \
+         			 SELECT 'task'::text AS run_kind, id AS run_key, created_at AS run_created_at \
              FROM public.job_tasks WHERE task_type = $2 \
          ) runs ORDER BY run_created_at DESC, run_key DESC \
          LIMIT $3 OFFSET $4",
@@ -537,7 +537,7 @@ async fn load_subscription_runs(
     }
     let key_list = keys
         .iter()
-        .map(|(schedule_key, _)| schedule_key.clone())
+        .map(|(run_key, _, _)| run_key.clone())
         .collect::<Vec<_>>();
     let rows = sqlx::query_as::<_, SubscriptionRunTaskRow>(
         "SELECT id, task_type, status, error_message, created_at, finished_at, payload_json, \
@@ -563,16 +563,16 @@ async fn load_subscription_runs(
     let mut by_key: HashMap<String, Vec<SubscriptionRunTaskRow>> = HashMap::new();
     for row in rows {
         let key = if row.task_type == imported_task_type || row.schedule_key.is_none() {
-            row.id.clone()
+            format!("task:{}", row.id)
         } else {
-            row.schedule_key.clone().unwrap_or_default()
+            format!("key:{}", row.schedule_key.clone().unwrap_or_default())
         };
         by_key.entry(key).or_default().push(row);
     }
     let items = keys
         .into_iter()
-        .filter_map(|(run_key, created_at)| {
-            let mut rows = by_key.remove(&run_key)?;
+        .filter_map(|(run_key, run_kind, created_at)| {
+            let mut rows = by_key.remove(&format!("{run_kind}:{run_key}"))?;
             if rows
                 .first()
                 .map(|row| row.task_type == imported_task_type)
