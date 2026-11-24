@@ -11,15 +11,15 @@
 ## Implementation Coverage
 
 - Requirement coverage:
-  - `REQ-PGCP-001`: 待实现，计划模块 `src/postgres_content.rs`。
+  - `REQ-PGCP-001`: 已实现 `src/postgres_content.rs`：claim/lease、attempt、provider admission、审计与投影发布均已接线；worker 随 `OCTORILL_PG_WORKER_ENABLED` 启动。
   - `REQ-PGCP-002`: 待实现，复用 `content_identity_upgrade` 身份与 `content_*` 表。
-  - `REQ-PGCP-003`: 待实现，复用 `postgres_translate` 的 provider 客户端与审计写法。
+  - `REQ-PGCP-003`: 已实现，复用 `postgres_translate::complete_with_audit` 与 `content_processing::validate_output`。
   - `REQ-PGCP-004`: 待实现，复用 `llm_model_health`、`llm_recovery_flags` 与既有退避常量。
-  - `REQ-PGCP-005`: 待实现；`postgres_content_overlay` 已覆盖 Release/公告的 translation/polishing 投影；通知当前走翻译请求/读取链路，其适配属于本主题。
+  - `REQ-PGCP-005`: 部分实现：Release `smart` 润色已可由 PG worker 执行并发布投影；reading 变体（`smart_public`/`smart_authorized`）、公告与通知仍待 evidence producer 与对应适配。
   - `REQ-PGCP-006`: 待实现；当前生产仍有 `translation.generate` 独自运行。第 1.5 分片已确保终态工作不会被自动入队重新排队，读投影的 PostgreSQL 生产者仍缺位。
   - `REQ-PGCP-007`: 读接口已存在；待新写入后验证。
-  - `REQ-PGCP-008`: 待实现。
-  - `REQ-PGCP-009`: 待实现。
+  - `REQ-PGCP-008`: 已实现：单行 `FOR UPDATE SKIP LOCKED` 认领、发布与审计写入幂等、单条失败不影响其他工作项。
+  - `REQ-PGCP-009`: 已实现结构化日志；指标接入待补。
 - Verification commands: 见各分片测试；PostgreSQL 集成测试沿用 `TEST_PG_TRANSLATE_URL` 隔离库模式。
 - Rollout facts: 生产 `content_processing_control.mode=global`；`content_current_result_projections` 12,023 行，最后发布 `2026-11-21T07:54:28Z`；切换后无新投影。
 
@@ -37,9 +37,16 @@
   6. 润色/阅读、公告、通知、批量与恢复对齐。
   7. 退役 legacy `translation.generate` 自动入队并完成切换验证。
 
+- 2026-11-24 第 2 分片：PostgreSQL 原生全局内容 worker。新增 `src/postgres_content.rs`：受限期认领（`FOR UPDATE SKIP LOCKED`）、attempt 事件与路由快照、每次 provider 请求前的 lease 续约与 provider admission、复用 `postgres_translate` 的模型路由/健康与 `llm_calls` 审计、复用 `content_processing::{build_prompt,validate_output}` 输出契约、发布结果投影与当前投影、过期 lease 恢复；Release 刷新在既有 `smart` 合约上限量准入润色工作（不伪造 reading evidence）。
+
 ## Remaining Gaps
 
-- 第 2–7 分片未开始。
+- 契约抽取：`build_prompt`/`validate_output` 已共用，但失败分类仍分属于两条链路。
+- PG admission：请求关联、缓存命中与 supersede 仍走 `translation.generate` 路径；只有 Release 刷新的 `smart` 润色有了 PG 侧准入。
+- 生产入口：`/api/translate/requests` 仍写 `translation_work_items`；全局通路尚未切换。
+- 润色/阅读：`smart_public`/`smart_authorized` 需要 PostgreSQL evidence producer；公告与通知未接入。
+- 指标：worker 目前只有结构化日志，未接 Prometheus 计数。
+- 退役 legacy `translation.generate` 自动入队尚未开始。
 
 ## Related Changes
 

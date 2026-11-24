@@ -202,6 +202,16 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     // same shutdown signal so a drain stops new dispatches immediately.
     crate::postgres_scheduler::spawn(state.clone(), worker_shutdown.subscribe());
     let worker_registry = state.task_registry.clone();
+    let content_worker = if postgres_worker_enabled() {
+        crate::postgres_content::spawn(
+            runtime.pool.clone(),
+            state.http.clone(),
+            config.ai.clone(),
+            worker_shutdown.subscribe(),
+        )
+    } else {
+        None
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -763,6 +773,9 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
     session_cleanup.abort();
     if let Ok(Err(error)) = worker.await {
         warn!(%error, "PostgreSQL worker stopped with an error");
+    }
+    if let Some(content_worker) = content_worker {
+        let _ = content_worker.await;
     }
     postgres_runtime_owner::unregister(&runtime.pool, &owner_id).await?;
     runtime.pool.close().await;

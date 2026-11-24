@@ -16,6 +16,7 @@
 
 ## Related Changes
 
+- 2026-11-24：新增 PostgreSQL 原生全局内容 worker（claim/lease、attempt、provider admission、LLM 审计、投影发布与 lease 恢复），并在 Release 刷新中按既有 `smart` 合约准入润色工作；reading 变体等待 evidence producer。
 - 2026-11-24：新增终端请求对账（启动时 + 60 秒调度 lane）与自动入队终态拦截，修复 `translation_requests` 停留在 `queued`/`running` 而工作项已终态的状态漂移；对账不调用 provider、不改写尝试与 LLM 审计。
 
 ## References

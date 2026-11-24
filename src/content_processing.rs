@@ -502,11 +502,11 @@ pub struct GlobalSubmissionResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct SourceSnapshot {
+pub(crate) struct SourceSnapshot {
     #[serde(default)]
-    source_blocks: Vec<translations::TranslationSourceBlock>,
+    pub(crate) source_blocks: Vec<translations::TranslationSourceBlock>,
     #[serde(default)]
-    target_slots: Vec<String>,
+    pub(crate) target_slots: Vec<String>,
 }
 
 fn evidence_snapshot_marker(
@@ -596,10 +596,10 @@ const GLOBAL_SUPERSESSION_CADENCE: Duration = Duration::from_secs(60);
 const GLOBAL_SUPERSESSION_LANE: &str = "content_processing_supersession";
 const GLOBAL_SUPERSESSION_BATCH_SIZE: usize = 100;
 const GLOBAL_SUPERSESSION_READ_PAGE_SIZE: usize = 256;
-const GLOBAL_MAX_TOKENS: u32 = 3_000;
+pub(crate) const GLOBAL_MAX_TOKENS: u32 = 3_000;
 const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
-const RETRY_DELAYS_SECS: [i64; 5] = [60, 300, 900, 3600, 14_400];
+pub(crate) const RETRY_DELAYS_SECS: [i64; 5] = [60, 300, 900, 3600, 14_400];
 const PROVIDER_DEFER_SECS: i64 = 10 * 60;
 
 async fn provider_breaker_open(state: &AppState) -> bool {
@@ -3138,7 +3138,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
+pub(crate) fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
     let is_release_reading =
         pipeline == "polishing" && snapshot.target_slots.iter().any(|slot| slot == "reading");
     let system = if is_release_reading {
@@ -3555,7 +3555,7 @@ fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
     Ok(output)
 }
 
-fn validate_output(
+pub(crate) fn validate_output(
     raw: &str,
     target_slots: &[String],
     source_blocks: &[translations::TranslationSourceBlock],
