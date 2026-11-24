@@ -847,7 +847,10 @@ pub(crate) async fn admit_release_polish(
             "evidence_status": "not_required",
         }))?;
         let inserted = sqlx::query(
-            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', $3, $4, $5, 'postgres-default', $6, $7, 'queued', 0, false, $8, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
+            // `cache_hit` stays out of the insert: the migrated schema declares
+            // it boolean, the imported one bigint, and both default to a falsy
+            // value, so only the column default is portable.
+            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', $3, $4, $5, 'postgres-default', $6, $7, 'queued', 0, $8, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
         )
         .bind(local_id::generate_local_id())
         .bind(release_id.to_string())
@@ -1050,12 +1053,28 @@ mod tests {
                 ALTER TABLE public.content_result_projections
                     ALTER COLUMN published_at TYPE text USING published_at::text,
                     ALTER COLUMN updated_at TYPE text USING updated_at::text;
+                ALTER TABLE public.content_work_items
+                    ALTER COLUMN cache_hit DROP DEFAULT,
+                    ALTER COLUMN cache_hit TYPE bigint USING cache_hit::int::bigint,
+                    ALTER COLUMN cache_hit SET DEFAULT 0;
+                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
+                  VALUES (46, 7, 'https://github.com/acme/demo/releases/tag/v2', 'v2', 'v2', 'Second notes', '2026-11-24T01:00:00Z');
                 "#,
             )
             .execute(&pool)
             .await?;
+            let admitted_text = admit_release_polish(&pool, &[46], "m1").await?;
+            assert_eq!(
+                admitted_text, 1,
+                "admission tolerates the imported bigint cache_hit column"
+            );
             sqlx::query(
-                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, lease_owner, lease_expires_at, created_at, updated_at) VALUES ('expired-work', 'release', '45', 'polishing', 'smart', 'zh-CN', 'expired', $1, 'postgres-default', '{}', 'fingerprint', 'running', 0, false, 0, 1, 'not_required', 'dead-worker', (now() - interval '5 minutes')::text, (now() - interval '10 minutes')::text, (now() - interval '10 minutes')::text)",
+                "DELETE FROM public.content_work_items WHERE canonical_resource_id = '46'",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, lease_owner, lease_expires_at, created_at, updated_at) VALUES ('expired-work', 'release', '45', 'polishing', 'smart', 'zh-CN', 'expired', $1, 'postgres-default', '{}', 'fingerprint', 'running', 0, DEFAULT, 0, 1, 'not_required', 'dead-worker', (now() - interval '5 minutes')::text, (now() - interval '10 minutes')::text, (now() - interval '10 minutes')::text)",
             )
             .bind(GLOBAL_PROTOCOL_VERSION)
             .execute(&pool)
@@ -1079,7 +1098,7 @@ mod tests {
             // A malformed snapshot must end in a recorded content failure, not a
             // permanently running claim that recovery requeues forever.
             sqlx::query(
-                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('poison-work', 'release', '43', 'polishing', 'smart', 'zh-CN', 'poison', $1, 'postgres-default', 'not-json', 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('poison-work', 'release', '43', 'polishing', 'smart', 'zh-CN', 'poison', $1, 'postgres-default', 'not-json', 'fingerprint', 'queued', 0, DEFAULT, 0, 0, 'not_required', now(), now())",
             )
             .bind(GLOBAL_PROTOCOL_VERSION)
             .execute(&pool)
@@ -1113,7 +1132,7 @@ mod tests {
                 "target_slots": ["title_zh", "summary_md"]
             }))?;
             sqlx::query(
-                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('length-work', 'release', '44', 'polishing', 'smart', 'zh-CN', 'length', $1, 'postgres-default', $2, 'fingerprint', 'queued', 0, false, 0, 0, 'not_required', now(), now())",
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ('length-work', 'release', '44', 'polishing', 'smart', 'zh-CN', 'length', $1, 'postgres-default', $2, 'fingerprint', 'queued', 0, DEFAULT, 0, 0, 'not_required', now(), now())",
             )
             .bind(GLOBAL_PROTOCOL_VERSION)
             .bind(&sd)
