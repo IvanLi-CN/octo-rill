@@ -56,3 +56,6 @@ None
 
 - `assets/admin-jobs-many-dense-ego.png`: Ego Lite Web Demo 在桌面视口中展示 `多行活动（同一小时 128 格）`；`09时` 桶实际换成两行方块。
 - `assets/admin-jobs-activity-detail-handoff.png`: 受控 Storybook 画布展示详情抽屉打开时活动图仍显示真实格子，已点击的格子保留选中态。
+- `assets/admin-jobs-llm-hover-preview.png`: LLM 活动图悬停预览以时间桶为标题、只呈现信息，指针可穿过浮窗继续探索其他格子。
+- `assets/admin-jobs-llm-pinned-preview.png`: 同一格固定后浮窗提供「关闭预览」与逐行调用操作。
+- `assets/admin-jobs-llm-preview-dismissed.png`: 指针离开活动图后悬停预览自行消失。
