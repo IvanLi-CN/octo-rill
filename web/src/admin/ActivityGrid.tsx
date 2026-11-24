@@ -14,6 +14,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useId,
 } from "react";
 import { createPortal } from "react-dom";
 
@@ -25,7 +26,7 @@ export type ActivityGridScrollPolicy = "page" | "panel";
 export type ActivityGridPreview = {
 	title: string;
 	lines: ReactNode[];
-	content?: ReactNode;
+	content?: ReactNode | ((state: { pinned: boolean }) => ReactNode);
 };
 
 export type ActivityGridCell = {
@@ -102,6 +103,9 @@ type PreviewPlacement = { left: number; top: number };
 
 const PREVIEW_GAP = 10;
 const VIEWPORT_MARGIN = 10;
+const HOVER_CLOSE_DELAY_MS = 160;
+const NEAREST_CELL_RADIUS_PX = 24;
+const SNAP_MIN_MOVEMENT_PX = 2;
 const LONG_PRESS_MS = 150;
 const TOUCH_MOVE_THRESHOLD = 8;
 const DENSE_CELL_LIMIT = 8_000;
@@ -120,25 +124,55 @@ function getViewportRect() {
 function placePreview(
 	anchor: Rect,
 	preview: { width: number; height: number },
+	avoidCells = false,
 ): PreviewPlacement {
 	const viewport = getViewportRect();
 	const preferredLeft =
 		anchor.left + (anchor.right - anchor.left) / 2 - preview.width / 2;
+	if (!avoidCells) {
+		const aboveTop = anchor.top - preview.height - PREVIEW_GAP;
+		const belowTop = anchor.bottom + PREVIEW_GAP;
+		const top =
+			aboveTop >= VIEWPORT_MARGIN
+				? aboveTop
+				: belowTop + preview.height <= viewport.height - VIEWPORT_MARGIN
+					? belowTop
+					: clamp(
+							aboveTop,
+							VIEWPORT_MARGIN,
+							Math.max(
+								VIEWPORT_MARGIN,
+								viewport.height - preview.height - VIEWPORT_MARGIN,
+							),
+						);
+		return {
+			left: clamp(
+				preferredLeft,
+				VIEWPORT_MARGIN,
+				Math.max(
+					VIEWPORT_MARGIN,
+					viewport.width - preview.width - VIEWPORT_MARGIN,
+				),
+			),
+			top,
+		};
+	}
 	const aboveTop = anchor.top - preview.height - PREVIEW_GAP;
 	const belowTop = anchor.bottom + PREVIEW_GAP;
-	const top =
-		aboveTop >= VIEWPORT_MARGIN
+	const preferredTop =
+		aboveTop >= VIEWPORT_MARGIN ||
+		belowTop + preview.height > viewport.height - VIEWPORT_MARGIN
 			? aboveTop
-			: belowTop + preview.height <= viewport.height - VIEWPORT_MARGIN
-				? belowTop
-				: clamp(
-						aboveTop,
-						VIEWPORT_MARGIN,
-						Math.max(
-							VIEWPORT_MARGIN,
-							viewport.height - preview.height - VIEWPORT_MARGIN,
-						),
-					);
+			: belowTop;
+	// 两侧都放不下时必须留在视口内：宁可压住锚点行，也不能把预览移出屏幕。
+	const top = clamp(
+		preferredTop,
+		VIEWPORT_MARGIN,
+		Math.max(
+			VIEWPORT_MARGIN,
+			viewport.height - preview.height - VIEWPORT_MARGIN,
+		),
+	);
 	return {
 		left: clamp(
 			preferredLeft,
@@ -160,6 +194,7 @@ function useSafePreview(
 	cell: ActivityGridCell | null,
 	anchor: Rect | null,
 	previewRef: RefObject<HTMLDivElement | null>,
+	avoidCells: boolean,
 ) {
 	const [placement, setPlacement] = useState<PreviewPlacement | null>(null);
 
@@ -167,9 +202,13 @@ function useSafePreview(
 		if (!cell || !anchor || !previewRef.current) return;
 		const rect = previewRef.current.getBoundingClientRect();
 		setPlacement(
-			placePreview(anchor, { width: rect.width, height: rect.height }),
+			placePreview(
+				anchor,
+				{ width: rect.width, height: rect.height },
+				avoidCells,
+			),
 		);
-	}, [anchor, cell, previewRef]);
+	}, [anchor, avoidCells, cell, previewRef]);
 
 	useLayoutEffect(() => {
 		if (!cell || !anchor) {
@@ -206,19 +245,28 @@ function PreviewLayer({
 	testId?: string;
 	onClose: () => void;
 }) {
-	const previewRef = useRef<HTMLDivElement>(null);
-	const placement = useSafePreview(cell, anchor, previewRef);
+	const previewRef = useRef<HTMLDivElement | null>(null);
+	const placement = useSafePreview(cell, anchor, previewRef, !pinned);
+	// 同一页面可能同时存在多个活动图，标题 id 必须按实例生成。
+	const titleId = useId();
 	if (!cell) return null;
+	const content =
+		typeof cell.preview.content === "function"
+			? cell.preview.content({ pinned })
+			: cell.preview.content;
 	return createPortal(
 		<div
 			ref={previewRef}
 			{...(pinned
-				? { role: "dialog" as const, "aria-label": cell.preview.title }
+				? {
+						role: "dialog" as const,
+						"aria-labelledby": titleId,
+					}
 				: { role: "tooltip" as const })}
 			aria-live="polite"
 			data-testid={testId}
 			data-activity-grid-preview="true"
-			className={`${pinned ? "pointer-events-auto" : "pointer-events-none"} fixed z-50 w-[min(28rem,calc(100vw-1.25rem))] rounded-md border bg-popover p-3 text-popover-foreground shadow-lg`}
+			className={`${pinned ? "pointer-events-auto" : "pointer-events-none"} fixed z-40 w-[min(28rem,calc(100vw-1.25rem))] rounded-md border bg-popover p-3 text-popover-foreground shadow-lg`}
 			style={
 				placement
 					? { left: placement.left, top: placement.top }
@@ -227,7 +275,8 @@ function PreviewLayer({
 		>
 			<div className="flex items-start justify-between gap-3">
 				<p
-					id="activity-grid-preview-title"
+					id={titleId}
+					data-testid="activity-grid-preview-title"
 					className="min-w-0 break-words text-sm font-medium"
 				>
 					{cell.preview.title}
@@ -235,14 +284,15 @@ function PreviewLayer({
 				{pinned ? (
 					<button
 						type="button"
-						className="pointer-events-auto shrink-0 text-xs text-muted-foreground underline-offset-2 hover:underline"
+						aria-label="关闭预览"
+						className="shrink-0 text-xs text-muted-foreground underline-offset-2 hover:underline"
 						onClick={onClose}
 					>
 						关闭
 					</button>
 				) : null}
 			</div>
-			{cell.preview.content ?? (
+			{content ?? (
 				<div className="mt-1 space-y-0.5 text-xs text-muted-foreground">
 					{cell.preview.lines.map((line, index) => (
 						<p key={index} className="break-words">
@@ -259,6 +309,7 @@ function PreviewLayer({
 function ActivityCellButton({
 	cell,
 	selected,
+	expanded = false,
 	setRef,
 	onPointerEnter,
 	onPointerLeave,
@@ -272,6 +323,7 @@ function ActivityCellButton({
 }: {
 	cell: ActivityGridCell;
 	selected: boolean;
+	expanded?: boolean;
 	setRef: (element: HTMLButtonElement | null) => void;
 	onPointerEnter: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 	onPointerLeave: (event: ReactPointerEvent<HTMLButtonElement>) => void;
@@ -298,7 +350,7 @@ function ActivityCellButton({
 			style: cell.color ? { backgroundColor: cell.color } : undefined,
 			"aria-label": cell.ariaLabel,
 			"aria-controls": cell.ariaControls,
-			"aria-expanded": cell.ariaControls ? selected : undefined,
+			"aria-expanded": cell.ariaControls ? expanded : undefined,
 			"aria-pressed": selected,
 			"data-activity-cell-id": cell.id,
 			"data-activity-outcome": cell.dataOutcome,
@@ -481,12 +533,14 @@ function useActivityCells(model: ActivityGridModel) {
 function WrappedRowsGrid({
 	model,
 	activeId,
+	hoveredId,
 	selectedCellId,
 	setCellRef,
 	getHandlers,
 }: {
 	model: Extract<ActivityGridModel, { layout: "wrapped-rows" }>;
 	activeId: string | null;
+	hoveredId?: string | null;
 	selectedCellId?: string | null;
 	setCellRef: (id: string, element: HTMLButtonElement | null) => void;
 	getHandlers: (
@@ -532,7 +586,9 @@ function WrappedRowsGrid({
 										{...handlers}
 										cell={cell}
 										selected={
-											activeId === cell.id || selectedCellId === cell.id
+											activeId === cell.id ||
+											hoveredId === cell.id ||
+											selectedCellId === cell.id
 										}
 										setRef={(element) => setCellRef(cell.id, element)}
 									/>
@@ -549,12 +605,14 @@ function WrappedRowsGrid({
 function MatrixGrid({
 	model,
 	activeId,
+	hoveredId,
 	selectedCellId,
 	setCellRef,
 	getHandlers,
 }: {
 	model: Extract<ActivityGridModel, { layout: "matrix" }>;
 	activeId: string | null;
+	hoveredId?: string | null;
 	selectedCellId?: string | null;
 	setCellRef: (id: string, element: HTMLButtonElement | null) => void;
 	getHandlers: (
@@ -692,7 +750,9 @@ function MatrixGrid({
 										{...handlers}
 										cell={cell}
 										selected={
-											activeId === cell.id || selectedCellId === cell.id
+											activeId === cell.id ||
+											hoveredId === cell.id ||
+											selectedCellId === cell.id
 										}
 										setRef={(element) => setCellRef(cell.id, element)}
 									/>
@@ -720,6 +780,20 @@ function DenseCanvasGrid({
 	setAnchor: (rect: Rect | null) => void;
 }) {
 	const rootRef = useRef<HTMLButtonElement>(null);
+	const hoverTimer = useRef<number | null>(null);
+	const clearHoverTimer = useCallback(() => {
+		if (hoverTimer.current === null) return;
+		window.clearTimeout(hoverTimer.current);
+		hoverTimer.current = null;
+	}, []);
+	const scheduleHoverClose = useCallback(() => {
+		if (hoverTimer.current !== null) return;
+		hoverTimer.current = window.setTimeout(() => {
+			hoverTimer.current = null;
+			setActiveId(null);
+		}, HOVER_CLOSE_DELAY_MS);
+	}, [setActiveId]);
+	useEffect(() => clearHoverTimer, [clearHoverTimer]);
 	const [width, setWidth] = useState(0);
 	const cellSize = model.cellSize ?? 12;
 	const gap = model.cellGap ?? 2;
@@ -843,6 +917,36 @@ function DenseCanvasGrid({
 		},
 		[cellSize, columns, labelWidth, model.rows, step],
 	);
+	/** 命中格子间隙或行内空白时取半径内最近的格子，避免从网格外进入后没有预览。 */
+	const nearestHitTest = useCallback(
+		(
+			event: {
+				clientX: number;
+				clientY: number;
+				currentTarget: HTMLCanvasElement;
+			},
+			rowIndex: number,
+		) => {
+			const rect = event.currentTarget.getBoundingClientRect();
+			const x = event.clientX - rect.left;
+			const y = event.clientY - rect.top;
+			const rowCells = model.rows[rowIndex].cells;
+			if (rowCells.length === 0) return null;
+			const lines = Math.ceil(rowCells.length / columns);
+			const column = clamp(Math.floor((x - labelWidth) / step), 0, columns - 1);
+			const line = clamp(Math.floor((y - 24) / step), 0, lines - 1);
+			const cell =
+				rowCells[Math.min(line * columns + column, rowCells.length - 1)];
+			if (!cell) return null;
+			const left = labelWidth + column * step;
+			const top = 24 + line * step;
+			const dx = Math.max(left - x, 0, x - (left + cellSize));
+			const dy = Math.max(top - y, 0, y - (top + cellSize));
+			if (Math.hypot(dx, dy) > NEAREST_CELL_RADIUS_PX) return null;
+			return cell;
+		},
+		[cellSize, columns, labelWidth, model.rows, step],
+	);
 	const getCellAnchor = useCallback(
 		(cellIndex: number, canvas: HTMLCanvasElement): Rect => {
 			const rect = canvas.getBoundingClientRect();
@@ -923,6 +1027,8 @@ function DenseCanvasGrid({
 			aria-describedby={activeId ? "activity-grid-canvas-active" : undefined}
 			tabIndex={0}
 			onKeyDown={onGridKeyDown}
+			onPointerEnter={clearHoverTimer}
+			onPointerLeave={scheduleHoverClose}
 			onFocus={() => {
 				if (!activeId && flatCells[0]) selectCanvasCell(flatCells[0]);
 			}}
@@ -967,11 +1073,15 @@ function DenseCanvasGrid({
 									}
 									return;
 								}
-								if (!cell) return;
-								setActiveId(cell.id);
+								// 跨行移动时上一块画布已排好延迟关闭，命中后必须取消。
+								clearHoverTimer();
+								const target =
+									cell ?? (activeId ? null : nearestHitTest(event, rowIndex));
+								if (!target) return;
+								setActiveId(target.id);
 								setAnchor(
 									getCellAnchor(
-										model.rows[rowIndex].cells.indexOf(cell),
+										model.rows[rowIndex].cells.indexOf(target),
 										event.currentTarget,
 									),
 								);
@@ -1022,7 +1132,7 @@ function DenseCanvasGrid({
 									setActiveId(null);
 								}
 							}}
-							onPointerLeave={() => setActiveId(null)}
+							onPointerLeave={scheduleHoverClose}
 							onClick={(event) => {
 								if (suppressTouchClickRef.current) {
 									suppressTouchClickRef.current = false;
@@ -1078,12 +1188,17 @@ export function ActivityGrid({
 		activated: boolean;
 		cell: ActivityGridCell;
 	} | null>(null);
+	const hoverCloseTimer = useRef<number | null>(null);
+	const snapFrame = useRef<number | null>(null);
+	const lastSnapPoint = useRef<{ x: number; y: number } | null>(null);
 	const [activeId, setActiveId] = useState<string | null>(null);
+	const [hoverId, setHoverId] = useState<string | null>(null);
 	const [pinnedId, setPinnedId] = useState<string | null>(null);
 	const [anchor, setAnchor] = useState<Rect | null>(null);
 	const gridRootRef = useRef<HTMLDivElement>(null);
 	const activeCell =
-		cells.find(({ cell }) => cell.id === (pinnedId ?? activeId))?.cell ?? null;
+		cells.find(({ cell }) => cell.id === (hoverId ?? pinnedId ?? activeId))
+			?.cell ?? null;
 	const isMatrix = model.layout === "matrix";
 
 	const syncAnchor = useCallback(() => {
@@ -1125,13 +1240,19 @@ export function ActivityGrid({
 				target &&
 				target instanceof Element &&
 				(target.closest("[data-activity-grid-root]") ||
-					target.closest("[data-activity-grid-preview]"))
+					target.closest("[data-activity-grid-preview]") ||
+					// 预览内的调用菜单通过 portal 渲染在预览之外，点击它不算点到外部。
+					target.closest("[data-radix-popper-content-wrapper]"))
 			)
 				return;
 			setPinnedId(null);
+			setHoverId(null);
+			setAnchor(null);
 		};
 		const closeOnEscape = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setPinnedId(null);
+			if (event.key !== "Escape") return;
+			setPinnedId(null);
+			setHoverId(null);
 		};
 		document.addEventListener("pointerdown", closeOutside);
 		document.addEventListener("keydown", closeOnEscape);
@@ -1149,6 +1270,123 @@ export function ActivityGrid({
 		() => () => {
 			if (longPressTimer.current !== null)
 				window.clearTimeout(longPressTimer.current);
+		},
+		[],
+	);
+
+	const clearHoverClose = useCallback(() => {
+		if (hoverCloseTimer.current === null) return;
+		window.clearTimeout(hoverCloseTimer.current);
+		hoverCloseTimer.current = null;
+	}, []);
+
+	const scheduleHoverClose = useCallback(() => {
+		if (hoverCloseTimer.current !== null) return;
+		hoverCloseTimer.current = window.setTimeout(() => {
+			hoverCloseTimer.current = null;
+			setHoverId(null);
+		}, HOVER_CLOSE_DELAY_MS);
+	}, []);
+
+	/** 格子与浮窗共用一次延迟关闭；任一侧的进入都会取消它。 */
+	const onPointerHoverEnter = useCallback(
+		(cell: ActivityGridCell, element: HTMLElement) => {
+			clearHoverClose();
+			setHoverId(cell.id);
+			setAnchor(element.getBoundingClientRect());
+		},
+		[clearHoverClose],
+	);
+
+	const onPointerHoverLeave = useCallback(
+		(element: HTMLElement, relatedTarget: EventTarget | null) => {
+			// 格子间隙、行标签和时间轴仍属于网格：保持当前预览，交给平滑移动。
+			if (
+				relatedTarget instanceof Node &&
+				(gridRootRef.current?.contains(relatedTarget) ?? false)
+			) {
+				clearHoverClose();
+				return;
+			}
+			if (document.activeElement === element) return;
+			scheduleHoverClose();
+		},
+		[clearHoverClose, scheduleHoverClose],
+	);
+
+	/** 指针落在格子之外的空隙时，取半径内最近的格子，避免预览缺失或跳动。 */
+	const snapToNearestCell = useCallback(
+		(clientX: number, clientY: number) => {
+			let best: { cell: ActivityGridCell; element: HTMLButtonElement } | null =
+				null;
+			let bestDistance = NEAREST_CELL_RADIUS_PX;
+			for (const { cell } of cells) {
+				const element = cellRefs.current.get(cell.id);
+				if (!element) continue;
+				const rect = element.getBoundingClientRect();
+				const dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
+				const dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
+				const distance = Math.hypot(dx, dy);
+				if (distance < bestDistance) {
+					bestDistance = distance;
+					best = { cell, element };
+				}
+			}
+			if (best) onPointerHoverEnter(best.cell, best.element);
+		},
+		[cells, onPointerHoverEnter],
+	);
+
+	const onGridPointerMove = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			if (event.pointerType === "touch" || hoverId !== null) return;
+			if (pinnedId !== null) return;
+			if (snapFrame.current !== null) return;
+			const { clientX, clientY } = event;
+			const last = lastSnapPoint.current;
+			// 空白处移动时每帧重扫全部格子代价高，微小位移不会改变最近格子。
+			if (
+				last &&
+				Math.hypot(clientX - last.x, clientY - last.y) < SNAP_MIN_MOVEMENT_PX
+			)
+				return;
+			snapFrame.current = window.requestAnimationFrame(() => {
+				snapFrame.current = null;
+				lastSnapPoint.current = { x: clientX, y: clientY };
+				snapToNearestCell(clientX, clientY);
+			});
+		},
+		[hoverId, pinnedId, snapToNearestCell],
+	);
+
+	const onGridPointerEnter = useCallback(() => {
+		clearHoverClose();
+	}, [clearHoverClose]);
+
+	const onGridPointerLeave = useCallback(() => {
+		// 网格内的焦点由 activeId/pinnedId 承载，指针离开必须结束悬浮预览。
+		lastSnapPoint.current = null;
+		clearHoverClose();
+		scheduleHoverClose();
+	}, [clearHoverClose, scheduleHoverClose]);
+
+	const releasePinned = useCallback(() => {
+		clearHoverClose();
+		const active = document.activeElement;
+		if (active instanceof HTMLElement && gridRootRef.current?.contains(active))
+			active.blur();
+		setPinnedId(null);
+		setHoverId(null);
+		setActiveId(null);
+		setAnchor(null);
+	}, [clearHoverClose]);
+
+	useEffect(
+		() => () => {
+			if (hoverCloseTimer.current !== null)
+				window.clearTimeout(hoverCloseTimer.current);
+			if (snapFrame.current !== null)
+				window.cancelAnimationFrame(snapFrame.current);
 		},
 		[],
 	);
@@ -1210,29 +1448,36 @@ export function ActivityGrid({
 			};
 			return {
 				cell,
-				selected: activeId === cell.id || pinnedId === cell.id,
+				selected:
+					activeId === cell.id || hoverId === cell.id || pinnedId === cell.id,
+				expanded: pinnedId === cell.id,
 				setRef: (element: HTMLButtonElement | null) => {
 					if (element) cellRefs.current.set(cell.id, element);
 					else cellRefs.current.delete(cell.id);
 				},
 				onPointerEnter: (event: ReactPointerEvent<HTMLButtonElement>) => {
-					if (event.pointerType !== "touch" && pinnedId === null)
-						setCurrent(cell, event.currentTarget);
+					if (event.pointerType === "touch") return;
+					onPointerHoverEnter(cell, event.currentTarget);
 				},
 				onPointerLeave: (event: ReactPointerEvent<HTMLButtonElement>) => {
-					if (
-						!isMatrix &&
-						event.pointerType !== "touch" &&
-						pinnedId === null &&
-						document.activeElement !== event.currentTarget
-					)
-						setCurrent(null);
+					if (event.pointerType !== "touch")
+						onPointerHoverLeave(event.currentTarget, event.relatedTarget);
 				},
 				onFocus: (event: ReactFocusEvent<HTMLButtonElement>) =>
 					setCurrent(cell, event.currentTarget),
 				onBlur: (event: ReactFocusEvent<HTMLButtonElement>) => {
-					if (pinnedId === null && !event.currentTarget.matches(":hover"))
-						setCurrent(null);
+					const related = event.relatedTarget;
+					if (related instanceof Node && gridRootRef.current?.contains(related))
+						return;
+					if (pinnedId !== null) return;
+					if (
+						document.activeElement !== null &&
+						document.activeElement !== event.currentTarget &&
+						gridRootRef.current?.contains(document.activeElement)
+					)
+						return;
+					setCurrent(null);
+					setHoverId(null);
 				},
 				onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => {
 					if (event.pointerType !== "touch") return;
@@ -1307,17 +1552,20 @@ export function ActivityGrid({
 						setAnchor(event.currentTarget.getBoundingClientRect());
 						return;
 					}
+					setHoverId(null);
 					onActivate(cell);
 				},
 				onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => {
 					if (event.key === "Enter") {
 						event.preventDefault();
 						if (isMatrix) setPinnedId(cell.id);
+						setHoverId(null);
 						onActivate(cell);
 						return;
 					}
 					if (event.key === "Escape") {
 						setPinnedId(null);
+						setHoverId(null);
 						setActiveId(null);
 						return;
 					}
@@ -1334,7 +1582,16 @@ export function ActivityGrid({
 				},
 			};
 		},
-		[activeId, isMatrix, moveSelection, onActivate, pinnedId],
+		[
+			activeId,
+			hoverId,
+			isMatrix,
+			moveSelection,
+			onActivate,
+			onPointerHoverEnter,
+			onPointerHoverLeave,
+			pinnedId,
+		],
 	);
 
 	if (loading) {
@@ -1356,6 +1613,9 @@ export function ActivityGrid({
 			data-activity-grid-root="true"
 			data-activity-grid-layout={model.layout}
 			data-activity-grid-scroll={model.scrollPolicy}
+			onPointerEnter={onGridPointerEnter}
+			onPointerLeave={onGridPointerLeave}
+			onPointerMove={onGridPointerMove}
 		>
 			{useCanvas ? (
 				<DenseCanvasGrid
@@ -1369,6 +1629,7 @@ export function ActivityGrid({
 				<WrappedRowsGrid
 					model={model}
 					activeId={activeId}
+					hoveredId={hoverId}
 					selectedCellId={selectedCellId}
 					setCellRef={(id, element) => {
 						if (element) cellRefs.current.set(id, element);
@@ -1380,6 +1641,7 @@ export function ActivityGrid({
 				<MatrixGrid
 					model={model}
 					activeId={activeId}
+					hoveredId={hoverId}
 					selectedCellId={selectedCellId}
 					setCellRef={(id, element) => {
 						if (element) cellRefs.current.set(id, element);
@@ -1394,7 +1656,7 @@ export function ActivityGrid({
 					anchor={anchor}
 					pinned={pinnedId !== null}
 					testId={previewTestId}
-					onClose={() => setPinnedId(null)}
+					onClose={releasePinned}
 				/>
 			) : null}
 		</div>

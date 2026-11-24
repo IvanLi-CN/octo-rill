@@ -201,41 +201,51 @@ function makeModel(
 				className: activityClass(count.succeeded, count.failed, maximum),
 				data: { model: model.model, column: index },
 				preview: {
-					title: `${model.model} 在 ${localTime(bucket.started_at)} 的调用摘要`,
+					title: `${localTime(bucket.started_at)} 起 1 小时的调用摘要`,
 					lines: [],
-					content: (
-						<div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] gap-x-3 gap-y-1 text-xs">
+					content: ({ pinned }) => (
+						<div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto_auto] items-center gap-x-3 gap-y-1 text-xs">
 							<span className="text-muted-foreground">模型</span>
 							<span className="text-right text-muted-foreground">成功</span>
 							<span className="text-right text-muted-foreground">失败</span>
 							<span className="text-right text-muted-foreground">成功率</span>
 							<span className="text-right text-muted-foreground">使用率</span>
-							{bucket.counts.map((item) => (
-								<div key={item.model} className="contents">
-									<span className="truncate font-mono" title={item.model}>
-										{item.model}
-									</span>
-									<span className="text-right tabular-nums">
-										{item.succeeded}
-									</span>
-									<span className="text-right tabular-nums">{item.failed}</span>
-									<span className="text-right tabular-nums">
-										{percent(item.succeeded, item.succeeded + item.failed)}
-									</span>
-									<span className="text-right tabular-nums">
-										{percent(item.succeeded, bucketSucceeded)}
-									</span>
-								</div>
-							))}
-							{onOpenCalls ? (
-								<div className="col-span-full mt-2 flex justify-end">
-									<LlmCallActionsMenu
-										target={target}
-										onOpen={onOpenCalls}
-										label={`${model.model} 的调用操作`}
-									/>
-								</div>
-							) : null}
+							<span aria-hidden="true" />
+							{bucket.counts.map((item) => {
+								const rowTarget: LlmCallDrilldown = {
+									model: item.model,
+									finishedFrom: bucket.started_at,
+									finishedBefore: bucket.ended_at,
+								};
+								return (
+									<div key={item.model} className="contents">
+										<span className="truncate font-mono" title={item.model}>
+											{item.model}
+										</span>
+										<span className="text-right tabular-nums">
+											{item.succeeded}
+										</span>
+										<span className="text-right tabular-nums">
+											{item.failed}
+										</span>
+										<span className="text-right tabular-nums">
+											{percent(item.succeeded, item.succeeded + item.failed)}
+										</span>
+										<span className="text-right tabular-nums">
+											{percent(item.succeeded, bucketSucceeded)}
+										</span>
+										{pinned && onOpenCalls ? (
+											<LlmCallActionsMenu
+												target={rowTarget}
+												onOpen={onOpenCalls}
+												label={`${item.model} 的调用操作`}
+											/>
+										) : (
+											<span aria-hidden="true" />
+										)}
+									</div>
+								);
+							})}
 						</div>
 					),
 				},
