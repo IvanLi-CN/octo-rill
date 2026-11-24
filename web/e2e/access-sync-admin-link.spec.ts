@@ -227,21 +227,24 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 				});
 			}
 
-			if (searchParams.get("task_type") === "sync.subscriptions") {
-				return json(route, {
-					items: [],
-					page: 1,
-					page_size: 20,
-					total: 0,
-				});
-			}
-
 			const items = accessTaskVisible ? [accessRefreshTask] : [];
 			return json(route, {
 				items,
 				page: 1,
 				page_size: 20,
 				total: items.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/subscriptions/runs"
+		) {
+			return json(route, {
+				items: [],
+				page: 1,
+				page_size: 20,
+				total: 0,
 			});
 		}
 
