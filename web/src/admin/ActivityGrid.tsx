@@ -14,6 +14,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useId,
 } from "react";
 import { createPortal } from "react-dom";
 
@@ -104,7 +105,7 @@ const PREVIEW_GAP = 10;
 const VIEWPORT_MARGIN = 10;
 const HOVER_CLOSE_DELAY_MS = 160;
 const NEAREST_CELL_RADIUS_PX = 24;
-const NEAREST_CELL_MAX_CELLS = 600;
+const SNAP_MIN_MOVEMENT_PX = 2;
 const LONG_PRESS_MS = 150;
 const TOUCH_MOVE_THRESHOLD = 8;
 const DENSE_CELL_LIMIT = 8_000;
@@ -158,11 +159,20 @@ function placePreview(
 	}
 	const aboveTop = anchor.top - preview.height - PREVIEW_GAP;
 	const belowTop = anchor.bottom + PREVIEW_GAP;
-	const top =
+	const preferredTop =
 		aboveTop >= VIEWPORT_MARGIN ||
 		belowTop + preview.height > viewport.height - VIEWPORT_MARGIN
 			? aboveTop
 			: belowTop;
+	// 两侧都放不下时必须留在视口内：宁可压住锚点行，也不能把预览移出屏幕。
+	const top = clamp(
+		preferredTop,
+		VIEWPORT_MARGIN,
+		Math.max(
+			VIEWPORT_MARGIN,
+			viewport.height - preview.height - VIEWPORT_MARGIN,
+		),
+	);
 	return {
 		left: clamp(
 			preferredLeft,
@@ -237,6 +247,8 @@ function PreviewLayer({
 }) {
 	const previewRef = useRef<HTMLDivElement | null>(null);
 	const placement = useSafePreview(cell, anchor, previewRef, !pinned);
+	// 同一页面可能同时存在多个活动图，标题 id 必须按实例生成。
+	const titleId = useId();
 	if (!cell) return null;
 	const content =
 		typeof cell.preview.content === "function"
@@ -248,7 +260,7 @@ function PreviewLayer({
 			{...(pinned
 				? {
 						role: "dialog" as const,
-						"aria-labelledby": "activity-grid-preview-title",
+						"aria-labelledby": titleId,
 					}
 				: { role: "tooltip" as const })}
 			aria-live="polite"
@@ -263,7 +275,8 @@ function PreviewLayer({
 		>
 			<div className="flex items-start justify-between gap-3">
 				<p
-					id="activity-grid-preview-title"
+					id={titleId}
+					data-testid="activity-grid-preview-title"
 					className="min-w-0 break-words text-sm font-medium"
 				>
 					{cell.preview.title}
@@ -904,6 +917,36 @@ function DenseCanvasGrid({
 		},
 		[cellSize, columns, labelWidth, model.rows, step],
 	);
+	/** 命中格子间隙或行内空白时取半径内最近的格子，避免从网格外进入后没有预览。 */
+	const nearestHitTest = useCallback(
+		(
+			event: {
+				clientX: number;
+				clientY: number;
+				currentTarget: HTMLCanvasElement;
+			},
+			rowIndex: number,
+		) => {
+			const rect = event.currentTarget.getBoundingClientRect();
+			const x = event.clientX - rect.left;
+			const y = event.clientY - rect.top;
+			const rowCells = model.rows[rowIndex].cells;
+			if (rowCells.length === 0) return null;
+			const lines = Math.ceil(rowCells.length / columns);
+			const column = clamp(Math.floor((x - labelWidth) / step), 0, columns - 1);
+			const line = clamp(Math.floor((y - 24) / step), 0, lines - 1);
+			const cell =
+				rowCells[Math.min(line * columns + column, rowCells.length - 1)];
+			if (!cell) return null;
+			const left = labelWidth + column * step;
+			const top = 24 + line * step;
+			const dx = Math.max(left - x, 0, x - (left + cellSize));
+			const dy = Math.max(top - y, 0, y - (top + cellSize));
+			if (Math.hypot(dx, dy) > NEAREST_CELL_RADIUS_PX) return null;
+			return cell;
+		},
+		[cellSize, columns, labelWidth, model.rows, step],
+	);
 	const getCellAnchor = useCallback(
 		(cellIndex: number, canvas: HTMLCanvasElement): Rect => {
 			const rect = canvas.getBoundingClientRect();
@@ -1030,13 +1073,18 @@ function DenseCanvasGrid({
 									}
 									return;
 								}
-								if (!cell) return;
-								setActiveId(cell.id);
-								const cellAnchor = getCellAnchor(
-									model.rows[rowIndex].cells.indexOf(cell),
-									event.currentTarget,
+								// 跨行移动时上一块画布已排好延迟关闭，命中后必须取消。
+								clearHoverTimer();
+								const target =
+									cell ?? (activeId ? null : nearestHitTest(event, rowIndex));
+								if (!target) return;
+								setActiveId(target.id);
+								setAnchor(
+									getCellAnchor(
+										model.rows[rowIndex].cells.indexOf(target),
+										event.currentTarget,
+									),
 								);
-								setAnchor(cellAnchor);
 							}}
 							onPointerDown={(event) => {
 								if (event.pointerType !== "touch") return;
@@ -1142,6 +1190,7 @@ export function ActivityGrid({
 	} | null>(null);
 	const hoverCloseTimer = useRef<number | null>(null);
 	const snapFrame = useRef<number | null>(null);
+	const lastSnapPoint = useRef<{ x: number; y: number } | null>(null);
 	const [activeId, setActiveId] = useState<string | null>(null);
 	const [hoverId, setHoverId] = useState<string | null>(null);
 	const [pinnedId, setPinnedId] = useState<string | null>(null);
@@ -1249,13 +1298,6 @@ export function ActivityGrid({
 		[clearHoverClose],
 	);
 
-	const hasGridFocus = () => {
-		const active = document.activeElement;
-		return active instanceof HTMLElement && active !== document.body
-			? (gridRootRef.current?.contains(active) ?? false)
-			: false;
-	};
-
 	const onPointerHoverLeave = useCallback(
 		(element: HTMLElement, relatedTarget: EventTarget | null) => {
 			// 格子间隙、行标签和时间轴仍属于网格：保持当前预览，交给平滑移动。
@@ -1275,7 +1317,6 @@ export function ActivityGrid({
 	/** 指针落在格子之外的空隙时，取半径内最近的格子，避免预览缺失或跳动。 */
 	const snapToNearestCell = useCallback(
 		(clientX: number, clientY: number) => {
-			if (cells.length > NEAREST_CELL_MAX_CELLS) return;
 			let best: { cell: ActivityGridCell; element: HTMLButtonElement } | null =
 				null;
 			let bestDistance = NEAREST_CELL_RADIUS_PX;
@@ -1302,8 +1343,16 @@ export function ActivityGrid({
 			if (pinnedId !== null) return;
 			if (snapFrame.current !== null) return;
 			const { clientX, clientY } = event;
+			const last = lastSnapPoint.current;
+			// 空白处移动时每帧重扫全部格子代价高，微小位移不会改变最近格子。
+			if (
+				last &&
+				Math.hypot(clientX - last.x, clientY - last.y) < SNAP_MIN_MOVEMENT_PX
+			)
+				return;
 			snapFrame.current = window.requestAnimationFrame(() => {
 				snapFrame.current = null;
+				lastSnapPoint.current = { x: clientX, y: clientY };
 				snapToNearestCell(clientX, clientY);
 			});
 		},
@@ -1315,9 +1364,11 @@ export function ActivityGrid({
 	}, [clearHoverClose]);
 
 	const onGridPointerLeave = useCallback(() => {
-		if (hasGridFocus()) return;
+		// 网格内的焦点由 activeId/pinnedId 承载，指针离开必须结束悬浮预览。
+		lastSnapPoint.current = null;
+		clearHoverClose();
 		scheduleHoverClose();
-	}, [scheduleHoverClose]);
+	}, [clearHoverClose, scheduleHoverClose]);
 
 	const releasePinned = useCallback(() => {
 		clearHoverClose();

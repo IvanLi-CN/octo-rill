@@ -378,5 +378,33 @@ export const DenseCanvas: Story = {
 		await expect(args.onOpenRecord).toHaveBeenCalled();
 		await userEvent.keyboard("{Escape}");
 		grid.blur();
+
+		// 跨行画布移动：上一行的延迟关闭不得清掉新行刚命中的预览。
+		const rows = grid.querySelectorAll("canvas");
+		if (rows.length < 2) throw new Error("Expected multiple row canvases");
+		const body = within(canvasElement.ownerDocument.body);
+		const cellPoint = (surface: HTMLCanvasElement) => {
+			const surfaceRect = surface.getBoundingClientRect();
+			return {
+				clientX: surfaceRect.left + 75,
+				clientY: surfaceRect.top + 28,
+			};
+		};
+		fireEvent.pointerMove(rows[0], cellPoint(rows[0]));
+		const preview = body.getByTestId("collection-activity-preview");
+		await expect(preview).toBeVisible();
+		const firstRowTitle =
+			body.getByTestId("activity-grid-preview-title").textContent ?? "";
+		// 浏览器在跨行移动时会先离开上一行画布，再在新画布上命中格子。
+		// React 由 pointerout/pointerover 合成 leave/enter，必须按浏览器顺序派发。
+		fireEvent.pointerOut(rows[0], { relatedTarget: rows[1] });
+		fireEvent.pointerOver(rows[1], { relatedTarget: rows[0] });
+		fireEvent.pointerMove(rows[1], cellPoint(rows[1]));
+		await expect(preview).toBeVisible();
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		await expect(preview).toBeVisible();
+		const secondRowTitle =
+			body.getByTestId("activity-grid-preview-title").textContent ?? "";
+		expect(secondRowTitle).not.toBe(firstRowTitle);
 	},
 };

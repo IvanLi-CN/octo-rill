@@ -3959,7 +3959,7 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 		page.getByRole("dialog", { name: /起 1 小时的调用摘要$/ }),
 	).toBeVisible();
 	await expect(
-		summary.locator("#activity-grid-preview-title"),
+		summary.getByTestId("activity-grid-preview-title"),
 	).not.toContainText("gpt-");
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
@@ -4252,7 +4252,7 @@ test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
 	// 悬停预览不接收指针：穿过浮窗落到页面上仍按离开网格处理。
 	await expect(summary).toHaveAttribute("role", "tooltip");
 	await page.mouse.move((summaryBox?.x ?? 0) + 12, (summaryBox?.y ?? 0) + 12);
-	await expect(summary).toHaveCount(0, { timeout: 3_000 });
+	await expect(summary).toHaveCount(0, { timeout: 800 });
 });
 
 test("admin llm activity keeps the preview across cell gaps", async ({
@@ -4265,38 +4265,80 @@ test("admin llm activity keeps the preview across cell gaps", async ({
 	const grid = page.getByTestId("llm-activity-grid");
 	const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
 	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
-	const cell = cells.nth(20);
-	await cell.hover();
 	const summary = page.getByTestId("llm-activity-summary");
-	await expect(summary).toBeVisible();
-	const title = await summary
-		.locator("#activity-grid-preview-title")
-		.textContent();
-	const box = await cell.boundingBox();
-	expect(box).not.toBeNull();
+	const title = page.getByTestId("activity-grid-preview-title");
 
-	// 2px 格子间隙仍属于网格：预览保持同一格数据，不得关闭或跳格。
+	// 该行最左侧的格子：只有行标签空白在它左边，最近格子唯一。
+	const firstCell = cells.first();
+	const box = await firstCell.boundingBox();
+	expect(box).not.toBeNull();
+	await firstCell.hover();
+	await expect(summary).toBeVisible();
+	const firstTitle = (await title.textContent()) ?? "";
+	expect(firstTitle).toMatch(/起 1 小时的调用摘要$/);
+
+	// 格子间隙（本例约 9px）仍属于网格：预览保持同一格数据，不得关闭或跳格。
 	await page.mouse.move(
-		(box?.x ?? 0) + (box?.width ?? 0) + 1,
+		(box?.x ?? 0) + (box?.width ?? 0) + 0.5,
 		(box?.y ?? 0) + (box?.height ?? 0) / 2,
 	);
 	await page.waitForTimeout(300);
 	await expect(summary).toBeVisible();
-	await expect(summary.locator("#activity-grid-preview-title")).toHaveText(
-		title ?? "",
-	);
+	await expect(title).toHaveText(firstTitle);
 
-	// 从网格外直接落进间隙：按最近格子显示，而不是保持空白。
+	// 指针离开网格：悬浮预览必须在需求上界（200ms + 余量）内消失。
 	await page.mouse.move(4, 4);
-	await expect(summary).toHaveCount(0, { timeout: 3_000 });
+	const leftAt = Date.now();
+	await expect(summary).toHaveCount(0, { timeout: 2_000 });
+	expect(Date.now() - leftAt).toBeLessThan(800);
+
+	// 从网格外直接落进同行左侧的行标签空白：按最近格子显示，而不是留空。
 	await page.mouse.move(
-		(box?.x ?? 0) + (box?.width ?? 0) + 1,
+		(box?.x ?? 0) - 20,
 		(box?.y ?? 0) + (box?.height ?? 0) / 2,
 	);
 	await expect(summary).toBeVisible();
-	await expect(summary.locator("#activity-grid-preview-title")).toHaveText(
-		title ?? "",
+	await expect(title).toHaveText(firstTitle);
+});
+
+test("admin llm activity returns a pinned preview to its cell after the pointer leaves", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	const summary = page.getByTestId("llm-activity-summary");
+	const title = page.getByTestId("activity-grid-preview-title");
+	const pinnedCell = cells.first();
+	const hoverCell = cells.nth(1);
+	const pinnedBox = await pinnedCell.boundingBox();
+	const hoverBox = await hoverCell.boundingBox();
+	expect(pinnedBox).not.toBeNull();
+	expect(hoverBox).not.toBeNull();
+
+	await pinnedCell.click();
+	await expect(summary).toHaveAttribute("role", "dialog");
+	const pinnedTitle = (await title.textContent()) ?? "";
+	expect(pinnedTitle).toMatch(/起 1 小时的调用摘要$/);
+
+	// 指针进入其他格子：预览临时跟随指针，但仍保持固定态。
+	await hoverCell.hover();
+	await expect(summary).toHaveAttribute("role", "dialog");
+	await expect(title).not.toHaveText(pinnedTitle);
+
+	// 经行标签空白离开网格（焦点仍留在固定格子上）：预览必须回到被固定的格子。
+	await page.mouse.move(
+		(pinnedBox?.x ?? 0) - 20,
+		(pinnedBox?.y ?? 0) + (pinnedBox?.height ?? 0) / 2,
 	);
+	await expect(title).not.toHaveText(pinnedTitle);
+	await page.mouse.move(4, 4);
+	await expect(title).toHaveText(pinnedTitle, { timeout: 800 });
+	await expect(summary).toBeVisible();
 });
 
 test("admin llm activity reanchors a pinned tooltip after activity refresh", async ({
