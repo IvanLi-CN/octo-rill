@@ -1,0 +1,156 @@
+name: PostgreSQL Tests
+
+# Dedicated PostgreSQL 18 job for the live read/write paths (REQ-RTR-005).
+#
+# It is a separate workflow instead of another job in `ci.yml` because the
+# quality-gates contract pins `ci.yml` to an exact set of job names that is
+# read from the base branch, so adding a job there would fail the contract
+# check for that file. A separate workflow also lets this job be rerun and
+# time-bounded on its own, which is what the retirement spec asks for.
+#
+# There is deliberately no `paths:` filter: documentation-only and mixed PRs
+# must still exercise the PostgreSQL runtime, and a skipped job would silently
+# drop coverage the retirement work depends on.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - edited
+  merge_group:
+    types:
+      - checks_requested
+  workflow_dispatch:
+
+concurrency:
+  group: postgres-tests-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  postgres-tests:
+    name: PostgreSQL 18 Tests
+    runs-on: ubuntu-24.04
+    # Bounded on purpose: a hung seed suite must fail the job instead of
+    # holding a runner. The whole job finishes in a few minutes when green.
+    timeout-minutes: 30
+    # One ephemeral cluster, published on loopback only. The database lives in
+    # the throwaway container for this job and disappears with the runner.
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      # Tests create and drop their own throwaway databases through this
+      # superuser URL, so nothing is shared between suites.
+      TEST_PG_TRANSLATE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      TEST_PG_TASKS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      PG_ADMIN_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      PG_SEED_SCHEMA_SOURCE: ${{ github.workspace }}/.ci/pg-seed-schema.db
+      BINARY_DIR: target/debug
+      PORT_BASE: "3400"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libsqlite3-dev postgresql-client
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+
+      - name: Cache cargo directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pg18-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pg18-
+            ${{ runner.os }}-cargo-
+
+      # Ubuntu's archive PostgreSQL is not upstream 18, and `initdb` therefore
+      # cannot be relied on to produce an 18 cluster. Pulling the same pinned
+      # `postgres:18` image the Docker smoke test uses keeps the server version
+      # pinned and the cluster ephemeral.
+      - name: Start ephemeral PostgreSQL 18 cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --rm \
+            --name octo-rill-pg18 \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 127.0.0.1:5432:5432 \
+            postgres:18 >/dev/null
+          for _ in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs octo-rill-pg18 || true
+          echo "ephemeral PostgreSQL 18 cluster did not become ready" >&2
+          exit 1
+
+      - name: Prove the cluster is PostgreSQL 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(psql "$PG_ADMIN_URL" -XAt -c 'SHOW server_version_num')"
+          [[ "${version}" == 18* ]] || {
+            echo "expected PostgreSQL 18, got server_version_num=${version}" >&2
+            exit 1
+          }
+
+      - name: Build test binaries
+        run: cargo build --locked --all-features --bins
+
+      # `--ignored` inverts the filter: it runs exactly the tests that carry a
+      # standing `#[ignore]` for an isolated PostgreSQL 18 cluster, instead of
+      # the default set that skips them. The remaining ignores are manual
+      # benchmarks that must not run on a shared runner, so they are skipped by
+      # name rather than silently left behind.
+      - name: Run PostgreSQL-gated tests
+        run: |
+          cargo test --locked --all-features -- --ignored \
+            --skip production_sized_fts_maintenance_benchmark \
+            --skip admin_collection_activity_production_shape_budget \
+            --skip admin_realtime_list_and_foreground_writes_meet_100k_latency_budget
+
+      # The import suite replays the legacy SQLite schema, so it needs a SQLite
+      # snapshot. It is built from `migrations/` at run time; `tower_sessions`
+      # is added by the builder because the session store creates that table
+      # outside the migration history.
+      - name: Build SQLite schema snapshot for the import suite
+        run: python3 scripts/build_pg_seed_schema.py --output "$PG_SEED_SCHEMA_SOURCE"
+
+      # Each suite creates its own throwaway database and drops it afterwards,
+      # so the suite is safe to run in one job and fails closed per suite.
+      - name: Run PostgreSQL seed suites
+        run: bash scripts/pg_seed_suite.sh
+
+      - name: Stop ephemeral PostgreSQL 18 cluster
+        if: ${{ always() }}
+        shell: bash
+        run: docker rm -f octo-rill-pg18 >/dev/null 2>&1 || true

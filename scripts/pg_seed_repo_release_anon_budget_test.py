@@ -40,10 +40,13 @@ TAIL_USER = "seed-anon-tail"
 
 MULTI_REPO = 7001
 MULTI_FULL_NAME = "anon/multipage"
-MULTI_RELEASE_COUNT = 250
-MULTI_PAGES = 3
+# The runtime asks for `RELEASES_PER_PAGE = 50`, so an exact page count needs a
+# genuinely short last page: 240 releases = 4 full pages plus a 40-entry page.
+MULTI_RELEASE_COUNT = 240
+MULTI_PAGES = 5
 
-BULK_REPOS = [(7100 + index, f"anon/bulk{index:02d}") for index in range(47)]
+# One single-page repository per remaining budget slot (50 - 5 pages).
+BULK_REPOS = [(7100 + index, f"anon/bulk{index:02d}") for index in range(45)]
 PROBE_REPO = 7200
 PROBE_FULL_NAME = "anon/probe"
 CAL_REPOS = [(7210 + index, f"anon/cal{index:02d}") for index in range(4)]
@@ -399,9 +402,9 @@ def main():
             assert multi_item[2] == str(MULTI_PAGES), multi_item
 
             # --- (b) the remaining slots are spent one page at a time ---------
-            # 50 slots - 3 pages = 47, so all 47 single-page repositories fit
+            # 50 slots - 5 pages = 45, so all 45 single-page repositories fit
             # and the anonymous allowance is exactly gone afterwards. Had the
-            # multi-page read been charged once, two slots would remain and the
+            # multi-page read been charged once, four slots would remain and the
             # deferred read below would have succeeded instead.
             status, result_json = run_task("task-bulk", "sync.releases", {"user_id": BULK_USER})
             assert status == "succeeded", (status, result_json)
