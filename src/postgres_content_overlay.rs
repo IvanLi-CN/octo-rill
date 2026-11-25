@@ -1349,3 +1349,36 @@ pub(crate) async fn latest_translation_request_ids(
     }
     Ok(requests)
 }
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    /// Public readers resolve the public variant and nothing else: the legacy
+    /// `smart` row may describe a reading derived from private compare evidence.
+    #[test]
+    fn public_audience_never_falls_back_to_legacy_smart() {
+        assert_eq!(
+            ReleaseAudience::Public.polishing_variants(),
+            &[translations::RELEASE_READING_PUBLIC_VARIANT]
+        );
+        assert!(
+            !ReleaseAudience::Public
+                .polishing_variants()
+                .contains(&"smart")
+        );
+    }
+
+    /// Authorized viewers keep the audit reading variant first, with the
+    /// pre-cutover `smart` projection as the documented fallback.
+    #[test]
+    fn authorized_audience_reads_its_variant_then_legacy_smart() {
+        let variants = ReleaseAudience::Authorized.polishing_variants();
+        assert_eq!(
+            variants[0],
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+        );
+        assert_eq!(variants.last().copied(), Some("smart"));
+        assert!(!variants.contains(&translations::RELEASE_READING_PUBLIC_VARIANT));
+    }
+}

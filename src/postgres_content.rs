@@ -19,10 +19,11 @@
 //! hands the validated payload to [`publish_translation_result`] instead of
 //! writing `content_result_projections` itself.
 //!
-//! Reading-evidence polishing (`smart_public` / `smart_authorized`) needs the
-//! PostgreSQL evidence producer and is intentionally not admitted here; this
-//! module only admits the established `smart` polishing contract whose output
-//! validation is satisfied by the stored source snapshot.
+//! Reading polishing is admitted per audience: `smart_public` for public
+//! readers and `smart_authorized` for authorized viewers, derived from the
+//! published Release text alone (ADR 0022). A Release whose published text does
+//! not state a change keeps only the established `smart` summary contract; a
+//! public reader never falls back to that legacy variant.
 
 use std::time::Duration;
 
@@ -967,12 +968,312 @@ pub(crate) fn spawn(
     Some(tokio::spawn(run_loop(pool, http, ai, shutdown)))
 }
 
-/// Admit Release polishing work that the established `smart` contract can
-/// validate from the stored release source alone.
+/// Source blocks shared by every polishing variant of one Release.
 ///
-/// Reading-evidence variants are excluded until the PostgreSQL evidence
-/// producer exists: admitting them here would queue work the output contract
-/// must reject.
+/// The blocks are the published Release text only: `metadata`, `title`,
+/// `body_markdown` come from `repo_releases`, and the revision blocks carry the
+/// identity tiebreak. No block can carry compare evidence.
+fn release_polish_source_blocks(
+    repo_identity: &str,
+    tag_name: &str,
+    title: &str,
+    body: &str,
+    observed_at: Option<&str>,
+    tiebreak: &str,
+) -> Vec<TranslationSourceBlock> {
+    let mut source_blocks = vec![
+        TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("{repo_identity}\n{}", tag_name.trim()),
+        },
+        TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title.to_owned(),
+        },
+    ];
+    if !body.is_empty() {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.to_owned(),
+        });
+    }
+    if let Some(observed_at) = observed_at.filter(|value| !value.trim().is_empty()) {
+        source_blocks.insert(
+            0,
+            TranslationSourceBlock {
+                slot: "source_revision_tiebreak".to_owned(),
+                text: tiebreak.to_owned(),
+            },
+        );
+        source_blocks.insert(
+            0,
+            TranslationSourceBlock {
+                slot: "source_observed_at".to_owned(),
+                text: observed_at.to_owned(),
+            },
+        );
+    }
+    source_blocks
+}
+
+/// Published-Release-text evidence named to the reading contract.
+///
+/// `validate_output` requires `reading_evidence_json` to declare readable
+/// evidence. Only the published title/body is named here: this producer never
+/// collects compare evidence, so nothing private can reach either audience
+/// (ADR 0022).
+fn published_release_text_evidence(release_id: i64) -> Vec<translations::ReleaseReadingEvidence> {
+    vec![translations::ReleaseReadingEvidence {
+        kind: "release_text".to_owned(),
+        reference: release_id.to_string(),
+        scope: Some("published title/body; compare evidence not used".to_owned()),
+    }]
+}
+
+/// One polishing request item for one variant of a Release.
+fn release_polish_item(
+    release_id: i64,
+    variant: &str,
+    source_blocks: &[TranslationSourceBlock],
+) -> TranslationRequestItemInput {
+    let mut source_blocks = source_blocks.to_vec();
+    let mut target_slots = vec!["title_zh".to_owned(), "summary_md".to_owned()];
+    if variant != "smart" {
+        // Reading variants answer with the structured `reading` slot; the output
+        // contract derives title_zh/summary_md from it.
+        target_slots.push("reading".to_owned());
+        source_blocks.push(TranslationSourceBlock {
+            slot: "reading_contract".to_owned(),
+            text: "human_changes_direct; machine_materials_collapsible; no_source_section; no_version_repetition; no_author_attribution".to_owned(),
+        });
+        source_blocks.push(TranslationSourceBlock {
+            slot: "reading_evidence_json".to_owned(),
+            text: serde_json::to_string(&published_release_text_evidence(release_id))
+                .unwrap_or_else(|_| "[]".to_owned()),
+        });
+        source_blocks.push(TranslationSourceBlock {
+            slot: "reading_compare".to_owned(),
+            text: "Published Release title/body is the only evidence; no code compare was used."
+                .to_owned(),
+        });
+    }
+    TranslationRequestItemInput {
+        producer_ref: "sync.releases.polish".to_owned(),
+        kind: "release_smart".to_owned(),
+        variant: variant.to_owned(),
+        entity_id: release_id.to_string(),
+        target_lang: TARGET_LANG.to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    }
+}
+
+/// Whether the published Release text already states a change a reader can see.
+///
+/// This gates the audience reading variants. They are built from the published
+/// title/body alone, so a Release that publishes only its version, a changelog
+/// link or machine metadata would be answered with `insufficient` although no
+/// compare evidence was ever checked — the exact confusion the release-reading
+/// evidence rules forbid. Such a Release keeps only the `smart` summary contract
+/// until the compare-evidence producer exists.
+///
+/// This is intentionally stricter than `api::release_body_has_actionable_content`
+/// and does not reuse it: that gate decides whether compare evidence should be
+/// fetched and already counts a template shell like `See full changelog below.`
+/// as actionable. Reading admission needs the stronger fact that the published
+/// text alone grounds a change statement, because a variant admitted here can
+/// never fall back to compare evidence.
+fn published_release_states_a_change(title: &str, body: &str) -> bool {
+    const LOW_VALUE_PREFIXES: [&str; 15] = [
+        "http://",
+        "https://",
+        "完整变更日志",
+        "full changelog",
+        "see full changelog",
+        "查看 commits",
+        "view commits",
+        "更新内容",
+        "主要更新",
+        "release notes",
+        "what's changed",
+        "release-identity:",
+        "source-sha:",
+        "commit:",
+        "sha:",
+    ];
+    let title = title.trim();
+    if title.is_empty() {
+        return false;
+    }
+    let lower_title = title.to_ascii_lowercase();
+    let normalized_title = lower_title.trim_start_matches('v').to_owned();
+    let version_only = normalized_title
+        .strip_prefix("release ")
+        .or_else(|| normalized_title.strip_prefix("version "))
+        .unwrap_or(&normalized_title)
+        .trim_matches(|ch: char| matches!(ch, ':' | '：' | '-' | '_' | '(' | ')' | '[' | ']'))
+        .trim_start_matches('v');
+    let title_is_version_only = semver::Version::parse(version_only).is_ok();
+    if !title_is_version_only
+        && title.chars().count() >= 8
+        && !LOW_VALUE_PREFIXES
+            .iter()
+            .any(|prefix| lower_title.starts_with(prefix))
+    {
+        // The title itself states the change; a body is not required.
+        return true;
+    }
+    for raw_line in body.replace("\r\n", "\n").lines() {
+        let line = raw_line
+            .trim()
+            .trim_start_matches(['-', '*', '>', '#'])
+            .trim();
+        if line.chars().count() < 8 {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if LOW_VALUE_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        {
+            continue;
+        }
+        let normalized = lower
+            .strip_prefix("release ")
+            .or_else(|| lower.strip_prefix("version "))
+            .unwrap_or(&lower)
+            .trim()
+            .trim_start_matches('v');
+        if semver::Version::parse(normalized).is_ok() || normalized == normalized_title {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Admit one polishing variant of one Release.
+///
+/// Returns 1 when a work item was created and 0 when an equivalent projection
+/// or an active work item already covers the variant.
+struct ReleaseRevision<'a> {
+    observed_at: Option<&'a str>,
+    tiebreak: &'a str,
+}
+
+async fn admit_polish_variant(
+    pool: &PgPool,
+    release_id: i64,
+    variant: &str,
+    item: &TranslationRequestItemInput,
+    revision: ReleaseRevision<'_>,
+    fingerprint: &str,
+    token_estimate: i64,
+) -> Result<usize> {
+    let source_hash = content_processing::source_hash_for_item(item);
+    let identity = ContentWorkIdentity {
+        canonical_resource_type: "release".to_owned(),
+        canonical_resource_id: release_id.to_string(),
+        pipeline: "polishing".to_owned(),
+        variant: variant.to_owned(),
+        target_lang: TARGET_LANG.to_owned(),
+        source_hash: source_hash.clone(),
+        protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+    };
+    let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
+    let has_projection: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.content_current_result_projections WHERE identity_id = $1)",
+    )
+    .bind(&identity_id)
+    .fetch_one(pool)
+    .await?;
+    if has_projection {
+        return Ok(0);
+    }
+    let already_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' AND variant = $2 AND target_lang = $3 AND protocol_version = $4 AND status IN ('queued', 'running', 'ready', 'deferred_provider', 'blocked_config'))",
+    )
+    .bind(release_id.to_string())
+    .bind(variant)
+    .bind(TARGET_LANG)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .fetch_one(pool)
+    .await?;
+    if already_active {
+        return Ok(0);
+    }
+    let snapshot = serde_json::to_string(&json!({
+        "source_blocks": item.source_blocks,
+        "target_slots": item.target_slots,
+        "source_revision": {
+            "source_observed_at": revision.observed_at,
+            "source_revision_tiebreak": revision.tiebreak,
+        },
+        "evidence_snapshot_id": Value::Null,
+        "evidence_status": "not_required",
+    }))?;
+    let inserted = sqlx::query(
+        // `cache_hit` stays out of the insert: the migrated schema declares it
+        // boolean, the imported one bigint, and both default to a falsy value,
+        // so only the column default is portable.
+        "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', $3, $4, $5, $6, 'postgres-default', $7, $8, 'queued', 0, $9, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(release_id.to_string())
+    .bind(variant)
+    .bind(TARGET_LANG)
+    .bind(&source_hash)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(&snapshot)
+    .bind(fingerprint)
+    .bind(token_estimate)
+    .execute(pool)
+    .await
+    .context("admit release polishing work")?;
+    if inserted.rows_affected() == 0 {
+        // A terminal row for the same source hash cannot be re-admitted, and
+        // the unique conflict is the only signal. Surface it instead of letting
+        // the release look silently polished.
+        let terminal: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' AND variant = $2 AND target_lang = $3 AND protocol_version = $4 AND source_hash = $5 AND model_profile = 'postgres-default' LIMIT 1",
+        )
+        .bind(release_id.to_string())
+        .bind(variant)
+        .bind(TARGET_LANG)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(&source_hash)
+        .fetch_optional(pool)
+        .await?;
+        if matches!(
+            terminal.as_deref(),
+            Some("failed" | "cancelled" | "superseded")
+        ) {
+            tracing::debug!(
+                release_id = %release_id,
+                variant,
+                status = terminal.as_deref().unwrap_or_default(),
+                "release polishing work stayed terminal; not re-admitted"
+            );
+        }
+    }
+    Ok(usize::try_from(inserted.rows_affected()).unwrap_or(0))
+}
+
+/// Admit Release polishing work that the stored Release source can satisfy.
+///
+/// Every Release keeps the established `smart` summary contract. When the
+/// published Release text already states a change, the audience reading
+/// variants are admitted beside it:
+///
+/// - `smart_public` for public readers,
+/// - `smart_authorized` for authorized viewers.
+///
+/// Both are built from the published title/body only, so no work item here can
+/// depend on private compare evidence (ADR 0022). A Release whose published
+/// text does not state a change is not admitted as a reading variant: its
+/// reading would need compare evidence this producer does not collect, and a
+/// public projection must never fall back to the legacy `smart` row.
 pub(crate) async fn admit_release_polish(
     pool: &PgPool,
     release_ids: &[i64],
@@ -1032,131 +1333,40 @@ pub(crate) async fn admit_release_polish(
             title.as_str(),
             body.as_str(),
         ]);
-        let mut source_blocks = vec![
-            TranslationSourceBlock {
-                slot: "metadata".to_owned(),
-                text: format!("{repo_identity}\n{}", tag_name.trim()),
-            },
-            TranslationSourceBlock {
-                slot: "title".to_owned(),
-                text: title.clone(),
-            },
-        ];
-        if !body.is_empty() {
-            source_blocks.push(TranslationSourceBlock {
-                slot: "body_markdown".to_owned(),
-                text: body.clone(),
-            });
+        let base_blocks = release_polish_source_blocks(
+            &repo_identity,
+            tag_name.as_str(),
+            title.as_str(),
+            body.as_str(),
+            observed_at,
+            tiebreak.as_str(),
+        );
+        let token_estimate =
+            i64::try_from(body.chars().count() + title.chars().count()).unwrap_or(i64::MAX);
+        let mut variants: Vec<&str> = vec!["smart"];
+        if published_release_states_a_change(title.as_str(), body.as_str()) {
+            variants.push(translations::RELEASE_READING_PUBLIC_VARIANT);
+            variants.push(translations::RELEASE_READING_AUTHORIZED_VARIANT);
         }
-        if let Some(observed_at) = observed_at.filter(|value| !value.trim().is_empty()) {
-            source_blocks.insert(
-                0,
-                TranslationSourceBlock {
-                    slot: "source_revision_tiebreak".to_owned(),
-                    text: tiebreak.clone(),
-                },
-            );
-            source_blocks.insert(
-                0,
-                TranslationSourceBlock {
-                    slot: "source_observed_at".to_owned(),
-                    text: observed_at.to_owned(),
-                },
-            );
-        }
-        let item = TranslationRequestItemInput {
-            producer_ref: "sync.releases.polish".to_owned(),
-            kind: "release_smart".to_owned(),
-            variant: "smart".to_owned(),
-            entity_id: release_id.to_string(),
-            target_lang: TARGET_LANG.to_owned(),
-            max_wait_ms: 0,
-            source_blocks,
-            target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
-        };
-        let source_hash = content_processing::source_hash_for_item(&item);
-        let identity = ContentWorkIdentity {
-            canonical_resource_type: "release".to_owned(),
-            canonical_resource_id: release_id.to_string(),
-            pipeline: "polishing".to_owned(),
-            variant: "smart".to_owned(),
-            target_lang: TARGET_LANG.to_owned(),
-            source_hash: source_hash.clone(),
-            protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
-        };
-        let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
-        let has_projection: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM public.content_current_result_projections WHERE identity_id = $1)",
-        )
-        .bind(&identity_id)
-        .fetch_one(pool)
-        .await?;
-        if has_projection {
-            continue;
-        }
-        let already_active: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' AND variant = 'smart' AND target_lang = $2 AND protocol_version = $3 AND status IN ('queued', 'running', 'ready', 'deferred_provider', 'blocked_config'))",
-        )
-        .bind(release_id.to_string())
-        .bind(TARGET_LANG)
-        .bind(GLOBAL_PROTOCOL_VERSION)
-        .fetch_one(pool)
-        .await?;
-        if already_active {
-            continue;
-        }
-        let snapshot = serde_json::to_string(&json!({
-            "source_blocks": item.source_blocks,
-            "target_slots": item.target_slots,
-            "source_revision": {
-                "source_observed_at": observed_at,
-                "source_revision_tiebreak": tiebreak,
-            },
-            "evidence_snapshot_id": Value::Null,
-            "evidence_status": "not_required",
-        }))?;
-        let inserted = sqlx::query(
-            // `cache_hit` stays out of the insert: the migrated schema declares
-            // it boolean, the imported one bigint, and both default to a falsy
-            // value, so only the column default is portable.
-            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, token_estimate, attempt_count, evidence_status, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', $3, $4, $5, 'postgres-default', $6, $7, 'queued', 0, $8, 0, 'not_required', now(), now()) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING",
-        )
-        .bind(local_id::generate_local_id())
-        .bind(release_id.to_string())
-        .bind(TARGET_LANG)
-        .bind(&source_hash)
-        .bind(GLOBAL_PROTOCOL_VERSION)
-        .bind(&snapshot)
-        .bind(&fingerprint)
-        .bind(i64::try_from(body.chars().count() + title.chars().count()).unwrap_or(i64::MAX))
-        .execute(pool)
-        .await
-        .context("admit release polishing work")?;
-        if inserted.rows_affected() == 0 {
-            // A terminal row for the same source hash cannot be re-admitted,
-            // and the unique conflict is the only signal. Surface it instead of
-            // letting the release look silently polished.
-            let terminal: Option<String> = sqlx::query_scalar(
-                "SELECT status FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' AND variant = 'smart' AND target_lang = $2 AND protocol_version = $3 AND source_hash = $4 AND model_profile = 'postgres-default' LIMIT 1",
-            )
-            .bind(release_id.to_string())
-            .bind(TARGET_LANG)
-            .bind(GLOBAL_PROTOCOL_VERSION)
-            .bind(&source_hash)
-            .fetch_optional(pool)
-            .await?;
-            if matches!(
-                terminal.as_deref(),
-                Some("failed" | "cancelled" | "superseded")
-            ) {
-                tracing::debug!(
-                    release_id = %release_id,
-                    status = terminal.as_deref().unwrap_or_default(),
-                    "release polishing work stayed terminal; not re-admitted"
-                );
+        for variant in variants {
+            if admitted >= POLISH_ADMISSION_CAP {
+                break;
             }
+            let item = release_polish_item(*release_id, variant, &base_blocks);
+            admitted += admit_polish_variant(
+                pool,
+                *release_id,
+                variant,
+                &item,
+                ReleaseRevision {
+                    observed_at,
+                    tiebreak: tiebreak.as_str(),
+                },
+                &fingerprint,
+                token_estimate,
+            )
+            .await?;
         }
-        admitted += usize::try_from(inserted.rows_affected()).unwrap_or(0);
     }
     if admitted > 0 {
         info!(admitted, "global content polishing work admitted");
@@ -1399,6 +1609,108 @@ mod tests {
         );
     }
 
+    /// Admission only offers reading variants to Releases whose published text
+    /// already states a change; the reading contract can then answer without
+    /// compare evidence, which this producer never collects.
+    #[test]
+    fn reading_variants_require_published_change_text() {
+        assert!(published_release_states_a_change(
+            "v1.2.0",
+            "- 每轮最多处理 10 批，此前为 5 批"
+        ));
+        assert!(published_release_states_a_change(
+            "CLI 4.8.0 新增 GitHub 注解支持",
+            ""
+        ));
+        assert!(!published_release_states_a_change("v1.2.0", ""));
+        assert!(!published_release_states_a_change(
+            "v1.2.0",
+            "See full changelog below."
+        ));
+        assert!(!published_release_states_a_change(
+            "v3.11.3",
+            "Release-Identity: b14681353067f0eb014d24b92871e898ce0bd3759b7ca2a52495f04287823ecd\nSource-SHA: d83dd15ae37130c6b424e9e6106e42638198ea6"
+        ));
+    }
+
+    /// Reading variants must carry published-text evidence only: nothing in the
+    /// prompt may let an audience projection derive from private compare facts.
+    #[test]
+    fn reading_variants_carry_published_text_evidence_only() {
+        let blocks = release_polish_source_blocks(
+            "acme/demo",
+            "v1.2.0",
+            "v1.2.0",
+            "- 每轮最多处理 10 批",
+            Some("2026-11-24T00:00:00Z"),
+            "7",
+        );
+        for variant in [
+            translations::RELEASE_READING_PUBLIC_VARIANT,
+            translations::RELEASE_READING_AUTHORIZED_VARIANT,
+        ] {
+            let item = release_polish_item(42, variant, &blocks);
+            assert_eq!(item.variant, variant);
+            assert!(item.target_slots.iter().any(|slot| slot == "reading"));
+            assert!(
+                !item
+                    .source_blocks
+                    .iter()
+                    .any(|block| block.slot == "reading_compare"
+                        && block.text.contains("base_sha")),
+                "reading variants must not embed compare scope"
+            );
+            let evidence = item
+                .source_blocks
+                .iter()
+                .find(|block| block.slot == "reading_evidence_json")
+                .map(|block| block.text.as_str())
+                .expect("reading variants declare their evidence");
+            assert!(evidence.contains("release_text"), "{evidence}");
+            assert!(!evidence.contains("github_compare"), "{evidence}");
+        }
+        // The legacy summary contract keeps its published slots and no reading
+        // evidence block at all.
+        let smart = release_polish_item(42, "smart", &blocks);
+        assert_eq!(smart.variant, "smart");
+        assert!(!smart.target_slots.iter().any(|slot| slot == "reading"));
+        assert!(
+            !smart
+                .source_blocks
+                .iter()
+                .any(|block| block.slot == "reading_evidence_json")
+        );
+    }
+
+    /// Each audience variant is its own global identity, and no reader may fall
+    /// back across audiences: public resolves only `smart_public`.
+    #[test]
+    fn audience_variants_are_distinct_identities() {
+        let blocks = release_polish_source_blocks(
+            "acme/demo",
+            "v1.2.0",
+            "v1.2.0",
+            "- 每轮最多处理 10 批",
+            None,
+            "7",
+        );
+        let public = release_polish_item(42, translations::RELEASE_READING_PUBLIC_VARIANT, &blocks);
+        let authorized = release_polish_item(
+            42,
+            translations::RELEASE_READING_AUTHORIZED_VARIANT,
+            &blocks,
+        );
+        let smart = release_polish_item(42, "smart", &blocks);
+        let hashes = [&public, &authorized, &smart].map(content_processing::source_hash_for_item);
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[0], hashes[2]);
+        assert_ne!(hashes[1], hashes[2]);
+        assert_eq!(
+            crate::postgres_content_overlay::ReleaseAudience::Public.polishing_variants(),
+            &[translations::RELEASE_READING_PUBLIC_VARIANT]
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
     async fn postgres_content_worker_publishes_a_polish_projection() -> anyhow::Result<()> {
@@ -1419,18 +1731,64 @@ mod tests {
             "/chat/completions",
             post({
                 let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                // Per-prompt truncation budget: the length-recovery fixture is
+                // truncated exactly once, then answered normally on retry.
+                let truncated = std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::<String>::new(),
+                ));
                 move |Json(payload): Json<Value>| {
                     let calls = calls.clone();
+                    let truncated = truncated.clone();
                     async move {
                         let model = payload["model"].as_str().unwrap_or_default().to_owned();
+                        let user = payload["messages"]
+                            .as_array()
+                            .and_then(|messages| {
+                                messages
+                                    .iter()
+                                    .rev()
+                                    .find(|message| message["role"] == "user")
+                            })
+                            .and_then(|message| message["content"].as_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let request: Value = serde_json::from_str(&user).unwrap_or(Value::Null);
+                        let is_reading = request["target_slots"]
+                            .as_array()
+                            .is_some_and(|slots| slots.iter().any(|slot| slot == "reading"));
+                        // The length-recovery fixture names itself in its source body
+                        // and is truncated only on its first provider call, so the
+                        // recovery call is answered normally.
+                        let truncate = user.contains("truncate once")
+                            && truncated.lock().is_ok_and(|mut seen| seen.insert(user.clone()));
                         let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // Request 2 is the length-recovery fixture: truncate once.
-                        let finish_reason = if index == 1 { "length" } else { "stop" };
+                        let finish_reason = if truncate { "length" } else { "stop" };
+                        let content = if is_reading {
+                            serde_json::to_string(&json!({
+                                "title_zh": "项目 v1 发布",
+                                "summary_md": "- 每轮最多处理 10 批",
+                                "reading": {
+                                    "version": "v1",
+                                    "outcome": "changes",
+                                    "title": "新增批处理重试",
+                                    "changes": [{
+                                        "text": "每轮最多处理 10 批",
+                                        "versions": ["v1"]
+                                    }],
+                                    "machine_materials": [],
+                                    "evidence": []
+                                }
+                            }))
+                            .unwrap_or_default()
+                        } else {
+                            "{\"title_zh\":\"é¡¹ç›® v1 å‘å¸ƒ\",\"summary_md\":\"- æ–°å¢žäº†å¹¶å‘Œå¤„ç†\"}"
+                                .to_owned()
+                        };
                         Json(json!({
                             "id": format!("provider-call-{index}"),
                             "model": model,
                             "choices": [{
-                                "message": {"content": "{\"title_zh\":\"é¡¹ç›® v1 å‘å¸ƒ\",\"summary_md\":\"- æ–°å¢žäº†å¹¶å‘Œå¤„ç†\"}"},
+                                "message": {"content": content},
                                 "finish_reason": finish_reason
                             }],
                             "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}
@@ -1456,7 +1814,7 @@ mod tests {
                 CREATE TABLE public.llm_calls(id text PRIMARY KEY, status text NOT NULL, source text NOT NULL, model text NOT NULL, requested_by text, parent_task_id text, parent_task_type text, max_tokens bigint NOT NULL, attempt_count bigint NOT NULL DEFAULT 0, scheduler_wait_ms bigint NOT NULL DEFAULT 0, duration_ms bigint, prompt_text text NOT NULL, response_text text, error_text text, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL, input_messages_json text, output_messages_json text, input_tokens bigint, output_tokens bigint, cached_input_tokens bigint, total_tokens bigint, first_token_wait_ms bigint, parent_translation_batch_id text, runtime_owner_id text, lease_heartbeat_at text, failure_class text, final_model text, fallback_count bigint NOT NULL DEFAULT 0, retry_scheduled_at text, recovery_attempt_count bigint NOT NULL DEFAULT 0, parent_brief_id text, finish_reason text, provider_request_id text, provider_http_status bigint);
                 CREATE TABLE public.llm_call_events(id text PRIMARY KEY, call_id text NOT NULL, event_type text NOT NULL, status text NOT NULL, source text NOT NULL, requested_by text, parent_task_id text, payload_json text, created_at text NOT NULL, failure_class text, model text, attempt bigint, retry_after_ms bigint, from_model text, to_model text, fallback_count bigint);
                 CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text, updated_at text, detected_at text);
-                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body', '2026-11-24T00:00:00Z');
+                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Batching now processes up to 10 batches per round', '2026-11-24T00:00:00Z');
                 CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, batch_id text, lease_owner text, lease_expires_at timestamptz, attempt_count integer NOT NULL DEFAULT 0, next_retry_at timestamptz, retry_expires_at timestamptz, retry_after_at timestamptz, failure_class text, supersedes_work_item_id text, cancelled_at timestamptz, created_at timestamptz NOT NULL, started_at timestamptz, finished_at timestamptz, updated_at timestamptz NOT NULL, evidence_snapshot_id text, evidence_status text NOT NULL DEFAULT 'not_required', UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
                 CREATE TABLE public.content_attempt_events(id text PRIMARY KEY, work_item_id text NOT NULL, attempt_no bigint NOT NULL, trigger text NOT NULL, event_type text NOT NULL, result_status text, error_code text, error_summary text, failure_class text, retry_disposition text, retry_eligible bigint NOT NULL DEFAULT 0, next_retry_at text, duration_ms bigint, token_count bigint, cost_microunits bigint, created_at text NOT NULL, configuration_snapshot_json text, route_snapshot_json text, configuration_fingerprint text, UNIQUE (work_item_id, attempt_no, event_type));
                 CREATE TABLE public.content_attempt_provider_admissions(id text PRIMARY KEY, attempt_event_id text NOT NULL, work_item_id text NOT NULL, attempt_no bigint NOT NULL, call_ordinal bigint NOT NULL, relation_role text NOT NULL, source_hash text NOT NULL, source_revision_json text NOT NULL DEFAULT '{}', admitted_at text NOT NULL, UNIQUE (attempt_event_id, call_ordinal));
@@ -1471,7 +1829,10 @@ mod tests {
             .await?;
 
             let admitted = admit_release_polish(&pool, &[42], "m1").await?;
-            assert_eq!(admitted, 1, "one polishing work item is admitted");
+            assert_eq!(
+                admitted, 3,
+                "smart plus the two audience reading variants are admitted"
+            );
             let admitted_again = admit_release_polish(&pool, &[42], "m1").await?;
             assert_eq!(admitted_again, 0, "an active work item is not re-admitted");
 
@@ -1487,6 +1848,35 @@ mod tests {
             assert_eq!(claim.work.pipeline, "polishing");
             assert_eq!(claim.work.variant, "smart");
             execute(&pool, &http, &ai, &claim).await?;
+            // The audience reading variants are admitted beside the legacy
+            // contract and run through the same worker: public first, then
+            // authorized.
+            let public_claim = claim_next(&pool, "m1")
+                .await?
+                .expect("public reading work is claimable");
+            assert_eq!(public_claim.work.pipeline, "polishing");
+            assert_eq!(
+                public_claim.work.variant,
+                translations::RELEASE_READING_PUBLIC_VARIANT
+            );
+            execute(&pool, &http, &ai, &public_claim).await?;
+            let authorized_claim = claim_next(&pool, "m1")
+                .await?
+                .expect("authorized reading work is claimable");
+            assert_eq!(
+                authorized_claim.work.variant,
+                translations::RELEASE_READING_AUTHORIZED_VARIANT
+            );
+            execute(&pool, &http, &ai, &authorized_claim).await?;
+            for published in [&public_claim, &authorized_claim] {
+                let published_status: String = sqlx::query_scalar(
+                    "SELECT status FROM public.content_work_items WHERE id = $1",
+                )
+                .bind(&published.work.id)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(published_status, "ready");
+            }
 
             let (status, attempt_count): (String, i32) = sqlx::query_as(
                 "SELECT status, attempt_count FROM public.content_work_items WHERE id = $1",
@@ -1498,7 +1888,7 @@ mod tests {
             assert_eq!(attempt_count, 1);
 
             let payload: String = sqlx::query_scalar(
-                "SELECT payload_json FROM public.content_current_result_projections",
+                "SELECT payload_json FROM public.content_current_result_projections p JOIN public.content_work_identities i ON i.id = p.identity_id WHERE i.variant = 'smart'",
             )
             .fetch_one(&pool)
             .await?;
@@ -1566,8 +1956,8 @@ mod tests {
             .await?;
             let admitted_text = admit_release_polish(&pool, &[46], "m1").await?;
             assert_eq!(
-                admitted_text, 1,
-                "admission tolerates the imported bigint cache_hit column"
+                admitted_text, 3,
+                "admission tolerates the imported bigint cache_hit column for every variant"
             );
             sqlx::query(
                 "DELETE FROM public.content_work_items WHERE canonical_resource_id = '46'",
@@ -1628,7 +2018,7 @@ mod tests {
                 "source_blocks": [
                     {"slot": "metadata", "text": "acme/demo\nv1"},
                     {"slot": "title", "text": "v1"},
-                    {"slot": "body_markdown", "text": "Release notes body"}
+                    {"slot": "body_markdown", "text": "Release notes body truncate once"}
                 ],
                 "target_slots": ["title_zh", "summary_md"]
             }))?;
