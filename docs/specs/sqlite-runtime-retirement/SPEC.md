@@ -32,7 +32,7 @@
 
 ### REQ-RTR-002 共用核心只实现一次
 
-- 被活路径引用的符号 MUST 先抽到聚焦的活模块，再删除原文件；实测抽取面为 43 个符号（`api` 10、`translations` 22、`content_processing` 4、`jobs` 4、`ai` 3）。
+- 被活路径引用的符号 MUST 先抽到按领域命名的活模块，再删除原文件；实测抽取面为 43 个符号（`api` 10、`translations` 22、`content_processing` 4、`jobs` 4、`ai` 3）。目标模块为 `content_source_identity`、`release_content`、`markdown`、`translation_admin_types`、`translation_types`、`translation_error`、`translation_runtime`、`llm_contract`、`postgres_admin_dashboard`、`postgres_tasks`，落位清单见 `IMPLEMENTATION.md`。
 - 源哈希与 revision、状态映射、尝试分类、摘要/活动聚合、`legacy_*` 判定 MUST 各只有一份实现。
 - 管理读模型 MUST NOT 与退役副本并存；同名函数差异 MUST 只剩数据源方言差异。
 
@@ -50,7 +50,7 @@
 ### REQ-RTR-005 活路径测试义务
 
 - 每个抽取出的核心与每个 PostgreSQL 读模型 MUST 有直接测试；测试 MUST NOT 只存在于退役副本。
-- 隔离 PostgreSQL 18 的 CI job MUST 先于测试迁移落地，并自动执行 PostgreSQL 测试；MUST NOT 以常驻 `#[ignore]` 代替。
+- 一个独立的 PostgreSQL 18 service job MUST 先于测试迁移落地：一次性数据库、设置 `TEST_PG_TRANSLATE_URL` 与 `TEST_PG_*`、取消常驻 `#[ignore]`，并运行 `postgres_*` 测试与 `pg_seed_*` / `pg_read_acceptance.py`。该 job MUST 与主测试 job 分开，便于单独重跑与限时。
 - 删除后测试总数 MUST NOT 下降。
 
 ### REQ-RTR-006 迁移历史收敛
@@ -60,7 +60,8 @@
 
 ### REQ-RTR-007 分批删除与保留点
 
-- 顺序 MUST 为：CI PostgreSQL job → 抽共用件与测试 → 原生 SQL → 删模块 → 删 `migrations/` 与 schema 收敛。
+- 顺序 MUST 为五个可独立回退的 PR：CI PostgreSQL job → 抽共用件与测试 → 原生 SQL → 删模块 → 删 `migrations/` 与 schema 收敛。
+- schema 收敛 MUST 是 forward-only 的最后一步：先改会话落 `public`，再以一条迁移迁 `tower_sessions` 并 `DROP TABLE` 空副本，最后 `DROP SCHEMA octo_rill`；MUST NOT 逐表拆迁移。
 - 在删除模块 PR 的 base 提交上 MUST 打注释标签 `legacy-sqlite-final`，CI 绿后、合并前推送；该提交 MUST 同时包含完整 `migrations/` 与 SQLite 模块。
 - 每一步 MUST 可独立回退；MUST NOT 以保留 `docs/legacy/` 副本作为保留方式。
 
@@ -89,6 +90,7 @@
 - VER-RTR-SQL: covers REQ-RTR-003。方言 `grep` 零命中；同一查询在空库与导入库计划一致。
 - VER-RTR-SCHEMA: covers REQ-RTR-004、REQ-RTR-006。仅解析出 `public`；控制行唯一；会话与迁移同 schema；升级后服务可启动。
 - VER-RTR-TESTS: covers REQ-RTR-005。CI PostgreSQL job 绿；删除前后测试数不降；无新增常驻 `#[ignore]`。
+- VER-RTR-GATES: covers REQ-RTR-003、REQ-RTR-004。`grep -RE 'julianday|json_extract|sqlite_master|INSERT OR IGNORE' src/postgres_*` 与 `grep -c 'allow(dead_code)' src/main.rs` 归零；`bash scripts/check-spec-lifecycle.sh` 绿。
 - VER-RTR-GATE: covers REQ-RTR-008。翻译全局通路等价结果已发布；按用户端点 wire shape 快照不变；旧事实行未被改写。
 - VER-RTR-LIFECYCLE: covers REQ-RTR-009。`scripts/check-spec-lifecycle.sh` 绿；superseded 行均有后继；词表无 `legacy` 裸用。
 

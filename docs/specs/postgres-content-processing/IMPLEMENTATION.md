@@ -39,6 +39,14 @@
 
 - 2026-11-24 第 2 分片：PostgreSQL 原生全局内容 worker。新增 `src/postgres_content.rs`：受限期认领（`FOR UPDATE SKIP LOCKED`）、attempt 事件与路由快照、每次 provider 请求前的 lease 续约与 provider admission、复用 `postgres_translate` 的模型路由/健康与 `llm_calls` 审计、复用 `content_processing::{build_prompt,validate_output}` 输出契约、发布结果投影与当前投影、过期 lease 恢复；Release 刷新在既有 `smart` 合约上限量准入润色工作（不伪造 reading evidence）。
 
+## 修复顺序
+
+1. 管理读真实状态：去掉无 observation 时对当前 legacy 工作行的 `legacy_conflict` 合成，按真实状态与尝试数展示（REQ-PGCP-010）。
+2. 翻译投影发布 + 受众润色变体：翻译完成写投影，producer 补 `smart_public`/`smart_authorized`（REQ-PGCP-011）。
+3. 既有 366 条输出回填为投影：零新增尝试、按 identity + `source_hash` 幂等写入。
+4. 翻译 admission 迁入全局生产者；按用户端点变适配器。
+5. 退役旧 `translation.generate` 自动入队（SQLite 退役 PR 4 的功能门禁）。
+
 ## Remaining Gaps
 
 - 契约抽取：`build_prompt`/`validate_output` 已共用，但失败分类仍分属于两条链路。

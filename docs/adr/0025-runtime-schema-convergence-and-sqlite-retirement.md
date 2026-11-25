@@ -30,6 +30,7 @@ ADR 0023 已把 PostgreSQL 定为唯一运行时权威，ADR 0024 已决定在 P
 - 回滚到 SQLite 可运行版本需要 `legacy-sqlite-final` 源码与旧镜像；数据库内存态不随代码回滚。
 - 共用纯函数必须先抽到活模块，`api.rs`/`sync.rs` 只搬被引用部分；大文件其余拆分延后。
 - PG 测试成为合并门禁的一部分，`scripts/check-spec-lifecycle.sh` 校验目录生命周期与 successor。
+- 五个可回退 PR 的退出条件与门禁命令见 `docs/specs/sqlite-runtime-retirement/IMPLEMENTATION.md`。
 - `octo_rill` schema 删除后，`tower_sessions` 的显式 schema 配置需同步修改；任何仍写 `octo_rill.` 的代码会显式失败而不是静默读空表。
 
 ## Alternatives Rejected

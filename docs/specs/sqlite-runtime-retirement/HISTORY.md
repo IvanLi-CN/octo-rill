@@ -7,3 +7,10 @@
 - 决定拆分职责：功能等价进 `postgres-content-processing`（新增 REQ-PGCP-010/011）；删除与收敛独立为本主题。
 - 处置过时 Spec：`sqlite-writer-coordinator` 由本主题接替（superseded）；`persistent-state-migrations` 收窄为存储引擎无关事实；`translation-scheduler` 去除 SQLite 假设；`postgresql-runtime` 用后继指针委托删除进度。
 - 记录 [ADR 0025](../../adr/0025-runtime-schema-convergence-and-sqlite-retirement.md)：单一 `public` schema、原生 SQL、Git + `legacy-sqlite-final` 保留、分批删除、CI 先行。
+
+## 执行切分
+
+- 决定符号按领域落位（`content_source_identity`、`release_content`、`markdown`、`translation_*`、`llm_contract`，已有模块 `postgres_tasks`/`postgres_admin_dashboard`），不沿用原文件名。
+- `api.rs`/`sync.rs` 搬完引用符号后整文件删除，测试随符号迁移。
+- 五个可回退 PR；CI PostgreSQL job 独立且先行；schema 收敛为最后一条 forward migration；`legacy-sqlite-final` 打在删模块 PR 的 base 提交。
+- 门禁固定为方言零命中、`allow(dead_code)` 归零与生命周期检查。
