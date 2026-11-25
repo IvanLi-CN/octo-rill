@@ -1046,17 +1046,30 @@ fn legacy_summary_with_evidence(
     summary
 }
 
-fn legacy_conflict_summary_with_tasks(rows: &[TaskRow]) -> AdminCollectionTaskSummary {
-    let mut summary = merge_summary(rows, "task");
-    summary.status = "legacy_conflict".to_owned();
-    summary.display_status = "legacy_conflict".to_owned();
-    summary.status_origin = "legacy_conflict".to_owned();
-    summary.legacy_evidence = Some(AdminContentProcessingEvidence {
-        status: "legacy_conflict".to_owned(),
-        status_origin: "legacy_conflict".to_owned(),
-        ..Default::default()
-    });
-    summary
+/// Resolve one pipeline lane for one collection record.
+///
+/// Precedence mirrors the read contract: a global work item wins, a traceable
+/// legacy observation classifies retained legacy evidence, and otherwise the
+/// current per-user work rows are reported with their real status and attempt
+/// count. No fallback synthesizes `legacy_conflict`; that classification is
+/// only ever emitted by a recorded observation.
+fn resolve_lane_summary(
+    global_rows: Option<&[&GlobalTaskRow]>,
+    observation: Option<&AdminContentProcessingEvidence>,
+    task_rows: &[TaskRow],
+    coverage_origin: &str,
+) -> AdminCollectionTaskSummary {
+    if let Some(global_rows) = global_rows {
+        let summary = global_summary_from_rows(global_rows);
+        return match observation {
+            Some(evidence) => global_summary_with_legacy_evidence(summary, evidence.clone()),
+            None => summary,
+        };
+    }
+    if let Some(evidence) = observation {
+        return legacy_summary_with_evidence(evidence, task_rows);
+    }
+    merge_summary(task_rows, coverage_origin)
 }
 
 async fn load_task_summaries(
@@ -1064,11 +1077,9 @@ async fn load_task_summaries(
     kind: CollectionRecordKind,
     entity_ids: &[String],
     coverage: &HashMap<(String, String), String>,
-    global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
-    load_task_summaries_in_connection(&mut connection, kind, entity_ids, coverage, global_mode)
-        .await
+    load_task_summaries_in_connection(&mut connection, kind, entity_ids, coverage).await
 }
 
 async fn load_task_summaries_in_connection(
@@ -1076,7 +1087,6 @@ async fn load_task_summaries_in_connection(
     kind: CollectionRecordKind,
     entity_ids: &[String],
     coverage: &HashMap<(String, String), String>,
-    global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
@@ -1133,58 +1143,22 @@ async fn load_task_summaries_in_connection(
         .iter()
         .map(|id| {
             let (translation, polish) = grouped.remove(id).unwrap_or_default();
-            let translation_summary = global_by_key
-                .get(&(id.clone(), "translation".to_owned()))
-                .map(|rows| {
-                    if let Some(evidence) =
-                        legacy_observations.get(&(id.clone(), "translation".to_owned()))
-                    {
-                        global_summary_with_legacy_evidence(
-                            global_summary_from_rows(rows),
-                            evidence.clone(),
-                        )
-                    } else {
-                        global_summary_from_rows(rows)
-                    }
-                })
-                .or_else(|| {
-                    legacy_observations
-                        .get(&(id.clone(), "translation".to_owned()))
-                        .map(|evidence| legacy_summary_with_evidence(evidence, &translation))
-                })
-                .unwrap_or_else(|| {
-                    if global_mode && !translation.is_empty() {
-                        legacy_conflict_summary_with_tasks(&translation)
-                    } else {
-                        merge_summary(&translation, &coverage_origin(coverage, id, "translation"))
-                    }
-                });
-            let polish_summary = global_by_key
-                .get(&(id.clone(), "polish".to_owned()))
-                .map(|rows| {
-                    if let Some(evidence) =
-                        legacy_observations.get(&(id.clone(), "polish".to_owned()))
-                    {
-                        global_summary_with_legacy_evidence(
-                            global_summary_from_rows(rows),
-                            evidence.clone(),
-                        )
-                    } else {
-                        global_summary_from_rows(rows)
-                    }
-                })
-                .or_else(|| {
-                    legacy_observations
-                        .get(&(id.clone(), "polish".to_owned()))
-                        .map(|evidence| legacy_summary_with_evidence(evidence, &polish))
-                })
-                .unwrap_or_else(|| {
-                    if global_mode && !polish.is_empty() {
-                        legacy_conflict_summary_with_tasks(&polish)
-                    } else {
-                        merge_summary(&polish, &coverage_origin(coverage, id, "polish"))
-                    }
-                });
+            let translation_summary = resolve_lane_summary(
+                global_by_key
+                    .get(&(id.clone(), "translation".to_owned()))
+                    .map(Vec::as_slice),
+                legacy_observations.get(&(id.clone(), "translation".to_owned())),
+                &translation,
+                &coverage_origin(coverage, id, "translation"),
+            );
+            let polish_summary = resolve_lane_summary(
+                global_by_key
+                    .get(&(id.clone(), "polish".to_owned()))
+                    .map(Vec::as_slice),
+                legacy_observations.get(&(id.clone(), "polish".to_owned())),
+                &polish,
+                &coverage_origin(coverage, id, "polish"),
+            );
             (
                 id.clone(),
                 TaskSummaries {
@@ -1322,15 +1296,13 @@ fn sql_global_status(
         "CASE
             WHEN {latest} IS NOT NULL THEN {latest}
             WHEN {observation} IS NOT NULL THEN {observation}
-            WHEN {legacy_latest} IS NOT NULL THEN 'legacy_conflict'
-            ELSE NULL
+            ELSE {legacy_latest}
         END"
     );
     let origin = format!(
         "CASE
             WHEN {latest} IS NOT NULL THEN 'global_work'
             WHEN {observation} IS NOT NULL THEN 'legacy_evidence'
-            WHEN {legacy_latest} IS NOT NULL THEN 'legacy_conflict'
             ELSE {coverage}
         END"
     );
@@ -2189,9 +2161,9 @@ fn collection_query_sql(
                             END
                         ) AS attempt_count,
                         CASE
-                            WHEN (gt.entity_id IS NOT NULL OR ct.status_origin = 'never_started')
+                            WHEN (gt.entity_id IS NOT NULL OR lt.entity_id IS NOT NULL OR ct.status_origin = 'never_started')
                              AND ot.entity_id IS NULL
-                             AND (gp.entity_id IS NOT NULL OR cp.status_origin = 'never_started')
+                             AND (gp.entity_id IS NOT NULL OR lp.entity_id IS NOT NULL OR cp.status_origin = 'never_started')
                              AND op.entity_id IS NULL
                             THEN 1 ELSE 0
                         END AS attempt_count_known
@@ -2583,8 +2555,7 @@ pub async fn admin_list_collection_records(
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let coverage = load_processing_coverage_in_connection(&mut transaction, kind, &ids).await?;
         let task_summaries =
-            load_task_summaries_in_connection(&mut transaction, kind, &ids, &coverage, global_mode)
-                .await?;
+            load_task_summaries_in_connection(&mut transaction, kind, &ids, &coverage).await?;
         let brief_summaries = if kind == CollectionRecordKind::Brief {
             load_brief_summaries_in_connection(&mut transaction, &ids, &coverage).await?
         } else {
@@ -3245,8 +3216,7 @@ pub async fn admin_get_collection_record_detail(
     let global_mode = current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    let task_summaries =
-        load_task_summaries(state.as_ref(), kind, &ids, &coverage, global_mode).await?;
+    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
         load_brief_summaries(state.as_ref(), &ids, &coverage).await?
     } else {
@@ -3626,4 +3596,389 @@ async fn legacy_mode_in_transaction(
     .fetch_one(&mut **tx)
     .await?
         == "legacy")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_row(
+        kind: &str,
+        status: &str,
+        result_status: Option<&str>,
+        attempt_count: i64,
+    ) -> TaskRow {
+        TaskRow {
+            id: format!("{kind}-row"),
+            kind: kind.to_owned(),
+            status: status.to_owned(),
+            result_status: result_status.map(ToOwned::to_owned),
+            attempt_count,
+            started_at: None,
+            finished_at: None,
+            updated_at: "2026-11-25T00:00:00Z".to_owned(),
+            last_attempt_at: None,
+        }
+    }
+
+    #[test]
+    fn legacy_rows_without_observation_report_real_status_and_attempts() {
+        let rows = vec![task_row("release_detail", "completed", Some("ready"), 3)];
+        let summary = resolve_lane_summary(None, None, &rows, "historical_unknown");
+        assert_eq!(summary.status, "ready");
+        assert_eq!(summary.display_status, "succeeded");
+        assert_eq!(summary.status_origin, "task");
+        assert_eq!(summary.attempt_count, 3);
+        assert!(summary.legacy_evidence.is_none());
+        assert_ne!(summary.status, "legacy_conflict");
+    }
+
+    #[test]
+    fn running_legacy_rows_stay_processing_without_synthesizing_conflict() {
+        let rows = vec![task_row("announcement_detail", "running", None, 1)];
+        let summary = resolve_lane_summary(None, None, &rows, "historical_unknown");
+        assert_eq!(summary.display_status, "running");
+        assert_eq!(summary.attempt_count, 1);
+        assert_eq!(
+            composite_activity_status(Some(&summary.display_status), "not_started"),
+            "processing"
+        );
+    }
+
+    #[test]
+    fn recorded_conflict_observation_wins_over_legacy_rows() {
+        let rows = vec![task_row("release_detail", "completed", Some("ready"), 2)];
+        let evidence = AdminContentProcessingEvidence {
+            status: "legacy_conflict".to_owned(),
+            status_origin: "legacy_evidence".to_owned(),
+            source_hash: Some("hash-1".to_owned()),
+            legacy_table: Some("translation_work_items".to_owned()),
+            legacy_primary_key: Some("legacy-1".to_owned()),
+            ..Default::default()
+        };
+        let summary = resolve_lane_summary(None, Some(&evidence), &rows, "historical_unknown");
+        assert_eq!(summary.status, "legacy_conflict");
+        assert_eq!(summary.display_status, "legacy_conflict");
+        assert_eq!(summary.status_origin, "legacy_evidence");
+        assert_eq!(
+            summary
+                .legacy_evidence
+                .and_then(|e| e.source_hash)
+                .as_deref(),
+            Some("hash-1")
+        );
+    }
+
+    #[test]
+    fn global_work_still_takes_precedence_over_legacy_rows() {
+        let global = GlobalTaskRow {
+            pipeline: "translation".to_owned(),
+            source_hash: "global-hash".to_owned(),
+            status: "ready".to_owned(),
+            attempt_count: 1,
+            started_at: None,
+            finished_at: Some("2026-11-25T00:01:00Z".to_owned()),
+            updated_at: "2026-11-25T00:01:00Z".to_owned(),
+            last_attempt_at: None,
+            canonical_resource_id: "101".to_owned(),
+            projection_work_item_id: Some("global-work".to_owned()),
+            projection_source_hash: Some("global-hash".to_owned()),
+            projection_updated_at: Some("2026-11-25T00:01:00Z".to_owned()),
+        };
+        let rows = vec![task_row("release_detail", "failed", None, 5)];
+        let global_rows = [&global];
+        let summary = resolve_lane_summary(Some(&global_rows), None, &rows, "historical_unknown");
+        assert_eq!(summary.status_origin, "global_work");
+        assert_eq!(summary.attempt_count, 1);
+        assert!(summary.result_projection.is_some());
+    }
+
+    #[test]
+    fn legacy_completed_lane_composites_to_completed_activity() {
+        let rows = vec![task_row("release_detail", "completed", Some("ready"), 4)];
+        let summary = resolve_lane_summary(None, None, &rows, "never_started");
+        assert_eq!(summary.display_status, "succeeded");
+        assert_eq!(
+            composite_activity_status(Some(&summary.display_status), "not_applicable"),
+            "completed"
+        );
+    }
+
+    async fn isolated_pool(name: &str) -> (sqlx::PgPool, sqlx::PgPool, String) {
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL").expect("TEST_PG_TRANSLATE_URL");
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect admin database");
+        let database = format!("{name}_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await
+            .expect("create isolated database");
+        let mut url = url::Url::parse(&admin_url).expect("parse test url");
+        url.set_path(&database);
+        let pool = sqlx::PgPool::connect(url.as_str())
+            .await
+            .expect("connect isolated database");
+        crate::postgres_database_migrations::run(&pool)
+            .await
+            .expect("apply runtime migrations");
+        (admin, pool, database)
+    }
+
+    async fn drop_isolated(admin: sqlx::PgPool, pool: sqlx::PgPool, database: String) {
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("drop isolated database");
+        admin.close().await;
+    }
+
+    async fn seed_release(pool: &sqlx::PgPool, release_id: i64, updated_at: &str) {
+        sqlx::query(
+            "INSERT INTO public.repo_releases(id, repo_id, release_id, tag_name, name, html_url, published_at, updated_at) VALUES ($1, 7, $2, $3, $3, 'https://example.test/release', $4, $4)",
+        )
+        .bind(release_id.to_string())
+        .bind(release_id)
+        .bind(format!("v{release_id}"))
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("seed release");
+        sqlx::query(
+            "INSERT INTO public.repo_release_work_items(id, repo_id, repo_full_name, status, request_origin, deadline_at, created_at, updated_at) VALUES ('work-item-7', 7, 'acme/demo', 'completed', 'system', $1, $1, $1) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("seed release repository");
+    }
+
+    struct LegacyWorkRow<'a> {
+        id: &'a str,
+        entity_id: &'a str,
+        kind: &'a str,
+        variant: &'a str,
+        status: &'a str,
+        result_status: Option<&'a str>,
+        attempt_count: i64,
+        updated_at: &'a str,
+    }
+
+    async fn seed_legacy_work_row(pool: &sqlx::PgPool, row: LegacyWorkRow<'_>) {
+        sqlx::query(
+            "INSERT INTO public.users(id, login, created_at, updated_at) VALUES ('user-a', 'user-a', $1, $1) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(row.updated_at)
+        .execute(pool)
+        .await
+        .expect("seed user");
+        sqlx::query(
+            "INSERT INTO public.translation_work_items(id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, result_status, created_at, updated_at, attempt_count) VALUES ($1, $1, 'user-a', $2, $3, $4, 'zh-CN', 'translation-request.v1', 'postgres-default', $1, '[]', '[]', 0, $5::timestamptz, $6, $7, $5::timestamptz, $5::timestamptz, $8)",
+        )
+        .bind(row.id)
+        .bind(row.kind)
+        .bind(row.variant)
+        .bind(row.entity_id)
+        .bind(row.updated_at)
+        .bind(row.status)
+        .bind(row.result_status)
+        .bind(row.attempt_count)
+        .execute(pool)
+        .await
+        .expect("seed legacy work row");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn global_mode_reports_legacy_rows_instead_of_synthesizing_conflict() {
+        let (admin, pool, database) = isolated_pool("admin_read_f1").await;
+        let result = async {
+            sqlx::query(
+                "UPDATE public.content_processing_control SET mode = 'global' WHERE id = 1",
+            )
+            .execute(&pool)
+            .await
+            .expect("switch to global mode");
+            seed_release(&pool, 101, "2026-11-25T02:00:00Z").await;
+            seed_legacy_work_row(
+                &pool,
+                LegacyWorkRow {
+                    id: "legacy-completed",
+                    entity_id: "101",
+                    kind: "release_detail",
+                    variant: "detail",
+                    status: "completed",
+                    result_status: Some("ready"),
+                    attempt_count: 2,
+                    updated_at: "2026-11-25T02:05:00Z",
+                },
+            )
+            .await;
+            seed_legacy_work_row(
+                &pool,
+                LegacyWorkRow {
+                    id: "legacy-smart",
+                    entity_id: "101",
+                    kind: "release_smart",
+                    variant: "smart",
+                    status: "completed",
+                    result_status: Some("ready"),
+                    attempt_count: 1,
+                    updated_at: "2026-11-25T02:06:00Z",
+                },
+            )
+            .await;
+
+            let mut connection = pool.acquire().await.expect("acquire connection");
+            let ids = vec!["101".to_owned()];
+            let coverage = load_processing_coverage_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                &ids,
+            )
+            .await
+            .expect("load coverage");
+            let summaries = load_task_summaries_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                &ids,
+                &coverage,
+            )
+            .await
+            .expect("load summaries");
+            let summary = &summaries
+                .get("101")
+                .expect("summary for release")
+                .translation;
+            assert_eq!(summary.status, "ready", "real terminal status is reported");
+            assert_eq!(summary.display_status, "succeeded");
+            assert_ne!(summary.status, "legacy_conflict");
+            assert_eq!(summary.attempt_count, 2, "real attempt count is reported");
+            assert!(summary.legacy_evidence.is_none());
+
+            let (total, rows) = list_collection_page_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                true,
+                Some("2026-11-25T00:00:00Z"),
+                Some("2026-11-25T03:00:00Z"),
+                AttemptCountRange { min: 0, max: None },
+                None,
+                None,
+                20,
+                0,
+            )
+            .await
+            .expect("list page");
+            assert_eq!(total, 1);
+            assert_eq!(rows[0].id, "101");
+
+            let (filtered_total, filtered_rows) = list_collection_page_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                true,
+                Some("2026-11-25T00:00:00Z"),
+                Some("2026-11-25T03:00:00Z"),
+                AttemptCountRange {
+                    min: 2,
+                    max: Some(2),
+                },
+                None,
+                None,
+                20,
+                0,
+            )
+            .await
+            .expect("attempt-filtered page");
+            assert_eq!(
+                filtered_total, 1,
+                "the real legacy attempt count is filterable in global mode"
+            );
+            assert_eq!(filtered_rows[0].id, "101");
+
+            let activity_sql = activity_query_sql(CollectionRecordKind::Release, true, false);
+            let activity = pg_query_as::<AdminCollectionActivityRow>(&activity_sql)
+                .bind("2026-11-24T15:00:00Z")
+                .bind("2026-11-25T03:00:00Z")
+                .fetch_all(&mut *connection)
+                .await
+                .expect("activity rows");
+            assert_eq!(activity.len(), 1);
+            assert_eq!(activity[0].translation_status.as_deref(), Some("succeeded"));
+            assert!(activity[0].translation_status.as_deref() != Some("legacy_conflict"));
+            assert_eq!(
+                composite_activity_status(
+                    activity[0].translation_status.as_deref(),
+                    &activity[0].polish_status
+                ),
+                "completed",
+                "completed translation lane composites to completed"
+            );
+        }
+        .await;
+        drop_isolated(admin, pool, database).await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn recorded_conflict_observation_still_reports_legacy_conflict() {
+        let (admin, pool, database) = isolated_pool("admin_read_f1_conflict").await;
+        let result = async {
+            sqlx::query("UPDATE public.content_processing_control SET mode = 'global' WHERE id = 1")
+                .execute(&pool)
+                .await
+                .expect("switch to global mode");
+            seed_release(&pool, 202, "2026-11-25T02:00:00Z").await;
+            seed_legacy_work_row(
+                &pool,
+                LegacyWorkRow {
+                    id: "legacy-conflicted",
+                    entity_id: "202",
+                    kind: "release_detail",
+                    variant: "detail",
+                    status: "completed",
+                    result_status: Some("ready"),
+                    attempt_count: 3,
+                    updated_at: "2026-11-25T02:05:00Z",
+                },
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO public.content_legacy_observations(id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES ('observation-1', 'translation_work_items', 'legacy-conflicted', 'hash-1', 'release', '202', 'translation', 'legacy_conflict', '{\"source_hash\":\"hash-1\"}', '2026-11-25T02:06:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed conflict observation");
+
+            let mut connection = pool.acquire().await.expect("acquire connection");
+            let ids = vec!["202".to_owned()];
+            let coverage = load_processing_coverage_in_connection(&mut connection, CollectionRecordKind::Release, &ids)
+                .await
+                .expect("load coverage");
+            let summaries =
+                load_task_summaries_in_connection(&mut connection, CollectionRecordKind::Release, &ids, &coverage)
+                    .await
+                    .expect("load summaries");
+            let summary = &summaries.get("202").expect("summary for release").translation;
+            assert_eq!(summary.status, "legacy_conflict");
+            assert_eq!(summary.display_status, "legacy_conflict");
+            assert_eq!(summary.status_origin, "legacy_evidence");
+            assert_eq!(summary.attempt_count, 3, "recorded legacy rows keep their real attempt count");
+
+            let activity_sql = activity_query_sql(CollectionRecordKind::Release, true, false);
+            let activity = pg_query_as::<AdminCollectionActivityRow>(&activity_sql)
+                .bind("2026-11-24T15:00:00Z")
+                .bind("2026-11-25T03:00:00Z")
+                .fetch_all(&mut *connection)
+                .await
+                .expect("activity rows");
+            assert_eq!(activity.len(), 1);
+            assert_eq!(activity[0].translation_status.as_deref(), Some("legacy_conflict"));
+        }
+        .await;
+        drop_isolated(admin, pool, database).await;
+        result
+    }
 }
