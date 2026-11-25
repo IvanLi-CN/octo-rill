@@ -48,7 +48,9 @@ use crate::{
     config::AiConfig,
     local_id,
     postgres_server::PostgresServerState,
-    translations::{TranslationSourceBlock, translation_error_summary},
+    translations::{
+        TranslationRequestItemInput, TranslationSourceBlock, translation_error_summary,
+    },
 };
 
 const TARGET_LANG: &str = "zh-CN";
@@ -1490,6 +1492,176 @@ async fn load_notification_targets(
     Ok(targets)
 }
 
+/// Publish the projection for a finished translation attempt.
+///
+/// The projection identity is rebuilt twice with the same construction the
+/// global read path uses (`postgres_content_overlay::identity_item`):
+///
+/// * from the attempt's persisted source blocks — the text that was actually
+///   translated;
+/// * from the stored release row — the text readers will look up.
+///
+/// Equal identities publish; a mismatch means the release changed after the
+/// work item was enqueued, so the output describes text no reader can resolve
+/// and publishing it would strand an unreachable row. A mismatch therefore
+/// logs and skips instead of writing a projection.
+///
+/// Results the shared output contract rejects are also skipped. Neither skip
+/// rewrites the attempt state, which stays the honest record of what ran.
+async fn publish_finished_translation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &Target,
+    title: Option<&str>,
+    summary: Option<&str>,
+) -> anyhow::Result<()> {
+    // Release detail is the only lane kind whose read path consumes a release
+    // content projection. Notifications read through their translation request,
+    // and the release feed body has its own truncated identity, so neither may
+    // publish under the detail identity.
+    if target.kind != TargetKind::ReleaseDetail {
+        return Ok(());
+    }
+    let Some(attempted) = attempted_identity_item(target) else {
+        return Ok(());
+    };
+    let Some(current) = release_publication_item(tx, target).await? else {
+        return Ok(());
+    };
+    let attempted_hash = crate::content_processing::source_hash_for_item(&attempted);
+    let current_hash = crate::content_processing::source_hash_for_item(&current);
+    if attempted_hash != current_hash {
+        warn!(
+            release_id = %target.entity_id,
+            attempted_source_hash = %attempted_hash,
+            canonical_source_hash = %current_hash,
+            "release content changed after the attempt was enqueued; projection not published"
+        );
+        return Ok(());
+    }
+    let raw = translations_payload_json(title, summary, &current.target_slots);
+    let output = match crate::content_processing::validate_output(
+        &raw,
+        &current.target_slots,
+        &current.source_blocks,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                release_id = %target.entity_id,
+                variant = %current.variant,
+                error = %error,
+                "translation result failed the global output contract; projection not published"
+            );
+            return Ok(());
+        }
+    };
+    crate::postgres_content::publish_translation_result(
+        tx,
+        crate::postgres_content::TranslationPublication {
+            canonical_resource_type: "release",
+            pipeline: "translation",
+            item: &current,
+            source_hash: &current_hash,
+            payload: &output,
+        },
+    )
+    .await
+    .context("publish translation projection")?;
+    Ok(())
+}
+
+/// Projection identity rebuilt from the attempt's persisted source blocks.
+///
+/// The metadata block carries `repository\ntag`; the reader builds the same
+/// metadata text from the release row, so this reproduces its identity for the
+/// text that was actually translated.
+fn attempted_identity_item(target: &Target) -> Option<TranslationRequestItemInput> {
+    let metadata = source_block_text(&target.source_blocks, "metadata")?.to_owned();
+    let title = source_block_text(&target.source_blocks, "title")?.to_owned();
+    let body = source_block_text(&target.source_blocks, "body_markdown").map(str::to_owned);
+    let mut item = crate::postgres_content_overlay::identity_item(
+        "release_detail",
+        "detail",
+        &target.entity_id,
+        metadata,
+        title,
+        body,
+    );
+    item.producer_ref = "postgres.translate".to_owned();
+    Some(item)
+}
+
+/// Rebuild the projection identity item for a release from its stored row.
+///
+/// Mirrors `postgres_content_overlay::ReleaseSource::identity_hash` for the
+/// release-detail identity: repository identity from the release URL (with the
+/// `unknown/<repo_id>` fallback), the tag line in metadata, the display title,
+/// and the body with line endings normalized but not trimmed.
+async fn release_publication_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &Target,
+) -> anyhow::Result<Option<TranslationRequestItemInput>> {
+    let entity_id = target.entity_id.as_str();
+    let Some(release_id) = entity_id.parse::<i64>().ok() else {
+        return Ok(None);
+    };
+    let Some(row) = sqlx::query(
+        "SELECT repo_id, html_url, tag_name, name, body FROM public.repo_releases WHERE release_id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load release row for projection publication")?
+    else {
+        return Ok(None);
+    };
+    let repo_id: i64 = row.try_get("repo_id")?;
+    let html_url: String = row.try_get("html_url")?;
+    let tag_name: String = row.try_get("tag_name")?;
+    let name: Option<String> = row.try_get("name")?;
+    let body: Option<String> = row.try_get("body")?;
+    let repo_identity = crate::postgres_content_overlay::release_repo_identity(&html_url, repo_id);
+    let title = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(tag_name.as_str())
+        .to_owned();
+    let mut item = crate::postgres_content_overlay::identity_item(
+        "release_detail",
+        "detail",
+        entity_id,
+        format!("{repo_identity}\n{tag_name}"),
+        title,
+        body,
+    );
+    item.producer_ref = "postgres.translate".to_owned();
+    Ok(Some(item))
+}
+
+/// Render stored translation fields as the JSON object the output contract
+/// validates.
+///
+/// `validate_output` reads a model response; the lane stores the parsed slots in
+/// columns, so this rebuilds the same object for contract validation instead of
+/// duplicating the slot rules.
+fn translations_payload_json(
+    title: Option<&str>,
+    summary: Option<&str>,
+    target_slots: &[String],
+) -> String {
+    let mut object = serde_json::Map::new();
+    for slot in target_slots {
+        let value = match slot.as_str() {
+            "title_zh" => title.map(str::to_owned).map(Value::String),
+            "body_md" | "summary_md" => summary.map(str::to_owned).map(Value::String),
+            _ => continue,
+        };
+        object.insert(slot.clone(), value.unwrap_or(Value::Null));
+    }
+    Value::Object(object).to_string()
+}
+
 fn with_source_revision(
     mut source_blocks: Vec<TranslationSourceBlock>,
     revision: Option<&str>,
@@ -2391,6 +2563,7 @@ async fn translate_target(
                 user_id,
                 target.kind,
                 &target.entity_id,
+                Some(target),
                 &scope,
                 AttemptOutcome {
                     result_status: "ready",
@@ -2412,6 +2585,7 @@ async fn translate_target(
                 user_id,
                 target.kind,
                 &target.entity_id,
+                Some(target),
                 &scope,
                 AttemptOutcome {
                     result_status: "error",
@@ -2450,6 +2624,7 @@ async fn finish_request(
     user_id: &str,
     kind: TargetKind,
     entity_id: &str,
+    publication: Option<&Target>,
     scope: &RequestScope,
     outcome: AttemptOutcome<'_>,
     call_ids_json: &str,
@@ -2458,6 +2633,13 @@ async fn finish_request(
     let summary_slot = outcome.summary.filter(|value| !value.trim().is_empty());
     let mut tx = pool.begin().await?;
     if outcome.result_status == "ready" {
+        // The projection commits with the terminal attempt state, so a stored
+        // `ready` translation is always readable through the global projection.
+        if let Some(target) = publication {
+            publish_finished_translation(&mut tx, target, outcome.title, summary_slot)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         sqlx::query(
             "UPDATE public.translation_work_items SET status = 'completed', result_status = 'ready', title_zh = $1, summary_md = $2, body_md = $2, error_text = NULL, finished_at = $3, updated_at = $3 WHERE id = $4",
         )
@@ -2803,6 +2985,7 @@ pub(crate) async fn translate_work_item_for_task(
             &user_id,
             kind,
             &entity_id,
+            None,
             &scope,
             AttemptOutcome {
                 result_status: "missing",
@@ -2848,6 +3031,7 @@ pub(crate) async fn translate_work_item_for_task(
                 &user_id,
                 kind,
                 &entity_id,
+                Some(&target),
                 &scope,
                 AttemptOutcome {
                     result_status: "ready",
@@ -2873,6 +3057,7 @@ pub(crate) async fn translate_work_item_for_task(
                 &user_id,
                 kind,
                 &entity_id,
+                Some(&target),
                 &scope,
                 AttemptOutcome {
                     result_status: "error",
@@ -4389,13 +4574,14 @@ fn db_failure(error: sqlx::Error) -> Response {
 mod tests {
     use super::{
         AUTO_RELEASE_TRANSLATION_CAP, AUTO_TRANSLATION_MAX_ATTEMPTS, AutoTranslationDecision,
-        AutomaticWorkItem, ModelRouteHealth, TargetKind, audit_recorder, auto_translation_decision,
-        automatic_retry_delay, chunk_chars_for_input_limit, classify_upstream_failure,
-        deduped_release_ids, enqueue_pending_translation_tasks, enqueue_release_translations,
-        insert_translation_request, is_credential_rejection, load_route_health, park_model,
-        record_model_failure, release_has_translatable_content, route_candidates, route_models,
-        start_attempt,
+        AutomaticWorkItem, ModelRouteHealth, Target, TargetKind, audit_recorder,
+        auto_translation_decision, automatic_retry_delay, chunk_chars_for_input_limit,
+        classify_upstream_failure, deduped_release_ids, enqueue_pending_translation_tasks,
+        enqueue_release_translations, insert_translation_request, is_credential_rejection,
+        load_route_health, park_model, publish_finished_translation, record_model_failure,
+        release_has_translatable_content, route_candidates, route_models, start_attempt,
     };
+    use crate::translations::TranslationSourceBlock;
 
     type LlmCallAuditRow = (String, String, Option<String>, i64, Option<String>);
 
@@ -4445,6 +4631,191 @@ mod tests {
             auto_translation_decision("queued", None, true),
             AutoTranslationDecision::SkipInFlight
         );
+    }
+
+    fn release_target_for_test(release_id: i64, body: &str) -> Target {
+        let source_blocks = vec![
+            TranslationSourceBlock {
+                slot: "metadata".to_owned(),
+                text: "acme/demo\nv1".to_owned(),
+            },
+            TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "v1".to_owned(),
+            },
+            TranslationSourceBlock {
+                slot: "body_markdown".to_owned(),
+                text: body.to_owned(),
+            },
+        ];
+        Target {
+            entity_id: release_id.to_string(),
+            kind: TargetKind::ReleaseDetail,
+            source: "test".to_owned(),
+            title: "v1".to_owned(),
+            body: body.to_owned(),
+            repo_full_name: "acme/demo".to_owned(),
+            reason: String::new(),
+            subject_type: String::new(),
+            source_blocks,
+            target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+            source_hash: crate::api::release_detail_source_hash("acme/demo", "v1", body),
+        }
+    }
+
+    async fn create_publication_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text);
+            CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', finished_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+            CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+            CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+            CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+            CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+            CREATE TABLE public.content_processing_control(id integer PRIMARY KEY, mode text NOT NULL, switch_token text, updated_at timestamptz NOT NULL);
+            INSERT INTO public.content_processing_control(id, mode, updated_at) VALUES (1, 'global', now());
+            CREATE TABLE public.content_identity_upgrade_control(id bigint PRIMARY KEY, status text NOT NULL, phase text NOT NULL);
+            INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A finished release translation publishes a projection that the public
+    /// detail read resolves as `ready`, and a republish of the same source
+    /// revision does not duplicate it.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_release_completion_publishes_a_readable_projection() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_publish_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_publication_schema(&pool).await?;
+            sqlx::query(
+                "INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body')",
+            )
+            .execute(&pool)
+            .await?;
+            let target = release_target_for_test(42, "Release notes body");
+
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("发布说明正文"),
+            )
+            .await?;
+            tx.commit().await?;
+
+            let overlay = crate::postgres_content_overlay::OverlayState::load(&pool).await;
+            let source = crate::postgres_content_overlay::ReleaseSource {
+                release_id: 42,
+                repo_full_name: "acme/demo",
+                repo_identity: "acme/demo",
+                tag_name: "v1",
+                name: Some("v1"),
+                body: Some("Release notes body"),
+                previous_tag_name: None,
+            };
+            let projection =
+                crate::postgres_content_overlay::public_release_translation(&pool, overlay, &source)
+                    .await?
+                    .expect("public detail resolves the published projection");
+            assert_eq!(projection.status, "ready");
+            assert_eq!(projection.title().as_deref(), Some("项目 v1 发布"));
+
+            // Republishing the same source revision stays a single row.
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("发布说明正文"),
+            )
+            .await?;
+            tx.commit().await?;
+            let projection_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(projection_rows, 1, "a retry must not duplicate the projection");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    /// A release edited after the attempt was enqueued describes text the
+    /// reader can no longer resolve, so its output is not published.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_stale_release_source_is_not_published() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_stale_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_publication_schema(&pool).await?;
+            // The attempt translated the old body; the row now holds new text.
+            sqlx::query(
+                "INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Edited body')",
+            )
+            .execute(&pool)
+            .await?;
+            let target = release_target_for_test(42, "Original body");
+
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("旧正文译文"),
+            )
+            .await?;
+            tx.commit().await?;
+
+            let projections: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            let currents: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_current_result_projections",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(projections, 0, "a stale release must not publish a projection");
+            assert_eq!(currents, 0, "a stale release must not publish a current projection");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
     }
 
     #[tokio::test]

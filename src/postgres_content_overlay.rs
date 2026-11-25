@@ -229,60 +229,6 @@ fn normalize_body(body: &str) -> String {
     body.replace("\r\n", "\n")
 }
 
-/// Build the content-work identity source hash for one translated slot.
-///
-/// This is the legacy `global_source_hash_from_fields` construction: the
-/// projection identities are keyed by the translation item built from the
-/// metadata/title/body source blocks, so the read paths must rebuild exactly
-/// that item.
-fn global_source_hash_from_fields(
-    kind: &str,
-    variant: &str,
-    entity_id: &str,
-    metadata: String,
-    title: String,
-    body: Option<String>,
-) -> String {
-    let mut source_blocks = vec![
-        TranslationSourceBlock {
-            slot: "metadata".to_owned(),
-            text: metadata,
-        },
-        TranslationSourceBlock {
-            slot: "title".to_owned(),
-            text: title,
-        },
-    ];
-    let has_body = body
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-    if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
-        source_blocks.push(TranslationSourceBlock {
-            slot: "body_markdown".to_owned(),
-            text: body,
-        });
-    }
-    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
-        if has_body {
-            vec!["title_zh".to_owned(), "body_md".to_owned()]
-        } else {
-            vec!["title_zh".to_owned()]
-        }
-    } else {
-        vec!["title_zh".to_owned(), "summary_md".to_owned()]
-    };
-    crate::content_processing::source_hash_for_item(&TranslationRequestItemInput {
-        producer_ref: String::new(),
-        kind: kind.to_owned(),
-        variant: variant.to_owned(),
-        entity_id: entity_id.to_owned(),
-        target_lang: TARGET_LANG.to_owned(),
-        max_wait_ms: 0,
-        source_blocks,
-        target_slots,
-    })
-}
-
 /// Repository identity the legacy content-processing writer used for a
 /// release.
 ///
@@ -297,6 +243,78 @@ fn global_source_hash_from_fields(
 pub(crate) fn release_repo_identity(html_url: &str, repo_id: i64) -> String {
     crate::release_links::parse_repo_full_name_from_release_url(html_url)
         .unwrap_or_else(|| format!("unknown/{repo_id}"))
+}
+
+/// The translation request item a content-work identity is keyed by.
+///
+/// Projection identities are the canonical `source_hash_for_item` hash of this
+/// item. The reader rebuilds it from live release/announcement text; the single
+/// projection writer must derive it the same way, so both go through here
+/// instead of maintaining two hash constructions.
+///
+/// Line endings are normalized here rather than by each caller: the stored body
+/// keeps whatever an ingest wrote, and an identity that changed with `\r\n`
+/// would make a published projection unreadable.
+pub(crate) fn identity_item(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> TranslationRequestItemInput {
+    let body = body
+        .map(|value| value.replace("\r\n", "\n"))
+        .filter(|value| !value.trim().is_empty());
+    let has_body = body.is_some();
+    let mut source_blocks = vec![
+        TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        },
+        TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if let Some(body) = body {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
+        if has_body {
+            vec!["title_zh".to_owned(), "body_md".to_owned()]
+        } else {
+            vec!["title_zh".to_owned()]
+        }
+    } else {
+        vec!["title_zh".to_owned(), "summary_md".to_owned()]
+    };
+    TranslationRequestItemInput {
+        producer_ref: String::new(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: TARGET_LANG.to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    }
+}
+
+fn global_source_hash_from_fields(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> String {
+    crate::content_processing::source_hash_for_item(&identity_item(
+        kind, variant, entity_id, metadata, title, body,
+    ))
 }
 
 /// Release-side resources for one projection lookup.
@@ -333,7 +351,9 @@ impl ReleaseSource<'_> {
         api::release_feed_body(self.body)
     }
 
-    fn identity_hash(&self, kind: &str, variant: &str, body: Option<&str>) -> String {
+    /// Identity hash the read path looks a projection up by. The single
+    /// projection writer must reproduce it for a published row to be readable.
+    pub(crate) fn identity_hash(&self, kind: &str, variant: &str, body: Option<&str>) -> String {
         global_source_hash_from_fields(
             kind,
             variant,

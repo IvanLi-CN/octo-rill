@@ -13,6 +13,12 @@
 //! - publish `content_result_projections` and `content_current_result_projections`,
 //! - recover expired leases and expose a bounded producer for Release polishing.
 //!
+//! This module also owns the **only** result-projection writer. The translation
+//! lane (`postgres_translate`) stays admission and attempt state; when one of
+//! its attempts finishes with output that passes the shared output contract, it
+//! hands the validated payload to [`publish_translation_result`] instead of
+//! writing `content_result_projections` itself.
+//!
 //! Reading-evidence polishing (`smart_public` / `smart_authorized`) needs the
 //! PostgreSQL evidence producer and is intentionally not admitted here; this
 //! module only admits the established `smart` polishing contract whose output
@@ -46,6 +52,13 @@ const RECOVERY_BATCH: i64 = 50;
 const RETRY_EXPIRES_HOURS: i64 = 24;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(15);
+/// `model_profile` stamped on projections published for a translation attempt.
+///
+/// The projection's `model_profile` is display metadata (readers select the
+/// newest row for the identity, not a model), so a stable profile keeps a
+/// republished identity to exactly one `content_result_projections` row even
+/// when a retry lands on a different routed model.
+const PUBLICATION_MODEL_PROFILE: &str = "translation-publish";
 const TARGET_LANG: &str = "zh-CN";
 /// Upper bound on polishing work one release sync may admit, mirroring the
 /// translation enqueue cap so a cold repository cannot create an unbounded
@@ -223,6 +236,296 @@ async fn read_retry_expires(pool: &PgPool, work_item_id: &str) -> Option<DateTim
     .flatten()
 }
 
+/// One result-projection write for an identity that already passed its
+/// pipeline output contract.
+struct ProjectionWrite<'a> {
+    identity_id: &'a str,
+    canonical_resource_type: &'a str,
+    canonical_resource_id: &'a str,
+    pipeline: &'a str,
+    variant: &'a str,
+    target_lang: &'a str,
+    protocol_version: &'a str,
+    model_profile: &'a str,
+    source_hash: &'a str,
+    work_item_id: &'a str,
+    payload_json: &'a str,
+    published_at: DateTime<Utc>,
+}
+
+/// Register the canonical work identity a projection hangs off.
+async fn ensure_identity_registered(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &ContentWorkIdentity,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let identity_id = content_identity_upgrade::identity_id_for(identity)?;
+    sqlx::query(
+        "INSERT INTO public.content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) ON CONFLICT DO NOTHING",
+    )
+    .bind(&identity_id)
+    .bind(&identity.canonical_resource_type)
+    .bind(&identity.canonical_resource_id)
+    .bind(&identity.pipeline)
+    .bind(&identity.variant)
+    .bind(&identity.target_lang)
+    .bind(&identity.source_hash)
+    .bind(&identity.protocol_version)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(identity_id)
+}
+
+/// Link a work item into an identity.
+///
+/// `content_current_result_projections` references the `(identity, work item)`
+/// member pair, so the membership must exist before the current projection is
+/// written — including for work items admitted before the global runtime.
+async fn link_identity_member(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    work_item_id: &str,
+    identity_id: &str,
+    identity: &ContentWorkIdentity,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO public.content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
+    )
+    .bind(work_item_id)
+    .bind(identity_id)
+    .bind(&identity.canonical_resource_type)
+    .bind(&identity.canonical_resource_id)
+    .bind(&identity.pipeline)
+    .bind(&identity.variant)
+    .bind(&identity.target_lang)
+    .bind(&identity.source_hash)
+    .bind(&identity.protocol_version)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Write the result projection plus the identity's current projection.
+///
+/// Both statements are keyed by the canonical identity, so republishing one
+/// identity updates the existing rows instead of appending duplicates.
+async fn write_projection(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    write: ProjectionWrite<'_>,
+) -> Result<()> {
+    let projection_id: String = sqlx::query_scalar(
+        "INSERT INTO public.content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12, $12) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at RETURNING id",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(write.canonical_resource_type)
+    .bind(write.canonical_resource_id)
+    .bind(write.pipeline)
+    .bind(write.variant)
+    .bind(write.target_lang)
+    .bind(write.protocol_version)
+    .bind(write.model_profile)
+    .bind(write.source_hash)
+    .bind(write.work_item_id)
+    .bind(write.payload_json)
+    .bind(write.published_at)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO public.content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ($1, $2, $2, $3, $4, $5, $5) ON CONFLICT (identity_id) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, source_projection_id = excluded.source_projection_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at",
+    )
+    .bind(write.identity_id)
+    .bind(write.work_item_id)
+    .bind(&projection_id)
+    .bind(write.payload_json)
+    .bind(write.published_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// What the translation lane hands to [`publish_translation_result`].
+///
+/// The lane owns admission and attempt state and already ran
+/// `content_processing::validate_output`; it owns neither the identity rows nor
+/// the projection tables. `item` must be the same request item the read path
+/// rebuilds from live content, because the projection is keyed by its
+/// `source_hash_for_item` hash.
+pub(crate) struct TranslationPublication<'a> {
+    /// Canonical resource type (`release`).
+    pub canonical_resource_type: &'a str,
+    /// Pipeline that produced the payload (`translation`).
+    pub pipeline: &'a str,
+    /// The request item the projection identity is keyed by.
+    pub item: &'a TranslationRequestItemInput,
+    /// Identity hash the attempt was bound to. It must equal the canonical hash
+    /// of `item`; a stale or mismatched hash is rejected instead of published.
+    pub source_hash: &'a str,
+    pub payload: &'a Value,
+}
+
+/// Why a publication was rejected before it touched the projection tables.
+#[derive(Debug)]
+pub(crate) enum PublicationError {
+    /// The attempt's hash does not describe the content being published.
+    SourceHashMismatch { reported: String, canonical: String },
+}
+
+impl std::fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceHashMismatch {
+                reported,
+                canonical,
+            } => write!(
+                formatter,
+                "translation publication source_hash {reported} does not match the canonical identity hash {canonical}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublicationError {}
+
+/// Publication-time fingerprint for the work item created to own a projection.
+///
+/// It identifies the publisher path that produced the row, not a model route:
+/// the attempt happened on the translation lane and its routing is recorded
+/// there.
+fn publication_fingerprint(source_hash: &str) -> String {
+    ai::sha256_hex(&format!(
+        "{GLOBAL_PROTOCOL_VERSION}\ntranslation-publication\n{source_hash}"
+    ))
+}
+
+/// Return the work item that owns a projection, creating it when absent.
+///
+/// A projection requires a `content_work_items` row (foreign key and admin
+/// joins), but the translation lane tracks its attempt in
+/// `translation_work_items`. The created row records a completed publication
+/// with `attempt_count = 0`, so no content attempt, provider admission or LLM
+/// audit fact is fabricated for it.
+async fn publication_work_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &ContentWorkIdentity,
+    item: &TranslationRequestItemInput,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let snapshot = serde_json::to_string(&json!({
+        "source_blocks": item.source_blocks,
+        "target_slots": item.target_slots,
+        "evidence_snapshot_id": Value::Null,
+        "evidence_status": "not_required",
+    }))?;
+    let token_estimate = i64::try_from(
+        item.source_blocks
+            .iter()
+            .map(|block| block.text.chars().count())
+            .sum::<usize>(),
+    )
+    .unwrap_or(i64::MAX);
+    let inserted = sqlx::query_scalar::<_, String>(
+        "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, token_estimate, attempt_count, evidence_status, finished_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ready', 0, $12, 0, 'not_required', $13, $13, $13) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile) DO NOTHING RETURNING id",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&identity.canonical_resource_type)
+    .bind(&identity.canonical_resource_id)
+    .bind(&identity.pipeline)
+    .bind(&identity.variant)
+    .bind(&identity.target_lang)
+    .bind(&identity.source_hash)
+    .bind(&identity.protocol_version)
+    .bind(PUBLICATION_MODEL_PROFILE)
+    .bind(&snapshot)
+    .bind(publication_fingerprint(&identity.source_hash))
+    .bind(token_estimate)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(work_item_id) = inserted {
+        return Ok(work_item_id);
+    }
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.content_work_items WHERE canonical_resource_type = $1 AND canonical_resource_id = $2 AND pipeline = $3 AND variant = $4 AND target_lang = $5 AND source_hash = $6 AND protocol_version = $7 AND model_profile = $8 LIMIT 1",
+    )
+    .bind(&identity.canonical_resource_type)
+    .bind(&identity.canonical_resource_id)
+    .bind(&identity.pipeline)
+    .bind(&identity.variant)
+    .bind(&identity.target_lang)
+    .bind(&identity.source_hash)
+    .bind(&identity.protocol_version)
+    .bind(PUBLICATION_MODEL_PROFILE)
+    .fetch_one(&mut **tx)
+    .await
+    .context("load publication work item")
+}
+
+/// Publish the projection for one completed translation attempt.
+///
+/// This is the only writer of `content_result_projections` for translations:
+/// the legacy enqueue path stays admission-only and never writes projections.
+/// It publishes inside the caller's transaction so the attempt's terminal state
+/// and its projection commit together — a stored `ready` attempt always has its
+/// projection, and a failed commit leaves neither behind.
+///
+/// Publication is idempotent: the identity is keyed by the attempt's canonical
+/// `source_hash`, so a retried publication updates the same rows instead of
+/// appending duplicates.
+pub(crate) async fn publish_translation_result(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    publication: TranslationPublication<'_>,
+) -> Result<()> {
+    let canonical_hash = content_processing::source_hash_for_item(publication.item);
+    if canonical_hash != publication.source_hash {
+        return Err(anyhow::Error::new(PublicationError::SourceHashMismatch {
+            reported: publication.source_hash.to_owned(),
+            canonical: canonical_hash,
+        }));
+    }
+    let identity = ContentWorkIdentity {
+        canonical_resource_type: publication.canonical_resource_type.to_owned(),
+        canonical_resource_id: publication.item.entity_id.clone(),
+        pipeline: publication.pipeline.to_owned(),
+        variant: publication.item.variant.clone(),
+        target_lang: publication.item.target_lang.clone(),
+        source_hash: canonical_hash,
+        protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+    };
+    let payload_json = publication.payload.to_string();
+    let now = Utc::now();
+    let identity_id = ensure_identity_registered(tx, &identity, now).await?;
+    let work_item_id = publication_work_item(tx, &identity, publication.item, now).await?;
+    link_identity_member(tx, &work_item_id, &identity_id, &identity, now).await?;
+    write_projection(
+        tx,
+        ProjectionWrite {
+            identity_id: &identity_id,
+            canonical_resource_type: &identity.canonical_resource_type,
+            canonical_resource_id: &identity.canonical_resource_id,
+            pipeline: &identity.pipeline,
+            variant: &identity.variant,
+            target_lang: &identity.target_lang,
+            protocol_version: &identity.protocol_version,
+            model_profile: PUBLICATION_MODEL_PROFILE,
+            source_hash: &identity.source_hash,
+            work_item_id: &work_item_id,
+            payload_json: &payload_json,
+            published_at: now,
+        },
+    )
+    .await?;
+    info!(
+        identity_id = %identity_id,
+        variant = %identity.variant,
+        source_hash = %identity.source_hash,
+        work_item_id = %work_item_id,
+        "translation projection published"
+    );
+    Ok(())
+}
+
 async fn publish_ready(
     pool: &PgPool,
     claim: &Claim,
@@ -299,61 +602,26 @@ async fn publish_ready(
         protocol_version: work.protocol_version.clone(),
     };
     let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
-    sqlx::query(
-        "INSERT INTO public.content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) ON CONFLICT DO NOTHING",
+    ensure_identity_registered(&mut tx, &identity, now).await?;
+    link_identity_member(&mut tx, &work.id, &identity_id, &identity, now).await?;
+    let payload_json = output.to_string();
+    write_projection(
+        &mut tx,
+        ProjectionWrite {
+            identity_id: &identity_id,
+            canonical_resource_type: &work.canonical_resource_type,
+            canonical_resource_id: &work.canonical_resource_id,
+            pipeline: &work.pipeline,
+            variant: &work.variant,
+            target_lang: &work.target_lang,
+            protocol_version: &work.protocol_version,
+            model_profile: &completion.model,
+            source_hash: &work.source_hash,
+            work_item_id: &work.id,
+            payload_json: &payload_json,
+            published_at: now,
+        },
     )
-    .bind(&identity_id)
-    .bind(&identity.canonical_resource_type)
-    .bind(&identity.canonical_resource_id)
-    .bind(&identity.pipeline)
-    .bind(&identity.variant)
-    .bind(&identity.target_lang)
-    .bind(&identity.source_hash)
-    .bind(&identity.protocol_version)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO public.content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
-    )
-    .bind(&work.id)
-    .bind(&identity_id)
-    .bind(&identity.canonical_resource_type)
-    .bind(&identity.canonical_resource_id)
-    .bind(&identity.pipeline)
-    .bind(&identity.variant)
-    .bind(&identity.target_lang)
-    .bind(&identity.source_hash)
-    .bind(&identity.protocol_version)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-    let projection_id: String = sqlx::query_scalar(
-        "INSERT INTO public.content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12, $12) ON CONFLICT (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at RETURNING id",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(&work.canonical_resource_type)
-    .bind(&work.canonical_resource_id)
-    .bind(&work.pipeline)
-    .bind(&work.variant)
-    .bind(&work.target_lang)
-    .bind(&work.protocol_version)
-    .bind(&completion.model)
-    .bind(&work.source_hash)
-    .bind(&work.id)
-    .bind(output.to_string())
-    .bind(now)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO public.content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ($1, $2, $2, $3, $4, $5, $5) ON CONFLICT (identity_id) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, source_projection_id = excluded.source_projection_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at",
-    )
-    .bind(&identity_id)
-    .bind(&work.id)
-    .bind(&projection_id)
-    .bind(output.to_string())
-    .bind(now)
-    .execute(&mut *tx)
     .await?;
     tx.commit().await.context("commit content publish")?;
     info!(
@@ -899,6 +1167,237 @@ pub(crate) async fn admit_release_polish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-trip the publication path against a real PostgreSQL cluster:
+    /// a validated translation output becomes a readable projection, a retry
+    /// updates rather than duplicates, a stale/foreign hash is refused, and the
+    /// public detail read reports `ready`.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_translation_publication_publishes_once_and_is_readable() -> anyhow::Result<()>
+    {
+        use sqlx::PgPool;
+
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("content_publish_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+
+        let result = async {
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text);
+                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body');
+                CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', finished_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+                CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+                CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+                CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+                CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+                CREATE TABLE public.content_processing_control(id integer PRIMARY KEY, mode text NOT NULL, switch_token text, updated_at timestamptz NOT NULL);
+                INSERT INTO public.content_processing_control(id, mode, updated_at) VALUES (1, 'global', now());
+                CREATE TABLE public.content_identity_upgrade_control(id bigint PRIMARY KEY, status text NOT NULL, phase text NOT NULL);
+                INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
+                "#,
+            )
+            .execute(&pool)
+            .await?;
+
+            let item = release_item("42", "v1", "v1", Some("Release notes body"));
+            let source_hash = content_processing::source_hash_for_item(&item);
+            let payload = json!({"title_zh": "项目 v1 发布", "body_md": "发布说明正文"});
+
+            // 1. Publish on completion.
+            let mut tx = pool.begin().await?;
+            publish_translation_result(
+                &mut tx,
+                TranslationPublication {
+                    canonical_resource_type: "release",
+                    pipeline: "translation",
+                    item: &item,
+                    source_hash: &source_hash,
+                    payload: &payload,
+                },
+            )
+            .await?;
+            tx.commit().await?;
+
+            let (projections, currents, work_items): (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM public.content_result_projections), (SELECT COUNT(*) FROM public.content_current_result_projections), (SELECT COUNT(*) FROM public.content_work_items)",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(projections, 1, "one result projection");
+            assert_eq!(currents, 1, "one current projection");
+            assert_eq!(work_items, 1, "one work item owns the projection");
+
+            // A publication creates no provider attempt or LLM audit fact.
+            let attempt_rows: i64 = sqlx::query_scalar(
+                "SELECT attempt_count::bigint FROM public.content_work_items LIMIT 1",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(attempt_rows, 0, "publication never fabricates an attempt");
+
+            // 2. Idempotent retry: same identity republishes in place.
+            let mut tx = pool.begin().await?;
+            publish_translation_result(
+                &mut tx,
+                TranslationPublication {
+                    canonical_resource_type: "release",
+                    pipeline: "translation",
+                    item: &item,
+                    source_hash: &source_hash,
+                    payload: &payload,
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            let projections_after: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            let currents_after: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_current_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            let work_items_after: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_work_items")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(projections_after, 1, "a retry must not add a projection");
+            assert_eq!(currents_after, 1, "a retry must not add a current projection");
+            assert_eq!(work_items_after, 1, "a retry must not add a work item");
+
+            // 3. A source hash that does not describe the item is refused and
+            // writes nothing.
+            let mut foreign = source_hash.clone();
+            foreign.push('0');
+            let mut tx = pool.begin().await?;
+            let error = publish_translation_result(
+                &mut tx,
+                TranslationPublication {
+                    canonical_resource_type: "release",
+                    pipeline: "translation",
+                    item: &item,
+                    source_hash: &foreign,
+                    payload: &payload,
+                },
+            )
+            .await
+            .expect_err("a mismatched source hash must be refused");
+            tx.rollback().await?;
+            assert!(
+                error.to_string().contains("does not match the canonical identity"),
+                "unexpected refusal reason: {error}"
+            );
+            let projections_after_mismatch: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(projections_after_mismatch, 1, "a refused publish writes nothing");
+
+            // 4. The public detail read resolves the published row as ready.
+            let overlay = crate::postgres_content_overlay::OverlayState::load(&pool).await;
+            assert!(overlay.is_global());
+            let source = crate::postgres_content_overlay::ReleaseSource {
+                release_id: 42,
+                repo_full_name: "acme/demo",
+                repo_identity: "acme/demo",
+                tag_name: "v1",
+                name: Some("v1"),
+                body: Some("Release notes body"),
+                previous_tag_name: None,
+            };
+            let projection =
+                crate::postgres_content_overlay::public_release_translation(&pool, overlay, &source)
+                    .await?
+                    .expect("the published translation is readable");
+            assert_eq!(projection.status, "ready");
+            assert_eq!(projection.title().as_deref(), Some("项目 v1 发布"));
+            assert_eq!(projection.translation_summary().as_deref(), Some("发布说明正文"));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    fn release_item(
+        entity_id: &str,
+        tag: &str,
+        title: &str,
+        body: Option<&str>,
+    ) -> TranslationRequestItemInput {
+        crate::postgres_content_overlay::identity_item(
+            "release_detail",
+            "detail",
+            entity_id,
+            format!("acme/demo\n{tag}"),
+            title.to_owned(),
+            body.map(str::to_owned),
+        )
+    }
+
+    /// The writer and the reader must derive one identity from one release
+    /// text; a divergence would publish a projection no read path can resolve.
+    #[test]
+    fn writer_and_reader_derive_the_same_release_identity() {
+        let item = release_item("42", "v1.2.0", "v1.2.0 release", Some("## Notes\n- item"));
+        let written = content_processing::source_hash_for_item(&item);
+        let reader = crate::postgres_content_overlay::ReleaseSource {
+            release_id: 42,
+            repo_full_name: "acme/demo",
+            repo_identity: "acme/demo",
+            tag_name: "v1.2.0",
+            name: Some("v1.2.0 release"),
+            body: Some("## Notes\n- item"),
+            previous_tag_name: None,
+        };
+        assert_eq!(
+            reader.identity_hash("release_detail", "detail", reader.body),
+            written
+        );
+    }
+
+    /// The stored body keeps whatever line endings it was ingested with; both
+    /// sides normalize them, so the identity must not depend on them.
+    #[test]
+    fn release_identity_is_stable_across_line_endings() {
+        let lf = release_item("7", "v1", "one", Some("a\nb"));
+        let crlf = release_item("7", "v1", "one", Some("a\r\nb"));
+        assert_eq!(
+            content_processing::source_hash_for_item(&lf),
+            content_processing::source_hash_for_item(&crlf)
+        );
+    }
+
+    /// A title-less release falls back to its tag on both sides.
+    #[test]
+    fn release_identity_uses_the_tag_when_the_name_is_blank() {
+        let with_blank_name = crate::postgres_content_overlay::identity_item(
+            "release_detail",
+            "detail",
+            "9",
+            "acme/demo\nv2".to_owned(),
+            "v2".to_owned(),
+            None,
+        );
+        let item = release_item("9", "v2", "v2", None);
+        assert_eq!(
+            content_processing::source_hash_for_item(&with_blank_name),
+            content_processing::source_hash_for_item(&item)
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
