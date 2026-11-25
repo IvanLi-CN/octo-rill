@@ -16,7 +16,7 @@ use chrono::Utc;
 use futures_util::stream;
 use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::FromRow;
 use std::convert::Infallible;
 use tokio::sync::watch;
@@ -4797,6 +4797,267 @@ async fn admin_release_freshness(
     }
 }
 
+/// Route a Release detail translation request through global admission.
+///
+/// Ownership rule: this adapter never writes `content_work_items`, never calls
+/// the provider and never publishes a projection. It resolves the canonical
+/// identity from the server-side Release row, hands it to
+/// [`crate::postgres_content::admit_release_detail_translation`], and records
+/// the per-user request row plus its requester link. `content_work_items.status`
+/// is the only terminal status; the row written here is a view of it, which is
+/// why nothing below writes `ready` or `failed` on its own authority.
+///
+/// Returns `None` for every other request kind, so this slice leaves the
+/// existing handling untouched.
+async fn admit_release_detail_request(
+    state: &PostgresServerState,
+    user_id: &str,
+    mode: &str,
+    item: &crate::translations::TranslationRequestItemInput,
+) -> Option<(StatusCode, axum::Json<Value>)> {
+    if item.kind != "release_detail" {
+        return None;
+    }
+    Some(release_detail_request_response(state, user_id, mode, item).await)
+}
+
+async fn release_detail_request_response(
+    state: &PostgresServerState,
+    user_id: &str,
+    mode: &str,
+    item: &crate::translations::TranslationRequestItemInput,
+) -> (StatusCode, axum::Json<Value>) {
+    if !matches!(mode, "async" | "wait" | "stream") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"code": "bad_request", "message": "unsupported translation mode"})),
+        );
+    }
+    let Ok(release_id) = item.entity_id.trim().parse::<i64>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(
+                json!({"code": "bad_request", "message": "release_id must be an integer string"}),
+            ),
+        );
+    };
+    // Authorization stays a live read; visibility is never inferred from the
+    // requester association the link records.
+    let visible = sqlx::query(
+        "SELECT sr.full_name, \
+                EXISTS(SELECT 1 FROM public.brief_release_memberships m JOIN public.briefs b ON b.id = m.brief_id WHERE b.user_id = $1 AND m.release_id = r.release_id) AS brief_visible \
+         FROM public.repo_releases r \
+         LEFT JOIN public.user_release_visible_repos sr ON sr.user_id = $1 AND sr.repo_id = r.repo_id \
+         WHERE r.release_id = $2",
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.runtime.pool)
+    .await;
+    match visible {
+        Ok(Some(row))
+            if sqlx::Row::get::<Option<String>, _>(&row, "full_name").is_some()
+                || sqlx::Row::get::<bool, _>(&row, "brief_visible") => {}
+        Ok(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"code": "not_found", "message": "release not found"})),
+            );
+        }
+        Err(error) => {
+            warn!(%error, release_id, "release detail translation authorization failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "translation_request_failed"})),
+            );
+        }
+    }
+    let fallback_model = state.ai_model.clone().unwrap_or_default();
+    let producer_ref = item.producer_ref.trim();
+    let producer_ref = if producer_ref.is_empty() {
+        format!("release_detail:{release_id}")
+    } else {
+        producer_ref.to_owned()
+    };
+    let admitted = match crate::postgres_content::admit_release_detail_translation(
+        &state.runtime.pool,
+        release_id,
+        fallback_model.as_str(),
+        producer_ref.as_str(),
+    )
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            warn!(%error, release_id, "release detail translation admission failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"code": "translation_enqueue_failed"})),
+            );
+        }
+    };
+    let request_id = local_id::generate_local_id();
+    let now = Utc::now();
+    // The per-user row is the caller-facing adapter. Its status mirrors the
+    // global work status; it is not a second terminal writer, so `title_zh` and
+    // `body_md` stay NULL here and are read from the projection instead.
+    let request_row = sqlx::query(
+        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, result_status, created_at, updated_at) VALUES ($1, $2, 'postgres', 'user', $3, $3, $4, 'release_detail', 'detail', $5, 'zh-CN', $6, $7, $8, $9, NULL, $10, $11, $12, $12)",
+    )
+    .bind(&request_id)
+    .bind(mode)
+    .bind(user_id)
+    .bind(&producer_ref)
+    .bind(release_id.to_string())
+    .bind(item.max_wait_ms.max(0))
+    .bind(&admitted.source_hash)
+    .bind(&admitted.source_blocks_json)
+    .bind(&admitted.target_slots_json)
+    .bind(request_view_status(admitted.status.as_str()))
+    .bind(admitted.status.as_str())
+    .bind(now)
+    .execute(&state.runtime.pool)
+    .await;
+    if let Err(error) = request_row {
+        warn!(%error, release_id, "release detail translation request row failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    if let Err(error) = crate::postgres_content::register_detail_request_link(
+        &state.runtime.pool,
+        &request_id,
+        &admitted.work_item_id,
+        user_id,
+        producer_ref.as_str(),
+        mode,
+        Some(admitted.status.as_str()),
+    )
+    .await
+    {
+        warn!(%error, release_id, "release detail requester link failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"code": "translation_enqueue_failed"})),
+        );
+    }
+    // Delivery semantics: `wait` blocks up to the caller's budget and then
+    // returns the current snapshot; `async`/`stream` return immediately. The
+    // work item stays the terminal writer in every mode.
+    let mut work_status = admitted.status.clone();
+    if mode == "wait" {
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(
+                u64::try_from(item.max_wait_ms.max(0))
+                    .unwrap_or(0)
+                    .min(60_000),
+            );
+        loop {
+            if matches!(
+                work_status.as_str(),
+                "ready" | "failed" | "cancelled" | "superseded"
+            ) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match crate::postgres_content::linked_work(&state.runtime.pool, &request_id, user_id)
+                .await
+            {
+                Some((_, status)) => work_status = status,
+                None => break,
+            }
+        }
+        let _ = crate::postgres_content::sync_linked_request_status(
+            &state.runtime.pool,
+            &request_id,
+            work_status.as_str(),
+        )
+        .await;
+    }
+    let (title_zh, body_md) = crate::postgres_content_overlay::release_detail_text(
+        &state.runtime.pool,
+        release_id,
+        work_status.as_str(),
+    )
+    .await;
+    tracing::debug!(
+        release_id,
+        work_item_id = %admitted.work_item_id,
+        ?admitted.outcome,
+        status = %work_status,
+        "release detail translation request admitted"
+    );
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(release_detail_request_body(
+            &request_id,
+            &admitted.work_item_id,
+            &producer_ref,
+            release_id,
+            work_status.as_str(),
+            title_zh,
+            body_md,
+        )),
+    )
+}
+
+/// Caller-facing body for an admitted Release detail request.
+///
+/// Kept as a pure function so the wire shape is asserted by a test rather than
+/// only by the client that consumes it: `request_id`, `status`, `work_item_id`,
+/// `poll_url` and a single `result` are the pre-existing contract, and the
+/// per-user adapter must not add or drop fields as the global model takes over.
+fn release_detail_request_body(
+    request_id: &str,
+    work_item_id: &str,
+    producer_ref: &str,
+    release_id: i64,
+    work_status: &str,
+    title_zh: Option<String>,
+    body_md: Option<String>,
+) -> Value {
+    json!({
+        "request_id": request_id,
+        "work_item_id": work_item_id,
+        "status": work_status,
+        "poll_url": format!("/api/translate/requests/{request_id}"),
+        "result": {
+            "producer_ref": producer_ref,
+            "entity_id": release_id.to_string(),
+            "kind": "release_detail",
+            "variant": "detail",
+            "status": work_status,
+            "title_zh": title_zh,
+            "summary_md": body_md,
+            "body_md": body_md,
+            "error": Value::Null,
+            "error_code": Value::Null,
+            "error_summary": Value::Null,
+            "error_detail": Value::Null,
+            "work_item_id": work_item_id,
+            "batch_id": Value::Null,
+        },
+    })
+}
+
+/// Map a global work status onto the `translation_requests.status` vocabulary.
+///
+/// The request row only has `queued`/`running`/`completed`/`failed`; the finer
+/// global status is what the API reports. The row mirrors it so the admin list
+/// and the legacy read views stay consistent with the authoritative work item.
+fn request_view_status(work_status: &str) -> &'static str {
+    match work_status {
+        "ready" => "completed",
+        "failed" | "cancelled" | "superseded" => "failed",
+        "running" => "running",
+        _ => "queued",
+    }
+}
+
 async fn submit_translation_request(
     State(state): State<PostgresServerState>,
     session: Session,
@@ -4817,6 +5078,11 @@ async fn submit_translation_request(
             axum::Json(json!({"code": "translation_item_required"})),
         );
     };
+    if let Some(response) =
+        admit_release_detail_request(&state, &user_id, request.mode.trim(), &item).await
+    {
+        return response;
+    }
     let now = Utc::now();
     let work_item_id = local_id::generate_local_id();
     let request_id = local_id::generate_local_id();
@@ -4945,6 +5211,50 @@ async fn get_translation_request(
     .bind(&user_id)
     .fetch_optional(&state.runtime.pool)
     .await;
+    // A request row linked to global work is a view: the work item owns the
+    // terminal status and the projection owns the text.
+    if let Some((work_item_id, work_status)) =
+        crate::postgres_content::linked_work(&state.runtime.pool, &request_id, &user_id).await
+    {
+        let _ = crate::postgres_content::sync_linked_request_status(
+            &state.runtime.pool,
+            &request_id,
+            work_status.as_str(),
+        )
+        .await;
+        let (title_zh, body_md) = match &row {
+            Ok(Some(row)) => match row.5.parse::<i64>() {
+                Ok(release_id) => {
+                    crate::postgres_content_overlay::release_detail_text(
+                        &state.runtime.pool,
+                        release_id,
+                        work_status.as_str(),
+                    )
+                    .await
+                }
+                Err(_) => (row.6.clone(), row.7.clone()),
+            },
+            _ => (None, None),
+        };
+        let summary_md = body_md.clone();
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "id": request_id,
+                "request_id": request_id,
+                "status": request_view_status(work_status.as_str()),
+                "work_item_id": work_item_id,
+                "poll_url": format!("/api/translate/requests/{request_id}"),
+                "result": {
+                    "status": work_status,
+                    "title_zh": title_zh,
+                    "summary_md": summary_md,
+                    "body_md": body_md,
+                    "work_item_id": work_item_id,
+                },
+            })),
+        );
+    }
     match row {
         Ok(Some((id, mode, status, kind, variant, entity_id, title_zh, summary_md, body_md))) => (
             StatusCode::OK,
@@ -4974,6 +5284,54 @@ async fn retry_translation_request(
             axum::Json(json!({"code": "unauthorized"})),
         );
     };
+    // A request linked to global work is retried through the global work item,
+    // never by reopening a `translation.generate` row: that would make this
+    // handler a second terminal writer for the same identity. Report the current
+    // work state with the supported conflict code and let the client poll.
+    if let Some((work_item_id, work_status)) =
+        crate::postgres_content::linked_work(&state.runtime.pool, &request_id, &user_id).await
+    {
+        let (title_zh, body_md) = match sqlx::query_scalar::<_, String>(
+            "SELECT entity_id FROM public.translation_requests WHERE id = $1",
+        )
+        .bind(&request_id)
+        .fetch_optional(&state.runtime.pool)
+        .await
+        {
+            Ok(Some(entity_id)) => match entity_id.parse::<i64>() {
+                Ok(release_id) => {
+                    crate::postgres_content_overlay::release_detail_text(
+                        &state.runtime.pool,
+                        release_id,
+                        work_status.as_str(),
+                    )
+                    .await
+                }
+                Err(_) => (None, None),
+            },
+            _ => (None, None),
+        };
+        let body = json!({
+            "code": "content_processing_active",
+            "message": "content processing is managed by the global work item",
+            "request_id": request_id,
+            "work_item_id": work_item_id,
+            "status": work_status,
+            "last_attempt_status": work_status,
+            "poll_url": format!("/api/translate/requests/{request_id}"),
+            "result": {
+                "status": work_status,
+                "title_zh": title_zh,
+                "summary_md": body_md,
+                "body_md": body_md,
+                "work_item_id": work_item_id,
+            },
+        });
+        // This slice has no admission-time retry entry for global work, so the
+        // caller receives the real state to poll rather than a fabricated
+        // requeue of a work item the worker still owns.
+        return (StatusCode::CONFLICT, axum::Json(body));
+    }
     let mut tx = match state.runtime.pool.begin().await {
         Ok(tx) => tx,
         Err(_) => {
@@ -5068,6 +5426,14 @@ async fn resolve_translation_results(
         }
     };
     for (request_id, _) in request.request_ids {
+        // A linked request's terminal state belongs to the global worker. This
+        // admin-style resolve step must not declare it ready.
+        if crate::postgres_content::linked_work(&state.runtime.pool, &request_id, &user_id)
+            .await
+            .is_some()
+        {
+            continue;
+        }
         if let Ok(result) = sqlx::query(
             "UPDATE public.translation_requests SET status = 'completed', result_status = 'ready', error_text = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND scope_user_id = $2 AND status IN ('queued', 'running', 'failed')",
         )
@@ -5112,6 +5478,49 @@ async fn stream_translation_request(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
+    // A linked request streams the global work status, not a locally derived
+    // phase, so the stream never disagrees with `GET` or the work item.
+    if let Some((work_item_id, work_status)) =
+        crate::postgres_content::linked_work(&state.runtime.pool, &request_id, &user_id).await
+    {
+        let (title_zh, body_md) = match sqlx::query_scalar::<_, String>(
+            "SELECT entity_id FROM public.translation_requests WHERE id = $1",
+        )
+        .bind(&request_id)
+        .fetch_optional(&state.runtime.pool)
+        .await
+        {
+            Ok(Some(entity_id)) => match entity_id.parse::<i64>() {
+                Ok(release_id) => {
+                    crate::postgres_content_overlay::release_detail_text(
+                        &state.runtime.pool,
+                        release_id,
+                        work_status.as_str(),
+                    )
+                    .await
+                }
+                Err(_) => (None, None),
+            },
+            _ => (None, None),
+        };
+        let payload = json!({
+            "request_id": request_id,
+            "work_item_id": work_item_id,
+            "status": work_status,
+            "result_status": work_status,
+            "title_zh": title_zh,
+            "summary_md": body_md,
+            "body_md": body_md,
+        });
+        let event = Event::default()
+            .event("translation.status")
+            .data(payload.to_string());
+        return Ok(Sse::new(stream::iter([Ok(event)])).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        ));
+    }
     let payload = json!({
         "request_id": row.0,
         "status": row.1,
@@ -5144,5 +5553,72 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod translation_admission_tests {
+    use super::{release_detail_request_body, request_view_status};
+
+    /// The per-user adapter keeps the pre-existing wire shape while the global
+    /// model owns the work: the same top-level keys, one `result`, and the
+    /// caller-facing fields the web client already reads.
+    #[test]
+    fn release_detail_request_keeps_the_existing_wire_shape() {
+        let body = release_detail_request_body(
+            "request-1",
+            "work-1",
+            "release_detail:42",
+            42,
+            "ready",
+            Some("项目 v1".to_owned()),
+            Some("发布说明".to_owned()),
+        );
+        let object = body.as_object().expect("body is an object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["poll_url", "request_id", "result", "status", "work_item_id"],
+            "the adapter must not change the submission envelope"
+        );
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["poll_url"], "/api/translate/requests/request-1");
+        let result = body["result"].as_object().expect("result is an object");
+        for field in [
+            "producer_ref",
+            "entity_id",
+            "kind",
+            "variant",
+            "status",
+            "title_zh",
+            "summary_md",
+            "body_md",
+            "error",
+            "error_code",
+            "error_summary",
+            "error_detail",
+            "work_item_id",
+            "batch_id",
+        ] {
+            assert!(result.contains_key(field), "result is missing {field}");
+        }
+        assert_eq!(result["entity_id"], "42");
+        assert_eq!(result["work_item_id"], "work-1");
+        assert_eq!(result["body_md"], "发布说明");
+    }
+
+    /// The request row's coarse status is a projection of the global status; it
+    /// must never claim a terminal state the work item does not have.
+    #[test]
+    fn request_view_status_only_completes_on_a_ready_work_item() {
+        assert_eq!(request_view_status("ready"), "completed");
+        assert_eq!(request_view_status("failed"), "failed");
+        assert_eq!(request_view_status("superseded"), "failed");
+        assert_eq!(request_view_status("cancelled"), "failed");
+        assert_eq!(request_view_status("running"), "running");
+        assert_eq!(request_view_status("queued"), "queued");
+        assert_eq!(request_view_status("blocked_config"), "queued");
+        assert_eq!(request_view_status("deferred_provider"), "queued");
     }
 }

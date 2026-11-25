@@ -19,6 +19,21 @@
 //! hands the validated payload to [`publish_translation_result`] instead of
 //! writing `content_result_projections` itself.
 //!
+//! Terminal-status ownership for one identity lives in exactly one place:
+//!
+//! * `content_work_items.status` is written by this worker
+//!   (`claim_next`, `publish_ready`, `publish_failure`, recovery) and by
+//!   admission when it must refuse to reopen a terminal identity;
+//! * `translation_work_items` / `translation_requests` are the legacy
+//!   caller-facing adapter. For an identity routed through global admission they
+//!   only mirror the work status ([`linked_work`] +
+//!   [`sync_linked_request_status`]) and never decide a terminal state
+//!   themselves.
+//!
+//! Release detail translation uses global admission
+//! ([`admit_release_detail_translation`]); Release feed/detail reads resolve its
+//! projection through `postgres_content_overlay`.
+//!
 //! Reading polishing is admitted per audience: `smart_public` for public
 //! readers and `smart_authorized` for authorized viewers, derived from the
 //! published Release text alone (ADR 0022). A Release whose published text does
@@ -33,7 +48,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::AiConfig,
@@ -1381,6 +1396,406 @@ pub(crate) async fn admit_release_polish(
     Ok(admitted)
 }
 
+// ---------------------------------------------------------------------------
+// Release detail translation admission
+// ---------------------------------------------------------------------------
+
+/// What global admission did with one Release detail request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailAdmission {
+    /// A current projection already covers this exact identity. The work item
+    /// is `ready`, `cache_hit`, carries zero attempts, and no provider call can
+    /// ever run for it (REQ-GTP-CACHE-HIT).
+    CacheHit,
+    /// New work for this identity was created and queued.
+    Created,
+    /// Existing work for this identity was reused with its own status.
+    Reused,
+}
+
+/// Admitted Release detail translation work, as the HTTP adapter reports it.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedDetailWork {
+    pub work_item_id: String,
+    /// Authoritative `content_work_items.status`. The caller-facing adapter
+    /// mirrors this value and never derives a competing terminal status.
+    pub status: String,
+    pub outcome: DetailAdmission,
+    /// Canonical source version. The adapter records it on its request row so
+    /// the row describes the same identity the work item is keyed by.
+    pub source_hash: String,
+    /// Canonical source blocks and target slots. They come from the server-side
+    /// Release row, never from client input, so a per-user request row cannot
+    /// describe a different identity than the global work it links to.
+    pub source_blocks_json: String,
+    pub target_slots_json: String,
+}
+
+/// Canonical identity of one Release detail translation source version.
+///
+/// Admission and the read path derive identities from the same request item
+/// (`postgres_content_overlay::release_detail_translation_item`), so this is a
+/// lookup helper, not a second identity construction.
+struct DetailIdentity {
+    item: TranslationRequestItemInput,
+    identity: ContentWorkIdentity,
+    identity_id: String,
+    snapshot_json: String,
+}
+
+fn detail_identity(
+    origin: &crate::postgres_content_overlay::ReleaseDetailOrigin<'_>,
+    producer_ref: &str,
+) -> Result<DetailIdentity> {
+    let item =
+        crate::postgres_content_overlay::release_detail_translation_item(origin, producer_ref);
+    let source_hash = content_processing::source_hash_for_item(&item);
+    let identity = ContentWorkIdentity {
+        canonical_resource_type: "release".to_owned(),
+        canonical_resource_id: origin.release_id.to_string(),
+        pipeline: "translation".to_owned(),
+        variant: "detail".to_owned(),
+        target_lang: TARGET_LANG.to_owned(),
+        source_hash,
+        protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+    };
+    let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
+    let snapshot_json = serde_json::to_string(&json!({
+        "source_blocks": item.source_blocks,
+        "target_slots": item.target_slots,
+        "source_revision": {
+            "source_observed_at": origin.observed_at,
+            "source_revision_tiebreak": item
+                .source_blocks
+                .iter()
+                .find(|block| block.slot == "source_revision_tiebreak")
+                .map(|block| block.text.clone()),
+        },
+        "evidence_snapshot_id": Value::Null,
+        "evidence_status": "not_required",
+    }))?;
+    Ok(DetailIdentity {
+        item,
+        identity,
+        identity_id,
+        snapshot_json,
+    })
+}
+
+/// Admit one Release detail translation through the global content model.
+///
+/// Ownership rule: **this function is the only code that admits Release detail
+/// translation work, and the global content worker is the only writer of its
+/// terminal status.** The HTTP adapter writes a per-user `translation_requests`
+/// row, but that row is a view: `content_work_items.status` decides what the
+/// caller sees, and `publish_failure`/`publish_ready` (worker) are the only
+/// places a terminal `ready`/`failed` is written for a work item this function
+/// did not retire at admission time.
+///
+/// Order of decisions, deliberately:
+/// 1. a current projection for the exact identity → `cache_hit` with zero
+///    attempts, no provider call (REQ-GTP-CACHE-HIT);
+/// 2. otherwise insert-or-reuse one work item keyed by the canonical identity,
+///    which makes concurrent duplicate admission idempotent (REQ-PGCP-008);
+/// 3. `superseded` stays a strict terminal (ADR 0015): admission never reopens
+///    it, and reports the real status so the adapter can redirect or surface
+///    it instead of pretending new work started.
+pub(crate) async fn admit_release_detail_translation(
+    pool: &PgPool,
+    release_id: i64,
+    fallback_model: &str,
+    producer_ref: &str,
+) -> Result<AdmittedDetailWork> {
+    let row = sqlx::query(
+        "SELECT repo_id, html_url, tag_name, name, body, updated_at, detected_at FROM public.repo_releases WHERE release_id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    .context("load release source for detail admission")?
+    .ok_or_else(|| anyhow::anyhow!("release {release_id} not found"))?;
+    let repo_id: i64 = row.try_get("repo_id")?;
+    let html_url: String = row.try_get("html_url")?;
+    let tag_name: String = row.try_get("tag_name")?;
+    let name: Option<String> = row.try_get("name")?;
+    let body: Option<String> = row.try_get("body")?;
+    let updated_at: Option<String> = row.try_get("updated_at").ok().flatten();
+    let detected_at: Option<String> = row.try_get("detected_at").ok().flatten();
+    let observed_at = content_processing::authoritative_release_revision(
+        updated_at.as_deref().unwrap_or_default(),
+        detected_at.as_deref(),
+    );
+    let detail = detail_identity(
+        &crate::postgres_content_overlay::ReleaseDetailOrigin {
+            release_id,
+            html_url: &html_url,
+            repo_id,
+            tag_name: &tag_name,
+            name: name.as_deref(),
+            body: body.as_deref(),
+            observed_at,
+        },
+        producer_ref,
+    )?;
+    let source_hash = detail.identity.source_hash.clone();
+    let token_estimate = i64::try_from(
+        detail
+            .item
+            .source_blocks
+            .iter()
+            .map(|block| block.text.chars().count())
+            .sum::<usize>(),
+    )
+    .unwrap_or(i64::MAX);
+
+    // Configuration validity only picks the initial status of *new* work; it
+    // never rewrites existing work or a published projection.
+    let (configuration_valid, fingerprint) =
+        match postgres_translate::route_models_for_runtime(pool, fallback_model).await {
+            Ok(models) if !models.is_empty() => (true, configuration_fingerprint(&models)),
+            _ => (false, cache_hit_fingerprint()),
+        };
+
+    let mut tx = pool.begin().await.context("begin detail admission")?;
+    let has_projection: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.content_current_result_projections WHERE identity_id = $1)",
+    )
+    .bind(&detail.identity_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let initial_status = if has_projection {
+        // The projection already satisfies this identity: the work item exists
+        // to record the hit and the requester link, with zero attempts and no
+        // provider call ever made for it (REQ-GTP-CACHE-HIT).
+        "ready"
+    } else if configuration_valid {
+        "queued"
+    } else {
+        "blocked_config"
+    };
+    let new_work_id = local_id::generate_local_id();
+    // One statement, so two simultaneous admissions of the same identity cannot
+    // both create work; `xmax = 0` distinguishes the insert from the conflict
+    // branch, which is what makes "admitted exactly once" observable.
+    // `cache_hit` stays out of the insert: the migrated schema declares it
+    // boolean, an imported snapshot declares it bigint, and both default to a
+    // falsy value (see `migrations_pg/0016_normalize_flag_columns.sql`).
+    let (work_item_id, status, attempt_count, inserted) =
+        sqlx::query_as::<_, (String, String, i32, bool)>(
+            r#"
+        INSERT INTO public.content_work_items (
+            id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+            target_lang, source_hash, protocol_version, model_profile,
+            source_snapshot_json, configuration_fingerprint, status, priority,
+            token_estimate, attempt_count, evidence_status, created_at, updated_at
+        ) VALUES (
+            $1, 'release', $2, 'translation', 'detail', $3, $4, $5, 'postgres-default',
+            $6, $7, $8, 0, $9, 0, 'not_required', now(), now()
+        )
+        ON CONFLICT (
+            canonical_resource_type, canonical_resource_id, pipeline, variant,
+            target_lang, source_hash, protocol_version, model_profile
+        ) DO UPDATE SET updated_at = public.content_work_items.updated_at
+        RETURNING id, status, attempt_count::integer AS attempt_count, (xmax = 0) AS inserted
+        "#,
+        )
+        .bind(&new_work_id)
+        .bind(release_id.to_string())
+        .bind(TARGET_LANG)
+        .bind(&source_hash)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(&detail.snapshot_json)
+        .bind(&fingerprint)
+        .bind(initial_status)
+        .bind(token_estimate)
+        .fetch_one(&mut *tx)
+        .await?;
+    let outcome = match (inserted, has_projection) {
+        (true, true) => DetailAdmission::CacheHit,
+        (true, false) => DetailAdmission::Created,
+        // A repeated cache hit sees the zero-attempt `ready` row the first hit
+        // created. Any other retained row keeps its own status and attempts:
+        // admission never relabels work it did not observe, and never reopens a
+        // terminal identity (ADR 0015).
+        (false, _) if status == "ready" && attempt_count == 0 => DetailAdmission::CacheHit,
+        (false, _) => DetailAdmission::Reused,
+    };
+    if outcome == DetailAdmission::CacheHit {
+        mark_cache_hit(&mut tx, &work_item_id).await?;
+    }
+    if outcome == DetailAdmission::Created {
+        // Register the identity and its membership at admission, so the worker
+        // publishes under a registered identity even when it races this call.
+        ensure_identity_registered(&mut tx, &detail.identity, Utc::now()).await?;
+        link_identity_member(
+            &mut tx,
+            &work_item_id,
+            &detail.identity_id,
+            &detail.identity,
+            Utc::now(),
+        )
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO public.content_work_admission_events (id, work_item_id, event_type, source_hash, source_revision_json, producer_ref, reason_code, created_at) VALUES ($1, $2, $3, $4, $5, $6, 'source_current', now()) ON CONFLICT DO NOTHING",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&work_item_id)
+    .bind(if outcome == DetailAdmission::Created {
+        "admission_accepted"
+    } else {
+        "admission_noop"
+    })
+    .bind(&source_hash)
+    .bind(source_revision_json(&detail.snapshot_json))
+    .bind(producer_ref)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await.context("commit detail admission")?;
+    if outcome == DetailAdmission::Created {
+        info!(
+            work_item_id = %work_item_id,
+            release_id,
+            status = %status,
+            "global release detail translation admitted"
+        );
+    } else {
+        debug!(
+            work_item_id = %work_item_id,
+            release_id,
+            status = %status,
+            attempts = attempt_count,
+            ?outcome,
+            "release detail admission reused retained work"
+        );
+    }
+    Ok(AdmittedDetailWork {
+        work_item_id,
+        status,
+        outcome,
+        source_hash,
+        source_blocks_json: serde_json::to_string(&detail.item.source_blocks)
+            .unwrap_or_else(|_| "[]".to_owned()),
+        target_slots_json: serde_json::to_string(&detail.item.target_slots)
+            .unwrap_or_else(|_| "[]".to_owned()),
+    })
+}
+
+/// Fingerprint recorded on work whose identity was satisfied from a cache hit.
+/// It records that fact; it is not a provider route the item ever used.
+fn cache_hit_fingerprint() -> String {
+    ai::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\ncache_hit"))
+}
+
+/// Record that a work item was admitted without ever needing an attempt.
+///
+/// `cache_hit` is `boolean` on the migrated schema but `bigint` on an imported
+/// snapshot (`migrations_pg/0016_normalize_flag_columns.sql` rewrites it), and
+/// PostgreSQL will not coerce one to the other. Binding a Rust `bool` or an
+/// integer therefore fails on one of the two shapes, so the column type decides
+/// which literal is written.
+async fn mark_cache_hit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    work_item_id: &str,
+) -> Result<()> {
+    let data_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'content_work_items' AND column_name = 'cache_hit'",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let statement = if data_type.as_deref() == Some("boolean") {
+        "UPDATE public.content_work_items SET cache_hit = TRUE WHERE id = $1"
+    } else {
+        "UPDATE public.content_work_items SET cache_hit = 1 WHERE id = $1"
+    };
+    sqlx::query(statement)
+        .bind(work_item_id)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("mark content cache hit for {work_item_id}"))?;
+    Ok(())
+}
+
+/// Global work behind one caller-facing request row.
+///
+/// The link, not the request row, is authoritative: when a request is linked to
+/// global work, its terminal status is `content_work_items.status`. `None` means
+/// the row has no link (every kind this slice does not route), so the caller
+/// keeps reading the row itself.
+pub(crate) async fn linked_work(
+    pool: &PgPool,
+    request_id: &str,
+    user_id: &str,
+) -> Option<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT l.work_item_id, w.status FROM public.content_request_links l JOIN public.content_work_items w ON w.id = l.work_item_id WHERE l.request_id = $1 AND l.requester_id = $2 LIMIT 1",
+    )
+    .bind(request_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Mirror a terminal global status onto the requester's request row.
+///
+/// Only the global worker decides the terminal status; this propagates it to the
+/// view so admin reads and legacy consumers observe the same fact. It never
+/// writes a status the work item does not have, and never writes result text —
+/// that stays a projection read.
+pub(crate) async fn sync_linked_request_status(
+    pool: &PgPool,
+    request_id: &str,
+    work_status: &str,
+) -> Result<()> {
+    let (view_status, result_status) = match work_status {
+        "ready" => ("completed", Some("ready")),
+        "running" => ("running", None),
+        "queued" | "blocked_config" | "deferred_provider" => ("queued", None),
+        _ => ("failed", Some("error")),
+    };
+    sqlx::query(
+        "UPDATE public.translation_requests SET status = $2, result_status = $3, updated_at = now() WHERE id = $1 AND (status <> $2 OR result_status IS DISTINCT FROM $3)",
+    )
+    .bind(request_id)
+    .bind(view_status)
+    .bind(result_status)
+    .execute(pool)
+    .await
+    .context("mirror global work status onto the request view")?;
+    Ok(())
+}
+
+/// Register the requester link that makes a caller-facing request row a view
+/// of global work instead of a second writer.
+pub(crate) async fn register_detail_request_link(
+    pool: &PgPool,
+    request_id: &str,
+    work_item_id: &str,
+    user_id: &str,
+    producer_ref: &str,
+    delivery_mode: &str,
+    response_status: Option<&str>,
+) -> Result<()> {
+    let authorization = json!({"user_id": user_id, "captured_at": Utc::now().to_rfc3339()});
+    sqlx::query(
+        "INSERT INTO public.content_request_links (id, request_id, work_item_id, requester_type, requester_id, authorization_snapshot_json, producer_ref, request_source, delivery_mode, response_status, created_at, updated_at) VALUES ($1, $2, $3, 'user', $4, $5, $6, 'api', $7, $8, now(), now()) ON CONFLICT (request_id) DO UPDATE SET work_item_id = EXCLUDED.work_item_id, response_status = EXCLUDED.response_status, updated_at = now()",
+    )
+    .bind(local_id::generate_local_id())
+    .bind(request_id)
+    .bind(work_item_id)
+    .bind(user_id)
+    .bind(authorization.to_string())
+    .bind(producer_ref)
+    .bind(delivery_mode)
+    .bind(response_status)
+    .execute(pool)
+    .await
+    .context("register content request link")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2070,5 +2485,312 @@ mod tests {
             .await?;
         admin.close().await;
         result
+    }
+
+    /// Fixture shared by the admission tests: the content tables plus the
+    /// release source an admission resolves an identity from.
+    async fn create_admission_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text, updated_at text, detected_at text);
+            CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', next_retry_at text, retry_expires_at text, retry_after_at text, failure_class text, lease_owner text, lease_expires_at text, started_at text, finished_at text, cancelled_at text, supersedes_work_item_id text, batch_id text, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+            CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+            CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+            CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+            CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+            CREATE TABLE public.content_work_admission_events(id text PRIMARY KEY, work_item_id text NOT NULL, event_type text NOT NULL, replaced_by_work_item_id text, source_hash text NOT NULL, source_revision_json text NOT NULL DEFAULT '{}', producer_ref text NOT NULL DEFAULT '', requester_id text, reason_code text NOT NULL DEFAULT '', created_at text NOT NULL, UNIQUE (work_item_id, event_type, source_hash));
+            CREATE TABLE public.content_attempt_events(id text PRIMARY KEY, work_item_id text NOT NULL, attempt_no bigint NOT NULL, trigger text NOT NULL, event_type text NOT NULL, result_status text, error_code text, error_summary text, failure_class text, retry_eligible bigint NOT NULL DEFAULT 0, next_retry_at text, duration_ms bigint, token_count bigint, cost_microunits bigint, created_at text NOT NULL, configuration_snapshot_json text, route_snapshot_json text, configuration_fingerprint text, UNIQUE (work_item_id, attempt_no, event_type));
+            CREATE TABLE public.content_request_links(id text PRIMARY KEY, request_id text NOT NULL UNIQUE, work_item_id text NOT NULL, requester_type text NOT NULL, requester_id text, authorization_snapshot_json text NOT NULL, producer_ref text NOT NULL, request_source text NOT NULL, delivery_mode text NOT NULL, response_status text, created_at text NOT NULL, updated_at text NOT NULL);
+            CREATE TABLE public.content_processing_control(id integer PRIMARY KEY, mode text NOT NULL, switch_token text, updated_at text NOT NULL);
+            INSERT INTO public.content_processing_control(id, mode, updated_at) VALUES (1, 'global', now()::text);
+            CREATE TABLE public.content_identity_upgrade_control(id bigint PRIMARY KEY, status text NOT NULL, phase text NOT NULL);
+            INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
+            CREATE TABLE public.admin_runtime_settings(id integer PRIMARY KEY, llm_models_json text NOT NULL);
+            INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '["m1"]');
+            INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
+              VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body', '2026-11-24T00:00:00Z');
+            CREATE TABLE public.translation_work_items(id text PRIMARY KEY, dedupe_key text UNIQUE NOT NULL, scope_user_id text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, token_estimate integer NOT NULL, deadline_at text NOT NULL, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text, cache_hit bigint NOT NULL DEFAULT 0, batch_id text, retry_count bigint NOT NULL DEFAULT 0, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL);
+            CREATE TABLE public.translation_requests(id text PRIMARY KEY, mode text NOT NULL, source text NOT NULL, request_origin text NOT NULL, requested_by text, scope_user_id text NOT NULL, producer_ref text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, max_wait_ms integer NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, work_item_id text, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL, UNIQUE (mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, source_hash));
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_admission_database()
+    -> anyhow::Result<(sqlx::PgPool, sqlx::PgPool, String, url::Url)> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("content_admission_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        create_admission_schema(&pool).await?;
+        Ok((admin, pool, database, url))
+    }
+
+    async fn drop_admission_database(
+        admin: &sqlx::PgPool,
+        pool: sqlx::PgPool,
+        database: &str,
+    ) -> anyhow::Result<()> {
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(admin)
+            .await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    /// Two different users asking for the same Release detail share exactly one
+    /// work item, and each requester gets its own link.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_detail_admission_shares_one_work_item_between_requesters()
+    -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let first = admit_release_detail_translation(&pool, 42, "m1", "user-a:detail").await?;
+            assert_eq!(first.outcome, DetailAdmission::Created);
+            let second = admit_release_detail_translation(&pool, 42, "m1", "user-b:detail").await?;
+            assert_eq!(second.outcome, DetailAdmission::Reused);
+            assert_eq!(
+                second.work_item_id, first.work_item_id,
+                "one canonical identity has one work item"
+            );
+            let work_items: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_work_items")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(work_items, 1);
+            let events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_work_admission_events WHERE event_type = 'admission_noop'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(events, 1, "the repeat admission records its own fact");
+
+            register_detail_request_link(
+                &pool,
+                "request-a",
+                &first.work_item_id,
+                "user-a",
+                "user-a:detail",
+                "async",
+                Some("queued"),
+            )
+            .await?;
+            register_detail_request_link(
+                &pool,
+                "request-b",
+                &second.work_item_id,
+                "user-b",
+                "user-b:detail",
+                "async",
+                Some("queued"),
+            )
+            .await?;
+            let links: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_request_links WHERE work_item_id = $1",
+            )
+            .bind(&first.work_item_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(links, 2, "both requesters are linked to the shared work");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// A current projection answers the request with zero attempts: the work
+    /// item is `ready`, `cache_hit`, and never claimable.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_detail_admission_cache_hit_creates_zero_attempts() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let first = admit_release_detail_translation(&pool, 42, "m1", "seed").await?;
+            assert_eq!(first.outcome, DetailAdmission::Created);
+
+            // Publish a current projection for the exact identity.
+            let row = sqlx::query(
+                "SELECT repo_id, html_url, tag_name, name, body, updated_at, detected_at FROM public.repo_releases WHERE release_id = 42",
+            )
+            .fetch_one(&pool)
+            .await?;
+            let html_url: String = row.try_get("html_url")?;
+            let repo_id: i64 = row.try_get("repo_id")?;
+            let tag_name: String = row.try_get("tag_name")?;
+            let name: Option<String> = row.try_get("name")?;
+            let body: Option<String> = row.try_get("body")?;
+            let observed_at: Option<String> = row.try_get("updated_at")?;
+            let detail = detail_identity(
+                &crate::postgres_content_overlay::ReleaseDetailOrigin {
+                    release_id: 42,
+                    html_url: &html_url,
+                    repo_id,
+                    tag_name: &tag_name,
+                    name: name.as_deref(),
+                    body: body.as_deref(),
+                    observed_at: observed_at.as_deref(),
+                },
+                "seed",
+            )?;
+            let mut tx = pool.begin().await?;
+            ensure_identity_registered(&mut tx, &detail.identity, Utc::now()).await?;
+            link_identity_member(
+                &mut tx,
+                &first.work_item_id,
+                &detail.identity_id,
+                &detail.identity,
+                Utc::now(),
+            )
+            .await?;
+            write_projection(
+                &mut tx,
+                ProjectionWrite {
+                    identity_id: &detail.identity_id,
+                    canonical_resource_type: "release",
+                    canonical_resource_id: "42",
+                    pipeline: "translation",
+                    variant: "detail",
+                    target_lang: TARGET_LANG,
+                    protocol_version: GLOBAL_PROTOCOL_VERSION,
+                    model_profile: "m1",
+                    source_hash: &detail.identity.source_hash,
+                    work_item_id: &first.work_item_id,
+                    payload_json: r#"{"title_zh":"项目 v1","body_md":"发布说明"}"#,
+                    published_at: Utc::now(),
+                },
+            )
+            .await?;
+            sqlx::query("UPDATE public.content_work_items SET status = 'ready' WHERE id = $1")
+                .bind(&first.work_item_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+
+            // A new source version with the same text is the same identity; a
+            // second release row must not be needed to observe the hit.
+            sqlx::query("DELETE FROM public.content_work_items WHERE id = $1")
+                .bind(&first.work_item_id)
+                .execute(&pool)
+                .await?;
+            let hit = admit_release_detail_translation(&pool, 42, "m1", "user-b:detail").await?;
+            assert_eq!(hit.outcome, DetailAdmission::CacheHit);
+            assert_eq!(hit.status, "ready");
+            let zero_attempts: i64 = sqlx::query_scalar(
+                "SELECT attempt_count::bigint FROM public.content_work_items WHERE id = $1",
+            )
+            .bind(&hit.work_item_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(zero_attempts, 0, "a cache hit never fabricates an attempt");
+            let cache_hit: bool = sqlx::query_scalar(
+                "SELECT cache_hit FROM public.content_work_items WHERE id = $1",
+            )
+            .bind(&hit.work_item_id)
+            .fetch_one(&pool)
+            .await?;
+            assert!(cache_hit, "the work item records the real cache hit");
+            let attempt_events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_attempt_events WHERE work_item_id = $1",
+            )
+            .bind(&hit.work_item_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(attempt_events, 0);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// Concurrent duplicate admission of one identity creates exactly one work
+    /// item and one accepted admission fact.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_detail_admission_is_idempotent_under_concurrency() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let mut handles = Vec::with_capacity(6);
+            for index in 0..6 {
+                let pool = pool.clone();
+                handles.push(tokio::spawn(async move {
+                    admit_release_detail_translation(
+                        &pool,
+                        42,
+                        "m1",
+                        format!("user-{index}:detail").as_str(),
+                    )
+                    .await
+                }));
+            }
+            let mut created = 0;
+            let mut work_item_ids = std::collections::HashSet::new();
+            for handle in handles {
+                let admitted = handle.await??;
+                if admitted.outcome == DetailAdmission::Created {
+                    created += 1;
+                }
+                work_item_ids.insert(admitted.work_item_id);
+            }
+            assert_eq!(created, 1, "exactly one concurrent admission creates work");
+            assert_eq!(work_item_ids.len(), 1, "every admission shares one work item");
+            let work_items: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_work_items")
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(work_items, 1);
+            let accepted: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_work_admission_events WHERE event_type = 'admission_accepted'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(accepted, 1);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// The admission source item and the detail reader must agree on identity;
+    /// a divergence would publish a projection no read path resolves.
+    #[test]
+    fn admission_item_matches_the_detail_reader_identity() {
+        let item = crate::postgres_content_overlay::release_detail_translation_item(
+            &crate::postgres_content_overlay::ReleaseDetailOrigin {
+                release_id: 42,
+                html_url: "https://github.com/acme/demo/releases/tag/v1",
+                repo_id: 7,
+                tag_name: "v1",
+                name: Some("v1"),
+                body: Some("Release notes body"),
+                observed_at: Some("2026-11-24T00:00:00Z"),
+            },
+            "release_detail:42",
+        );
+        let reader = crate::postgres_content_overlay::ReleaseSource {
+            release_id: 42,
+            repo_full_name: "acme/demo",
+            repo_identity: "acme/demo",
+            tag_name: "v1",
+            name: Some("v1"),
+            body: Some("Release notes body"),
+            previous_tag_name: None,
+        };
+        assert_eq!(
+            content_processing::source_hash_for_item(&item),
+            reader.identity_hash("release_detail", "detail", reader.body)
+        );
     }
 }

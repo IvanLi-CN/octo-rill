@@ -245,6 +245,76 @@ pub(crate) fn release_repo_identity(html_url: &str, repo_id: i64) -> String {
         .unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
 
+/// Source fields one canonical Release detail translation is built from.
+pub(crate) struct ReleaseDetailOrigin<'a> {
+    pub release_id: i64,
+    pub html_url: &'a str,
+    pub repo_id: i64,
+    pub tag_name: &'a str,
+    pub name: Option<&'a str>,
+    pub body: Option<&'a str>,
+    /// Authoritative source revision metadata. It is not part of the identity.
+    pub observed_at: Option<&'a str>,
+}
+
+/// One canonical Release detail translation request.
+///
+/// Admission mints the work identity from these fields and the detail read path
+/// rebuilds the same identity through [`ReleaseSource::identity_hash`], so both
+/// sides must agree byte for byte. Keeping the construction here is what makes
+/// that agreement checkable instead of re-derived at a call site.
+///
+/// `source_observed_at` and `source_revision_tiebreak` are source-revision
+/// metadata, not identity: `content_processing::source_hash_for_item` drops them
+/// while provider admission persists them for currency checks.
+pub(crate) fn release_detail_translation_item(
+    origin: &ReleaseDetailOrigin<'_>,
+    producer_ref: &str,
+) -> TranslationRequestItemInput {
+    let repo_identity = release_repo_identity(origin.html_url, origin.repo_id);
+    let title = origin
+        .name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(origin.tag_name)
+        .to_owned();
+    let body = origin.body.map(normalize_body).unwrap_or_default();
+    let tiebreak = crate::content_processing::release_source_revision_content_tiebreak(&[
+        origin.html_url,
+        origin.tag_name,
+        title.as_str(),
+        body.as_str(),
+    ]);
+    let mut item = identity_item(
+        "release_detail",
+        "detail",
+        &origin.release_id.to_string(),
+        format!("{repo_identity}\n{}", origin.tag_name),
+        title,
+        Some(body),
+    );
+    item.producer_ref = producer_ref.to_owned();
+    // Revision metadata belongs in front of the identity blocks, exactly where
+    // `with_source_revision` puts it for every other producer.
+    if let Some(observed_at) = origin.observed_at.filter(|value| !value.trim().is_empty()) {
+        item.source_blocks.insert(
+            0,
+            TranslationSourceBlock {
+                slot: "source_observed_at".to_owned(),
+                text: observed_at.to_owned(),
+            },
+        );
+        item.source_blocks.insert(
+            1,
+            TranslationSourceBlock {
+                slot: "source_revision_tiebreak".to_owned(),
+                text: tiebreak,
+            },
+        );
+    }
+    item
+}
+
 /// The translation request item a content-work identity is keyed by.
 ///
 /// Projection identities are the canonical `source_hash_for_item` hash of this
@@ -1231,6 +1301,46 @@ pub(crate) async fn announcement_detail_processing(
     )
     .await?;
     Ok(DetailProcessing { translation, smart })
+}
+
+/// Text of the current Release detail projection, if one exists.
+///
+/// The API adapter uses this so a cache-hit response carries the retained
+/// translation instead of an empty `ready`. It resolves the same exact identity
+/// the admission did.
+pub(crate) async fn release_detail_text(
+    pool: &PgPool,
+    release_id: i64,
+    work_status: &str,
+) -> (Option<String>, Option<String>) {
+    if work_status != "ready" {
+        return (None, None);
+    }
+    let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>)>(
+        "SELECT repo_id, html_url, tag_name, name, body FROM public.repo_releases WHERE release_id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    else {
+        return (None, None);
+    };
+    let (repo_id, html_url, tag_name, name, body) = row;
+    let repo_identity = release_repo_identity(&html_url, repo_id);
+    let source = ReleaseSource {
+        release_id,
+        repo_full_name: repo_identity.as_str(),
+        repo_identity: repo_identity.as_str(),
+        tag_name: tag_name.as_str(),
+        name: name.as_deref(),
+        body: body.as_deref(),
+        previous_tag_name: None,
+    };
+    let state = OverlayState::load(pool).await;
+    match public_release_translation(pool, state, &source).await {
+        Ok(Some(projection)) => (projection.title(), projection.translation_summary()),
+        _ => (None, None),
+    }
 }
 
 /// Public Release translation: the exact detail projection only.
