@@ -150,6 +150,29 @@ jobs:
       - name: Run PostgreSQL seed suites
         run: bash scripts/pg_seed_suite.sh
 
+      # Read-path acceptance: every GET route in `src/postgres_server.rs` is
+      # probed against a seeded disposable database. The runner owns the whole
+      # lifecycle (database, schema bootstrap, fixture, service, probe) and
+      # prints each case, so unrunnable routes stay visible in the log.
+      #
+      # Known blockers, printed by the step so they stay visible:
+      #   * 7 routes need a live OAuth round-trip or callback context and can
+      #     never run here; they are listed in the runner's EXPECTED_NOT_RUN.
+      #   * 4 routes return 500 because of two defects in `src/` that also
+      #     reproduce on origin/main and are covered by no other suite:
+      #     - PgBriefRow decodes briefs.created_at (timestamptz) as String; the
+      #       two SELECTs in src/postgres_server.rs lack the ::text cast.
+      #     - translation_batches.item_count is INT4 but status() reads it as
+      #       i64 without the ::bigint cast its sibling queries use.
+      #     They are quarantined in EXPECTED_FAILURES, so any NEW failure fails
+      #     the step, and each entry must be deleted once its route passes.
+      - name: Run PostgreSQL read acceptance
+        run: |
+          python3 scripts/pg_read_acceptance_ci.py \
+            --admin-url "$PG_ADMIN_URL" \
+            --binary-dir "$BINARY_DIR" \
+            --port 3201
+
       - name: Stop ephemeral PostgreSQL 18 cluster
         if: ${{ always() }}
         shell: bash
