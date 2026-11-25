@@ -51,6 +51,10 @@ while IFS= read -r line; do
   spec_path="${spec_path%%)*}"
   [[ -f "$specs_dir/$spec_path" ]] || fail_msg "$topic: missing SPEC file '$spec_path'"
   slug="${spec_path%/SPEC.md}"
+  if [[ -z "$slug" || "$slug" == "$spec_path" ]]; then
+    fail_msg "$topic: SPEC cell must point at a <topic>/SPEC.md path"
+    continue
+  fi
   printf '%s\t%s\t%s\n' "$slug" "$lifecycle" "$successor" >>"$rows"
 
   if [[ "$lifecycle" == "superseded" ]]; then

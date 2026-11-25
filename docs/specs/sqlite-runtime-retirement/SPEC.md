@@ -43,14 +43,16 @@
 
 ### REQ-RTR-004 单一 schema 与单一控制行
 
-- 运行时表 MUST 只存在于 `public`；`octo_rill` 的空副本 MUST 删除，有数据者 MUST 迁移。
+- 运行时表 MUST 只存在于 `public`；`octo_rill` 表 MUST 逐表判定为“迁移到 public”“删除陈旧副本”或“保留证据后删除”，MUST NOT 以“空副本”一词概括。
+- `octo_rill._sqlx_migrations` MUST 在删除 schema 前迁入 `public`，且该迁移 MUST 是运行时迁移历史的最后一条；`public` 中 MUST NOT 另建一份不同历史。
+- `migration_manifests` MUST 作为导入证据保留（迁入 `public`），不得随 schema 静默删除；`content_processing_control` 与 `llm_recovery_flags` 的陈旧副本 MUST 在确认 `public` 行为权威后删除。
 - MUST 只存在一份 `content_processing_control`；`tower_sessions` 与迁移记录 MUST 落在 `public`。
 - 代码 MUST NOT 依赖 `search_path` 顺序的巧合。
 
 ### REQ-RTR-005 活路径测试义务
 
 - 每个抽取出的核心与每个 PostgreSQL 读模型 MUST 有直接测试；测试 MUST NOT 只存在于退役副本。
-- 一个独立的 PostgreSQL 18 service job MUST 先于测试迁移落地：一次性数据库、设置 `TEST_PG_TRANSLATE_URL` 与 `TEST_PG_*`、取消常驻 `#[ignore]`，并运行 `postgres_*` 测试与 `pg_seed_*` / `pg_read_acceptance.py`。该 job MUST 与主测试 job 分开，便于单独重跑与限时。
+- 一个独立的 PostgreSQL 18 service job MUST 先于测试迁移落地：一次性数据库、设置 `TEST_PG_TRANSLATE_URL`、取消常驻 `#[ignore]`，并运行 `postgres_*` 测试；seed 与读验收脚本按 `--admin-url` / `--base-url` 参数运行。该 job MUST 与主测试 job 分开，便于单独重跑与限时。
 - 删除后测试总数 MUST NOT 下降。
 
 ### REQ-RTR-006 迁移历史收敛
@@ -60,19 +62,24 @@
 
 ### REQ-RTR-007 分批删除与保留点
 
-- 顺序 MUST 为五个可独立回退的 PR：CI PostgreSQL job → 抽共用件与测试 → 原生 SQL → 删模块 → 删 `migrations/` 与 schema 收敛。
-- schema 收敛 MUST 是 forward-only 的最后一步：先改会话落 `public`，再以一条迁移迁 `tower_sessions` 并 `DROP TABLE` 空副本，最后 `DROP SCHEMA octo_rill`；MUST NOT 逐表拆迁移。
-- 在删除模块 PR 的 base 提交上 MUST 打注释标签 `legacy-sqlite-final`，CI 绿后、合并前推送；该提交 MUST 同时包含完整 `migrations/` 与 SQLite 模块。
-- 每一步 MUST 可独立回退；MUST NOT 以保留 `docs/legacy/` 副本作为保留方式。
+- 顺序 MUST 为五个 PR：CI PostgreSQL job → 抽共用件与测试 → 原生 SQL → 删模块 → 删 `migrations/` 与 schema 收敛。PR 1–4 MUST 可独立回退；PR 5 MUST 为 forward-only，不回退。
+- schema 收敛 MUST 是 forward-only 的最后一步：先改会话落 `public`；再以一条迁移迁 `tower_sessions`、`_sqlx_migrations` 与 `migration_manifests`，按逐表清单删除陈旧副本；最后 `DROP SCHEMA octo_rill`。MUST NOT 逐表拆迁移。
+- 在删除模块 PR 的 base 提交上 MUST 打注释标签 `legacy-sqlite-final`，该提交的 CI 绿后、合并前推送；该提交 MUST 同时包含完整 `migrations/` 与 SQLite 模块。
+- PR 1–4 MUST 可独立回退；PR 5 MUST 前向修复，不回退。MUST NOT 以保留 `docs/legacy/` 副本作为保留方式。
 
 ### REQ-RTR-008 功能门禁
 
 - 删除 `translation.generate` 旧自动入队之前，PGCP 的翻译全局通路 MUST 已发布等价结果，并满足 `REQ-PGCP-006`。
 - 按用户翻译表 `translation_work_items` / `translation_requests` 与 `ai_translations` 的只读兼容 MUST 保留；删除的是写入方与运行时代码，不是历史行。
 
-### REQ-RTR-009 生命周期与词表处置
+### REQ-RTR-009 在线迁移 operator 与接口退役
 
-- 下列处置 MUST 执行：`sqlite-writer-coordinator` 标 `superseded` 并由本文件接替；`persistent-state-migrations` 修订为 PostgreSQL 持久事实与旧事实观察；`translation-scheduler` 修订去除 SQLite 快照与 coordinator 假设；`postgresql-runtime` 用后继指针指向本文件。
+- 在线迁移 operator 及其管理接口在 PostgreSQL 运行时没有写入者；退役 PR MUST 删除该 operator 与接口，MUST NOT 留下只读假象或无效的 pause/resume 控件。
+- 退役前，`persistent-state-migrations` 的 ORDER/PAUSE/LEASE 与接口契约继续有效；退役后 MUST 只保留 admission、observation 与 forward repair。
+
+### REQ-RTR-010 生命周期与词表处置
+
+- 下列处置 MUST 执行：`sqlite-writer-coordinator` 标 `superseded` 并由本文件接替；`persistent-state-migrations` 修订为 PostgreSQL 持久事实与旧事实观察；`translation-scheduler` 修订去除 SQLite 快照与 coordinator 假设；`postgresql-runtime` 在范围与 Notes 中指向本文件。
 - `superseded` 标记 MUST 随替代需求合并立即生效，不等删除完成；删除完成后相关篇目 MUST 为 `superseded` 或 `archived`。
 - 词表 MUST 区分“旧事实”与“退役运行时”。仅顺带提及 SQLite 的篇目 MUST 只在契约语义变化时加注。
 
@@ -82,6 +89,7 @@
 - 不拆 `api.rs`（47k）/`sync.rs`（28k）的其余部分。
 - 不重做部署、镜像、Traefik 与监控。
 - 不删除 `ai_translations` 与按用户翻译表的历史行。
+- 不把在线迁移 operator 移植到 PostgreSQL；本主题直接退役。
 
 ## Verification
 
@@ -90,9 +98,10 @@
 - VER-RTR-SQL: covers REQ-RTR-003。方言 `grep` 零命中；同一查询在空库与导入库计划一致。
 - VER-RTR-SCHEMA: covers REQ-RTR-004、REQ-RTR-006。仅解析出 `public`；控制行唯一；会话与迁移同 schema；升级后服务可启动。
 - VER-RTR-TESTS: covers REQ-RTR-005。CI PostgreSQL job 绿；删除前后测试数不降；无新增常驻 `#[ignore]`。
-- VER-RTR-GATES: covers REQ-RTR-003、REQ-RTR-004。`grep -RE 'julianday|json_extract|sqlite_master|INSERT OR IGNORE' src/postgres_*` 与 `grep -c 'allow(dead_code)' src/main.rs` 归零；`bash scripts/check-spec-lifecycle.sh` 绿。
-- VER-RTR-GATE: covers REQ-RTR-008。翻译全局通路等价结果已发布；按用户端点 wire shape 快照不变；旧事实行未被改写。
-- VER-RTR-LIFECYCLE: covers REQ-RTR-009。`scripts/check-spec-lifecycle.sh` 绿；superseded 行均有后继；词表无 `legacy` 裸用。
+- VER-RTR-GATES: covers REQ-RTR-003、REQ-RTR-004。`grep -RE 'julianday|json_extract|sqlite_master|INSERT OR IGNORE' src/postgres_*.rs` 与 `grep -R 'allow(dead_code)' src/` 归零；`bash scripts/check-spec-lifecycle.sh` 绿。
+- VER-RTR-FUNCTIONAL-GATE: covers REQ-RTR-008。翻译全局通路等价结果已发布；按用户端点 wire shape 快照不变；旧事实行未被改写。
+- VER-RTR-OPERATOR: covers REQ-RTR-009。退役后迁移管理接口与其控件不存在；不得只读展示陈旧运行。
+- VER-RTR-LIFECYCLE: covers REQ-RTR-010。`scripts/check-spec-lifecycle.sh` 绿；superseded 行均有后继；词表无 `legacy` 裸用。
 
 ## Interfaces & Contracts
 

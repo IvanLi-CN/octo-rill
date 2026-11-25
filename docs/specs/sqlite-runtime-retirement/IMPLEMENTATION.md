@@ -21,6 +21,7 @@
 | `content_source_identity` | `ai` | `sha256_hex` |
 | `release_content`（新增） | `api` | `release_feed_body` |
 | `markdown`（新增） | `api` | `markdown_structure_preserved` |
+| `content_source_identity` | `translations` | `announcement_smart_feed_source_hash`、`release_smart_feed_source_hash` |
 | `translation_admin_types`（新增） | `translations` | `AdminTranslationAttemptEvent`、`AdminTranslationAttemptEventsResponse`、`AdminTranslationAttemptListQuery`、`AdminTranslationBatchResultSummary`、`AdminTranslationBatchRow`、`AdminTranslationBatchesResponse`、`AdminTranslationLinkedLlmCall`、`AdminTranslationListQuery`、`AdminTranslationRequestDetailResponse`、`AdminTranslationRequestsResponse`、`AdminTranslationStatusResponse`、`AdminTranslationWorkerStatus`、`RequestRow`、`admin_translation_result_item`、`request_row_select_sql` |
 | `translation_types`（新增） | `translations` | `TranslationResultItem`、`translation_batch_business_outcome` |
 | `translation_error`（新增） | `translations` | `classify_translation_error`；`api` 的 `SMART_NO_VALUABLE_VERSION_INFO` |
@@ -41,27 +42,42 @@
 | 2 | 抽共用件与测试 | 43 个符号全部有活模块归属；同域测试在新位置通过；`api.rs`/`sync.rs` 只剩未搬代码 | revert PR |
 | 3 | 原生 SQL | `pg_sql()` 删除；方言 `grep` 零命中；空库与导入库计划一致 | revert PR |
 | 4 | 删模块 + 标签 | 28 个模块删除；`allow(dead_code)` 归零；`legacy-sqlite-final` 已推送到 base 提交 | revert PR（标签保留） |
-| 5 | 迁移与 schema | `tower_sessions` 已落 `public`；一条 forward migration 迁表并 `DROP TABLE` 空副本；`DROP SCHEMA octo_rill`；`migrations/` 删除 | 前向迁移，不回退 |
+| 5 | 迁移与 schema | 迁移历史与会话已落 `public`；逐表处置完成；`DROP SCHEMA octo_rill`；`migrations/` 与无写入者的迁移管理接口删除 | forward-only，不回退 |
 
 ## CI PostgreSQL job
 
 - 独立 job，一次性 `postgres:18` service；每次运行创建隔离数据库，结束即销毁。
-- 环境：`TEST_PG_TRANSLATE_URL` 指向服务实例；seed 脚本以 `--admin-url` 指向可建库的超级用户，`psql` 与 `createdb` 可用。
+- 环境只要求 `TEST_PG_TRANSLATE_URL`（指向服务实例）；seed 脚本以 `--admin-url` 指向可建库的超级用户，`psql` 与 `createdb` 可用。
 - 取消 `postgres_*` 用例的常驻 `#[ignore]`；保留需要人工环境的显式 ignore 必须在用例注释说明。
 - seed 脚本各自创建一次性库并携带 `--binary-dir` 启动被测服务；`pg_read_acceptance.py` 以 `--base-url`、`--cookie-file` 与 `--output` 运行。限时与主测试 job 分开，便于单独重跑。
 
 ## Schema 迁移内容（PR 5）
 
-1. 先改 `session_store` 的 schema 为 `public` 并部署。
-2. 一条迁移：`ALTER TABLE octo_rill.tower_sessions SET SCHEMA public`；对 20 张空副本逐表 `DROP TABLE`（含 `content_processing_control`、`translation_work_items` 等）；保留 `_sqlx_migrations` 中仍需的历史行迁移说明。
-3. `DROP SCHEMA octo_rill`；删除 `migrations/`。
-4. 启动冒烟：会话可读写、控制行唯一、管理读与公开读正常。
+代码先改为显式使用 `public`，但同一次启动内迁移先于会话 store 初始化，因此不需要中间版本。
+
+1. 一条 forward migration 内按顺序执行：
+   - `ALTER TABLE octo_rill.tower_sessions SET SCHEMA public`
+   - `ALTER TABLE octo_rill._sqlx_migrations SET SCHEMA public`（该迁移因此成为历史表里的最后一条）
+   - `ALTER TABLE octo_rill.migration_manifests SET SCHEMA public`
+   - 删除陈旧副本（见下表）
+2. `DROP SCHEMA octo_rill`；删除 `migrations/`。
+3. 验证：空库启动、导入库启动、重启各一次；`public._sqlx_migrations` 只含一套历史且无 pending；会话可读写；无 `octo_rill` schema 残留。
+4. 若 SQLx 在迁移内移动自身历史表后无法记录版本，退化为两条迁移：先迁表，再单独 `DROP SCHEMA`；不得手工补写版本行。
+
+| 表 | 行数 | 处置 |
+| --- | --- | --- |
+| `_sqlx_migrations` | 22 | 迁入 `public`，作为唯一运行时迁移历史 |
+| `tower_sessions` | 7 | 迁入 `public` |
+| `migration_manifests` | 1 | 迁入 `public`，保留导入证据 |
+| `content_processing_control` | 1 | 陈旧副本；`public` 为权威，删除 |
+| `llm_recovery_flags` | 1 | 与 `public` 行比对；代码只读 `public`，确认后删除 |
+| 其余 15 张 | 0 | `briefs`、`brief_release_memberships`、`content_batch_items`、`content_batches`、`content_result_projections`、`content_work_items`、`llm_diagnostic_access_audit`、`llm_model_health`、`schema_migrations`、`translation_attempt_events`、`translation_attempt_llm_calls`、`translation_batch_items`、`translation_batches`、`translation_requests`、`translation_work_items`，全部删除 |
 
 ## 固定门禁
 
 ```bash
 grep -RE 'julianday|json_extract|sqlite_master|INSERT OR IGNORE' src/postgres_*.rs   # 应为空
-grep -c 'allow(dead_code)' src/main.rs                                               # 应为 0
+grep -R 'allow(dead_code)' src/                                                      # 应为空
 bash scripts/check-spec-lifecycle.sh                                                 # 应为 ok
 ```
 
@@ -72,3 +88,4 @@ bash scripts/check-spec-lifecycle.sh                                            
 - 目录生命周期检查已落地并接入 `check-rust-source-quality.sh` 与 lefthook。
 - `migrations/` 仍存在，删除后门禁尚未生效。
 - 功能门禁（PGCP 翻译等价）未完成，PR 4 不可先合并。
+- 在线迁移 operator 与 `/api/admin/jobs/migrations` 在 PG 运行时无写入者；PR 5 删除接口与控件，不保留只读假象。

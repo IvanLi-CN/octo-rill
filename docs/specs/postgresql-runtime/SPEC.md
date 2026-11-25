@@ -34,6 +34,7 @@
 ### REQ-PGR-003
 
 - PostgreSQL schema MUST 由 `migrations_pg/` 独立维护；已发布迁移不可修改；导入库与空库 MUST 启动到同一可运行 schema，SQLite 类型差异通过 forward migration 或读路径归一。
+- 运行时迁移 MUST 在 HTTP listen 前应用；校验或应用失败 MUST 使进程启动失败，不得以空 schema 或部分 schema 提供服务。
 - Inputs: 已发布迁移集合。
 - Outputs: 两库一致的列类型与可启动服务。
 

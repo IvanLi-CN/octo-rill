@@ -83,7 +83,7 @@
 - 只有存在可追溯 observation 且证据确实无法调和时，MUST 继续使用 `legacy_cached` / `legacy_conflict`。
 - 活动图的翻译 lane MUST 因此反映当前状态：已完成计入完成，仍在跑计入处理中，缺失才计入中性。
 - 读取 MUST 保持纯只读，不补覆盖、不创建工作项、不写缓存。
-- Inherits `REQ-GTP-ADMIN-READS` and `REQ-GTP-ADMIN-ACTIVITY` unchanged.
+- Amends `REQ-GTP-ADMIN-READS` for post-cutover rows: 切换后由旧入队路径新产生的按用户工作行不属于 retained legacy evidence，不得据其合成 `legacy_conflict`。`REQ-GTP-ADMIN-ACTIVITY` 不变。
 - Inputs: 源记录、`translation_work_items` 终态行、可选 observation。
 - Outputs: 与事实一致的翻译状态、尝试次数与综合状态。
 
@@ -91,7 +91,7 @@
 
 - 翻译完成后 MUST 发布结果投影；公开详情与已授权读取 MUST 按既有 audience/variant 规则命中翻译结果，MUST NOT 返回 `translated.status=missing`。
 - 润色 MUST 发布对应受众变体（`smart_public` / `smart_authorized`）；公开读取 MUST NOT 依赖 legacy `smart` 变体。
-- 翻译尚在旧入队路径期间，旧路径 MUST 只作为 producer；终态仍 MUST 由全局投影表达。
+- 翻译尚在旧入队路径期间，旧路径 MUST 只作为 admission 来源；结果投影的唯一发布者 MUST 是全局 content worker 或其委托的单一发布适配器，旧入队路径 MUST NOT 直接写投影。
 - Inputs: 已完成的翻译输出与 `source_hash`。
 - Outputs: `content_result_projections`、`content_current_result_projections` 与可读的公开翻译。
 

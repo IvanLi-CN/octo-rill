@@ -11,6 +11,7 @@
 - 每个主题使用一个稳定目录：`docs/specs/<topic>/`。
 - `<topic>` 使用稳定的 lowercase kebab-case，不再分配或依赖 legacy spec ID。
 - companion docs 固定为 `SPEC.md`、`IMPLEMENTATION.md`、`HISTORY.md`。
+- `Successor` 列仅在 `superseded` 行必填，可指向 SPEC 或 ADR；`active` 行的委托范围写 Notes。
 
 ## Lifecycle
 
@@ -119,6 +120,6 @@
 | 公开指标 API | active | [IMPLEMENTATION.md](./public-metrics-api/IMPLEMENTATION.md) / [HISTORY.md](./public-metrics-api/HISTORY.md) | [SPEC.md](./public-metrics-api/SPEC.md) | - | 实施中；公开治理统计 API + 真实可用的部分小时趋势 |
 | 核心性能监控 | active | [IMPLEMENTATION.md](./monitoring-dashboard/IMPLEMENTATION.md) / [HISTORY.md](./monitoring-dashboard/HISTORY.md) | [SPEC.md](./monitoring-dashboard/SPEC.md) | - | 应用 metrics + Grafana/Prometheus 资产 + 固定只读诊断 CLI；隔离运行验收与 PR 收敛进行中 |
 | Release 阅读内容与变更依据 | active | [IMPLEMENTATION.md](./release-reading-content/IMPLEMENTATION.md) / [HISTORY.md](./release-reading-content/HISTORY.md) | [SPEC.md](./release-reading-content/SPEC.md) | [ADR 0022](../adr/0022-release-reading-private-evidence-boundary.md) | 结构化变化结果、受控 compare 依据、Feed/详情/日报一致消费与最近 30 天回填已实现；内容规则已确认，权限隔离与集成验证待完成 |
-| PostgreSQL 运行时持久化 | active | [IMPLEMENTATION.md](./postgresql-runtime/IMPLEMENTATION.md) / [HISTORY.md](./postgresql-runtime/HISTORY.md) | [SPEC.md](./postgresql-runtime/SPEC.md) | [SPEC.md](./sqlite-runtime-retirement/SPEC.md) | 已实现；运行时固定 PostgreSQL 18，离线导入 + 独立 runtime schema、七通道调度、共享 Release 刷新判定与全局内容读投影；删除进度已委托 |
+| PostgreSQL 运行时持久化 | active | [IMPLEMENTATION.md](./postgresql-runtime/IMPLEMENTATION.md) / [HISTORY.md](./postgresql-runtime/HISTORY.md) | [SPEC.md](./postgresql-runtime/SPEC.md) | - | 已实现；运行时固定 PostgreSQL 18，离线导入 + 独立 runtime schema、七通道调度、共享 Release 刷新判定与全局内容读投影；删除进度见 sqlite-runtime-retirement |
 | PostgreSQL 全局内容处理运行时 | active | [IMPLEMENTATION.md](./postgres-content-processing/IMPLEMENTATION.md) / [HISTORY.md](./postgres-content-processing/HISTORY.md) | [SPEC.md](./postgres-content-processing/SPEC.md) | - | 进行中；PostgreSQL 原生 producer/worker 分片交付；新增翻译切换、管理读真实状态与公开翻译恢复（REQ-PGCP-010/011） |
 | SQLite 退役运行时删除与运行时路径收敛 | active | [IMPLEMENTATION.md](./sqlite-runtime-retirement/IMPLEMENTATION.md) / [HISTORY.md](./sqlite-runtime-retirement/HISTORY.md) | [SPEC.md](./sqlite-runtime-retirement/SPEC.md) | - | 删不可达模块、抽共用核心、原生 SQL、schema 收敛、搬测试并接 CI PostgreSQL 层；快照标签 `legacy-sqlite-final`；CI PG job 先行 |

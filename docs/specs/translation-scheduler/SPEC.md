@@ -19,6 +19,7 @@
 ## Requirements
 
 - REQ-SCHEDULER: 调度器必须把翻译或润色请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略；全局工作身份依照[全局翻译与润色工作模型](../global-translation-and-polish/SPEC.md)，Release 润色只能由调度器执行和写入终态缓存。
+- REQ-LEGACY-ADAPTER: 翻译表在全局内容处理完整接管后必须退化为只读兼容适配层；表名、请求与结果字段保持，不再作为新写入的唯一事实。
 - REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。每个尝试必须记录处理阶段、稳定错误代码、安全摘要、重试处置以及精确的模型调用归因链接。
 - REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；筛选和排序使用各类型来源时间，历史空发现时间仍保留并显示为“未知”；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要。任务摘要必须显示包含首次执行的总尝试次数，已知未开始为 `0` 次，历史证据不足时显示“未知”；旧证据与任务记录并存且无法证明覆盖完整历史时，总次数和受限次数筛选仍按未知处理。记录级总尝试次数筛选必须在计数和分页前执行。详情中的条目数只表示返回的尝试记录数，不得当成记录级总尝试次数。日报总次数按关联模型调用的尝试数求和，详情保留各调用内部的尝试序号；无法从历史事件确认的单次状态必须保持未记录，不得推断为失败，也不得用调用级聚合状态、模型或时间戳回填该次尝试；缺少该次逐次事件时 `llm_calls` 必须为空，不得生成可下钻的模型调用归因链接。
 - REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露处理阶段、模型调用与输出契约的独立结果、错误分类、重试信息和可用下钻链接。诊断载荷过期时必须明确呈现为过期，不得显示为未关联模型调用。
@@ -37,6 +38,7 @@
 - VER-COLLECTION-READ-AVAILABILITY: 覆盖: REQ-COLLECTION-READ-AVAILABILITY, REQ-COLLECTION-READ-FAILURE。通过 Rust 集成测试、Storybook 交互和管理员 Playwright 回归验证同键读取合并与重试、新筛选请求不被旧响应覆盖或显示旧行、列表与活动图可独立完成，以及同键失败刷新保留最后成功列表且不自动重试。
 - VER-COLLECTION-READ-PERFORMANCE: 覆盖: REQ-COLLECTION-READ-PLAN, REQ-COLLECTION-READ-AVAILABILITY。通过生产结构的合成 fixture 和有代表性的后台写压力测量 `24h`、`7d`、`30d` 读取；每种窗口的 `p95` 必须不超过一秒，`p99` 必须不超过两秒。
 - VER-CONTENT-PROCESSING-FAILURE-AUDIT: 覆盖: REQ-CONTENT-PROCESSING-FAILURE-AUDIT。通过失败工作项回归验证审计记录成功持久化，且不会产生列值数量不匹配的 SQL 错误。
+- VER-LEGACY-ADAPTER: 覆盖: REQ-LEGACY-ADAPTER。全局接管后验证表名、请求/结果字段与按用户 API wire shape 不变，新写入不再只落按用户表。
 
 ## 目标 / 非目标
 
@@ -81,8 +83,6 @@
 | `translation_requests` / `translation_work_items` / `translation_batches` / `translation_batch_items` / `translation_attempt_events` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 | `llm_calls` delivery metadata and translation parent link | DB schema | internal | Modify | `./contracts/db.md` | backend | backend / web-admin |
 | `translation_attempt_llm_calls` | DB schema | internal | New | `./contracts/db.md` | backend | backend / web-admin |
-
-翻译表在全局内容处理完整接管后 MUST 退化为只读兼容适配层；表名、请求与结果字段保持，不再作为新写入的唯一事实。
 
 ### 契约文档（按 Kind 拆分）
 

@@ -14,3 +14,12 @@
 - `api.rs`/`sync.rs` 搬完引用符号后整文件删除，测试随符号迁移。
 - 五个可回退 PR；CI PostgreSQL job 独立且先行；schema 收敛为最后一条 forward migration；`legacy-sqlite-final` 打在删模块 PR 的 base 提交。
 - 门禁固定为方言零命中、`allow(dead_code)` 归零与生命周期检查。
+
+## 审查修正
+
+- 补全 43 个符号落位中的两个 smart feed source hash。
+- 明确 `_sqlx_migrations` 必须在删除 schema 前迁入 `public`，并逐表列出迁移/删除清单与验证方式。
+- 修正“五个 PR 全部可回退”为 PR 1–4 可回退、PR 5 forward-only。
+- 把 PGCP-010 从“继承 GTP 管理读”改为“修订”，并同步 GTP 原文；补充投影唯一发布者。
+- 将在先迁移不变量迁入 `postgresql-runtime`；PSM 去除写许可措辞并标注 operator 退役边界。
+- 门禁改为扫描整个 `src/`；翻译表适配条款转为带验证的 REQ。
