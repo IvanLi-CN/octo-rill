@@ -47,6 +47,10 @@
 - 润色/阅读：`smart_public`/`smart_authorized` 需要 PostgreSQL evidence producer；公告与通知未接入。
 - 指标：worker 目前只有结构化日志，未接 Prometheus 计数。
 - 退役 legacy `translation.generate` 自动入队尚未开始。
+- 管理读模型：切换后翻译只落按用户工作行且无 observation，管理端与活动图把它合成为 `legacy_conflict`；`REQ-PGCP-010` 未实现（2026-11-25 实测 48/48 活动 cell 为中性）。
+- 公开读：global 模式详情只读全局投影，翻译输出未投影，公开详情返回 `translated.status=missing`；切换后 366/366 条已完成翻译无缓存行。`REQ-PGCP-011` 未实现。
+- 受众变体：全局 producer 只 admit `smart`，公开受众只读 `smart_public`；公开 `smart.status=missing`。
+- 数据修复：需要把上述 366 条既有输出以零新增尝试转为投影，尚未开始。
 
 ## Related Changes
 

@@ -7,6 +7,7 @@
 - Context: 全局翻译与润色流水线（`content_processing`）目前只有 SQLite 写入实现。PostgreSQL 运行时切换后，读路径已经从 `content_current_result_projections` 取内容，但没有任何生产者继续写入工作项、尝试事件和结果投影，导致切换后的内容面停更。
 - In scope: PostgreSQL 原生的全局内容 admission、claim/lease、provider 调用、输出契约、结果投影发布、失败恢复、调度接线与自动生产入口；覆盖 Release 翻译、Release 润色/阅读、公告与通知的翻译/润色。Release 与公告读侧沿用 `postgres_content_overlay` 的投影；通知当前走翻译请求/读取链路而不是该 overlay，其读取适配属于本主题范围。
 - Out of scope: 修改既有 prompt 与输出字段契约；日报生成；重新设计管理端读模型；SQLite 历史数据回填。
+- 删除退役 SQLite 运行时代码、schema 收敛与共用核心抽取由 [`../sqlite-runtime-retirement/SPEC.md`](../sqlite-runtime-retirement/SPEC.md) 拥有；本主题只拥有功能等价与读侧真实状态。
 
 ## Terms and Interfaces
 
@@ -76,6 +77,24 @@
 - Inputs: 每次 admission/claim/attempt/publish。
 - Outputs: 结构化事件与计数指标。
 
+### REQ-PGCP-010
+
+- 当翻译尚未产生全局工作或结果投影、而按用户隔离的 `translation_work_items` 已有终态行时，管理读 MUST 显示该行的真实状态与可显示输出，MUST NOT 合成为 `legacy_conflict`，MUST NOT 报告未知的尝试历史。
+- 只有存在可追溯 observation 且证据确实无法调和时，MUST 继续使用 `legacy_cached` / `legacy_conflict`。
+- 活动图的翻译 lane MUST 因此反映当前状态：已完成计入完成，仍在跑计入处理中，缺失才计入中性。
+- 读取 MUST 保持纯只读，不补覆盖、不创建工作项、不写缓存。
+- Inherits `REQ-GTP-ADMIN-READS` and `REQ-GTP-ADMIN-ACTIVITY` unchanged.
+- Inputs: 源记录、`translation_work_items` 终态行、可选 observation。
+- Outputs: 与事实一致的翻译状态、尝试次数与综合状态。
+
+### REQ-PGCP-011
+
+- 翻译完成后 MUST 发布结果投影；公开详情与已授权读取 MUST 按既有 audience/variant 规则命中翻译结果，MUST NOT 返回 `translated.status=missing`。
+- 润色 MUST 发布对应受众变体（`smart_public` / `smart_authorized`）；公开读取 MUST NOT 依赖 legacy `smart` 变体。
+- 翻译尚在旧入队路径期间，旧路径 MUST 只作为 producer；终态仍 MUST 由全局投影表达。
+- Inputs: 已完成的翻译输出与 `source_hash`。
+- Outputs: `content_result_projections`、`content_current_result_projections` 与可读的公开翻译。
+
 ## Verification
 
 ### VER-PGCP-001
@@ -120,6 +139,18 @@
 - covers: `REQ-PGCP-006`, `REQ-PGR-009`
 - Pass condition: 同一身份只有 PostgreSQL 写入者发布投影，legacy `translation.generate` 自动入队在覆盖后停止且没有双写。
 
+### VER-PGCP-008
+
+- Method: 在只有按用户翻译工作行、没有全局工作与 observation 的 Release 上读取管理与活动接口。
+- covers: `REQ-PGCP-010`, `REQ-GTP-ADMIN-READS`, `REQ-GTP-ADMIN-ACTIVITY`
+- Pass condition: 管理端显示真实终态与尝试次数，不是 `legacy_conflict`；活动 cell 为完成；有可追溯冲突 observation 的旧行仍显示 `legacy_conflict`。
+
+### VER-PGCP-009
+
+- Method: 对刚完成翻译的 Release 读取公开详情与已授权详情。
+- covers: `REQ-PGCP-011`, `REQ-GTP-RESULTS`
+- Pass condition: `translated.status=ready` 且标题/摘要与投影一致；无全局投影时不再返回 `missing`；投影源哈希与身份一致。
+
 ## Related ADRs
 
 - [ADR 0007: 全局翻译与润色工作模型](../../adr/0007-global-translation-and-polish-work-model.md)
@@ -138,3 +169,4 @@
 - `./HISTORY.md`
 - [`../global-translation-and-polish/SPEC.md`](../global-translation-and-polish/SPEC.md)
 - [`../postgresql-runtime/SPEC.md`](../postgresql-runtime/SPEC.md)
+- [`../sqlite-runtime-retirement/SPEC.md`](../sqlite-runtime-retirement/SPEC.md)

@@ -1,6 +1,8 @@
 # SQLite 单写入调度层
 
-> 当前有效规范以本文为准；实现覆盖与当前状态见 `./IMPLEMENTATION.md`，关键演进原因见 `./HISTORY.md`。
+> 本文保留历史契约；实现覆盖见 `./IMPLEMENTATION.md`，关键演进原因见 `./HISTORY.md`。
+>
+> **Status: superseded.** 生产运行时已固定 PostgreSQL（ADR 0023），SQLite 运行时代码进入删除队列。本文件保留 SQLite writer coordinator 的历史契约；删除与收敛由 [SQLite 退役运行时删除](../sqlite-runtime-retirement/SPEC.md) 接替。
 
 ## 背景 / 问题陈述
 
@@ -367,6 +369,7 @@
 
 - 风险：单 writer permit 内如果保留长事务，会把锁竞争从 SQLite 转移成应用排队长尾；实现必须保持写入段短小。
 - 假设：SQLite 继续作为当前主数据库，生产部署另行确认。
+- 假设（已被取代）：SQLite 运行时仍是生产路径；最新事实为 PostgreSQL 唯一权威。
 
 ## Related ADRs
 

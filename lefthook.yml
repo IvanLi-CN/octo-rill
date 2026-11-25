@@ -5,6 +5,9 @@ pre-commit:
       glob: "**/*.{rs}"
       run: cargo fmt --all
       stage_fixed: true
+    spec-lifecycle:
+      glob: "docs/specs/**"
+      run: bash ./scripts/check-spec-lifecycle.sh
     web-lint:
       run: |
         set -euo pipefail
