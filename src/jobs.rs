@@ -43,14 +43,10 @@ pub const STATUS_SUCCEEDED: &str = "succeeded";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_CANCELED: &str = "canceled";
 
-pub const TASK_SYNC_STARRED: &str = "sync.starred";
 pub const TASK_SYNC_STARRED_DELTA: &str = "sync.starred.delta";
 pub const TASK_SYNC_STARRED_RECONCILE: &str = "sync.starred.reconcile";
-pub const TASK_SYNC_RELEASES: &str = "sync.releases";
-pub const TASK_SYNC_NOTIFICATIONS: &str = "sync.notifications";
 pub const TASK_SYNC_ALL: &str = "sync.all";
 pub const TASK_SYNC_ACCESS_REFRESH: &str = "sync.access_refresh";
-pub const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_BRIEF_HISTORY_RECOMPUTE: &str = "brief.history_recompute";
@@ -89,7 +85,7 @@ fn is_webhook_push_task_type(task_type: &str) -> bool {
 
 pub const SCHEDULED_TASK_TYPES: &[&str] = &[
     TASK_BRIEF_DAILY_SLOT,
-    TASK_SYNC_SUBSCRIPTIONS,
+    crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
     TASK_SYNC_STARRED_DELTA,
     TASK_SYNC_STARRED_RECONCILE,
     TASK_RETRY_RECENT_FAILURES,
@@ -163,7 +159,7 @@ impl ReleaseEvidenceRequest {
     }
 
     pub(crate) fn request_key(&self) -> String {
-        ai::sha256_hex(&format!(
+        crate::content_source_identity::sha256_hex(&format!(
             "release-evidence.v1\nrepo_id={}\nrepo={}\naudience={}\naudience_user_id={}\nrelease_id={}\nbase={}\nhead={}\nrevision={}",
             self.repo_id,
             self.repo_full_name,
@@ -390,8 +386,6 @@ const SCHEDULER_DISPATCH_LANE: &str = "scheduler_dispatch";
 const SCHEDULER_DISPATCH_TRANSACTION_BUDGET: Duration = Duration::from_millis(750);
 const RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND: i64 = 100;
 const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60);
-#[cfg(test)]
-const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
 static TASK_CLAIM_ADMISSION: ClaimAdmission = ClaimAdmission::new();
 #[cfg(test)]
 static TASK_CLAIM_TEST_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -663,7 +657,7 @@ pub fn spawn_admin_dashboard_rollup_scheduler(state: Arc<AppState>) {
         loop {
             if let Err(err) = api::refresh_admin_dashboard_rollups(
                 state.as_ref(),
-                api::ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
+                crate::postgres_admin_dashboard::ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
             )
             .await
             {
@@ -769,7 +763,7 @@ pub async fn enqueue_subscription_run_if_due(
         SUBSCRIPTION_SCHEDULE_NAME,
         &schedule_key,
         NewTask {
-            task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
             payload,
             source: "scheduler".to_owned(),
             requested_by: None,
@@ -1900,7 +1894,7 @@ async fn collect_release_evidence_with_token(
     Ok(ReleaseEvidenceCollection {
         snapshot,
         resources,
-        content_hash: ai::sha256_hex(&serialized),
+        content_hash: crate::content_source_identity::sha256_hex(&serialized),
     })
 }
 
@@ -2188,7 +2182,7 @@ async fn persist_release_evidence_collection(
     for resource in &collection.resources {
         let payload_json = serde_json::to_string(&resource.payload)
             .context("serialize release evidence index payload")?;
-        let content_hash = ai::sha256_hex(&payload_json);
+        let content_hash = crate::content_source_identity::sha256_hex(&payload_json);
         let index_id = local_id::generate_local_id().to_string();
         sqlx::query(
             r#"
@@ -3325,7 +3319,7 @@ async fn dispatch_scheduled_task_atomic(
                 tx,
                 task_type_run_in_flight_in_transaction(
                     tx.as_transaction_mut(),
-                    TASK_SYNC_SUBSCRIPTIONS,
+                    crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
                 )
                 .await
             ) =>
@@ -3840,7 +3834,7 @@ async fn mark_brief_generation_source(
 fn task_supports_log_file(task_type: &str) -> bool {
     matches!(
         task_type,
-        TASK_SYNC_SUBSCRIPTIONS | TASK_SYNC_ACCESS_REFRESH
+        crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS | TASK_SYNC_ACCESS_REFRESH
     )
 }
 
@@ -4707,7 +4701,7 @@ pub async fn retry_task(
             .ok_or_else(|| anyhow!("release reading backfill retry missing run_id"))?;
         prepare_release_reading_backfill_manual_retry(state, run_id).await?;
     }
-    if source.task_type == TASK_SYNC_SUBSCRIPTIONS
+    if source.task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS
         && let Value::Object(object) = &mut payload
     {
         object.insert(
@@ -5622,7 +5616,7 @@ async fn has_queued_task(state: &AppState) -> Result<bool> {
     )
     .bind(STATUS_QUEUED)
     .bind(Utc::now().to_rfc3339())
-    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
     .bind(TASK_RETRY_RECENT_FAILURES)
     .bind(STATUS_RUNNING)
     .fetch_one(&state.pool)
@@ -5659,7 +5653,7 @@ async fn claim_next_queued_task_admitted(state: &AppState) -> Result<Option<Task
     )
     .bind(STATUS_QUEUED)
     .bind(Utc::now().to_rfc3339())
-    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
     .bind(TASK_RETRY_RECENT_FAILURES)
     .bind(STATUS_RUNNING)
     .fetch_optional(&mut *tx)
@@ -6242,7 +6236,7 @@ async fn execute_task(
         }));
     }
     match task_type {
-        TASK_SYNC_STARRED => {
+        crate::postgres_tasks::TASK_SYNC_STARRED => {
             let user_id = payload_local_id(payload, "user_id")?;
             let res = sync::sync_starred_delta_for_user(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
@@ -6267,7 +6261,7 @@ async fn execute_task(
             let res = sync::sync_starred_reconciliation_slice(state, epoch_id).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
-        TASK_SYNC_RELEASES => {
+        crate::postgres_tasks::TASK_SYNC_RELEASES => {
             let user_id = payload_local_id(payload, "user_id")?;
             let res = sync::sync_releases(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
@@ -6286,7 +6280,7 @@ async fn execute_task(
             };
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
-        TASK_SYNC_NOTIFICATIONS => {
+        crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS => {
             let user_id = payload_local_id(payload, "user_id")?;
             let res = sync::sync_notifications(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
@@ -6304,7 +6298,7 @@ async fn execute_task(
             )
             .await
         }
-        TASK_SYNC_SUBSCRIPTIONS => {
+        crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS => {
             let res = sync::sync_subscriptions(state, task_id, payload).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
@@ -9095,20 +9089,20 @@ mod tests {
         NewTask, RELEASE_EVIDENCE_MAX_ATTEMPTS, RELEASE_READING_BACKFILL_BATCH_SIZE,
         ReleaseEvidenceCollection, ReleaseEvidenceRequest, ReleaseEvidenceResource,
         ReleaseReadingBackfillItemRow, RetryTranslationCandidateRow, SCHEDULER_DISPATCH_LANE,
-        SMART_NO_VALUABLE_VERSION_INFO, STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX,
-        STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX, STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED,
-        STATUS_RUNNING, STATUS_SUCCEEDED, SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy,
-        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
-        TASK_RELEASE_EVIDENCE, TASK_RELEASE_READING_BACKFILL, TASK_RETRY_RECENT_FAILURES,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow,
-        TranslationStreamCursor, cancel_task, claim_next_queued_task, complete_task,
-        current_recent_failures_retry_schedule_key, current_star_sync_delta_schedule_key,
-        current_subscription_schedule_key, defer_task_after_sqlite_write_backpressure,
-        dispatch_scheduled_task_atomic, enqueue_brief_history_recompute_if_needed,
-        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        enqueue_recent_failures_retry_if_due, enqueue_release_reading_backfill_follow_up_if_queued,
+        STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX, STAR_SYNC_RECONCILE_SCHEDULE_NAME_PREFIX,
+        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
+        SUBSCRIPTION_SCHEDULE_NAME, ScheduledDispatchPolicy, TASK_BRIEF_DAILY_SLOT,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RELEASE_EVIDENCE,
+        TASK_RELEASE_READING_BACKFILL, TASK_RETRY_RECENT_FAILURES,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_STARRED_DELTA,
+        TASK_SYNC_STARRED_RECONCILE, TASK_TYPE_RUN_IN_FLIGHT_SQL, TASK_WEBHOOK_PUSH_AUDIT,
+        TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor, cancel_task,
+        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
+        current_star_sync_delta_schedule_key, current_subscription_schedule_key,
+        defer_task_after_sqlite_write_backpressure, dispatch_scheduled_task_atomic,
+        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
+        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
+        enqueue_release_reading_backfill_follow_up_if_queued,
         enqueue_release_reading_backfill_if_needed, enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
@@ -9217,7 +9211,14 @@ mod tests {
         let state = setup_state(pool.clone());
         let task_id = "heartbeat-pressure-task";
         let old_heartbeat = "2026-03-06T00:00:00Z";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         sqlx::query(
             "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
         )
@@ -9273,7 +9274,14 @@ mod tests {
             setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let task_id = "foreground-reschedule-pressure-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
             .bind(state.runtime_owner_id.as_str())
             .bind(task_id)
@@ -9379,7 +9387,14 @@ mod tests {
             setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
         let task_id = "foreground-finalize-pressure-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         sqlx::query(
             "UPDATE job_tasks SET runtime_owner_id = ?, lease_heartbeat_at = ? WHERE id = ?",
         )
@@ -9492,7 +9507,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "sse-resume-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            0,
+        )
+        .await;
 
         for (event_id, payload) in [
             ("sse-event-1", r#"{"stage":"star_refreshed"}"#),
@@ -9557,11 +9579,18 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "sse-fallback-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            0,
+        )
+        .await;
         seed_task(
             &pool,
             "sse-other-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_SUCCEEDED,
             1,
         )
@@ -9626,7 +9655,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "sse-late-terminal-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            0,
+        )
+        .await;
 
         sqlx::query(
             r#"
@@ -9682,7 +9718,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "sse-long-terminal-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            0,
+        )
+        .await;
 
         for index in 0..205 {
             sqlx::query(
@@ -9737,7 +9780,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            seed_task(&pool, task_id, TASK_SYNC_RELEASES, status, index as i64).await;
+            seed_task(
+                &pool,
+                task_id,
+                crate::postgres_tasks::TASK_SYNC_RELEASES,
+                status,
+                index as i64,
+            )
+            .await;
             sqlx::query(
                 r#"
                 INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
@@ -9939,7 +9989,7 @@ mod tests {
         let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {TASK_TYPE_RUN_IN_FLIGHT_SQL}"))
             .bind(STATUS_QUEUED)
             .bind(STATUS_RUNNING)
-            .bind(TASK_SYNC_SUBSCRIPTIONS)
+            .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
             .fetch_all(&pool)
             .await
             .expect("load scheduler in-flight query plan");
@@ -9997,7 +10047,7 @@ mod tests {
             ) VALUES ('scheduler-fixture-target', ?, ?, 'test', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
             "#,
         )
-        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(STATUS_QUEUED)
         .execute(&pool)
         .await
@@ -10009,7 +10059,7 @@ mod tests {
             let exists = sqlx::query_scalar::<_, i64>(TASK_TYPE_RUN_IN_FLIGHT_SQL)
                 .bind(STATUS_QUEUED)
                 .bind(STATUS_RUNNING)
-                .bind(TASK_SYNC_SUBSCRIPTIONS)
+                .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
                 .fetch_one(&pool)
                 .await
                 .expect("run scheduler in-flight query");
@@ -10114,7 +10164,7 @@ mod tests {
             "scheduler-rollback-test",
             "schedule-key-1",
             NewTask {
-                task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
                 payload: json!({"source": "rollback-test"}),
                 source: "scheduler".to_owned(),
                 requested_by: None,
@@ -10134,7 +10184,7 @@ mod tests {
         let task_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
         )
-        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .fetch_one(&pool)
         .await
         .expect("count rolled back scheduler tasks");
@@ -10196,7 +10246,7 @@ mod tests {
         let task_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
         )
-        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .fetch_one(&pool)
         .await
         .expect("count subscription tasks");
@@ -10248,7 +10298,7 @@ mod tests {
         let task_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
         )
-        .bind(TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .fetch_one(&pool)
         .await
         .expect("count deferred subscription tasks");
@@ -10391,7 +10441,7 @@ mod tests {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM job_tasks WHERE task_type = ? AND source = 'scheduler'",
             )
-            .bind(TASK_SYNC_SUBSCRIPTIONS)
+            .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
             .fetch_one(&pool)
             .await
             .expect("count scheduler pressure tasks"),
@@ -10936,7 +10986,9 @@ mod tests {
     #[test]
     fn scheduled_task_types_include_subscription_sync() {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
-        assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
+        assert!(is_scheduled_task_type(
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS
+        ));
         assert!(is_scheduled_task_type(TASK_RETRY_RECENT_FAILURES));
         assert!(is_scheduled_task_type(TASK_WEBHOOK_PUSH_AUDIT));
         assert!(!is_scheduled_task_type("translate.release"));
@@ -11131,7 +11183,7 @@ mod tests {
         seed_task(
             &pool,
             "sync-running",
-            TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             STATUS_RUNNING,
             0,
         )
@@ -11139,7 +11191,7 @@ mod tests {
         seed_task(
             &pool,
             "sync-queued",
-            TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             STATUS_QUEUED,
             1,
         )
@@ -11207,7 +11259,7 @@ mod tests {
         seed_task(
             &pool,
             "sync-queued",
-            TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             STATUS_QUEUED,
             0,
         )
@@ -11218,7 +11270,10 @@ mod tests {
             .expect("claim queued task")
             .expect("task claimed");
         assert_eq!(claimed.id, "sync-queued");
-        assert_eq!(claimed.task_type, TASK_SYNC_SUBSCRIPTIONS);
+        assert_eq!(
+            claimed.task_type,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS
+        );
     }
 
     #[tokio::test]
@@ -11226,7 +11281,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
-        seed_task(&pool, "stale-task", TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            "stale-task",
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         sqlx::query(
             r#"
             UPDATE job_tasks
@@ -11308,7 +11370,7 @@ mod tests {
         seed_task(
             &pool,
             "stale-worker-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11459,7 +11521,7 @@ mod tests {
         seed_task(
             &pool,
             "stale-complete-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11503,7 +11565,7 @@ mod tests {
         seed_task(
             &pool,
             "lease-revived-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11649,7 +11711,7 @@ mod tests {
         seed_task(
             &pool,
             "concurrent-recovery-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11681,7 +11743,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
-        seed_task(&pool, "live-task", TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            "live-task",
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
@@ -11719,7 +11788,7 @@ mod tests {
         seed_task(
             &pool,
             "foreign-live-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11777,7 +11846,7 @@ mod tests {
         seed_task(
             &pool,
             "startup-foreign-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -11831,7 +11900,7 @@ mod tests {
         seed_task(
             &pool,
             "startup-live-foreign-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -12410,7 +12479,7 @@ mod tests {
         seed_task(
             &pool,
             "sqlite-deadline-task",
-            TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_RUNNING,
             0,
         )
@@ -12430,7 +12499,7 @@ mod tests {
             .expect("set deferred task retry count");
         let task = TaskRow {
             id: "sqlite-deadline-task".to_owned(),
-            task_type: TASK_SYNC_RELEASES.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
             source: "scheduler".to_owned(),
             requested_by: None,
             payload_json: payload.to_string(),
@@ -12472,7 +12541,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "sqlite-reclaimed-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         let payload = json!({"retry_count": 3});
         sqlx::query("UPDATE job_tasks SET payload_json = ?, runtime_owner_id = ? WHERE id = ?")
             .bind(payload.to_string())
@@ -12483,7 +12559,7 @@ mod tests {
             .expect("seed reclaimed task owner");
         let task = TaskRow {
             id: task_id.to_owned(),
-            task_type: TASK_SYNC_RELEASES.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
             source: "scheduler".to_owned(),
             requested_by: None,
             payload_json: payload.to_string(),
@@ -12522,7 +12598,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let task_id = "owned-reschedule-reclaimed-task";
-        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        seed_task(
+            &pool,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
         sqlx::query("UPDATE job_tasks SET runtime_owner_id = ? WHERE id = ?")
             .bind("new-runtime-owner")
             .bind(task_id)
@@ -13254,7 +13337,7 @@ mod tests {
             .bind((now + Duration::hours(1)).to_rfc3339())
             .bind("failed")
             .bind("missing")
-            .bind(SMART_NO_VALUABLE_VERSION_INFO)
+            .bind(crate::translation_error::SMART_NO_VALUABLE_VERSION_INFO)
             .bind(created_at.as_str())
             .bind(updated_at.as_str())
             .execute(&pool)

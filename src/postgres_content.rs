@@ -36,7 +36,6 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
-    ai,
     config::AiConfig,
     content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::{
@@ -86,7 +85,7 @@ struct Claim {
 }
 
 fn configuration_fingerprint(route_models: &[String]) -> String {
-    ai::sha256_hex(&format!(
+    crate::content_source_identity::sha256_hex(&format!(
         "{GLOBAL_PROTOCOL_VERSION}\nroute={}",
         serde_json::to_string(route_models).unwrap_or_default()
     ))
@@ -395,7 +394,7 @@ impl std::error::Error for PublicationError {}
 /// the attempt happened on the translation lane and its routing is recorded
 /// there.
 fn publication_fingerprint(source_hash: &str) -> String {
-    ai::sha256_hex(&format!(
+    crate::content_source_identity::sha256_hex(&format!(
         "{GLOBAL_PROTOCOL_VERSION}\ntranslation-publication\n{source_hash}"
     ))
 }
@@ -478,7 +477,7 @@ pub(crate) async fn publish_translation_result(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     publication: TranslationPublication<'_>,
 ) -> Result<()> {
-    let canonical_hash = content_processing::source_hash_for_item(publication.item);
+    let canonical_hash = crate::content_source_identity::source_hash_for_item(publication.item);
     if canonical_hash != publication.source_hash {
         return Err(anyhow::Error::new(PublicationError::SourceHashMismatch {
             reported: publication.source_hash.to_owned(),
@@ -767,7 +766,9 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                 claim,
                 FailureOutcome {
                     class: failure.class.as_str().to_owned(),
-                    summary: translations::translation_error_summary(Some(&failure.message)),
+                    summary: crate::translation_error::translation_error_summary(Some(
+                        &failure.message,
+                    )),
                 },
             )
             .await;
@@ -809,7 +810,9 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                     claim,
                     FailureOutcome {
                         class: failure.class.as_str().to_owned(),
-                        summary: translations::translation_error_summary(Some(&failure.message)),
+                        summary: crate::translation_error::translation_error_summary(Some(
+                            &failure.message,
+                        )),
                     },
                 )
                 .await;
@@ -840,7 +843,9 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                 claim,
                 FailureOutcome {
                     class: "output_contract_invalid".to_owned(),
-                    summary: translations::translation_error_summary(Some(&error.to_string())),
+                    summary: crate::translation_error::translation_error_summary(Some(
+                        &error.to_string(),
+                    )),
                 },
             )
             .await;
@@ -1022,8 +1027,10 @@ fn release_polish_source_blocks(
 /// evidence. Only the published title/body is named here: this producer never
 /// collects compare evidence, so nothing private can reach either audience
 /// (ADR 0022).
-fn published_release_text_evidence(release_id: i64) -> Vec<translations::ReleaseReadingEvidence> {
-    vec![translations::ReleaseReadingEvidence {
+fn published_release_text_evidence(
+    release_id: i64,
+) -> Vec<crate::translation_types::ReleaseReadingEvidence> {
+    vec![crate::translation_types::ReleaseReadingEvidence {
         kind: "release_text".to_owned(),
         reference: release_id.to_string(),
         scope: Some("published title/body; compare evidence not used".to_owned()),
@@ -1171,7 +1178,7 @@ async fn admit_polish_variant(
     fingerprint: &str,
     token_estimate: i64,
 ) -> Result<usize> {
-    let source_hash = content_processing::source_hash_for_item(item);
+    let source_hash = crate::content_source_identity::source_hash_for_item(item);
     let identity = ContentWorkIdentity {
         canonical_resource_type: "release".to_owned(),
         canonical_resource_id: release_id.to_string(),
@@ -1323,11 +1330,11 @@ pub(crate) async fn admit_release_polish(
         }
         let repo_identity =
             crate::postgres_content_overlay::release_repo_identity(&html_url, repo_id);
-        let observed_at = content_processing::authoritative_release_revision(
+        let observed_at = crate::content_source_identity::authoritative_release_revision(
             updated_at.as_deref().unwrap_or_default(),
             detected_at.as_deref(),
         );
-        let tiebreak = content_processing::release_source_revision_content_tiebreak(&[
+        let tiebreak = crate::content_source_identity::release_source_revision_content_tiebreak(&[
             html_url.as_str(),
             tag_name.as_str(),
             title.as_str(),
@@ -1418,7 +1425,7 @@ mod tests {
             .await?;
 
             let item = release_item("42", "v1", "v1", Some("Release notes body"));
-            let source_hash = content_processing::source_hash_for_item(&item);
+            let source_hash = crate::content_source_identity::source_hash_for_item(&item);
             let payload = json!({"title_zh": "项目 v1 发布", "body_md": "发布说明正文"});
 
             // 1. Publish on completion.
@@ -1563,7 +1570,7 @@ mod tests {
     #[test]
     fn writer_and_reader_derive_the_same_release_identity() {
         let item = release_item("42", "v1.2.0", "v1.2.0 release", Some("## Notes\n- item"));
-        let written = content_processing::source_hash_for_item(&item);
+        let written = crate::content_source_identity::source_hash_for_item(&item);
         let reader = crate::postgres_content_overlay::ReleaseSource {
             release_id: 42,
             repo_full_name: "acme/demo",
@@ -1586,8 +1593,8 @@ mod tests {
         let lf = release_item("7", "v1", "one", Some("a\nb"));
         let crlf = release_item("7", "v1", "one", Some("a\r\nb"));
         assert_eq!(
-            content_processing::source_hash_for_item(&lf),
-            content_processing::source_hash_for_item(&crlf)
+            crate::content_source_identity::source_hash_for_item(&lf),
+            crate::content_source_identity::source_hash_for_item(&crlf)
         );
     }
 
@@ -1604,8 +1611,8 @@ mod tests {
         );
         let item = release_item("9", "v2", "v2", None);
         assert_eq!(
-            content_processing::source_hash_for_item(&with_blank_name),
-            content_processing::source_hash_for_item(&item)
+            crate::content_source_identity::source_hash_for_item(&with_blank_name),
+            crate::content_source_identity::source_hash_for_item(&item)
         );
     }
 
@@ -1701,7 +1708,8 @@ mod tests {
             &blocks,
         );
         let smart = release_polish_item(42, "smart", &blocks);
-        let hashes = [&public, &authorized, &smart].map(content_processing::source_hash_for_item);
+        let hashes = [&public, &authorized, &smart]
+            .map(crate::content_source_identity::source_hash_for_item);
         assert_ne!(hashes[0], hashes[1]);
         assert_ne!(hashes[0], hashes[2]);
         assert_ne!(hashes[1], hashes[2]);

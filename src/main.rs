@@ -23,6 +23,7 @@ mod config;
 mod content_identity_upgrade;
 #[allow(dead_code)]
 mod content_processing;
+mod content_source_identity;
 mod crypto;
 #[allow(dead_code)]
 mod database_migrations;
@@ -35,7 +36,9 @@ mod github_api;
 mod jobs;
 #[allow(dead_code)]
 mod linuxdo;
+mod llm_contract;
 mod local_id;
+mod markdown;
 #[allow(dead_code)]
 mod metrics;
 mod observability;
@@ -70,6 +73,7 @@ pub mod postgres_worker;
 mod postgres_write;
 #[allow(dead_code)]
 mod public_metrics;
+mod release_content;
 #[allow(dead_code)]
 mod release_links;
 #[allow(dead_code)]
@@ -87,6 +91,10 @@ mod sqlite_write;
 mod state;
 #[allow(dead_code)]
 mod sync;
+mod translation_admin_types;
+mod translation_error;
+mod translation_runtime;
+mod translation_types;
 #[allow(dead_code)]
 mod translations;
 mod version;

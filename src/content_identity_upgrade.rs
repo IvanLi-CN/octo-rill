@@ -8,7 +8,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tower_sessions::Session;
 
 use crate::{
-    ai, api,
+    api,
     error::ApiError,
     local_id,
     sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_retryable_write_error},
@@ -202,7 +202,7 @@ pub(crate) fn identity_id_for(key: &ContentWorkIdentity) -> Result<String> {
     ))?;
     Ok(format!(
         "content-work-{}",
-        ai::sha256_hex(&format!("content-work-identity.v1\n{encoded}"))
+        crate::content_source_identity::sha256_hex(&format!("content-work-identity.v1\n{encoded}"))
     ))
 }
 

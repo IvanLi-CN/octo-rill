@@ -648,22 +648,18 @@ fn source_hash(item: &translations::TranslationRequestItemInput) -> Result<Strin
         "source_blocks": source_blocks,
         "target_slots": item.target_slots,
     }))?;
-    Ok(ai::sha256_hex(&format!(
+    Ok(crate::content_source_identity::sha256_hex(&format!(
         "{GLOBAL_PROTOCOL_VERSION}\n{source}"
     )))
 }
 
-pub(crate) fn source_hash_for_item(item: &translations::TranslationRequestItemInput) -> String {
-    source_hash(item).expect("translation request source fields are serializable")
-}
-
 async fn runtime_configuration_fingerprint(state: &AppState, model_profile: &str) -> String {
     let Some(snapshot) = current_attempt_route_snapshot(state).await else {
-        return ai::sha256_hex(&format!(
+        return crate::content_source_identity::sha256_hex(&format!(
             "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nai-disabled"
         ));
     };
-    ai::sha256_hex(&format!(
+    crate::content_source_identity::sha256_hex(&format!(
         "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\n{}",
         snapshot.configuration_fingerprint
     ))
@@ -683,12 +679,12 @@ async fn current_attempt_route_snapshot(state: &AppState) -> Option<AttemptRoute
     }
     let configuration_snapshot_json = json!({
         "base_url_origin": config.base_url.origin().ascii_serialization(),
-        "base_url_sha256": ai::sha256_hex(config.base_url.as_str()),
-        "api_key_sha256": ai::sha256_hex(&config.api_key),
+        "base_url_sha256": crate::content_source_identity::sha256_hex(config.base_url.as_str()),
+        "api_key_sha256": crate::content_source_identity::sha256_hex(&config.api_key),
     })
     .to_string();
     let route_snapshot_json = serde_json::to_string(&routing.llm_models).ok()?;
-    let configuration_fingerprint = ai::sha256_hex(&format!(
+    let configuration_fingerprint = crate::content_source_identity::sha256_hex(&format!(
         "{GLOBAL_PROTOCOL_VERSION}\n{configuration_snapshot_json}\n{route_snapshot_json}"
     ));
     Some(AttemptRouteSnapshot {
@@ -777,15 +773,16 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
         .unwrap_or_else(|| json!({}));
     let mut reading_incompatible = false;
     if let Some(raw_reading) = result.get("reading").cloned() {
-        let normalized =
-            serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
-                .ok()
-                .and_then(|mut reading| {
-                    reading.normalize_references().ok()?;
-                    reading.validate().ok()?;
-                    reading.evidence.clear();
-                    serde_json::to_value(reading).ok()
-                });
+        let normalized = serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(
+            raw_reading.clone(),
+        )
+        .ok()
+        .and_then(|mut reading| {
+            reading.normalize_references().ok()?;
+            reading.validate().ok()?;
+            reading.evidence.clear();
+            serde_json::to_value(reading).ok()
+        });
         if let Some(normalized) = normalized {
             result["reading"] = normalized;
         } else {
@@ -2082,9 +2079,9 @@ pub(crate) fn release_reading_projection_is_incompatible(projection: &Value) -> 
     let Some(raw_reading) = projection.get("reading") else {
         return false;
     };
-    let Ok(mut reading) =
-        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
-    else {
+    let Ok(mut reading) = serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(
+        raw_reading.clone(),
+    ) else {
         return true;
     };
     reading.normalize_references().is_err() || reading.validate().is_err()
@@ -3573,8 +3570,10 @@ pub(crate) fn validate_output(
         };
         if slot == "reading" {
             let mut parsed =
-                serde_json::from_value::<translations::ReleaseReadingResult>(value.clone())
-                    .context("reading is not a valid ReleaseReadingResult")?;
+                serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(
+                    value.clone(),
+                )
+                .context("reading is not a valid ReleaseReadingResult")?;
             parsed.normalize_references().map_err(anyhow::Error::msg)?;
             parsed.validate().map_err(anyhow::Error::msg)?;
             if let Some(expected_version) = source_blocks
@@ -3609,8 +3608,10 @@ pub(crate) fn validate_output(
                 .iter()
                 .find(|block| block.slot == "reading_evidence_json")
                 .and_then(|block| {
-                    serde_json::from_str::<Vec<translations::ReleaseReadingEvidence>>(&block.text)
-                        .ok()
+                    serde_json::from_str::<Vec<crate::translation_types::ReleaseReadingEvidence>>(
+                        &block.text,
+                    )
+                    .ok()
                 })
                 .unwrap_or_default();
             let evidence_has_release_body = evidence
@@ -3678,7 +3679,7 @@ pub(crate) fn validate_output(
             let translated = value
                 .as_str()
                 .ok_or_else(|| anyhow!("global content output target slot is not text: {slot}"))?;
-            if !crate::api::markdown_structure_preserved(source, translated) {
+            if !crate::markdown::markdown_structure_preserved(source, translated) {
                 return Err(anyhow!(
                     "global content output failed to preserve markdown structure: {slot}"
                 ));
@@ -3735,21 +3736,21 @@ fn release_reading_material_value_has_human_prose(value: &str) -> bool {
 }
 
 fn release_reading_machine_materials(
-    evidence: &[translations::ReleaseReadingEvidence],
-) -> Vec<translations::ReleaseReadingMaterial> {
+    evidence: &[crate::translation_types::ReleaseReadingEvidence],
+) -> Vec<crate::translation_types::ReleaseReadingMaterial> {
     let mut materials = Vec::new();
     let mut push = |label: &str, value: &str| {
         let value = value.trim();
         if value.is_empty()
-            || materials
-                .iter()
-                .any(|material: &translations::ReleaseReadingMaterial| {
+            || materials.iter().any(
+                |material: &crate::translation_types::ReleaseReadingMaterial| {
                     material.label == label && material.value == value
-                })
+                },
+            )
         {
             return;
         }
-        materials.push(translations::ReleaseReadingMaterial {
+        materials.push(crate::translation_types::ReleaseReadingMaterial {
             label: label.to_owned(),
             value: value.to_owned(),
         });
@@ -3827,7 +3828,7 @@ fn output_validation_error_code(error: &anyhow::Error) -> Option<&'static str> {
 #[derive(Debug)]
 struct GlobalExecutionFailure {
     call_ids: Vec<String>,
-    class: ai::LlmFailureClass,
+    class: crate::llm_contract::LlmFailureClass,
     message: String,
 }
 
@@ -3839,7 +3840,9 @@ impl std::fmt::Display for GlobalExecutionFailure {
 
 impl std::error::Error for GlobalExecutionFailure {}
 
-fn global_execution_failure_class(error: &anyhow::Error) -> Option<ai::LlmFailureClass> {
+fn global_execution_failure_class(
+    error: &anyhow::Error,
+) -> Option<crate::llm_contract::LlmFailureClass> {
     error
         .downcast_ref::<GlobalExecutionFailure>()
         .map(|failure| failure.class)
@@ -3990,7 +3993,7 @@ async fn request_global_completion(
     .await
     .map_err(|_| {
         anyhow::Error::new(ai::LlmCallFailure {
-            class: ai::LlmFailureClass::Transient,
+            class: crate::llm_contract::LlmFailureClass::Transient,
             call_id: None,
         })
     })
@@ -4081,7 +4084,7 @@ async fn complete_global_output(
     let Some(ai_config) = state.config.ai.clone() else {
         return Err(anyhow::Error::new(GlobalExecutionFailure {
             call_ids: Vec::new(),
-            class: ai::LlmFailureClass::Configuration,
+            class: crate::llm_contract::LlmFailureClass::Configuration,
             message: "AI configuration is missing".to_owned(),
         }));
     };
@@ -4107,7 +4110,8 @@ async fn complete_global_output(
             if let Some(call_id) = ai::llm_call_id(&error) {
                 call_ids.push(call_id);
             }
-            let class = ai::llm_failure_class(&error).unwrap_or(ai::LlmFailureClass::Transient);
+            let class = ai::llm_failure_class(&error)
+                .unwrap_or(crate::llm_contract::LlmFailureClass::Transient);
             return Err(anyhow::Error::new(GlobalExecutionFailure {
                 call_ids,
                 class,
@@ -4141,7 +4145,8 @@ async fn complete_global_output(
                 if let Some(call_id) = ai::llm_call_id(&error) {
                     call_ids.push(call_id);
                 }
-                let class = ai::llm_failure_class(&error).unwrap_or(ai::LlmFailureClass::Transient);
+                let class = ai::llm_failure_class(&error)
+                    .unwrap_or(crate::llm_contract::LlmFailureClass::Transient);
                 return Err(anyhow::Error::new(GlobalExecutionFailure {
                     call_ids,
                     class,
@@ -4265,39 +4270,8 @@ fn source_revision_snapshot_json(observed_at: Option<String>, tiebreak: String) 
     json!({"source_blocks": blocks}).to_string()
 }
 
-pub(crate) fn notification_source_revision_tiebreak(
-    thread_id: &str,
-    repo_full_name: Option<&str>,
-    subject_title: Option<&str>,
-    reason: Option<&str>,
-    subject_type: Option<&str>,
-) -> String {
-    format!(
-        "thread={thread_id}\nrepo={}\ntitle={}\nreason={}\nsubject_type={}",
-        repo_full_name.unwrap_or_default(),
-        subject_title.unwrap_or_default(),
-        reason.unwrap_or_default(),
-        subject_type.unwrap_or_default(),
-    )
-}
-
 pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
     parts.join("\n")
-}
-
-pub(crate) fn release_source_revision_content_tiebreak(parts: &[&str]) -> String {
-    let evidence_rank = if parts.iter().any(|part| {
-        let normalized = part.to_ascii_lowercase();
-        normalized.contains("compare evidence is unavailable")
-            || normalized.contains("truncated or paginated")
-            || normalized.contains("compare_unavailable")
-            || normalized.contains("github_compare_incomplete")
-    }) {
-        0
-    } else {
-        1
-    };
-    format!("evidence_rank={evidence_rank}\n{}", parts.join("\n"))
 }
 
 pub(crate) fn announcement_source_revision_tiebreak(
@@ -4328,16 +4302,6 @@ pub(crate) fn compare_announcement_source_revisions(
     )
 }
 
-pub(crate) fn authoritative_release_revision<'a>(
-    updated_at: &'a str,
-    detected_at: Option<&str>,
-) -> Option<&'a str> {
-    let updated_at = updated_at.trim();
-    detected_at
-        .filter(|detected_at| !detected_at.trim().is_empty() && *detected_at != updated_at)
-        .and((!updated_at.is_empty()).then_some(updated_at))
-}
-
 async fn current_source_revision_snapshot_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
@@ -4364,7 +4328,7 @@ async fn current_source_revision_snapshot_in_transaction(
                 .unwrap_or(tag_name.as_str());
             let body = body.unwrap_or_default().replace("\r\n", "\n");
             (
-                authoritative_release_revision(&updated_at, detected_at.as_deref())
+                crate::content_source_identity::authoritative_release_revision(&updated_at, detected_at.as_deref())
                     .map(str::to_owned),
                 source_revision_content_tiebreak(&[
                     html_url.as_str(),
@@ -4390,7 +4354,7 @@ async fn current_source_revision_snapshot_in_transaction(
         .map(|(updated_at, thread_id, repo, title, reason, subject_type)| {
             (
                 updated_at,
-                notification_source_revision_tiebreak(
+                crate::content_source_identity::notification_source_revision_tiebreak(
                     &thread_id,
                     repo.as_deref(),
                     title.as_deref(),
@@ -5052,12 +5016,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                     llm_class
                         .map(|value| value.as_str().to_owned())
                         .or_else(|| {
-                            translations::classify_translation_error(Some(error_text.as_str()))
-                                .map(|value| value.code.to_owned())
+                            crate::translation_error::classify_translation_error(Some(
+                                error_text.as_str(),
+                            ))
+                            .map(|value| value.code.to_owned())
                         })
                 })
                 .unwrap_or_else(|| "unknown_internal_error".to_owned());
-            let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
+            let retryable = llm_class
+                .is_some_and(crate::llm_contract::LlmFailureClass::is_recoverable)
                 || matches!(
                     class.as_str(),
                     "output_contract_invalid" | "output_truncated" | "reading_evidence_unavailable"
@@ -5080,7 +5047,8 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .bind(work.attempt_count)
             .fetch_one(&mut *tx)
             .await?;
-            let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
+            let error_summary =
+                crate::translation_error::translation_error_summary(Some(error_text.as_str()));
             let linked_call_ids = unique_call_ids(
                 output_validation_call_ids(&error)
                     .into_iter()
@@ -9689,15 +9657,24 @@ mod tests {
             "octo/demo#42\nTitle\nBody"
         );
         assert_eq!(
-            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:01Z")),
+            crate::content_source_identity::authoritative_release_revision(
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:00:01Z")
+            ),
             Some("2026-01-01T00:00:00Z")
         );
         assert_eq!(
-            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:00Z")),
+            crate::content_source_identity::authoritative_release_revision(
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:00:00Z")
+            ),
             None
         );
         assert_eq!(
-            authoritative_release_revision("2026-01-01T00:00:00Z", None),
+            crate::content_source_identity::authoritative_release_revision(
+                "2026-01-01T00:00:00Z",
+                None
+            ),
             None
         );
         assert_eq!(

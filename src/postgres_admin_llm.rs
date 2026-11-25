@@ -261,13 +261,13 @@ pub(super) async fn status(State(state): State<PostgresServerState>, session: Se
             let parked=h.is_some_and(|h|h["last_failure_class"]=="configuration")&&cooling;
             if !cooling&&selected.is_none(){selected=Some(model.clone());}
             if !parked&&let Some(until)=cooldown.filter(|v|*v>Utc::now())&&earliest.as_ref().is_none_or(|(_,old)|until<*old){earliest=Some((model.clone(),until));}
-            let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(model));
+            let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::llm_contract::resolve_model_input_limit_for_model(model));
             let failures=h.and_then(|h|h["relevant_failure_count"].as_i64()).unwrap_or(0);
             let status=if parked{"parked"}else if cooling{"cooldown"}else{"ready"};
             statuses.push(json!({"model":model,"priority":i+1,"status":status,"consecutive_final_failures":failures,"relevant_failure_count":failures,"cooldown_until":cooldown.filter(|v|*v>Utc::now()).map(|v|v.to_rfc3339()),"effective_input_limit":limit,"effective_input_limit_source":source}));
         }
         if selected.is_none(){selected=earliest.map(|(model,_)|model);}
-        let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::ai::resolve_model_input_limit_for_model(selected.as_deref().unwrap_or_default()));
+        let (limit,source)=context.map(|n|(n.max(1) as u32,"admin_override")).unwrap_or_else(||crate::llm_contract::resolve_model_input_limit_for_model(selected.as_deref().unwrap_or_default()));
         let in_flight:i64=stats.try_get("running")?;let enabled=state.ai_model.is_some()&&std::env::var("OCTORILL_PG_WORKER_ENABLED").as_deref()!=Ok("0");let actual_max=if enabled{1}else{0};
         let recovery_enabled=recovery.get("llm_recovery_enabled").is_some_and(|v|v.as_bool().unwrap_or_else(||v.as_i64().unwrap_or(0)!=0));
         Ok::<_,sqlx::Error>(json!({"scheduler_enabled":enabled,"llm_models":models,"selected_model_for_new_calls":selected,"max_concurrency":max,"ai_model_context_limit":context,"effective_model_input_limit":limit,"effective_model_input_limit_source":source,"model_statuses":statuses,"available_slots":(actual_max-in_flight).max(0),"waiting_calls":stats.try_get::<i64,_>("waiting")?,"in_flight_calls":in_flight,"calls_24h":stats.try_get::<i64,_>("calls")?,"failed_24h":stats.try_get::<i64,_>("failed")?,"avg_wait_ms_24h":stats.try_get::<Option<f64>,_>("wait")?.map(|v|v.round() as i64),"avg_duration_ms_24h":stats.try_get::<Option<f64>,_>("duration")?.map(|v|v.round() as i64),"last_success_at":stats.try_get::<Option<String>,_>("success")?,"last_failure_at":stats.try_get::<Option<String>,_>("failure")?,"llm_recovery_enabled":recovery_enabled,"llm_recovery_rollout_percent":recovery.get("llm_recovery_rollout_percent").and_then(|v|v.as_i64()).unwrap_or(0)}))

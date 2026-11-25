@@ -807,11 +807,11 @@ pub(crate) async fn admin_patch_llm_runtime_config(
         )
         .bind(i64::try_from(max_concurrency).unwrap_or(i64::MAX))
         .bind(i64::try_from(
-            crate::translations::DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
+            crate::translation_runtime::DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         )
         .unwrap_or(1))
         .bind(i64::try_from(
-            crate::translations::DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            crate::translation_runtime::DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
         )
         .unwrap_or(1))
         .bind(ai_model_context_limit)

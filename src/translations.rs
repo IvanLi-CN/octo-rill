@@ -20,7 +20,6 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
-use url::Url;
 
 use crate::{
     admin_runtime, ai, api, content_processing,
@@ -31,6 +30,22 @@ use crate::{
         is_sqlite_write_deadline_error,
     },
     state::AppState,
+    translation_admin_types::{
+        AdminTranslationAttemptEvent, AdminTranslationAttemptEventsResponse,
+        AdminTranslationAttemptListQuery, AdminTranslationBatchDetailResponse,
+        AdminTranslationBatchListItem, AdminTranslationBatchResultItem,
+        AdminTranslationBatchResultSummary, AdminTranslationBatchRow,
+        AdminTranslationBatchesResponse, AdminTranslationLinkedLlmCall, AdminTranslationListQuery,
+        AdminTranslationRequestDetailResponse, AdminTranslationRequestsResponse,
+        AdminTranslationStatusResponse, AdminTranslationWorkerStatus, RequestRow,
+        admin_translation_result_item, request_row_select_sql,
+    },
+    translation_error::classify_translation_error,
+    translation_runtime::{
+        DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+        DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
+    },
+    translation_types::{TranslationResultItem, translation_batch_business_outcome},
 };
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
@@ -45,8 +60,6 @@ const TRANSLATION_MAX_ITEMS_PER_REQUEST: usize = 60;
 const TRANSLATION_MIN_WAIT_MS: i64 = 0;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
 const MAX_TRANSLATION_WORKER_CONCURRENCY: usize = 64;
-pub const DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY: usize = 3;
-pub const DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY: usize = 1;
 
 static TRANSLATION_BATCH_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -107,341 +120,6 @@ pub struct TranslationResolveRequest {
     pub retry_on_error: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TranslationResultItem {
-    pub producer_ref: String,
-    pub entity_id: String,
-    pub kind: String,
-    pub variant: String,
-    pub status: String,
-    pub title_zh: Option<String>,
-    pub summary_md: Option<String>,
-    pub body_md: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reading: Option<ReleaseReadingResult>,
-    pub error: Option<String>,
-    pub work_item_id: Option<String>,
-    pub batch_id: Option<String>,
-}
-
-/// Structured, human-facing facts extracted from a Release body and/or its
-/// frozen compare evidence. The evidence field is retained in the projection
-/// for internal audit only and is never exposed by the public reading views.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseReadingResult {
-    pub version: String,
-    pub outcome: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub changes: Vec<ReleaseReadingChange>,
-    #[serde(default)]
-    pub machine_materials: Vec<ReleaseReadingMaterial>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<ReleaseReadingEvidence>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseReadingChange {
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub versions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<ReleaseReadingReference>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseReadingReference {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub number: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseReadingMaterial {
-    pub label: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseReadingEvidence {
-    pub kind: String,
-    pub reference: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-}
-
-impl ReleaseReadingResult {
-    pub fn is_changes(&self) -> bool {
-        self.outcome == "changes"
-    }
-
-    pub fn is_insufficient(&self) -> bool {
-        self.outcome == "insufficient"
-    }
-
-    /// Normalize the only clickable references allowed in human-facing Release
-    /// reading content. Legacy model output may still contain `[PR#123](url)`
-    /// in the change text; move those links into the controlled reference
-    /// field so every projection can render the same label and URL safely.
-    pub fn normalize_references(&mut self) -> Result<(), &'static str> {
-        for change in &mut self.changes {
-            let mut text = String::with_capacity(change.text.len());
-            let mut references = change.references.clone();
-            let mut cursor = 0usize;
-            while let Some(open_offset) = change.text[cursor..].find('[') {
-                let open = cursor + open_offset;
-                text.push_str(&change.text[cursor..open]);
-                let Some(label_end_offset) = change.text[open + 1..].find(']') else {
-                    text.push_str(&change.text[open..]);
-                    cursor = change.text.len();
-                    break;
-                };
-                let label_end = open + 1 + label_end_offset;
-                let label = &change.text[open + 1..label_end];
-                let Some(target_start) = change.text[label_end + 1..].strip_prefix('(') else {
-                    text.push_str(&change.text[open..=label_end]);
-                    cursor = label_end + 1;
-                    continue;
-                };
-                let Some(target_end_offset) = target_start.find(')') else {
-                    return Err("reading change contains an incomplete reference");
-                };
-                let target_end = label_end + 1 + 1 + target_end_offset;
-                let url = target_start[..target_end_offset].trim();
-                let Some(label_number) = label
-                    .strip_prefix("PR#")
-                    .and_then(|value| value.parse::<u64>().ok().filter(|number| *number > 0))
-                else {
-                    return Err("reading change contains an unsupported link label");
-                };
-                let Some(url_number) = release_reading_pr_number(url) else {
-                    return Err("reading change contains an unsupported reference URL");
-                };
-                if label_number != url_number {
-                    return Err("reading PR reference label does not match its URL");
-                }
-                references.push(ReleaseReadingReference {
-                    label: Some(format!("PR#{url_number}")),
-                    url: url.to_owned(),
-                    number: Some(url_number),
-                });
-                cursor = target_end + 1;
-            }
-            if cursor < change.text.len() {
-                text.push_str(&change.text[cursor..]);
-            }
-            change.text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            references.sort_by(|left, right| left.url.cmp(&right.url));
-            references.dedup_by(|left, right| left.url == right.url);
-            for reference in &mut references {
-                if let Some(number) = release_reading_pr_number(&reference.url) {
-                    reference.number = Some(number);
-                    reference.label = Some(format!("PR#{number}"));
-                } else {
-                    let label = reference
-                        .label
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|label| !label.is_empty())
-                        .ok_or("reading non-PR references require a label")?;
-                    if !release_reading_reference_url_is_allowed(&reference.url)
-                        || release_reading_text_is_low_value(label)
-                    {
-                        return Err("reading contains an unsupported reference");
-                    }
-                    reference.label = Some(label.to_owned());
-                    reference.number = None;
-                }
-            }
-            change.references = references;
-        }
-        Ok(())
-    }
-
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version.trim().is_empty() {
-            return Err("reading.version must be non-empty");
-        }
-        if !matches!(self.outcome.as_str(), "changes" | "insufficient") {
-            return Err("reading.outcome must be changes or insufficient");
-        }
-        if self.title.as_deref().is_some_and(|title| {
-            let text = title.trim();
-            text.is_empty() || release_reading_text_is_low_value(text)
-        }) {
-            return Err("reading.title must contain a useful change title");
-        }
-        if self.changes.iter().any(|change| {
-            let text = change.text.trim();
-            text.is_empty() || release_reading_text_is_low_value(text)
-        }) {
-            return Err("reading.changes must contain readable text");
-        }
-        if self
-            .machine_materials
-            .iter()
-            .any(|material| material.label.trim().is_empty() || material.value.trim().is_empty())
-        {
-            return Err("reading.machine_materials must contain labels and values");
-        }
-        if self
-            .changes
-            .iter()
-            .flat_map(|change| change.references.iter())
-            .any(|reference| {
-                if let Some(number) = release_reading_pr_number(&reference.url) {
-                    reference.number != Some(number)
-                        || reference.label.as_deref() != Some(format!("PR#{number}").as_str())
-                } else {
-                    reference.number.is_some()
-                        || reference.label.as_deref().is_none_or(|label| {
-                            label.trim().is_empty() || release_reading_text_is_low_value(label)
-                        })
-                        || !release_reading_reference_url_is_allowed(&reference.url)
-                }
-            })
-        {
-            return Err("reading references must be controlled labeled links");
-        }
-        if self.is_changes() && self.changes.is_empty() {
-            return Err("reading.changes must be non-empty for changes outcome");
-        }
-        if self.is_insufficient() && !self.changes.is_empty() {
-            return Err("reading.changes must be empty for insufficient outcome");
-        }
-        if self.is_insufficient() && !self.machine_materials.is_empty() {
-            return Err("reading.machine_materials must be empty for insufficient outcome");
-        }
-        Ok(())
-    }
-}
-
-pub fn release_reading_pr_number(raw: &str) -> Option<u64> {
-    let url = Url::parse(raw.trim()).ok()?;
-    if url.scheme() != "https"
-        || !matches!(url.host_str(), Some("github.com") | Some("www.github.com"))
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let segments = url.path_segments()?.collect::<Vec<_>>();
-    if segments.len() != 4 || segments[2] != "pull" {
-        return None;
-    }
-    segments[3].parse::<u64>().ok().filter(|number| *number > 0)
-}
-
-fn release_reading_reference_url_is_allowed(raw: &str) -> bool {
-    let Ok(url) = Url::parse(raw.trim()) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && matches!(
-            url.host_str(),
-            Some("github.com") | Some("www.github.com") | Some("docs.github.com")
-        )
-        && url.path() != "/"
-}
-
-fn release_reading_text_is_low_value(text: &str) -> bool {
-    let normalized = text.trim().to_ascii_lowercase();
-    let version_only = normalized
-        .strip_prefix("release ")
-        .or_else(|| normalized.strip_prefix("version "))
-        .unwrap_or(&normalized)
-        .trim_start_matches('v');
-    normalized.starts_with("相关链接")
-        || normalized.starts_with("来源")
-        || normalized.starts_with("实现依据")
-        || normalized.starts_with("发布原文")
-        || (normalized.starts_with("由 ") && normalized.contains("提交"))
-        || normalized.starts_with("http://")
-        || normalized.starts_with("https://")
-        || semver::Version::parse(version_only).is_ok()
-        || matches!(
-            normalized.as_str(),
-            "版本更新" | "更新要点" | "发布说明" | "版本发布" | "稳定版更新" | "补丁更新"
-        )
-}
-
-#[derive(Debug, Clone)]
-pub struct ClassifiedTranslationError {
-    pub code: &'static str,
-    pub summary: &'static str,
-    pub detail: String,
-}
-
-pub fn classify_translation_error(error_text: Option<&str>) -> Option<ClassifiedTranslationError> {
-    let detail = error_text
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_owned();
-    let normalized = detail.to_ascii_lowercase();
-
-    let (code, summary) = if normalized == "ai response missing content" {
-        ("empty_content", "模型输出为空")
-    } else if normalized == "llm upstream temporarily unavailable" {
-        ("transient", "上游暂时不可用")
-    } else if normalized == "llm upstream rate limited" {
-        ("rate_limited", "上游请求被限流")
-    } else if normalized == "llm configuration or request rejected" {
-        ("configuration", "模型配置或请求被拒绝")
-    } else if normalized.contains("runtime_lease_expired") {
-        ("runtime_lease_expired", "运行时租约失效")
-    } else if normalized.contains("preserve markdown structure")
-        || normalized.contains("markdown structure")
-    {
-        ("markdown_structure_mismatch", "Markdown 结构校验失败")
-    } else if normalized.contains("body exceeds 3000 chars")
-        || (normalized.contains("3000")
-            && normalized.contains("body")
-            && normalized.contains("exceed"))
-        || (normalized.contains("3000")
-            && normalized.contains("body")
-            && normalized.contains("too long"))
-    {
-        ("body_too_long", "正文超过 3000 字符")
-    } else if normalized.contains("output_truncated") || normalized.contains("output was truncated")
-    {
-        ("output_truncated", "模型输出被截断")
-    } else if normalized.contains("empty summary") || normalized.contains("empty translation") {
-        ("empty_translation", "模型输出为空")
-    } else if normalized.contains("ai output did not satisfy")
-        || normalized.contains("ai output did not contain usable")
-        || normalized.contains("global content output")
-    {
-        ("output_contract_invalid", "模型输出未通过 JSON 契约")
-    } else if normalized.contains("upstream model/channel rejected request")
-        || normalized.contains("invalid_model_error")
-        || normalized.contains("model not found")
-        || normalized.contains("insufficient_quota")
-        || normalized.contains("bad key")
-        || normalized.contains("ai returned 401")
-        || normalized.contains("ai returned 403")
-        || normalized.contains("ai returned 429")
-    {
-        ("upstream_rejected", "上游模型拒绝请求")
-    } else {
-        ("unknown_internal_error", "翻译失败")
-    };
-
-    Some(ClassifiedTranslationError {
-        code,
-        summary,
-        detail,
-    })
-}
-
-pub fn translation_error_summary(error_text: Option<&str>) -> Option<String> {
-    classify_translation_error(error_text).map(|classified| classified.summary.to_owned())
-}
-
 fn output_contract_failed(error_text: Option<&str>) -> bool {
     classify_translation_error(error_text)
         .is_some_and(|classified| classified.code == "output_contract_invalid")
@@ -454,24 +132,6 @@ fn translation_retry_disposition(contract_recovered: bool, retry_scheduled: bool
         "scheduled"
     } else {
         "not_needed"
-    }
-}
-
-pub(crate) fn admin_translation_result_item(
-    item: TranslationResultItem,
-) -> AdminTranslationRequestResultItem {
-    let classified = (item.status == "error")
-        .then(|| classify_translation_error(item.error.as_deref()))
-        .flatten();
-    let mut item = item;
-    if let Some(classified) = classified.as_ref() {
-        item.error = Some(classified.summary.to_owned());
-    }
-    AdminTranslationRequestResultItem {
-        item,
-        error_code: classified.as_ref().map(|value| value.code.to_owned()),
-        error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
-        error_detail: None,
     }
 }
 
@@ -544,210 +204,9 @@ pub struct PublicTranslationResultItem {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AdminTranslationListQuery {
-    pub status: Option<String>,
-    pub task_group: Option<String>,
-    pub discovered_from: Option<String>,
-    pub discovered_before: Option<String>,
-    pub page: Option<i64>,
-    pub page_size: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AdminTranslationAttemptListQuery {
-    pub entity_id: Option<String>,
-    pub request_id: Option<String>,
-    pub work_item_id: Option<String>,
-    pub kind: Option<String>,
-    pub variant: Option<String>,
-    pub page: Option<i64>,
-    pub page_size: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationStatusResponse {
-    pub scheduler_enabled: bool,
-    pub llm_enabled: bool,
-    pub scan_interval_ms: i64,
-    pub batch_token_threshold: i64,
-    pub ai_model_context_limit: Option<i64>,
-    pub effective_model_input_limit: i64,
-    pub effective_model_input_limit_source: String,
-    pub general_worker_concurrency: i64,
-    pub dedicated_worker_concurrency: i64,
-    pub worker_concurrency: i64,
-    pub target_general_worker_concurrency: i64,
-    pub target_dedicated_worker_concurrency: i64,
-    pub target_worker_concurrency: i64,
-    pub idle_workers: i64,
-    pub busy_workers: i64,
-    pub workers: Vec<AdminTranslationWorkerStatus>,
-    pub queued_requests: i64,
-    pub queued_work_items: i64,
-    pub running_batches: i64,
-    pub requests_24h: i64,
-    pub completed_batches_24h: i64,
-    pub clean_completed_batches_24h: i64,
-    pub completed_with_issues_batches_24h: i64,
-    pub failed_batches_24h: i64,
-    pub error_work_items_24h: i64,
-    pub missing_work_items_24h: i64,
-    pub avg_wait_ms_24h: Option<i64>,
-    pub last_batch_finished_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AdminTranslationRuntimeConfigUpdateRequest {
     pub general_worker_concurrency: i64,
     pub dedicated_worker_concurrency: i64,
-}
-
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct AdminTranslationRequestListItem {
-    pub id: String,
-    pub status: String,
-    pub source: String,
-    pub request_origin: String,
-    pub requested_by: Option<String>,
-    pub scope_user_id: String,
-    pub producer_ref: String,
-    pub kind: String,
-    pub variant: String,
-    pub entity_id: String,
-    pub batch_id: Option<String>,
-    pub retry_count: i64,
-    pub created_at: String,
-    pub started_at: Option<String>,
-    pub last_attempt_at: Option<String>,
-    pub finished_at: Option<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationRequestsResponse {
-    pub items: Vec<AdminTranslationRequestListItem>,
-    pub page: i64,
-    pub page_size: i64,
-    pub total: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminTranslationAttemptEvent {
-    pub id: i64,
-    pub work_item_id: String,
-    pub request_id: Option<String>,
-    pub batch_id: Option<String>,
-    pub scope_user_id: String,
-    pub kind: String,
-    pub variant: String,
-    pub entity_id: String,
-    pub target_lang: String,
-    pub attempt_no: i64,
-    pub trigger: String,
-    pub event_type: String,
-    pub result_status: Option<String>,
-    pub error_code: Option<String>,
-    pub error_summary: Option<String>,
-    pub failure_class: Option<String>,
-    pub retry_eligible: bool,
-    pub next_retry_at: Option<String>,
-    pub llm_call_ids: Vec<String>,
-    pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
-    pub processing_stage: Option<String>,
-    pub provider_status: Option<String>,
-    pub output_contract_status: Option<String>,
-    pub retry_disposition: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationAttemptEventsResponse {
-    pub items: Vec<AdminTranslationAttemptEvent>,
-    pub page: i64,
-    pub page_size: i64,
-    pub total: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationRequestDetailResponse {
-    pub request: AdminTranslationRequestListItem,
-    pub result: AdminTranslationRequestResultItem,
-    pub attempts: Vec<AdminTranslationAttemptEvent>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct AdminTranslationBatchResultSummary {
-    pub ready: i64,
-    pub error: i64,
-    pub missing: i64,
-    pub disabled: i64,
-    pub queued: i64,
-    pub running: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AdminTranslationBatchListItem {
-    pub id: String,
-    pub status: String,
-    pub trigger_reason: String,
-    pub worker_slot: i64,
-    pub request_count: i64,
-    pub item_count: i64,
-    pub estimated_input_tokens: i64,
-    pub created_at: String,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
-    pub updated_at: String,
-    pub result_summary: AdminTranslationBatchResultSummary,
-    pub business_outcome: api::AdminBusinessOutcome,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationBatchesResponse {
-    pub items: Vec<AdminTranslationBatchListItem>,
-    pub page: i64,
-    pub page_size: i64,
-    pub total: i64,
-}
-
-#[derive(Debug, Clone, Serialize, sqlx::FromRow, Deserialize)]
-pub struct AdminTranslationLinkedLlmCall {
-    pub id: String,
-    pub status: String,
-    pub source: String,
-    pub model: String,
-    pub scheduler_wait_ms: i64,
-    pub duration_ms: Option<i64>,
-    #[sqlx(default)]
-    pub stage: Option<String>,
-    #[sqlx(default)]
-    pub relation_role: Option<String>,
-    #[sqlx(default)]
-    pub evidence_availability: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AdminTranslationBatchDetailResponse {
-    pub batch: AdminTranslationBatchListItem,
-    pub items: Vec<AdminTranslationBatchResultItem>,
-    pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub(crate) struct AdminTranslationBatchRow {
-    pub(crate) id: String,
-    status: String,
-    trigger_reason: String,
-    worker_slot: i64,
-    request_count: i64,
-    item_count: i64,
-    estimated_input_tokens: i64,
-    error_text: Option<String>,
-    created_at: String,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    updated_at: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -813,41 +272,6 @@ impl AdminTranslationAttemptEventRow {
             created_at: self.created_at,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AdminTranslationBatchResultItem {
-    #[serde(flatten)]
-    pub item: TranslationResultItem,
-    pub error_code: Option<String>,
-    pub error_summary: Option<String>,
-    pub error_detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AdminTranslationRequestResultItem {
-    #[serde(flatten)]
-    pub item: TranslationResultItem,
-    pub error_code: Option<String>,
-    pub error_summary: Option<String>,
-    pub error_detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct AdminTranslationWorkerStatus {
-    pub worker_id: String,
-    pub worker_slot: i64,
-    pub worker_kind: String,
-    pub status: String,
-    pub current_batch_id: Option<String>,
-    pub request_count: i64,
-    pub work_item_count: i64,
-    pub trigger_reason: Option<String>,
-    pub updated_at: String,
-    pub error_text: Option<String>,
-    pub error_code: Option<String>,
-    pub error_summary: Option<String>,
-    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1074,7 +498,7 @@ struct TranslationAttemptEventDetails<'a> {
     event_type: &'static str,
     result_status: Option<&'a str>,
     error_text: Option<&'a str>,
-    failure_class: Option<ai::LlmFailureClass>,
+    failure_class: Option<crate::llm_contract::LlmFailureClass>,
     retry_eligible: bool,
     next_retry_at: Option<&'a str>,
     llm_call_ids: &'a [String],
@@ -1088,7 +512,7 @@ struct TranslationAttemptCompletion<'a> {
     batch_id: &'a str,
     result_status: &'a str,
     error_text: Option<&'a str>,
-    failure_class: Option<ai::LlmFailureClass>,
+    failure_class: Option<crate::llm_contract::LlmFailureClass>,
     retry_eligible: bool,
     next_retry_at: Option<&'a str>,
     llm_call_ids: &'a [String],
@@ -1097,7 +521,7 @@ struct TranslationAttemptCompletion<'a> {
 struct TranslationRetrySchedule<'a> {
     batch_id: &'a str,
     next_retry_at: &'a str,
-    failure_class: Option<ai::LlmFailureClass>,
+    failure_class: Option<crate::llm_contract::LlmFailureClass>,
     error_text: Option<&'a str>,
     llm_call_ids: &'a [String],
 }
@@ -1132,91 +556,6 @@ struct ClaimCandidateRow {
     finished_at: Option<String>,
     updated_at: String,
     request_origin: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub(crate) struct RequestRow {
-    id: String,
-    mode: String,
-    source: String,
-    request_origin: String,
-    requested_by: Option<String>,
-    scope_user_id: String,
-    producer_ref: String,
-    kind: String,
-    variant: String,
-    entity_id: String,
-    target_lang: String,
-    max_wait_ms: i64,
-    work_item_id: Option<String>,
-    status: String,
-    result_status: Option<String>,
-    title_zh: Option<String>,
-    summary_md: Option<String>,
-    body_md: Option<String>,
-    error_text: Option<String>,
-    created_at: String,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    updated_at: String,
-    work_item_status: Option<String>,
-    batch_id: Option<String>,
-    retry_count: i64,
-    last_attempt_at: Option<String>,
-}
-
-impl RequestRow {
-    fn effective_status(&self) -> &str {
-        if self.status == "queued"
-            && work_item_status_counts_as_running(self.work_item_status.as_deref())
-        {
-            "running"
-        } else {
-            self.status.as_str()
-        }
-    }
-
-    pub(crate) fn to_admin_request_list_item(&self) -> AdminTranslationRequestListItem {
-        AdminTranslationRequestListItem {
-            id: self.id.clone(),
-            status: self.effective_status().to_owned(),
-            source: self.source.clone(),
-            request_origin: self.request_origin.clone(),
-            requested_by: self.requested_by.clone(),
-            scope_user_id: self.scope_user_id.clone(),
-            producer_ref: self.producer_ref.clone(),
-            kind: self.kind.clone(),
-            variant: self.variant.clone(),
-            entity_id: self.entity_id.clone(),
-            batch_id: self.batch_id.clone(),
-            retry_count: self.retry_count,
-            created_at: self.created_at.clone(),
-            started_at: self.started_at.clone(),
-            last_attempt_at: self.last_attempt_at.clone(),
-            finished_at: self.finished_at.clone(),
-            updated_at: self.updated_at.clone(),
-        }
-    }
-
-    pub(crate) fn to_result(&self) -> TranslationResultItem {
-        TranslationResultItem {
-            producer_ref: self.producer_ref.clone(),
-            entity_id: self.entity_id.clone(),
-            kind: self.kind.clone(),
-            variant: self.variant.clone(),
-            status: self.result_status.clone().unwrap_or_else(|| {
-                pending_result_status_from_work_status(self.work_item_status.as_deref()).to_owned()
-            }),
-            title_zh: self.title_zh.clone(),
-            summary_md: self.summary_md.clone(),
-            body_md: self.body_md.clone(),
-            reading: None,
-            error: self.error_text.clone(),
-            work_item_id: self.work_item_id.clone(),
-            batch_id: self.batch_id.clone(),
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -1415,79 +754,6 @@ fn translation_batch_item_effective_result_status_sql(
     )
 }
 
-fn translation_batch_result_summary_total(summary: &AdminTranslationBatchResultSummary) -> i64 {
-    summary.ready
-        + summary.error
-        + summary.missing
-        + summary.disabled
-        + summary.queued
-        + summary.running
-}
-
-pub(crate) fn translation_batch_business_outcome(
-    status: &str,
-    summary: &AdminTranslationBatchResultSummary,
-    expected_total: i64,
-    error_text: Option<&str>,
-) -> api::AdminBusinessOutcome {
-    let total = translation_batch_result_summary_total(summary).max(expected_total.max(0));
-    let result_pending = summary.queued > 0 || summary.running > 0;
-
-    match status {
-        "failed" => api::AdminBusinessOutcome {
-            code: "failed".to_owned(),
-            label: "业务失败".to_owned(),
-            message: error_text
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("批次执行失败，未产出可用结果。")
-                .to_owned(),
-        },
-        "queued" | "running" => api::AdminBusinessOutcome {
-            code: "unknown".to_owned(),
-            label: "处理中".to_owned(),
-            message: "批次仍在执行中，业务结果尚未稳定。".to_owned(),
-        },
-        _ if total <= 0 => api::AdminBusinessOutcome {
-            code: "unknown".to_owned(),
-            label: "结果未知".to_owned(),
-            message: "批次已结束，但没有可汇总的条目结果。".to_owned(),
-        },
-        _ if summary.disabled == total => api::AdminBusinessOutcome {
-            code: "disabled".to_owned(),
-            label: "AI 已禁用".to_owned(),
-            message: "批次条目全部命中禁用路径，未执行翻译。".to_owned(),
-        },
-        _ if summary.error > 0 || summary.missing > 0 => api::AdminBusinessOutcome {
-            code: "partial".to_owned(),
-            label: "部分成功".to_owned(),
-            message: "批次已完成，但仍有条目失败或缺失。".to_owned(),
-        },
-        _ if result_pending => api::AdminBusinessOutcome {
-            code: "partial".to_owned(),
-            label: "部分成功".to_owned(),
-            message: "批次已标记完成，但仍有条目未收敛。".to_owned(),
-        },
-        _ if summary.ready == total => api::AdminBusinessOutcome {
-            code: "ok".to_owned(),
-            label: "业务成功".to_owned(),
-            message: "批次条目已全部成功完成。".to_owned(),
-        },
-        _ if summary.ready > 0 && summary.ready + summary.disabled == total => {
-            api::AdminBusinessOutcome {
-                code: "ok".to_owned(),
-                label: "业务成功".to_owned(),
-                message: "批次已完成；可翻译条目成功完成，其余条目命中禁用路径。".to_owned(),
-            }
-        }
-        _ => api::AdminBusinessOutcome {
-            code: "unknown".to_owned(),
-            label: "结果未知".to_owned(),
-            message: "批次已结束，但缺少稳定的业务结果统计。".to_owned(),
-        },
-    }
-}
-
 impl AdminTranslationBatchRow {
     pub(crate) fn into_list_item(
         self,
@@ -1554,13 +820,15 @@ struct TerminalWorkResult {
     summary_md: Option<String>,
     body_md: Option<String>,
     error: Option<String>,
-    failure_class: Option<ai::LlmFailureClass>,
+    failure_class: Option<crate::llm_contract::LlmFailureClass>,
 }
 
-fn terminal_failure_class_from_api_error(error: &ApiError) -> Option<ai::LlmFailureClass> {
+fn terminal_failure_class_from_api_error(
+    error: &ApiError,
+) -> Option<crate::llm_contract::LlmFailureClass> {
     error
         .failure_class()
-        .and_then(ai::LlmFailureClass::from_str)
+        .and_then(crate::llm_contract::LlmFailureClass::from_str)
 }
 
 impl ClaimCandidateRow {
@@ -2314,21 +1582,6 @@ fn claim_origin_case_sql() -> &'static str {
       ) THEN 'user'
       ELSE 'system'
     END
-    "#
-}
-
-pub(crate) fn request_row_select_sql() -> &'static str {
-    r#"
-    SELECT r.id, r.mode, r.source, r.request_origin, r.requested_by, r.scope_user_id,
-           r.producer_ref, r.kind, r.variant, r.entity_id, r.target_lang, r.max_wait_ms,
-           r.work_item_id, r.status, r.result_status, r.title_zh, r.summary_md, r.body_md,
-           r.error_text,
-           r.created_at, r.started_at, r.finished_at, r.updated_at,
-           (SELECT status FROM translation_work_items w WHERE w.id = r.work_item_id) AS work_item_status,
-           (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id,
-           COALESCE((SELECT retry_count FROM translation_work_items w WHERE w.id = r.work_item_id), 0) AS retry_count,
-           (SELECT MAX(created_at) FROM translation_attempt_events e WHERE e.work_item_id = r.work_item_id) AS last_attempt_at
-    FROM translation_requests r
     "#
 }
 
@@ -5100,7 +4353,11 @@ async fn record_translation_attempt_event(
     .bind(details.result_status)
     .bind(classified.as_ref().map(|value| value.code))
     .bind(classified.as_ref().map(|value| value.summary))
-    .bind(details.failure_class.map(ai::LlmFailureClass::as_str))
+    .bind(
+        details
+            .failure_class
+            .map(crate::llm_contract::LlmFailureClass::as_str),
+    )
     .bind(i64::from(details.retry_eligible))
     .bind(details.next_retry_at)
     .bind(llm_call_ids_json)
@@ -6546,7 +5803,7 @@ fn terminal_result_from_batch_item(
         failure_class: translated
             .failure_class
             .as_deref()
-            .and_then(ai::LlmFailureClass::from_str),
+            .and_then(crate::llm_contract::LlmFailureClass::from_str),
     };
     if matches!(
         item.kind.as_str(),
@@ -6602,7 +5859,7 @@ fn translation_recovery_in_rollout(work_item_id: &str, rollout_percent: u8) -> b
     if rollout_percent >= 100 {
         return true;
     }
-    let digest = ai::sha256_hex(work_item_id);
+    let digest = crate::content_source_identity::sha256_hex(work_item_id);
     let bucket = u8::from_str_radix(&digest[..2], 16).unwrap_or(0) % 100;
     bucket < rollout_percent
 }
@@ -6663,7 +5920,7 @@ async fn finalize_batch_success(
             .as_ref()
             .and_then(|row| row.get::<Option<String>, _>("retry_expires_at"));
         let recovery_enabled = result.result_status == "error"
-            && failure_class.is_some_and(ai::LlmFailureClass::is_recoverable)
+            && failure_class.is_some_and(crate::llm_contract::LlmFailureClass::is_recoverable)
             && recovery_config.enabled
             && translation_recovery_in_rollout(
                 work_item.id.as_str(),
@@ -6724,7 +5981,7 @@ async fn finalize_batch_success(
         .bind(result.body_md.as_deref())
         .bind(result.error.as_deref())
         .bind(classify_translation_error(result.error.as_deref()).map(|value| value.code))
-        .bind(failure_class.map(ai::LlmFailureClass::as_str))
+        .bind(failure_class.map(crate::llm_contract::LlmFailureClass::as_str))
         .bind(work_item.kind.as_str())
         .bind(if result.result_status == "error" && !contract_failed {
             "failed"
@@ -7391,7 +6648,7 @@ async fn fail_batch_with_message(
     batch_id: &str,
     items: &[WorkItemRow],
     message: &str,
-    failure_class: Option<ai::LlmFailureClass>,
+    failure_class: Option<crate::llm_contract::LlmFailureClass>,
     now: &str,
 ) -> Result<(), ApiError> {
     for item in items {
@@ -7418,7 +6675,7 @@ async fn fail_batch_with_message(
         )
         .bind(message)
         .bind(classify_translation_error(Some(message)).map(|value| value.code))
-        .bind(failure_class.map(ai::LlmFailureClass::as_str))
+        .bind(failure_class.map(crate::llm_contract::LlmFailureClass::as_str))
         .bind(item.kind.as_str())
         .bind(now)
         .bind(now)
@@ -8237,7 +7494,7 @@ fn normalize_request_items(
     Ok(out)
 }
 
-fn build_source_hash(item: &TranslationRequestItemInput) -> String {
+pub(crate) fn build_source_hash(item: &TranslationRequestItemInput) -> String {
     if uses_release_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
         let repo_full_name = item
             .source_blocks
@@ -8258,7 +7515,11 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
             .find(|block| block.slot == "body_markdown")
             .map(|block| block.text.as_str())
             .unwrap_or_default();
-        return crate::api::release_detail_source_hash(repo_full_name, title, body);
+        return crate::content_source_identity::release_detail_source_hash(
+            repo_full_name,
+            title,
+            body,
+        );
     }
 
     if uses_announcement_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
@@ -8269,7 +7530,7 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
             .map(|block| block.text.as_str())
             .unwrap_or_default();
         let (repo_full_name, discussion_number) =
-            crate::api::parse_announcement_translation_metadata(metadata);
+            crate::content_source_identity::parse_announcement_translation_metadata(metadata);
         let title = item
             .source_blocks
             .iter()
@@ -8282,7 +7543,7 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
             .find(|block| block.slot == "body_markdown")
             .map(|block| block.text.as_str())
             .unwrap_or_default();
-        return crate::api::announcement_detail_source_hash(
+        return crate::content_source_identity::announcement_detail_source_hash(
             repo_full_name.as_str(),
             discussion_number,
             title,
@@ -8293,7 +7554,7 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
     let blocks_json =
         serde_json::to_string(&item.source_blocks).unwrap_or_else(|_| "[]".to_owned());
     let slots_json = serde_json::to_string(&item.target_slots).unwrap_or_else(|_| "[]".to_owned());
-    ai::sha256_hex(&format!(
+    crate::content_source_identity::sha256_hex(&format!(
         "version={TRANSLATION_PROTOCOL_VERSION}\nkind={}\nvariant={}\nlang={}\nentity={}\nblocks={}\ntarget_slots={}\n",
         item.kind, item.variant, item.target_lang, item.entity_id, blocks_json, slots_json,
     ))
@@ -8439,92 +7700,6 @@ struct CanonicalFeedAnnouncementRow {
     body: Option<String>,
 }
 
-fn release_smart_metadata_text(
-    repo_full_name: &str,
-    tag_name: &str,
-    previous_tag_name: Option<&str>,
-) -> String {
-    let mut metadata = format!("repo={repo_full_name}\nhead_tag={tag_name}");
-    if let Some(previous_tag_name) = previous_tag_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        metadata.push('\n');
-        metadata.push_str("compare_base_tag=");
-        metadata.push_str(previous_tag_name);
-    }
-    metadata
-}
-
-pub(crate) fn release_smart_feed_source_hash(
-    entity_id: &str,
-    repo_full_name: &str,
-    title: &str,
-    body: Option<&str>,
-    tag_name: &str,
-    previous_tag_name: Option<&str>,
-) -> String {
-    let mut source_blocks = vec![TranslationSourceBlock {
-        slot: "title".to_owned(),
-        text: title.trim().to_owned(),
-    }];
-    if let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) {
-        source_blocks.push(TranslationSourceBlock {
-            slot: "body_markdown".to_owned(),
-            text: body.to_owned(),
-        });
-    }
-    source_blocks.push(TranslationSourceBlock {
-        slot: "metadata".to_owned(),
-        text: release_smart_metadata_text(repo_full_name, tag_name, previous_tag_name),
-    });
-
-    build_source_hash(&TranslationRequestItemInput {
-        producer_ref: format!("feed.smart:release:{entity_id}"),
-        kind: "release_smart".to_owned(),
-        variant: "feed_card".to_owned(),
-        entity_id: entity_id.to_owned(),
-        target_lang: "zh-CN".to_owned(),
-        max_wait_ms: 0,
-        source_blocks,
-        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
-    })
-}
-
-pub(crate) fn announcement_smart_feed_source_hash(
-    entity_id: &str,
-    repo_full_name: &str,
-    discussion_number: Option<i64>,
-    title: &str,
-    body: Option<&str>,
-) -> String {
-    let mut source_blocks = vec![TranslationSourceBlock {
-        slot: "title".to_owned(),
-        text: title.trim().to_owned(),
-    }];
-    if let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) {
-        source_blocks.push(TranslationSourceBlock {
-            slot: "body_markdown".to_owned(),
-            text: body.to_owned(),
-        });
-    }
-    source_blocks.push(TranslationSourceBlock {
-        slot: "metadata".to_owned(),
-        text: crate::api::announcement_translation_metadata_text(repo_full_name, discussion_number),
-    });
-
-    build_source_hash(&TranslationRequestItemInput {
-        producer_ref: format!("feed.smart:announcement:{entity_id}"),
-        kind: "announcement_smart".to_owned(),
-        variant: "feed_card".to_owned(),
-        entity_id: entity_id.to_owned(),
-        target_lang: "zh-CN".to_owned(),
-        max_wait_ms: 0,
-        source_blocks,
-        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
-    })
-}
-
 async fn build_canonical_feed_request_item(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -8547,7 +7722,9 @@ async fn build_canonical_feed_request_item(
         "announcement_summary" | "announcement_smart" | "announcement_detail"
     ) {
         let Some((repo_full_name, discussion_number)) =
-            crate::api::parse_announcement_discussion_key(item.entity_id.as_str())
+            crate::content_source_identity::parse_announcement_discussion_key(
+                item.entity_id.as_str(),
+            )
         else {
             return Ok(None);
         };
@@ -8585,7 +7762,7 @@ async fn build_canonical_feed_request_item(
             .filter(|value| !value.is_empty())
             .unwrap_or("Announcement")
             .to_owned();
-        let metadata = crate::api::announcement_translation_metadata_text(
+        let metadata = crate::content_source_identity::announcement_translation_metadata_text(
             row.repo_full_name.trim(),
             Some(row.discussion_number),
         );
@@ -8679,7 +7856,7 @@ async fn build_canonical_feed_request_item(
         .unwrap_or(&row.tag_name)
         .to_owned();
     let metadata = if item.kind == "release_smart" {
-        release_smart_metadata_text(
+        crate::content_source_identity::release_smart_metadata_text(
             row.full_name.trim(),
             row.tag_name.trim(),
             row.previous_tag_name.as_deref(),
@@ -8697,7 +7874,7 @@ async fn build_canonical_feed_request_item(
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     } else {
-        crate::api::release_feed_body(row.body.as_deref())
+        crate::release_content::release_feed_body(row.body.as_deref())
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     };
@@ -8887,6 +8064,9 @@ async fn load_last_batch_finished_at(state: &AppState) -> Result<Option<String>,
 
 #[cfg(test)]
 mod tests {
+    use crate::translation_types::{
+        ReleaseReadingChange, ReleaseReadingResult, release_reading_pr_number,
+    };
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use sqlx::{
@@ -9199,7 +8379,10 @@ mod tests {
 
         let result = terminal_result_from_batch_item(&work_item, &translated);
         assert_eq!(result.error.as_deref(), Some("AI response missing content"));
-        assert_eq!(result.failure_class, Some(ai::LlmFailureClass::Transient));
+        assert_eq!(
+            result.failure_class,
+            Some(crate::llm_contract::LlmFailureClass::Transient)
+        );
     }
 
     #[test]
@@ -9528,7 +8711,7 @@ mod tests {
             TranslationRetrySchedule {
                 batch_id: "batch-failed-attempt",
                 next_retry_at: "2026-09-04T01:05:00Z",
-                failure_class: Some(ai::LlmFailureClass::Transient),
+                failure_class: Some(crate::llm_contract::LlmFailureClass::Transient),
                 error_text: Some("temporary upstream failure"),
                 llm_call_ids: &llm_call_ids,
             },
@@ -10922,7 +10105,7 @@ mod tests {
                 summary_md: None,
                 body_md: None,
                 error: Some("AI returned 429 Too Many Requests: rpm exhausted".to_owned()),
-                failure_class: Some(ai::LlmFailureClass::RateLimited),
+                failure_class: Some(crate::llm_contract::LlmFailureClass::RateLimited),
             }],
         )
         .await
@@ -11984,7 +11167,7 @@ mod tests {
         assert_eq!(state_row.get::<String, _>("entity_type"), "release_detail");
         assert_eq!(
             state_row.get::<String, _>("source_hash"),
-            crate::api::release_detail_source_hash(
+            crate::content_source_identity::release_detail_source_hash(
                 "openai/codex",
                 "Release v2.0.0",
                 "- current body",
@@ -12004,7 +11187,7 @@ mod tests {
         let full_body = format!(
             "{}
 {}",
-            "a".repeat(crate::api::RELEASE_FEED_BODY_MAX_CHARS + 64),
+            "a".repeat(crate::release_content::RELEASE_FEED_BODY_MAX_CHARS + 64),
             "- keep tail"
         );
         seed_feed_release(
@@ -12018,8 +11201,8 @@ mod tests {
         )
         .await;
 
-        let truncated_body =
-            crate::api::release_feed_body(Some(full_body.as_str())).expect("truncated feed body");
+        let truncated_body = crate::release_content::release_feed_body(Some(full_body.as_str()))
+            .expect("truncated feed body");
         assert_ne!(truncated_body, full_body);
 
         let item = release_feed_item(
@@ -12034,7 +11217,7 @@ mod tests {
             .expect("create canonical request");
         assert_eq!(created.status, "queued");
 
-        let expected_hash = crate::api::release_detail_source_hash(
+        let expected_hash = crate::content_source_identity::release_detail_source_hash(
             "openai/codex",
             "Release v2.0.1",
             full_body.as_str(),
@@ -12123,7 +11306,7 @@ mod tests {
             .expect("create canonical detail request");
         assert_eq!(created.status, "queued");
 
-        let expected_hash = crate::api::release_detail_source_hash(
+        let expected_hash = crate::content_source_identity::release_detail_source_hash(
             "openai/codex",
             "Release v2.0.3",
             "- current body\n- current tail",

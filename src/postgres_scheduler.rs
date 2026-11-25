@@ -74,8 +74,10 @@ const WEBHOOK_AUDIT_DEFAULT_INTERVAL_DAYS: i64 = 7;
 const WEBHOOK_AUDIT_MIN_INTERVAL_DAYS: i64 = 1;
 const WEBHOOK_AUDIT_MAX_INTERVAL_DAYS: i64 = 30;
 
-const SUBSCRIPTION_TASK_TYPES: [&str; 2] =
-    [jobs::TASK_SYNC_RELEASES, jobs::TASK_SYNC_NOTIFICATIONS];
+const SUBSCRIPTION_TASK_TYPES: [&str; 2] = [
+    crate::postgres_tasks::TASK_SYNC_RELEASES,
+    crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
+];
 
 /// Deployment defaults the lanes need besides their PostgreSQL tables.
 #[derive(Clone, Debug)]
@@ -296,7 +298,7 @@ async fn lane_admin_rollup(
     refresh_admin_dashboard_rollups(
         pool,
         defaults,
-        crate::api::ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
+        crate::postgres_admin_dashboard::ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
         now,
     )
     .await
@@ -627,7 +629,7 @@ pub(crate) async fn enqueue_star_sync_runs_if_due(
         let task_id = match insert_single_flight(
             &mut tx,
             ScheduledTask {
-                task_type: jobs::TASK_SYNC_STARRED,
+                task_type: crate::postgres_tasks::TASK_SYNC_STARRED,
                 source: "scheduler",
                 requested_by: None,
                 payload,
@@ -690,7 +692,7 @@ pub(crate) async fn enqueue_due_star_epoch_slices(
         match insert_single_flight_pool(
             pool,
             ScheduledTask {
-                task_type: jobs::TASK_SYNC_STARRED,
+                task_type: crate::postgres_tasks::TASK_SYNC_STARRED,
                 source: "scheduler",
                 requested_by: None,
                 payload,

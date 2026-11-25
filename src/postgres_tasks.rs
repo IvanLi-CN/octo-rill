@@ -15,6 +15,13 @@ use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tracing::{debug, info, warn};
 
+/// Business task types owned by the PostgreSQL task executors. The scheduler,
+/// admin job groups and job center read surfaces all share these names.
+pub(crate) const TASK_SYNC_STARRED: &str = "sync.starred";
+pub(crate) const TASK_SYNC_RELEASES: &str = "sync.releases";
+pub(crate) const TASK_SYNC_NOTIFICATIONS: &str = "sync.notifications";
+pub(crate) const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
+
 use crate::{
     config::AiConfig,
     crypto::EncryptionKey,

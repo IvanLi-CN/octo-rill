@@ -48,9 +48,8 @@ use crate::{
     config::AiConfig,
     local_id,
     postgres_server::PostgresServerState,
-    translations::{
-        TranslationRequestItemInput, TranslationSourceBlock, translation_error_summary,
-    },
+    translation_error::translation_error_summary,
+    translations::{TranslationRequestItemInput, TranslationSourceBlock},
 };
 
 const TARGET_LANG: &str = "zh-CN";
@@ -1354,17 +1353,21 @@ async fn load_release_targets(
             .map(|value| value.trim().to_owned())
             .unwrap_or_default();
 
-        let tiebreak = crate::content_processing::release_source_revision_content_tiebreak(&[
+        let tiebreak = crate::content_source_identity::release_source_revision_content_tiebreak(&[
             html_url.as_str(),
             tag_name.as_str(),
             title.as_str(),
             body.as_str(),
         ]);
-        let observed_at = crate::content_processing::authoritative_release_revision(
+        let observed_at = crate::content_source_identity::authoritative_release_revision(
             updated_at.as_deref().unwrap_or_default(),
             detected_at.as_deref(),
         );
-        let source_hash = crate::api::release_detail_source_hash(&repo_full_name, &title, &body);
+        let source_hash = crate::content_source_identity::release_detail_source_hash(
+            &repo_full_name,
+            &title,
+            &body,
+        );
         let mut source_blocks = vec![
             TranslationSourceBlock {
                 slot: "metadata".to_owned(),
@@ -1448,14 +1451,14 @@ async fn load_notification_targets(
         let reason = reason.unwrap_or_default();
         let subject_type = subject_type.unwrap_or_default();
 
-        let tiebreak = crate::content_processing::notification_source_revision_tiebreak(
+        let tiebreak = crate::content_source_identity::notification_source_revision_tiebreak(
             thread_id.as_str(),
             Some(repo_full_name.as_str()),
             Some(title.as_str()),
             Some(reason.as_str()),
             Some(subject_type.as_str()),
         );
-        let source_hash = crate::ai::sha256_hex(&format!(
+        let source_hash = crate::content_source_identity::sha256_hex(&format!(
             "kind=notification\nrepo={repo_full_name}\ntitle={title}\nreason={reason}\nsubject_type={subject_type}\n"
         ));
         let source_blocks = with_source_revision(
@@ -1527,8 +1530,8 @@ async fn publish_finished_translation(
     let Some(current) = release_publication_item(tx, target).await? else {
         return Ok(());
     };
-    let attempted_hash = crate::content_processing::source_hash_for_item(&attempted);
-    let current_hash = crate::content_processing::source_hash_for_item(&current);
+    let attempted_hash = crate::content_source_identity::source_hash_for_item(&attempted);
+    let current_hash = crate::content_source_identity::source_hash_for_item(&current);
     if attempted_hash != current_hash {
         warn!(
             release_id = %target.entity_id,
@@ -3293,13 +3296,13 @@ fn parse_json_translation(raw: &str) -> (Option<String>, Option<String>) {
 
 #[derive(Debug)]
 pub(crate) struct LlmFailure {
-    pub(crate) class: crate::ai::LlmFailureClass,
+    pub(crate) class: crate::llm_contract::LlmFailureClass,
     pub(crate) message: String,
 }
 
 impl LlmFailure {
     fn empty_content() -> Self {
-        let class = crate::ai::LlmFailureClass::EmptyContent;
+        let class = crate::llm_contract::LlmFailureClass::EmptyContent;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3307,7 +3310,7 @@ impl LlmFailure {
     }
 
     fn transient() -> Self {
-        let class = crate::ai::LlmFailureClass::Transient;
+        let class = crate::llm_contract::LlmFailureClass::Transient;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3315,7 +3318,7 @@ impl LlmFailure {
     }
 
     fn configuration() -> Self {
-        let class = crate::ai::LlmFailureClass::Configuration;
+        let class = crate::llm_contract::LlmFailureClass::Configuration;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3483,18 +3486,30 @@ async fn body_chunk_chars_for_route(
     let candidates = route_candidates(&models, &health, Utc::now());
     let input_limit = candidates
         .iter()
-        .map(|model| crate::ai::resolve_model_input_limit_for_model(model).0)
+        .map(|model| crate::llm_contract::resolve_model_input_limit_for_model(model).0)
         .min()
-        .unwrap_or_else(|| crate::ai::resolve_model_input_limit_for_model(fallback_model.trim()).0);
+        .unwrap_or_else(|| {
+            crate::llm_contract::resolve_model_input_limit_for_model(fallback_model.trim()).0
+        });
     Ok(chunk_chars_for_input_limit(input_limit))
 }
 
-async fn record_model_failure(pool: &PgPool, model: &str, class: crate::ai::LlmFailureClass) {
+async fn record_model_failure(
+    pool: &PgPool,
+    model: &str,
+    class: crate::llm_contract::LlmFailureClass,
+) {
     record_model_health(pool, model, class, false).await;
 }
 
 async fn park_model(pool: &PgPool, model: &str) {
-    record_model_health(pool, model, crate::ai::LlmFailureClass::Configuration, true).await;
+    record_model_health(
+        pool,
+        model,
+        crate::llm_contract::LlmFailureClass::Configuration,
+        true,
+    )
+    .await;
 }
 
 /// Read the administrator-ordered model list for a caller outside this module.
@@ -3508,7 +3523,7 @@ pub(crate) async fn route_models_for_runtime(
 async fn record_model_health(
     pool: &PgPool,
     model: &str,
-    class: crate::ai::LlmFailureClass,
+    class: crate::llm_contract::LlmFailureClass,
     park: bool,
 ) {
     if model.trim().is_empty() {
@@ -3660,7 +3675,7 @@ impl AuditRecorder<'_> {
         let mut last_failure: Option<LlmFailure> = None;
         for (candidate_index, model) in candidates.into_iter().enumerate() {
             let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
-            let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
+            let mut retry_class: Option<crate::llm_contract::LlmFailureClass> = None;
             for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
                 if remaining == 0 {
                     break;
@@ -3745,13 +3760,13 @@ impl AuditRecorder<'_> {
                         let class = failure.error.class;
                         let http_status = failure.http_status;
                         last_failure = Some(failure.error);
-                        if class == crate::ai::LlmFailureClass::Configuration {
+                        if class == crate::llm_contract::LlmFailureClass::Configuration {
                             if is_credential_rejection(http_status) {
                                 park_model(self.pool, model.as_str()).await;
                             }
                             break;
                         }
-                        if class == crate::ai::LlmFailureClass::EmptyContent {
+                        if class == crate::llm_contract::LlmFailureClass::EmptyContent {
                             retry_class = Some(class);
                             break;
                         }
@@ -3888,19 +3903,19 @@ struct CallFailure {
     http_status: Option<i64>,
 }
 
-fn classify_upstream_failure(status: u16, detail: &str) -> crate::ai::LlmFailureClass {
+fn classify_upstream_failure(status: u16, detail: &str) -> crate::llm_contract::LlmFailureClass {
     let lowered = detail.to_ascii_lowercase();
     let model_rejected = lowered.contains("model not found")
         || lowered.contains("invalid_model_error")
         || lowered.contains("insufficient_quota")
         || lowered.contains("model_not_found");
     if status == 429 {
-        return crate::ai::LlmFailureClass::RateLimited;
+        return crate::llm_contract::LlmFailureClass::RateLimited;
     }
     if model_rejected || matches!(status, 400..=499) {
-        return crate::ai::LlmFailureClass::Configuration;
+        return crate::llm_contract::LlmFailureClass::Configuration;
     }
-    crate::ai::LlmFailureClass::Transient
+    crate::llm_contract::LlmFailureClass::Transient
 }
 
 fn is_credential_rejection(status: Option<i64>) -> bool {
@@ -4092,7 +4107,7 @@ pub(crate) enum CompletionFailure {
 impl CompletionFailure {
     fn from_admission(error: anyhow::Error) -> Self {
         Self::Provider(LlmFailure {
-            class: crate::ai::LlmFailureClass::Transient,
+            class: crate::llm_contract::LlmFailureClass::Transient,
             message: format!("provider admission failed: {error}"),
         })
     }
@@ -4220,7 +4235,7 @@ pub(crate) async fn complete_with_audit(
             "fallback"
         };
         let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
-        let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
+        let mut retry_class: Option<crate::llm_contract::LlmFailureClass> = None;
         for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
             if remaining == 0 {
                 break;
@@ -4313,13 +4328,13 @@ pub(crate) async fn complete_with_audit(
                     let class = failure.error.class;
                     let http_status = failure.http_status;
                     last_failure = Some(failure.error);
-                    if class == crate::ai::LlmFailureClass::Configuration {
+                    if class == crate::llm_contract::LlmFailureClass::Configuration {
                         if is_credential_rejection(http_status) {
                             park_model(pool, model.as_str()).await;
                         }
                         break;
                     }
-                    if class == crate::ai::LlmFailureClass::EmptyContent {
+                    if class == crate::llm_contract::LlmFailureClass::EmptyContent {
                         retry_class = Some(class);
                         break;
                     }
@@ -4659,7 +4674,11 @@ mod tests {
             subject_type: String::new(),
             source_blocks,
             target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
-            source_hash: crate::api::release_detail_source_hash("acme/demo", "v1", body),
+            source_hash: crate::content_source_identity::release_detail_source_hash(
+                "acme/demo",
+                "v1",
+                body,
+            ),
         }
     }
 
@@ -5220,15 +5239,15 @@ mod tests {
         assert!(!is_credential_rejection(Some(400)));
         assert_eq!(
             classify_upstream_failure(429, "rate limited"),
-            crate::ai::LlmFailureClass::RateLimited
+            crate::llm_contract::LlmFailureClass::RateLimited
         );
         assert_eq!(
             classify_upstream_failure(401, "unauthorized"),
-            crate::ai::LlmFailureClass::Configuration
+            crate::llm_contract::LlmFailureClass::Configuration
         );
         assert_eq!(
             classify_upstream_failure(500, "upstream error"),
-            crate::ai::LlmFailureClass::Transient
+            crate::llm_contract::LlmFailureClass::Transient
         );
     }
 
@@ -5263,13 +5282,13 @@ mod tests {
             record_model_failure(
                 &pool,
                 "model-a",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             record_model_failure(
                 &pool,
                 "model-a",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             let (count, cooldown, class): (
@@ -5307,7 +5326,7 @@ mod tests {
             record_model_failure(
                 &pool,
                 "model-c",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             let (count, cooldown): (i64, Option<chrono::DateTime<chrono::Utc>>) =
@@ -5369,7 +5388,7 @@ mod tests {
                 .expect_err("a missing routing settings row must fail closed");
             assert_eq!(
                 missing_error.class,
-                crate::ai::LlmFailureClass::Configuration
+                crate::llm_contract::LlmFailureClass::Configuration
             );
             sqlx::query(
                 "INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '[]')",
@@ -5395,7 +5414,7 @@ mod tests {
                 .expect_err("malformed routing settings must fail closed");
             assert_eq!(
                 parse_error.class,
-                crate::ai::LlmFailureClass::Configuration
+                crate::llm_contract::LlmFailureClass::Configuration
             );
             sqlx::query("DROP TABLE public.admin_runtime_settings")
                 .execute(&pool)
@@ -5403,7 +5422,7 @@ mod tests {
             let read_error = route_models(&pool, "fallback")
                 .await
                 .expect_err("unreadable routing settings must fail closed");
-            assert_eq!(read_error.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(read_error.class, crate::llm_contract::LlmFailureClass::Transient);
             sqlx::raw_sql(
                 "CREATE TABLE public.llm_model_health(model text PRIMARY KEY, cooldown_until timestamptz, last_failure_class text);",
             )
@@ -5415,7 +5434,7 @@ mod tests {
             let health_error = load_route_health(&pool)
                 .await
                 .expect_err("unreadable health must fail closed");
-            assert_eq!(health_error.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(health_error.class, crate::llm_contract::LlmFailureClass::Transient);
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -5574,7 +5593,7 @@ mod tests {
                 .complete("body", "system", "user", 64)
                 .await
                 .expect_err("all failing candidates must exhaust the attempt budget");
-            assert_eq!(failure.class, crate::ai::LlmFailureClass::RateLimited);
+            assert_eq!(failure.class, crate::llm_contract::LlmFailureClass::RateLimited);
             let observed_after_budget = observed.lock().await.clone();
             assert_eq!(observed_after_budget.len(), 11);
             assert_eq!(
@@ -5688,7 +5707,7 @@ mod tests {
                 .complete("body", "system", "user", 64)
                 .await
                 .expect_err("malformed health must fail closed");
-            assert_eq!(failure.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(failure.class, crate::llm_contract::LlmFailureClass::Transient);
             assert_eq!(observed.lock().await.len(), before_health_failure);
             let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
                 .fetch_one(&pool)

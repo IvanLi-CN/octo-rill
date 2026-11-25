@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{api, content_processing, error::ApiError, state::AppState, translations};
+use crate::{api, content_processing, error::ApiError, state::AppState};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
@@ -3320,7 +3320,9 @@ fn build_brief_attempts(
                 .and_then(|event| event.failure_class.clone())
                 .or_else(|| terminal.and_then(|event| event.failure_class.clone()));
             let classified = (is_latest && status == "failed")
-                .then(|| translations::classify_translation_error(call.error_text.as_deref()))
+                .then(|| {
+                    crate::translation_error::classify_translation_error(call.error_text.as_deref())
+                })
                 .flatten();
             let retry_eligible = status == "failed"
                 && attempt_no < latest_attempt

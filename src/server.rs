@@ -1206,7 +1206,7 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
         return "octo_rill_sid".to_owned();
     }
 
-    let discriminator = crate::ai::sha256_hex(&format!(
+    let discriminator = crate::content_source_identity::sha256_hex(&format!(
         "{scheme}\n{host}\n{effective_port}\n{}",
         normalized_path
     ));

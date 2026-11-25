@@ -33,7 +33,6 @@ use crate::{
         parse_internal_release_ref, parse_release_locator_from_github_release_url,
         parse_repo_full_name_from_release_url,
     },
-    translations,
 };
 
 const SESSION_KEY_USER_ID: &str = "user_id";
@@ -476,7 +475,7 @@ fn normalize_translation_fields(
 fn translation_error_metadata(
     error_text: Option<&str>,
 ) -> (Option<&'static str>, Option<&'static str>, Option<String>) {
-    match translations::classify_translation_error(error_text) {
+    match crate::translation_error::classify_translation_error(error_text) {
         Some(classified) => (
             Some(classified.code),
             Some(classified.summary),
@@ -681,9 +680,19 @@ fn smart_terminal_item(
             window,
             None,
         )),
-        "missing" if error_text == Some(crate::api::SMART_NO_VALUABLE_VERSION_INFO) => Some(
-            smart_item_json("insufficient", None, None, Some(false), None, window, None),
-        ),
+        "missing"
+            if error_text == Some(crate::translation_error::SMART_NO_VALUABLE_VERSION_INFO) =>
+        {
+            Some(smart_item_json(
+                "insufficient",
+                None,
+                None,
+                Some(false),
+                None,
+                window,
+                None,
+            ))
+        }
         "missing" | "error" | "incompatible" => Some(smart_item_json(
             status,
             None,
@@ -773,9 +782,9 @@ fn release_reading_state(payload: &Value) -> (Option<Value>, bool) {
     let Some(raw_reading) = payload.get("reading") else {
         return (None, false);
     };
-    let Ok(mut reading) =
-        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
-    else {
+    let Ok(mut reading) = serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(
+        raw_reading.clone(),
+    ) else {
         return (None, true);
     };
     if reading.normalize_references().is_err() || reading.validate().is_err() {
@@ -789,7 +798,8 @@ fn release_reading_state(payload: &Value) -> (Option<Value>, bool) {
                 .references
                 .into_iter()
                 .filter_map(|reference| {
-                    let number = translations::release_reading_pr_number(&reference.url);
+                    let number =
+                        crate::translation_types::release_reading_pr_number(&reference.url);
                     let label = reference
                         .label
                         .or_else(|| number.map(|number| format!("PR#{number}")))?;
@@ -1190,13 +1200,13 @@ async fn build_release_detail_response(
         ));
     }
 
-    let source_hash = crate::api::release_detail_source_hash(
+    let source_hash = crate::content_source_identity::release_detail_source_hash(
         &resolved_full_name,
         original_title.as_str(),
         original_body.as_str(),
     );
-    let smart_body = crate::api::release_feed_body(row.body.as_deref());
-    let smart_source_hash = translations::release_smart_feed_source_hash(
+    let smart_body = crate::release_content::release_feed_body(row.body.as_deref());
+    let smart_source_hash = crate::content_source_identity::release_smart_feed_source_hash(
         row.release_id.to_string().as_str(),
         &resolved_full_name,
         &original_title,
@@ -1472,9 +1482,9 @@ async fn fetch_announcement_detail_source_from_db(
         let resolved_discussion_number = row
             .discussion_number
             .or_else(|| {
-                row.html_url
-                    .as_deref()
-                    .and_then(crate::api::parse_discussion_number_from_github_url)
+                row.html_url.as_deref().and_then(
+                    crate::content_source_identity::parse_discussion_number_from_github_url,
+                )
             })
             .unwrap_or(discussion_number);
         let title = row
@@ -1825,8 +1835,10 @@ async fn build_announcement_detail_response(
     user_id: &str,
     source: AnnouncementDetailSource,
 ) -> Result<Value, ApiError> {
-    let discussion_key =
-        crate::api::announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let discussion_key = crate::content_source_identity::announcement_discussion_key(
+        &source.repo_full_name,
+        source.discussion_number,
+    );
     let original_body = source.body.clone().unwrap_or_default();
     let overlay = postgres_content_overlay::OverlayState::load(&state.runtime.pool).await;
 
@@ -1949,13 +1961,13 @@ async fn build_announcement_detail_response(
     let translation_state =
         load_announcement_translation_state(&state.runtime.pool, user_id, discussion_key.as_str())
             .await?;
-    let source_hash = crate::api::announcement_detail_source_hash(
+    let source_hash = crate::content_source_identity::announcement_detail_source_hash(
         &source.repo_full_name,
         Some(source.discussion_number),
         source.title.as_str(),
         original_body.as_str(),
     );
-    let smart_source_hash = translations::announcement_smart_feed_source_hash(
+    let smart_source_hash = crate::content_source_identity::announcement_smart_feed_source_hash(
         discussion_key.as_str(),
         source.repo_full_name.as_str(),
         Some(source.discussion_number),
@@ -4497,7 +4509,7 @@ fn public_translation_item(row: &PublicReleaseRow, content: &str) -> Option<Valu
             None => Some(translated_missing_item(true, None)),
         }
     } else {
-        let source_hash = crate::api::release_detail_source_hash(
+        let source_hash = crate::content_source_identity::release_detail_source_hash(
             &row.repo_full_name,
             &original_title,
             &original_body,
@@ -4567,8 +4579,8 @@ fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<Value> {
             None => Some(smart_missing_item(None, None)),
         }
     } else {
-        let smart_body = crate::api::release_feed_body(row.body.as_deref());
-        let source_hash = translations::release_smart_feed_source_hash(
+        let smart_body = crate::release_content::release_feed_body(row.body.as_deref());
+        let source_hash = crate::content_source_identity::release_smart_feed_source_hash(
             row.release_id.to_string().as_str(),
             &row.repo_full_name,
             &original_title,

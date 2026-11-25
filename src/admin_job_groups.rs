@@ -21,10 +21,10 @@ pub(crate) const TASK_WEBHOOK_PUSH_RECONCILE: &str = "webhook.push.reconcile";
 /// Executors registered by `serve_postgres`. The unit tests below require every
 /// entry to appear in exactly one [`ADMIN_JOB_TASK_GROUPS`] group.
 pub(crate) const POSTGRES_TASK_EXECUTOR_TYPES: &[&str] = &[
-    jobs::TASK_SYNC_STARRED,
-    jobs::TASK_SYNC_RELEASES,
+    crate::postgres_tasks::TASK_SYNC_STARRED,
+    crate::postgres_tasks::TASK_SYNC_RELEASES,
     TASK_SYNC_REPO_RELEASE,
-    jobs::TASK_SYNC_NOTIFICATIONS,
+    crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
     jobs::TASK_SYNC_ALL,
     jobs::TASK_SYNC_ACCESS_REFRESH,
     jobs::TASK_WEBHOOK_PUSH_MANAGE,
@@ -39,11 +39,11 @@ pub(crate) const POSTGRES_TASK_EXECUTOR_TYPES: &[&str] = &[
 /// They remain in history so the job center can explain past failures, but the
 /// overview counters and dashboard rollups exclude them.
 pub(crate) const LEGACY_TASK_TYPES: &[&str] = &[
-    jobs::TASK_SYNC_SUBSCRIPTIONS,
+    crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
     jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
     jobs::TASK_RELEASE_EVIDENCE,
-    jobs::TASK_SYNC_STARRED_DELTA,
-    jobs::TASK_SYNC_STARRED_RECONCILE,
+    crate::jobs::TASK_SYNC_STARRED_DELTA,
+    crate::jobs::TASK_SYNC_STARRED_RECONCILE,
     jobs::TASK_BRIEF_HISTORY_RECOMPUTE,
     jobs::TASK_BRIEF_REFRESH_CONTENT,
     jobs::TASK_WEBHOOK_PUSH_AUDIT,
@@ -126,17 +126,17 @@ pub(crate) const ADMIN_JOB_TASK_GROUPS: &[AdminJobTaskGroup] = &[
         label: "同步",
         task_types: &[
             spec(
-                jobs::TASK_SYNC_STARRED,
+                crate::postgres_tasks::TASK_SYNC_STARRED,
                 "同步 Star",
                 AdminJobTaskLane::UserSync,
             ),
             spec(
-                jobs::TASK_SYNC_RELEASES,
+                crate::postgres_tasks::TASK_SYNC_RELEASES,
                 "同步 Release",
                 AdminJobTaskLane::Scheduled,
             ),
             spec(
-                jobs::TASK_SYNC_NOTIFICATIONS,
+                crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
                 "同步通知",
                 AdminJobTaskLane::Scheduled,
             ),
@@ -291,7 +291,10 @@ mod tests {
             assert!(!group.task_types.is_empty(), "group {} is empty", group.key);
         }
         assert!(runtime_task_types().any(|task_type| task_type == TASK_TRANSLATION_GENERATE));
-        assert!(!runtime_task_types().any(|task_type| task_type == jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(
+            !runtime_task_types()
+                .any(|task_type| task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
+        );
     }
 
     #[test]
@@ -303,7 +306,9 @@ mod tests {
             );
             assert!(is_legacy_task_type(legacy));
         }
-        assert!(is_legacy_task_type(jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(is_legacy_task_type(
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS
+        ));
         assert!(!is_legacy_task_type(TASK_TRANSLATION_GENERATE));
         assert!(!is_legacy_task_type("unknown.task.type"));
     }
@@ -315,8 +320,8 @@ mod tests {
         let realtime = lane_task_types(AdminJobTaskLane::Realtime).collect::<Vec<_>>();
         assert!(scheduled.contains(&jobs::TASK_BRIEF_DAILY_SLOT));
         assert!(scheduled.contains(&jobs::TASK_BRIEF_GENERATE));
-        assert!(!scheduled.contains(&jobs::TASK_SYNC_STARRED));
-        assert_eq!(user_sync, vec![jobs::TASK_SYNC_STARRED]);
+        assert!(!scheduled.contains(&crate::postgres_tasks::TASK_SYNC_STARRED));
+        assert_eq!(user_sync, vec![crate::postgres_tasks::TASK_SYNC_STARRED]);
         assert!(realtime.contains(&TASK_TRANSLATION_GENERATE));
         assert!(realtime.contains(&TASK_SYNC_REPO_RELEASE));
         assert_eq!(
@@ -330,10 +335,13 @@ mod tests {
         let sync = scheduled_group_task_types("sync");
         assert_eq!(
             sync,
-            vec![jobs::TASK_SYNC_RELEASES, jobs::TASK_SYNC_NOTIFICATIONS]
+            vec![
+                crate::postgres_tasks::TASK_SYNC_RELEASES,
+                crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS
+            ]
         );
-        assert!(!sync.contains(&jobs::TASK_SYNC_SUBSCRIPTIONS));
-        assert!(!sync.contains(&jobs::TASK_SYNC_STARRED));
+        assert!(!sync.contains(&crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!sync.contains(&crate::postgres_tasks::TASK_SYNC_STARRED));
         assert!(scheduled_group_task_types("unknown").is_empty());
     }
 }

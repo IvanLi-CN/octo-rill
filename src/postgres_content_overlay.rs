@@ -20,7 +20,6 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
-    api,
     content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::GLOBAL_PROTOCOL_VERSION,
     translations::{self, TranslationRequestItemInput, TranslationSourceBlock},
@@ -211,7 +210,8 @@ pub(crate) fn reading_state(payload: &Value) -> (Option<String>, bool) {
     let Some(raw) = payload.get("reading") else {
         return (None, false);
     };
-    let Ok(mut reading) = serde_json::from_value::<translations::ReleaseReadingResult>(raw.clone())
+    let Ok(mut reading) =
+        serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(raw.clone())
     else {
         return (None, true);
     };
@@ -312,7 +312,7 @@ fn global_source_hash_from_fields(
     title: String,
     body: Option<String>,
 ) -> String {
-    crate::content_processing::source_hash_for_item(&identity_item(
+    crate::content_source_identity::source_hash_for_item(&identity_item(
         kind, variant, entity_id, metadata, title, body,
     ))
 }
@@ -348,7 +348,7 @@ impl ReleaseSource<'_> {
 
     /// Truncated feed body, as the feed translation cache hash uses it.
     fn feed_body(&self) -> Option<String> {
-        api::release_feed_body(self.body)
+        crate::release_content::release_feed_body(self.body)
     }
 
     /// Identity hash the read path looks a projection up by. The single
@@ -380,7 +380,7 @@ impl AnnouncementSource<'_> {
             kind,
             variant,
             self.discussion_key,
-            api::announcement_translation_metadata_text(
+            crate::content_source_identity::announcement_translation_metadata_text(
                 self.repo_full_name,
                 Some(self.discussion_number),
             ),
@@ -1060,17 +1060,18 @@ pub(crate) async fn release_feed_processing(
     )
     .await?;
     Ok(FeedProcessing {
-        translation_source_hash: api::release_feed_translation_source_hash(
-            source.repo_full_name,
-            &title,
-            feed_body.as_deref(),
-        ),
-        detail_source_hash: api::release_detail_source_hash(
+        translation_source_hash:
+            crate::content_source_identity::release_feed_translation_source_hash(
+                source.repo_full_name,
+                &title,
+                feed_body.as_deref(),
+            ),
+        detail_source_hash: crate::content_source_identity::release_detail_source_hash(
             source.repo_full_name,
             &title,
             source.body.unwrap_or(""),
         ),
-        smart_source_hash: translations::release_smart_feed_source_hash(
+        smart_source_hash: crate::content_source_identity::release_smart_feed_source_hash(
             &entity_id,
             source.repo_full_name,
             &title,
@@ -1091,7 +1092,7 @@ pub(crate) async fn announcement_feed_processing(
     source: &AnnouncementSource<'_>,
 ) -> Result<FeedProcessing, sqlx::Error> {
     let key = source.discussion_key;
-    let feed_body = api::release_feed_body(source.body);
+    let feed_body = crate::release_content::release_feed_body(source.body);
     let translation = read_first_projection(
         pool,
         state,
@@ -1139,19 +1140,20 @@ pub(crate) async fn announcement_feed_processing(
     )
     .await?;
     Ok(FeedProcessing {
-        translation_source_hash: api::announcement_feed_translation_source_hash(
-            source.repo_full_name,
-            Some(source.discussion_number),
-            source.title,
-            feed_body.as_deref(),
-        ),
-        detail_source_hash: api::announcement_detail_source_hash(
+        translation_source_hash:
+            crate::content_source_identity::announcement_feed_translation_source_hash(
+                source.repo_full_name,
+                Some(source.discussion_number),
+                source.title,
+                feed_body.as_deref(),
+            ),
+        detail_source_hash: crate::content_source_identity::announcement_detail_source_hash(
             source.repo_full_name,
             Some(source.discussion_number),
             source.title,
             source.body.unwrap_or(""),
         ),
-        smart_source_hash: translations::announcement_smart_feed_source_hash(
+        smart_source_hash: crate::content_source_identity::announcement_smart_feed_source_hash(
             key,
             source.repo_full_name,
             Some(source.discussion_number),
