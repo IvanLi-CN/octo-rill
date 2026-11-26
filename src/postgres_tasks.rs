@@ -50,8 +50,8 @@ pub struct ReleasesExecutor {
     pool: PgPool,
     http: Client,
     encryption_key: EncryptionKey,
-    /// Present only when automatic release translation can run; without it the
-    /// lane stores releases and queues no translation work.
+    /// Present only when global release content admission can run; without it
+    /// the lane stores releases and admits no translation or polishing work.
     ai: Option<AiConfig>,
     /// The process-wide unauthenticated read allowance, shared with the
     /// single-repository worker lane.
@@ -1211,7 +1211,7 @@ impl TaskExecutor for ReleasesExecutor {
                 summary.deferred_count
             );
         }
-        let translations_enqueued = self.enqueue_translations(&user_id, &new_release_ids).await;
+        let translations_enqueued = self.admit_release_translations(&new_release_ids).await;
         Ok(json!({
             "releases": total,
             "repositories": repositories,
@@ -1230,80 +1230,32 @@ impl TaskExecutor for ReleasesExecutor {
 }
 
 impl ReleasesExecutor {
-    /// Queue automatic release translation for the releases this sync inserted
-    /// and drain one bounded slice of the backlog the batch cap left behind.
+    /// Admit this sync's newly inserted Releases to the global content pipeline.
     ///
-    /// The sync already committed its repository writes, so a failure here is
-    /// reported and swallowed: the releases stay stored and the next sync of the
-    /// same repository is unaffected. Without a configured AI provider the lane
-    /// writes nothing.
-    async fn enqueue_translations(&self, user_id: &str, new_release_ids: &[i64]) -> usize {
-        if self.ai.is_none() {
+    /// The lane no longer writes per-user `translation_work_items`,
+    /// `translation_requests` or `translation.generate` tasks: Release detail
+    /// translation goes through global admission and Release polishing through
+    /// its own admission, so the global worker owns every attempt and
+    /// projection (REQ-PGCP-006).
+    ///
+    /// Returns how many Releases got new global translation work: a Release
+    /// without translatable content, an already-admitted identity or a satisfied
+    /// projection counts zero. The sync already committed its repository writes,
+    /// so a failure here is reported and swallowed: the Releases stay stored and
+    /// the next sync or an explicit request re-admits them. Without a configured
+    /// AI provider the lane admits nothing.
+    async fn admit_release_translations(&self, new_release_ids: &[i64]) -> usize {
+        let Some(ai) = self.ai.as_ref() else {
             return 0;
-        }
-        let mut enqueued = 0usize;
-        if !new_release_ids.is_empty() {
-            match crate::postgres_translate::enqueue_release_translations(
-                &self.pool,
-                user_id,
-                new_release_ids,
-                "sync.releases.auto_translate",
-            )
-            .await
-            {
-                Ok(count) => {
-                    if count > 0 {
-                        info!(
-                            event = "translation.enqueue",
-                            operation = "sync.releases",
-                            user_id,
-                            translations_enqueued = count,
-                            "automatic release translation queued"
-                        );
-                    }
-                    enqueued = count;
-                }
-                Err(error) => warn!(
-                    event = "translation.enqueue",
-                    operation = "sync.releases",
-                    user_id,
-                    error = %error,
-                    "automatic release translation enqueue failed"
-                ),
-            }
-        }
-        let total = match crate::postgres_translate::enqueue_pending_translation_tasks(
-            &self.pool,
-            user_id,
-            "sync.releases.translation_backlog",
-        )
-        .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!(
-                        event = "translation.enqueue",
-                        operation = "sync.releases",
-                        user_id,
-                        translations_drained = count,
-                        "automatic translation backlog drained"
-                    );
-                }
-                enqueued + count
-            }
-            Err(error) => {
-                warn!(
-                    event = "translation.enqueue",
-                    operation = "sync.releases",
-                    user_id,
-                    error = %error,
-                    "automatic translation backlog drain failed"
-                );
-                enqueued
-            }
         };
-        if let Some(ai) = self.ai.as_ref()
-            && !new_release_ids.is_empty()
+        let admitted = crate::postgres_translate::admit_release_detail_translations(
+            &self.pool,
+            new_release_ids,
+            ai.model.as_str(),
+            "sync.releases.auto_translate",
+        )
+        .await;
+        if !new_release_ids.is_empty()
             && let Err(error) = crate::postgres_content::admit_release_polish(
                 &self.pool,
                 new_release_ids,
@@ -1314,12 +1266,11 @@ impl ReleasesExecutor {
             warn!(
                 event = "content.polish.enqueue",
                 operation = "sync.releases",
-                user_id,
                 error = %error,
                 "global polishing admission failed"
             );
         }
-        total
+        admitted
     }
 }
 
@@ -1394,7 +1345,7 @@ struct AccountRepoOutcome {
     repo_full_name: String,
     fetched: usize,
     /// Releases this refresh inserted into the shared cache; they are the only
-    /// ones automatic translation may queue.
+    /// ones global translation admission may admit.
     new_release_ids: Vec<i64>,
     failure: Option<RefreshFailure>,
     /// Set when the anonymous budget could not pay for this repository.
@@ -2136,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn only_newly_inserted_releases_feed_automatic_translation() {
+    fn only_newly_inserted_releases_feed_global_translation_admission() {
         let mut ids = Vec::new();
         push_inserted_release(
             &mut ids,
