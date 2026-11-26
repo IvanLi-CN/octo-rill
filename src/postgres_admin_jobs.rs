@@ -47,10 +47,9 @@ const STREAM_TEXT_SOURCE_TICK_INTERVAL: u64 = 4;
 const STREAM_BATCH_LIMIT: i64 = 200;
 const SYNC_SUBSCRIPTION_EVENT_LIMIT: usize = 20;
 
-/// `result_json` is written as SQLite JSON text. Only a value that PostgreSQL
-/// can parse as JSONB, and whose `skipped` member is a valid boolean, counts as
-/// skipped; anything else degrades to `false` exactly like the legacy
-/// `json_extract(...) = 1` predicate.
+/// `result_json` is JSON text written by the job center. Only a value that
+/// PostgreSQL can parse as JSONB, and whose `skipped` member is a valid
+/// boolean, counts as skipped; anything else degrades to `false`.
 const SKIPPED_EXPRESSION: &str = r#"CASE
     WHEN pg_input_is_valid(result_json, 'jsonb')
      AND jsonb_typeof(result_json::jsonb -> 'skipped') = 'boolean'

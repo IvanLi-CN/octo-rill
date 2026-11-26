@@ -536,7 +536,7 @@ async fn load_processing_coverage_in_connection(
         return Ok(HashMap::new());
     }
     let mut query = PgReadBuilder::new(
-        "SELECT record_id, pipeline, status_origin FROM admin_collection_processing_coverage WHERE record_kind = ",
+        "SELECT record_id, pipeline, status_origin FROM public.admin_collection_processing_coverage WHERE record_kind = ",
     );
     query.push_bind(collection_record_kind_label(kind));
     query.push(" AND record_id IN (");
@@ -741,7 +741,7 @@ async fn load_global_task_rows_in_connection(
         return Ok(Vec::new());
     }
     let identity_upgrade_state = match pg_query_as::<(String, String)>(
-        "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
+        "SELECT status, phase FROM public.content_identity_upgrade_control WHERE id = 1",
     )
     .fetch_optional(&mut *connection)
     .await
@@ -753,9 +753,9 @@ async fn load_global_task_rows_in_connection(
     let identity_upgrade_complete = identity_upgrade_state
         .is_some_and(|(status, phase)| status == "completed" && phase == "complete");
     let source = if identity_upgrade_complete {
-        "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_identity_work AS (SELECT * FROM ranked_members WHERE member_rank = 1), ranked_global_work AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY canonical_resource_id, CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END ORDER BY julianday(created_at) DESC, created_at DESC, CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC) AS global_rank FROM canonical_identity_work), canonical_work AS (SELECT * FROM ranked_global_work WHERE global_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
+        GLOBAL_TASK_ROWS_CANONICAL_SQL
     } else {
-        "SELECT w.pipeline, w.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items w WHERE w.canonical_resource_type = "
+        GLOBAL_TASK_ROWS_SQL
     };
     let mut query = PgReadBuilder::new(source);
     query.push_bind(collection_record_kind_label(kind));
@@ -768,7 +768,7 @@ async fn load_global_task_rows_in_connection(
     }
     query.push(")");
     query.push(" AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart'))");
-    query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
+    query.push(" ORDER BY w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, w.updated_at DESC, w.id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&mut *connection)
@@ -785,7 +785,7 @@ async fn identity_upgrade_complete_in_connection(
     connection: &mut SqliteConnection,
 ) -> Result<bool, ApiError> {
     match pg_query_as::<(String, String)>(
-        "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
+        "SELECT status, phase FROM public.content_identity_upgrade_control WHERE id = 1",
     )
     .fetch_optional(&mut *connection)
     .await
@@ -892,7 +892,7 @@ async fn load_legacy_observations_in_connection(
         return Ok(HashMap::new());
     }
     let mut query = PgReadBuilder::new(
-        "SELECT canonical_resource_id, pipeline, classification, legacy_table, legacy_primary_key, observed_at, observation_basis_json FROM content_legacy_observations WHERE canonical_resource_type = ",
+        "SELECT canonical_resource_id, pipeline, classification, legacy_table, legacy_primary_key, observed_at, observation_basis_json FROM public.content_legacy_observations WHERE canonical_resource_type = ",
     );
     query.push_bind(collection_record_kind_label(kind));
     query.push(" AND canonical_resource_id IN (");
@@ -1094,7 +1094,7 @@ async fn load_task_summaries_in_connection(
         return Ok(HashMap::new());
     }
     let mut query = PgReadBuilder::new(
-        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM translation_work_items w WHERE w.kind IN (",
+        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM public.translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM public.translation_work_items w WHERE w.kind IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -1188,8 +1188,8 @@ async fn load_brief_summaries_in_connection(
     }
     let mut query = PgReadBuilder::new(
         "SELECT c.id, c.status, c.source, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
-            (SELECT MAX(e.created_at) FROM llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
-            c.error_text, c.parent_brief_id FROM llm_calls c WHERE c.parent_brief_id IN (",
+            (SELECT MAX(e.created_at) FROM public.llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
+            c.error_text, c.parent_brief_id FROM public.llm_calls c WHERE c.parent_brief_id IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -1325,11 +1325,19 @@ fn source_window_sql(
 ) -> String {
     let mut predicates = Vec::new();
     if let Some(value) = from {
-        predicates.push(format!("julianday({expression}) >= julianday(?)"));
+        predicates.push(format!(
+            "{} >= ({})::timestamptz",
+            pg_instant(expression),
+            sql_placeholder(binds)
+        ));
         binds.push(CollectionQueryBind::Text(value.to_owned()));
     }
     if let Some(value) = before {
-        predicates.push(format!("julianday({expression}) < julianday(?)"));
+        predicates.push(format!(
+            "{} < ({})::timestamptz",
+            pg_instant(expression),
+            sql_placeholder(binds)
+        ));
         binds.push(CollectionQueryBind::Text(value.to_owned()));
     }
     if predicates.is_empty() {
@@ -1337,6 +1345,23 @@ fn source_window_sql(
     } else {
         predicates.join(" AND ")
     }
+}
+
+/// Render a timestamp expression as a comparable PostgreSQL `timestamptz`.
+///
+/// Imported runtime tables still store ISO-8601 text (releases, notifications,
+/// LLM audit rows) while PostgreSQL-native tables store `timestamptz`.
+/// `pg_input_is_valid` keeps unparseable imported values as NULL so they sort
+/// last instead of failing the whole statement.
+fn pg_instant(expression: &str) -> String {
+    format!(
+        "CASE WHEN pg_input_is_valid(({expression})::text, 'timestamptz') THEN ({expression})::timestamptz END"
+    )
+}
+
+/// Positional placeholder for the next bind of a dynamic query.
+fn sql_placeholder(binds: &[CollectionQueryBind]) -> String {
+    format!("${}", binds.len() + 1)
 }
 
 fn source_records_sql(
@@ -1356,7 +1381,7 @@ fn source_records_sql(
             format!(
                 "release_repositories AS (
                 SELECT repo_id, MIN(repo_full_name) AS repository
-                FROM repo_release_work_items
+                FROM public.repo_release_work_items
                 GROUP BY repo_id
             ),
             raw_source_records AS (
@@ -1368,7 +1393,7 @@ fn source_records_sql(
                     COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at,
                     r.detected_at,
                     NULL AS generated_at
-                FROM repo_releases r
+                FROM public.repo_releases r
                 LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
                 WHERE {window}
             )"
@@ -1386,14 +1411,14 @@ fn source_records_sql(
                     e.occurred_at AS occurred_at,
                     e.detected_at,
                     NULL AS generated_at
-                FROM social_activity_events e
+                FROM public.social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
                   AND {window}
                   AND e.id = (
                     SELECT latest.id
-                    FROM social_activity_events latest
+                    FROM public.social_activity_events latest
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
@@ -1415,7 +1440,7 @@ fn source_records_sql(
                         COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC,
                         COALESCE(n.subject_type, '') DESC, n.id DESC
                     ) AS source_rank
-                FROM notifications n
+                FROM public.notifications n
             ),
             raw_source_records AS (
                 SELECT
@@ -1444,7 +1469,7 @@ fn source_records_sql(
                     NULL AS occurred_at,
                     NULL AS detected_at,
                     b.created_at AS generated_at
-                FROM briefs b
+                FROM public.briefs b
                 WHERE {window}
             )"
             )
@@ -1459,16 +1484,20 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     CAST(r.release_id AS TEXT) AS id,
                     COALESCE(
                         (SELECT MIN(wi.repo_full_name)
-                         FROM repo_release_work_items wi
+                         FROM public.repo_release_work_items wi
                          WHERE wi.repo_id = r.repo_id),
                         '仓库 #' || CAST(r.repo_id AS TEXT)
                     ) AS repository,
                     COALESCE(NULLIF(r.name, ''), r.tag_name) AS title,
                     COALESCE(r.published_at, r.created_at, r.updated_at) AS source_time
-                FROM repo_releases r
-                WHERE julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) >= julianday(?)
-                  AND julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) < julianday(?)
+                FROM public.repo_releases r
+                WHERE {release_window} >= $1::timestamptz
+                  AND {release_window} < $2::timestamptz
             )"
+        .replace(
+            "{release_window}",
+            &pg_instant("COALESCE(r.published_at, r.created_at, r.updated_at)"),
+        )
         .to_owned(),
         CollectionRecordKind::Announcement => "bounded_announcement_rows AS MATERIALIZED (
                 SELECT
@@ -1476,15 +1505,15 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     lower(e.repo_full_name) AS repo_key,
                     e.discussion_number,
                     e.occurred_at AS source_time
-                FROM social_activity_events e
+                FROM public.social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                    AND julianday(e.occurred_at) >= julianday(?)
-                    AND julianday(e.occurred_at) < julianday(?)
+                    AND {event_window} >= $1::timestamptz
+                    AND {event_window} < $2::timestamptz
                   AND e.id = (
                     SELECT latest.id
-                    FROM social_activity_events latest
+                    FROM public.social_activity_events latest
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
@@ -1499,9 +1528,10 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     COALESCE(NULLIF(e.title, ''), '公告') AS title,
                     c.source_time
                 FROM bounded_announcement_rows c
-                JOIN social_activity_events e
+                JOIN public.social_activity_events e
                   ON e.id = c.source_id
             )"
+        .replace("{event_window}", &pg_instant("e.occurred_at"))
         .to_owned(),
         CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
                 WITH ranked_notifications AS (
@@ -1513,7 +1543,7 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                         COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC,
                         COALESCE(n.subject_type, '') DESC, n.id DESC
                     ) AS source_rank
-                  FROM notifications n
+                  FROM public.notifications n
                 )
                 SELECT
                     n.thread_id AS id,
@@ -1521,10 +1551,11 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     COALESCE(NULLIF(n.subject_title, ''), '通知') AS title,
                     n.updated_at AS source_time
                 FROM ranked_notifications n
-                WHERE julianday(n.updated_at) >= julianday(?)
-                  AND julianday(n.updated_at) < julianday(?)
+                WHERE {notification_window} >= $1::timestamptz
+                  AND {notification_window} < $2::timestamptz
                   AND n.source_rank = 1
             )"
+        .replace("{notification_window}", &pg_instant("n.updated_at"))
         .to_owned(),
         CollectionRecordKind::Brief => "bounded_source_records AS MATERIALIZED (
                 SELECT
@@ -1532,10 +1563,11 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     NULL AS repository,
                     b.date AS title,
                     b.created_at AS source_time
-                FROM briefs b
-                WHERE julianday(b.created_at) >= julianday(?)
-                  AND julianday(b.created_at) < julianday(?)
+                FROM public.briefs b
+                WHERE {brief_window} >= $1::timestamptz
+                  AND {brief_window} < $2::timestamptz
             )"
+        .replace("{brief_window}", &pg_instant("b.created_at"))
         .to_owned(),
     }
 }
@@ -1556,12 +1588,12 @@ fn global_work_candidates_ctes(
                             WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
                             WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
                             WHEN 'superseded' THEN 9 ELSE 6 END,
-                            w.attempt_count DESC, julianday(w.updated_at) DESC,
+                            w.attempt_count DESC,
                             w.updated_at DESC, w.id DESC
                     ) AS member_rank
                 FROM {source_cte} s
-                CROSS JOIN content_work_identity_members m
-                JOIN content_work_items w ON w.id = m.work_item_id
+                CROSS JOIN public.content_work_identity_members m
+                JOIN public.content_work_items w ON w.id = m.work_item_id
                 WHERE w.canonical_resource_type = '{resource_type}'
                   AND w.canonical_resource_id = s.id
                   AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
@@ -1575,7 +1607,7 @@ fn global_work_candidates_ctes(
                     ROW_NUMBER() OVER (
                         PARTITION BY canonical_resource_id,
                             CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
-                        ORDER BY julianday(created_at) DESC, created_at DESC,
+                        ORDER BY created_at DESC,
                             CASE status
                                 WHEN 'queued' THEN 0
                                 WHEN 'running' THEN 1
@@ -1587,7 +1619,7 @@ fn global_work_candidates_ctes(
                                 ELSE 6
                             END,
                             CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END,
-                            julianday(updated_at) DESC, updated_at DESC, id DESC
+                            updated_at DESC, id DESC
                     ) AS global_rank
                 FROM canonical_identity_work
             ),
@@ -1599,7 +1631,7 @@ fn global_work_candidates_ctes(
         format!(
             "global_work_candidates AS MATERIALIZED (
                 SELECT w.* FROM {source_cte} s
-                CROSS JOIN content_work_items w
+                CROSS JOIN public.content_work_items w
                 WHERE w.canonical_resource_type = '{resource_type}'
                   AND w.canonical_resource_id = s.id
                   AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
@@ -1670,7 +1702,7 @@ fn activity_query_sql(
                             CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END
                         ORDER BY w.updated_at DESC, w.id DESC
                     ) AS row_rank
-                FROM translation_work_items w
+                FROM public.translation_work_items w
                 JOIN bounded_source_records s ON s.id = w.entity_id
                 WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
             ),
@@ -1684,12 +1716,12 @@ fn activity_query_sql(
                     o.canonical_resource_id AS entity_id,
                     CASE WHEN o.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
                     o.legacy_table,
-                    json_extract(o.observation_basis_json, '$.source_hash') AS source_hash,
+                    (o.observation_basis_json::jsonb ->> 'source_hash') AS source_hash,
                     o.classification
                 FROM content_legacy_observations o
                 JOIN bounded_source_records s ON s.id = o.canonical_resource_id
                 WHERE o.canonical_resource_type = '{resource_type}'
-                  AND json_extract(o.observation_basis_json, '$.source_hash') IS NOT NULL
+                  AND (o.observation_basis_json::jsonb ->> 'source_hash') IS NOT NULL
             ),
             legacy_observations AS (
                 SELECT
@@ -1732,7 +1764,6 @@ fn activity_query_sql(
                             PARTITION BY w.canonical_resource_id,
                                 CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
                             ORDER BY
-                                julianday(w.created_at) DESC,
                                 w.created_at DESC,
                                 CASE w.status
                                     WHEN 'queued' THEN 0
@@ -1745,7 +1776,6 @@ fn activity_query_sql(
                                     ELSE 6
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
-                                julianday(w.updated_at) DESC,
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
@@ -1814,12 +1844,13 @@ fn activity_query_sql(
         }
     }
 
-    sql.push_str(
+    sql.push_str(&format!(
         " SELECT id, title, repository, source_time,
                  translation_status, polish_status
           FROM status_projection
-          ORDER BY julianday(source_time) DESC, source_time DESC, id DESC",
-    );
+          ORDER BY {source_time_sort} DESC, source_time DESC, id DESC",
+        source_time_sort = pg_instant("source_time"),
+    ));
     sql
 }
 
@@ -1990,12 +2021,12 @@ fn collection_query_sql(
                         PARTITION BY c.parent_brief_id
                         ORDER BY c.updated_at DESC, c.id DESC
                     ) AS row_rank
-                FROM llm_calls c
+                FROM public.llm_calls c
                 JOIN source_records s ON s.id = c.parent_brief_id
             ),
             brief_attempts AS (
-                SELECT parent_brief_id AS entity_id, SUM(MAX(attempt_count, 0)) AS attempt_count
-                FROM llm_calls c
+                SELECT parent_brief_id AS entity_id, SUM(GREATEST(attempt_count, 0)) AS attempt_count
+                FROM public.llm_calls c
                 JOIN source_records s ON s.id = c.parent_brief_id
                 GROUP BY parent_brief_id
             ),
@@ -2018,7 +2049,7 @@ fn collection_query_sql(
                 LEFT JOIN brief_rows b
                   ON b.entity_id = s.id AND b.row_rank = 1
                 LEFT JOIN brief_attempts ba ON ba.entity_id = s.id
-                LEFT JOIN admin_collection_processing_coverage bc
+                LEFT JOIN public.admin_collection_processing_coverage bc
                   ON bc.record_kind = 'brief' AND bc.record_id = s.id AND bc.pipeline = 'polish'
             )",
         );
@@ -2039,7 +2070,7 @@ fn collection_query_sql(
                             CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END
                         ORDER BY w.updated_at DESC, w.id DESC
                     ) AS row_rank
-                FROM translation_work_items w
+                FROM public.translation_work_items w
                 JOIN source_records s ON s.id = w.entity_id
                 WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
             ),
@@ -2058,12 +2089,12 @@ fn collection_query_sql(
                     canonical_resource_id AS entity_id,
                     CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
                     legacy_table,
-                    json_extract(observation_basis_json, '$.source_hash') AS source_hash,
+                    (observation_basis_json::jsonb ->> 'source_hash') AS source_hash,
                     classification
-                FROM content_legacy_observations
+                FROM public.content_legacy_observations
                 JOIN source_records s ON s.id = canonical_resource_id
                 WHERE canonical_resource_type = '{resource_type}'
-                  AND json_extract(observation_basis_json, '$.source_hash') IS NOT NULL
+                  AND (observation_basis_json::jsonb ->> 'source_hash') IS NOT NULL
             ),
             legacy_observations AS (
                 SELECT
@@ -2084,7 +2115,7 @@ fn collection_query_sql(
             ),
             coverage AS (
                 SELECT record_id AS entity_id, pipeline, status_origin
-                FROM admin_collection_processing_coverage
+                FROM public.admin_collection_processing_coverage
                 JOIN source_records s ON s.id = record_id
                 WHERE record_kind = '{resource_type}'
             )"
@@ -2111,7 +2142,6 @@ fn collection_query_sql(
                             PARTITION BY w.canonical_resource_id,
                                 CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
                             ORDER BY
-                                julianday(w.created_at) DESC,
                                 w.created_at DESC,
                                 CASE w.status
                                     WHEN 'queued' THEN 0
@@ -2124,7 +2154,6 @@ fn collection_query_sql(
                                     ELSE 6
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
-                                julianday(w.updated_at) DESC,
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
@@ -2149,7 +2178,7 @@ fn collection_query_sql(
                         s.*,
                         {translation_status} AS translation_status,
                         {polish_status} AS polish_status,
-                        MAX(
+                        GREATEST(
                             CASE WHEN gt.entity_id IS NOT NULL
                                 THEN COALESCE(gat.attempt_count, 0)
                                 ELSE COALESCE(lat.attempt_count, 0)
@@ -2208,7 +2237,7 @@ fn collection_query_sql(
                         s.*,
                         {translation_status} AS translation_status,
                         {polish_status} AS polish_status,
-                        MAX(COALESCE(lat.attempt_count, 0), COALESCE(lap.attempt_count, 0)) AS attempt_count,
+                        GREATEST(COALESCE(lat.attempt_count, 0), COALESCE(lap.attempt_count, 0)) AS attempt_count,
                         CASE
                             WHEN ((lt.entity_id IS NOT NULL AND ot.entity_id IS NULL) OR ct.status_origin = 'never_started')
                              AND ((lp.entity_id IS NOT NULL AND op.entity_id IS NULL) OR cp.status_origin = 'never_started')
@@ -2232,10 +2261,16 @@ fn collection_query_sql(
     if attempts.min > 0 || attempts.max.is_some() {
         sql.push_str(" AND attempt_count_known = 1");
     }
-    sql.push_str(" AND attempt_count >= ?");
+    sql.push_str(&format!(
+        " AND attempt_count >= {}",
+        sql_placeholder(&binds)
+    ));
     binds.push(CollectionQueryBind::Integer(attempts.min));
     if let Some(max) = attempts.max {
-        sql.push_str(" AND attempt_count <= ?");
+        sql.push_str(&format!(
+            " AND attempt_count <= {}",
+            sql_placeholder(&binds)
+        ));
         binds.push(CollectionQueryBind::Integer(max));
     }
     if kind != CollectionRecordKind::Brief
@@ -2243,39 +2278,40 @@ fn collection_query_sql(
         && !values.is_empty()
     {
         sql.push_str(" AND translation_status IN (");
-        for (index, _) in values.iter().enumerate() {
+        for (index, value) in values.iter().enumerate() {
             if index > 0 {
                 sql.push_str(", ");
             }
-            sql.push('?');
+            sql.push_str(&sql_placeholder(&binds));
+            binds.push(CollectionQueryBind::Text(value.clone()));
         }
         sql.push(')');
-        binds.extend(values.iter().cloned().map(CollectionQueryBind::Text));
     }
     if let Some(values) = polish_filter
         && !values.is_empty()
     {
         sql.push_str(" AND polish_status IN (");
-        for (index, _) in values.iter().enumerate() {
+        for (index, value) in values.iter().enumerate() {
             if index > 0 {
                 sql.push_str(", ");
             }
-            sql.push('?');
+            sql.push_str(&sql_placeholder(&binds));
+            binds.push(CollectionQueryBind::Text(value.clone()));
         }
         sql.push(')');
-        binds.extend(values.iter().cloned().map(CollectionQueryBind::Text));
     }
     sql.push(')');
     if let Some((page_size, offset)) = page {
         let order = if kind == CollectionRecordKind::Release {
-            "ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC"
+            "ORDER BY {source_time_sort} DESC, CAST(id AS bigint) DESC"
         } else {
-            "ORDER BY datetime(source_time) DESC, id DESC"
+            "ORDER BY {source_time_sort} DESC, id DESC"
         };
         sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at, COUNT(*) OVER () AS total_count FROM filtered_records ");
-        sql.push_str(order);
-        sql.push_str(" LIMIT ? OFFSET ?");
+        sql.push_str(&order.replace("{source_time_sort}", &pg_instant("source_time")));
+        sql.push_str(&format!(" LIMIT {}", sql_placeholder(&binds)));
         binds.push(CollectionQueryBind::Integer(page_size));
+        sql.push_str(&format!(" OFFSET {}", sql_placeholder(&binds)));
         binds.push(CollectionQueryBind::Integer(offset));
     }
     (sql, binds)
@@ -2623,16 +2659,16 @@ async fn load_source_record(
 ) -> Result<SourceRecordRow, ApiError> {
     let sql = match kind {
         CollectionRecordKind::Release => {
-            "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE CAST(r.release_id AS TEXT) = ? LIMIT 1"
+            "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM public.repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM public.repo_releases r WHERE CAST(r.release_id AS TEXT) = $1 LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, lower(COALESCE(e.repo_full_name, '')) DESC, e.discussion_number DESC, COALESCE(e.title, '') DESC, COALESCE(e.body, '') DESC, e.id DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, lower(COALESCE(e.repo_full_name, '')) DESC, e.discussion_number DESC, COALESCE(e.title, '') DESC, COALESCE(e.body, '') DESC, e.id DESC) AS source_rank FROM public.social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = $1) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
-            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC, COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC, COALESCE(n.subject_type, '') DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
+            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC, COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC, COALESCE(n.subject_type, '') DESC, n.id DESC) AS source_rank FROM public.notifications n WHERE n.thread_id = $1) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Brief => {
-            "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
+            "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM public.briefs b WHERE b.id = $1 LIMIT 1"
         }
     };
     pg_query_as::<SourceRecordRow>(sql)
@@ -2658,7 +2694,7 @@ async fn load_record_tasks(
         return Ok(Vec::new());
     };
     pg_query_as::< TaskRow>(
-        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at FROM translation_work_items w WHERE w.entity_id = ? AND w.kind IN (?, ?)",
+        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM public.translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at FROM public.translation_work_items w WHERE w.entity_id = $1 AND w.kind IN ($2, $3)",
     )
     .bind(entity_id)
     .bind(translation_kind)
@@ -2680,7 +2716,7 @@ async fn load_task_attempts(
         .map(|task| (task.id.clone(), task.kind.clone()))
         .collect::<HashMap<_, _>>();
     let mut query = PgReadBuilder::new(
-        "SELECT work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, processing_stage, provider_status, output_contract_status, retry_disposition, retry_eligible, next_retry_at, llm_call_ids_json, created_at FROM translation_attempt_events WHERE work_item_id IN (",
+        "SELECT work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, processing_stage, provider_status, output_contract_status, retry_disposition, retry_eligible, next_retry_at, llm_call_ids_json, created_at FROM public.translation_attempt_events WHERE work_item_id IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -2688,7 +2724,7 @@ async fn load_task_attempts(
             separated.push_bind(task.id.as_str());
         }
     }
-    query.push(") ORDER BY datetime(created_at) ASC, id ASC");
+    query.push(") ORDER BY created_at ASC, id ASC");
     let events = query
         .build_query_as::<AttemptEventRow>()
         .fetch_all(&state.pool)
@@ -2705,8 +2741,9 @@ async fn load_task_attempts(
     let calls_by_id = if call_ids.is_empty() {
         HashMap::new()
     } else {
-        let mut query =
-            PgReadBuilder::new("SELECT id, status, source, model FROM llm_calls WHERE id IN (");
+        let mut query = PgReadBuilder::new(
+            "SELECT id, status, source, model FROM public.llm_calls WHERE id IN (",
+        );
         {
             let mut separated = query.separated(", ");
             for id in call_ids {
@@ -2724,7 +2761,7 @@ async fn load_task_attempts(
             .collect::<HashMap<_, _>>()
     };
     let mut relation_query = PgReadBuilder::new(
-        "SELECT work_item_id, attempt_no, llm_call_id, stage, relation_role, evidence_availability FROM translation_attempt_llm_calls WHERE work_item_id IN (",
+        "SELECT work_item_id, attempt_no, llm_call_id, stage, relation_role, evidence_availability FROM public.translation_attempt_llm_calls WHERE work_item_id IN (",
     );
     {
         let mut separated = relation_query.separated(", ");
@@ -2884,7 +2921,7 @@ async fn load_global_attempts(
     let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
     let rows = load_global_attempt_rows_in_connection(&mut connection, kind, entity_id).await?;
     let mut call_query = PgReadBuilder::new(
-        "SELECT id, attempt_event_id, status, model FROM content_attempt_llm_calls WHERE attempt_event_id IN (",
+        "SELECT id, attempt_event_id, status, model FROM public.content_attempt_llm_calls WHERE attempt_event_id IN (",
     );
     {
         let mut separated = call_query.separated(", ");
@@ -3018,19 +3055,185 @@ async fn load_global_attempts(
     Ok(attempts)
 }
 
-const GLOBAL_ATTEMPT_ROWS_SQL: &str = "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
+/// Ranked global work rows for one canonical resource type. The caller appends
+/// its `canonical_resource_id IN (...)` predicate after `$1` (the record kind).
+const GLOBAL_TASK_ROWS_SQL: &str = "
+SELECT
+    w.pipeline,
+    w.source_hash,
+    w.status,
+    w.attempt_count,
+    w.started_at,
+    w.finished_at,
+    w.updated_at,
+    (SELECT MAX(e.created_at) FROM public.content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at,
+    w.canonical_resource_id,
+    (SELECT p.work_item_id FROM public.content_result_projections p
+     WHERE p.canonical_resource_type = w.canonical_resource_type
+       AND p.canonical_resource_id = w.canonical_resource_id
+       AND p.pipeline = w.pipeline AND p.variant = w.variant
+       AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version
+       AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash
+     ORDER BY p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id,
+    (SELECT p.source_hash FROM public.content_result_projections p
+     WHERE p.canonical_resource_type = w.canonical_resource_type
+       AND p.canonical_resource_id = w.canonical_resource_id
+       AND p.pipeline = w.pipeline AND p.variant = w.variant
+       AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version
+       AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash
+     ORDER BY p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash,
+    (SELECT p.updated_at FROM public.content_result_projections p
+     WHERE p.canonical_resource_type = w.canonical_resource_type
+       AND p.canonical_resource_id = w.canonical_resource_id
+       AND p.pipeline = w.pipeline AND p.variant = w.variant
+       AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version
+       AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash
+     ORDER BY p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at
+FROM public.content_work_items w
+WHERE w.canonical_resource_type = ";
 
-const GLOBAL_CANONICAL_ATTEMPT_ROWS_SQL: &str = "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart'))), canonical_identity_work AS (SELECT * FROM ranked_members WHERE member_rank = 1), ranked_global_work AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY canonical_resource_id, CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END ORDER BY julianday(created_at) DESC, created_at DESC, CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC) AS global_rank FROM canonical_identity_work), canonical_work AS (SELECT id AS work_item_id FROM ranked_global_work WHERE global_rank = 1) SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN canonical_work cw ON cw.work_item_id = e.work_item_id JOIN content_work_items w ON w.id = e.work_item_id ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
+/// Same projection once the identity upgrade completed: members collapse to one
+/// canonical work item per identity, then one row wins per lane.
+const GLOBAL_TASK_ROWS_CANONICAL_SQL: &str = "
+WITH ranked_members AS (
+    SELECT m.identity_id, w.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY m.identity_id
+            ORDER BY CASE w.status
+                WHEN 'queued' THEN 0 WHEN 'running' THEN 1
+                WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
+                WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
+                WHEN 'superseded' THEN 9 ELSE 6 END,
+                w.attempt_count DESC, w.updated_at DESC, w.id DESC
+        ) AS member_rank
+    FROM public.content_work_identity_members m
+    JOIN public.content_work_items w ON w.id = m.work_item_id
+),
+canonical_identity_work AS (SELECT * FROM ranked_members WHERE member_rank = 1),
+ranked_global_work AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY canonical_resource_id,
+                CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
+            ORDER BY created_at DESC,
+                CASE status
+                    WHEN 'queued' THEN 0 WHEN 'running' THEN 1
+                    WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
+                    WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
+                    WHEN 'superseded' THEN 9 ELSE 6 END,
+                CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END,
+                updated_at DESC, id DESC
+        ) AS global_rank
+    FROM canonical_identity_work
+),
+canonical_work AS (SELECT * FROM ranked_global_work WHERE global_rank = 1)
+SELECT
+    w.pipeline,
+    i.source_hash,
+    w.status,
+    w.attempt_count,
+    w.started_at,
+    w.finished_at,
+    w.updated_at,
+    (SELECT MAX(e.created_at) FROM public.content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at,
+    w.canonical_resource_id,
+    p.work_item_id AS projection_work_item_id,
+    i.source_hash AS projection_source_hash,
+    p.updated_at AS projection_updated_at
+FROM canonical_work w
+JOIN public.content_work_identities i ON i.id = w.identity_id
+LEFT JOIN public.content_current_result_projections p ON p.identity_id = i.id
+WHERE w.canonical_resource_type = ";
+
+const GLOBAL_ATTEMPT_ROWS_SQL: &str = "
+SELECT
+    e.id AS event_id,
+    e.work_item_id,
+    w.pipeline,
+    e.attempt_no,
+    e.trigger,
+    e.event_type,
+    e.result_status,
+    e.error_code,
+    e.error_summary,
+    e.failure_class,
+    e.retry_eligible,
+    e.next_retry_at,
+    e.created_at
+FROM public.content_attempt_events e
+JOIN public.content_work_items w ON w.id = e.work_item_id
+WHERE w.canonical_resource_type = $1
+  AND w.canonical_resource_id = $2
+  AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+    OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+ORDER BY e.created_at ASC, e.id ASC";
+
+const GLOBAL_CANONICAL_ATTEMPT_ROWS_SQL: &str = "
+WITH ranked_members AS (
+    SELECT m.identity_id, w.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY m.identity_id
+            ORDER BY CASE w.status
+                WHEN 'queued' THEN 0 WHEN 'running' THEN 1
+                WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
+                WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
+                WHEN 'superseded' THEN 9 ELSE 6 END,
+                w.attempt_count DESC, w.updated_at DESC, w.id DESC
+        ) AS member_rank
+    FROM public.content_work_identity_members m
+    JOIN public.content_work_items w ON w.id = m.work_item_id
+    WHERE w.canonical_resource_type = $1
+      AND w.canonical_resource_id = $2
+      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+),
+canonical_identity_work AS (SELECT * FROM ranked_members WHERE member_rank = 1),
+ranked_global_work AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY canonical_resource_id,
+                CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
+            ORDER BY created_at DESC,
+                CASE status
+                    WHEN 'queued' THEN 0 WHEN 'running' THEN 1
+                    WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
+                    WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
+                    WHEN 'superseded' THEN 9 ELSE 6 END,
+                CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END,
+                updated_at DESC, id DESC
+        ) AS global_rank
+    FROM canonical_identity_work
+),
+canonical_work AS (SELECT id AS work_item_id FROM ranked_global_work WHERE global_rank = 1)
+SELECT
+    e.id AS event_id,
+    e.work_item_id,
+    w.pipeline,
+    e.attempt_no,
+    e.trigger,
+    e.event_type,
+    e.result_status,
+    e.error_code,
+    e.error_summary,
+    e.failure_class,
+    e.retry_eligible,
+    e.next_retry_at,
+    e.created_at
+FROM public.content_attempt_events e
+JOIN canonical_work cw ON cw.work_item_id = e.work_item_id
+JOIN public.content_work_items w ON w.id = e.work_item_id
+ORDER BY e.created_at ASC, e.id ASC";
 
 async fn load_brief_attempts(
     state: &AppState,
     brief_id: &str,
 ) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
-    let calls = pg_query_as::< BriefCallRow>(
+    let calls = pg_query_as::< BriefCallRow>(&format!(
         "SELECT c.id, c.status, c.source, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
-            (SELECT MAX(e.created_at) FROM llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
-            c.error_text FROM llm_calls c WHERE c.parent_brief_id = ? ORDER BY datetime(c.created_at) ASC, c.id ASC",
-    )
+            (SELECT MAX(e.created_at) FROM public.llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
+            c.error_text FROM public.llm_calls c WHERE c.parent_brief_id = $1 ORDER BY {created_instant} ASC, c.id ASC",
+        created_instant = pg_instant("c.created_at"),
+    ))
     .bind(brief_id)
     .fetch_all(&state.pool)
     .await
@@ -3041,10 +3244,11 @@ async fn load_brief_attempts(
     let mut query = PgReadBuilder::new(
         "SELECT call_id, event_type, status, model, attempt,
             CASE WHEN event_type IN ('llm.succeeded', 'llm.failed')
-                THEN CAST(json_extract(payload_json, '$.attempt_count') AS INTEGER)
+                THEN CASE WHEN pg_input_is_valid(payload_json::jsonb ->> 'attempt_count', 'bigint')
+                    THEN (payload_json::jsonb ->> 'attempt_count')::bigint END
             END AS terminal_attempt_count,
             failure_class, created_at
-         FROM llm_call_events WHERE call_id IN (",
+         FROM public.llm_call_events WHERE call_id IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -3052,7 +3256,9 @@ async fn load_brief_attempts(
             separated.push_bind(call.id.as_str());
         }
     }
-    query.push(") ORDER BY datetime(created_at), id");
+    query.push(") ORDER BY ");
+    query.push(pg_instant("created_at"));
+    query.push(" ASC, id ASC");
     let events = query
         .build_query_as::<BriefAttemptEventRow>()
         .fetch_all(&state.pool)
@@ -3245,162 +3451,6 @@ pub async fn admin_get_collection_record_detail(
     };
     Ok(Json(AdminCollectionRecordDetail { record, attempts }))
 }
-
-fn pg_sql(input: &str) -> String {
-    fn transform(input: &str) -> String {
-        let bytes = input.as_bytes();
-        let mut out = String::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' {
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&input[start..i]);
-                continue;
-            }
-            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let word = &input[start..i];
-                let mut open = i;
-                while open < bytes.len() && bytes[open].is_ascii_whitespace() {
-                    open += 1;
-                }
-                if open < bytes.len()
-                    && bytes[open] == b'('
-                    && matches!(
-                        word.to_ascii_lowercase().as_str(),
-                        "julianday" | "datetime" | "json_extract" | "max" | "min"
-                    )
-                {
-                    let mut end = open + 1;
-                    let mut depth = 1;
-                    let mut quote = false;
-                    let mut args = Vec::new();
-                    let mut begin = end;
-                    while end < bytes.len() {
-                        match bytes[end] {
-                            b'\'' => {
-                                if quote && end + 1 < bytes.len() && bytes[end + 1] == b'\'' {
-                                    end += 2;
-                                    continue;
-                                }
-                                quote = !quote
-                            }
-                            b'(' if !quote => depth += 1,
-                            b')' if !quote => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    args.push(&input[begin..end]);
-                                    break;
-                                }
-                            }
-                            b',' if !quote && depth == 1 => {
-                                args.push(&input[begin..end]);
-                                begin = end + 1
-                            }
-                            _ => {}
-                        }
-                        end += 1;
-                    }
-                    if depth == 0 {
-                        let args = args.into_iter().map(transform).collect::<Vec<_>>();
-                        let name = word.to_ascii_lowercase();
-                        if matches!(name.as_str(), "julianday" | "datetime") {
-                            out.push_str(&format!(
-                                "EXTRACT(EPOCH FROM NULLIF(({})::text,'')::timestamptz)",
-                                args[0]
-                            ));
-                        } else if name == "json_extract" {
-                            let key = args[1].trim().trim_matches('\'').trim_start_matches("$.");
-                            out.push_str(&format!("(({})::jsonb ->> '{}')", args[0], key));
-                        } else {
-                            let name = if args.len() > 1 {
-                                if name == "max" { "GREATEST" } else { "LEAST" }
-                            } else {
-                                word
-                            };
-                            out.push_str(&format!("{}({})", name, args.join(",")));
-                        }
-                        i = end + 1;
-                        continue;
-                    }
-                }
-                out.push_str(word);
-                continue;
-            }
-            let ch = input[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-        out
-    }
-    let mut sql = transform(input).replace(" AS INTEGER)", " AS BIGINT)");
-    for table in [
-        "admin_collection_processing_coverage",
-        "content_identity_upgrade_control",
-        "content_work_identity_members",
-        "content_work_identities",
-        "content_current_result_projections",
-        "content_work_items",
-        "content_result_projections",
-        "content_legacy_observations",
-        "translation_work_items",
-        "translation_attempt_events",
-        "translation_attempt_llm_calls",
-        "content_attempt_events",
-        "content_attempt_llm_calls",
-        "llm_calls",
-        "llm_call_events",
-        "repo_release_work_items",
-        "repo_releases",
-        "social_activity_events",
-        "notifications",
-        "briefs",
-    ] {
-        for prefix in ["FROM ", "JOIN "] {
-            sql = sql.replace(
-                &format!("{prefix}{table} "),
-                &format!("{prefix}public.{table} "),
-            );
-        }
-    }
-    let mut output = String::new();
-    let mut index = 0;
-    let mut quoted = false;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\'' {
-            output.push(c);
-            if quoted && chars.peek() == Some(&'\'') {
-                output.push(chars.next().unwrap());
-                continue;
-            }
-            quoted = !quoted;
-        } else if c == '?' && !quoted {
-            index += 1;
-            output.push_str(&format!("${index}"));
-        } else {
-            output.push(c)
-        }
-    }
-    output
-}
-
 #[derive(Clone)]
 enum PgBind {
     Text(Option<String>),
@@ -3471,7 +3521,7 @@ impl<T: serde::de::DeserializeOwned + Send + Unpin> PgReadQuery<T> {
     where
         E: sqlx::Executor<'e, Database = Postgres>,
     {
-        let sql = pg_sql(&self.sql);
+        let sql = &self.sql;
         let wrapped = format!("SELECT to_jsonb(pg_collection_row) FROM ({sql}) pg_collection_row");
         let mut query = sqlx::query_scalar::<_, serde_json::Value>(&wrapped);
         for value in self.binds {
@@ -3545,7 +3595,7 @@ impl PgReadBuilder {
         self
     }
     fn push_bind(&mut self, value: impl IntoPgBind) -> &mut Self {
-        self.sql.push('?');
+        self.sql.push_str(&format!("${}", self.binds.len() + 1));
         self.binds.push(value.into_pg_bind());
         self
     }
@@ -3977,6 +4027,155 @@ mod tests {
                 .expect("activity rows");
             assert_eq!(activity.len(), 1);
             assert_eq!(activity[0].translation_status.as_deref(), Some("legacy_conflict"));
+        }
+        .await;
+        drop_isolated(admin, pool, database).await;
+        result
+    }
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn admin_list_and_activity_keep_statuses_and_instant_order() {
+        let (admin, pool, database) = isolated_pool("admin_native_sql").await;
+        let result = async {
+            seed_release(&pool, 301, "2026-11-25T02:00:00Z").await;
+            seed_legacy_work_row(
+                &pool,
+                LegacyWorkRow {
+                    id: "legacy-301-detail",
+                    entity_id: "301",
+                    kind: "release_detail",
+                    variant: "detail",
+                    status: "completed",
+                    result_status: Some("ready"),
+                    attempt_count: 2,
+                    updated_at: "2026-11-25T02:05:00Z",
+                },
+            )
+            .await;
+            seed_legacy_work_row(
+                &pool,
+                LegacyWorkRow {
+                    id: "legacy-301-smart",
+                    entity_id: "301",
+                    kind: "release_smart",
+                    variant: "smart",
+                    status: "failed",
+                    result_status: None,
+                    attempt_count: 1,
+                    updated_at: "2026-11-25T02:06:00Z",
+                },
+            )
+            .await;
+            // Same instant expressed with a `+09:00` offset: text order and
+            // chronological order disagree, so only a real timestamptz
+            // comparison orders these two releases correctly.
+            sqlx::query(
+                "INSERT INTO public.repo_releases(id, repo_id, release_id, tag_name, name, html_url, published_at, updated_at) VALUES ($1, 7, $2, $3, $3, 'https://example.test/release', $4, $5)",
+            )
+            .bind("release-offset")
+            .bind(302_i64)
+            .bind("v302")
+            .bind("2026-11-25T09:00:00+09:00")
+            .bind("2026-11-25T02:10:00Z")
+            .execute(&pool)
+            .await
+            .expect("seed offset release");
+
+            let mut connection = pool.acquire().await.expect("acquire connection");
+            let (total, rows) = list_collection_page_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                false,
+                Some("2026-11-24T00:00:00Z"),
+                Some("2026-11-26T00:00:00Z"),
+                AttemptCountRange { min: 0, max: None },
+                None,
+                None,
+                20,
+                0,
+            )
+            .await
+            .expect("list page");
+            assert_eq!(total, 2);
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                vec!["301", "302"],
+                "descending order follows the instant, not the stored text"
+            );
+
+            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+            let coverage = load_processing_coverage_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                &ids,
+            )
+            .await
+            .expect("load coverage");
+            let summaries = load_task_summaries_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                &ids,
+                &coverage,
+            )
+            .await
+            .expect("load summaries");
+            let summary = &summaries.get("301").expect("summary for release").clone();
+            assert_eq!(summary.translation.status, "ready");
+            assert_eq!(summary.translation.display_status, "succeeded");
+            assert_eq!(summary.translation.attempt_count, 2);
+            assert_eq!(summary.polish.status, "failed");
+            assert_eq!(summary.polish.display_status, "failed");
+            assert_eq!(
+                composite_activity_status(
+                    Some(&summary.translation.display_status),
+                    &summary.polish.display_status
+                ),
+                "exception"
+            );
+
+            let (failed_total, failed_rows) = list_collection_page_in_connection(
+                &mut connection,
+                CollectionRecordKind::Release,
+                false,
+                Some("2026-11-24T00:00:00Z"),
+                Some("2026-11-26T00:00:00Z"),
+                AttemptCountRange { min: 0, max: None },
+                None,
+                Some(&["failed".to_owned()]),
+                20,
+                0,
+            )
+            .await
+            .expect("polish filtered page");
+            assert_eq!(failed_total, 1);
+            assert_eq!(failed_rows[0].id, "301");
+
+            let activity_sql = activity_query_sql(CollectionRecordKind::Release, false, false);
+            let activity = pg_query_as::<AdminCollectionActivityRow>(&activity_sql)
+                .bind("2026-11-24T15:00:00Z")
+                .bind("2026-11-25T03:00:00Z")
+                .fetch_all(&mut *connection)
+                .await
+                .expect("activity rows");
+            assert_eq!(
+                activity.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                vec!["301", "302"],
+                "activity rows keep instant descending order"
+            );
+            assert_eq!(activity[0].translation_status.as_deref(), Some("succeeded"));
+            assert_eq!(activity[0].polish_status, "failed");
+            assert_eq!(
+                composite_activity_status(activity[0].translation_status.as_deref(), &activity[0].polish_status),
+                "exception"
+            );
+            // Release 302 has no work rows and no coverage row, so both lanes
+            // keep the recorded "no evidence" status rather than "not_started"
+            // (which only a `never_started` coverage row may produce).
+            assert_eq!(
+                activity[1].translation_status.as_deref(),
+                Some("historical_unknown")
+            );
+            assert_eq!(activity[1].polish_status, "historical_unknown");
         }
         .await;
         drop_isolated(admin, pool, database).await;
