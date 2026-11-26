@@ -68,6 +68,7 @@ mod postgres_server;
 mod postgres_star_epochs;
 mod postgres_tasks;
 mod postgres_translate;
+mod postgres_translation_backfill;
 mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
@@ -157,6 +158,32 @@ async fn main() -> Result<()> {
             tracing::info!(lane = %lane, enqueued, "PostgreSQL scheduler lane tick applied");
         }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
+        runtime.pool.close().await;
+        return Ok(());
+    }
+    // One-shot repair: republish finished translation outputs as projections
+    // without running any new attempt, then exit without serving traffic.
+    if std::env::var(postgres_translation_backfill::MODE_ENV).as_deref() == Ok("1") {
+        if config.database_backend()? != config::DatabaseBackend::Postgres {
+            anyhow::bail!(
+                "{} requires a postgres DATABASE_URL",
+                postgres_translation_backfill::MODE_ENV
+            );
+        }
+        let runtime = postgres_runtime::connect_from_config(&config).await?;
+        let report = postgres_translation_backfill::run_from_env(&runtime.pool).await?;
+        tracing::info!(
+            scanned = report.scanned,
+            published = report.published,
+            already_current = report.already_current,
+            skipped_source_hash_mismatch = report.skipped_source_hash_mismatch,
+            skipped_output_contract = report.skipped_output_contract,
+            skipped_missing_release = report.skipped_missing_release,
+            skipped_incomplete_source = report.skipped_incomplete_source,
+            failed = report.failed,
+            out_of_scope = ?report.skipped_out_of_scope,
+            "translation projection backfill is complete"
+        );
         runtime.pool.close().await;
         return Ok(());
     }
