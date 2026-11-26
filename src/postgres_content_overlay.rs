@@ -265,7 +265,7 @@ pub(crate) struct ReleaseDetailOrigin<'a> {
 /// that agreement checkable instead of re-derived at a call site.
 ///
 /// `source_observed_at` and `source_revision_tiebreak` are source-revision
-/// metadata, not identity: `content_processing::source_hash_for_item` drops them
+/// metadata, not identity: `content_source_identity::source_hash_for_item` drops them
 /// while provider admission persists them for currency checks.
 pub(crate) fn release_detail_translation_item(
     origin: &ReleaseDetailOrigin<'_>,
@@ -279,7 +279,7 @@ pub(crate) fn release_detail_translation_item(
         .unwrap_or(origin.tag_name)
         .to_owned();
     let body = origin.body.map(normalize_body).unwrap_or_default();
-    let tiebreak = crate::content_processing::release_source_revision_content_tiebreak(&[
+    let tiebreak = crate::content_source_identity::release_source_revision_content_tiebreak(&[
         origin.html_url,
         origin.tag_name,
         title.as_str(),

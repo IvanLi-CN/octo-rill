@@ -1449,7 +1449,7 @@ fn detail_identity(
 ) -> Result<DetailIdentity> {
     let item =
         crate::postgres_content_overlay::release_detail_translation_item(origin, producer_ref);
-    let source_hash = content_processing::source_hash_for_item(&item);
+    let source_hash = crate::content_source_identity::source_hash_for_item(&item);
     let identity = ContentWorkIdentity {
         canonical_resource_type: "release".to_owned(),
         canonical_resource_id: origin.release_id.to_string(),
@@ -1521,7 +1521,7 @@ pub(crate) async fn admit_release_detail_translation(
     let body: Option<String> = row.try_get("body")?;
     let updated_at: Option<String> = row.try_get("updated_at").ok().flatten();
     let detected_at: Option<String> = row.try_get("detected_at").ok().flatten();
-    let observed_at = content_processing::authoritative_release_revision(
+    let observed_at = crate::content_source_identity::authoritative_release_revision(
         updated_at.as_deref().unwrap_or_default(),
         detected_at.as_deref(),
     );
@@ -1684,7 +1684,7 @@ pub(crate) async fn admit_release_detail_translation(
 /// Fingerprint recorded on work whose identity was satisfied from a cache hit.
 /// It records that fact; it is not a provider route the item ever used.
 fn cache_hit_fingerprint() -> String {
-    ai::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\ncache_hit"))
+    crate::content_source_identity::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\ncache_hit"))
 }
 
 /// Record that a work item was admitted without ever needing an attempt.
@@ -2789,7 +2789,7 @@ mod tests {
             previous_tag_name: None,
         };
         assert_eq!(
-            content_processing::source_hash_for_item(&item),
+            crate::content_source_identity::source_hash_for_item(&item),
             reader.identity_hash("release_detail", "detail", reader.body)
         );
     }
