@@ -20,8 +20,8 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
-    content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::GLOBAL_PROTOCOL_VERSION,
+    content_source_identity::ContentWorkIdentity,
     translations::{self, TranslationRequestItemInput, TranslationSourceBlock},
 };
 
@@ -558,7 +558,7 @@ pub(crate) async fn read_exact_projection(
             source_hash: expected_source_hash.to_owned(),
             protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
         };
-        let identity_id = content_identity_upgrade::identity_id_for(&key)
+        let identity_id = crate::content_source_identity::identity_id_for(&key)
             .expect("content work identity keys are serializable");
         let payload = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM public.content_current_result_projections WHERE identity_id = $1",
@@ -623,7 +623,7 @@ async fn identity_projection(
         source_hash: expected_source_hash.to_owned(),
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&key)
+    let identity_id = crate::content_source_identity::identity_id_for(&key)
         .expect("content work identity keys are serializable");
     let exact = sqlx::query_scalar::<_, String>(
         "SELECT payload_json FROM public.content_current_result_projections WHERE identity_id = $1",

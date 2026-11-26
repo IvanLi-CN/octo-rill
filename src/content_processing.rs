@@ -893,7 +893,7 @@ async fn load_projection(
 ) -> Result<Option<Value>> {
     if content_identity_upgrade::is_complete_in_transaction(tx).await? {
         let key = identity_from_work(work);
-        let identity_id = content_identity_upgrade::identity_id_for(&key)?;
+        let identity_id = crate::content_source_identity::identity_id_for(&key)?;
         let exact = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
         )
@@ -939,8 +939,8 @@ async fn load_projection(
         .transpose()
 }
 
-fn identity_from_work(work: &WorkRow) -> content_identity_upgrade::ContentWorkIdentity {
-    content_identity_upgrade::ContentWorkIdentity {
+fn identity_from_work(work: &WorkRow) -> crate::content_source_identity::ContentWorkIdentity {
+    crate::content_source_identity::ContentWorkIdentity {
         canonical_resource_type: work.canonical_resource_type.clone(),
         canonical_resource_id: work.canonical_resource_id.clone(),
         pipeline: work.pipeline.clone(),
@@ -1000,9 +1000,10 @@ async fn load_work_by_id_from_pool(
 
 async fn work_for_identity(
     pool: &SqlitePool,
-    key: &content_identity_upgrade::ContentWorkIdentity,
+    key: &crate::content_source_identity::ContentWorkIdentity,
 ) -> Result<Option<WorkRow>, ApiError> {
-    let identity_id = content_identity_upgrade::identity_id_for(key).map_err(ApiError::internal)?;
+    let identity_id =
+        crate::content_source_identity::identity_id_for(key).map_err(ApiError::internal)?;
     let projected_work_item_id = sqlx::query_scalar::<_, String>(
         "SELECT work_item_id FROM content_current_result_projections WHERE identity_id = ?",
     )
@@ -1032,9 +1033,9 @@ async fn work_for_identity(
 
 async fn work_for_identity_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
-    key: &content_identity_upgrade::ContentWorkIdentity,
+    key: &crate::content_source_identity::ContentWorkIdentity,
 ) -> Result<Option<WorkRow>> {
-    let identity_id = content_identity_upgrade::identity_id_for(key)?;
+    let identity_id = crate::content_source_identity::identity_id_for(key)?;
     let projected_work_item_id = sqlx::query_scalar::<_, String>(
         "SELECT work_item_id FROM content_current_result_projections WHERE identity_id = ?",
     )
@@ -1223,7 +1224,7 @@ async fn submit_item_with_admission(
             .await
             .map_err(ApiError::internal)?;
     let model_profile = current_model_profile(state).await;
-    let identity = content_identity_upgrade::ContentWorkIdentity {
+    let identity = crate::content_source_identity::ContentWorkIdentity {
         canonical_resource_type: resource_type.to_owned(),
         canonical_resource_id: item.entity_id.clone(),
         pipeline: pipeline.to_owned(),
@@ -1768,7 +1769,7 @@ pub async fn read_global_resource(
         .await
         .map_err(ApiError::internal)?
     {
-        let key = content_identity_upgrade::ContentWorkIdentity {
+        let key = crate::content_source_identity::ContentWorkIdentity {
             canonical_resource_type: resource_type.to_owned(),
             canonical_resource_id: resource_id.to_owned(),
             pipeline: pipeline.to_owned(),
@@ -1778,7 +1779,7 @@ pub async fn read_global_resource(
             protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
         };
         let identity_id =
-            content_identity_upgrade::identity_id_for(&key).map_err(ApiError::internal)?;
+            crate::content_source_identity::identity_id_for(&key).map_err(ApiError::internal)?;
         let exact_payload = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
         )
@@ -1954,7 +1955,7 @@ pub async fn read_global_resource_exact(
         .await
         .map_err(ApiError::internal)?
     {
-        let key = content_identity_upgrade::ContentWorkIdentity {
+        let key = crate::content_source_identity::ContentWorkIdentity {
             canonical_resource_type: resource_type.to_owned(),
             canonical_resource_id: resource_id.to_owned(),
             pipeline: pipeline.to_owned(),
@@ -1964,7 +1965,7 @@ pub async fn read_global_resource_exact(
             protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
         };
         let identity_id =
-            content_identity_upgrade::identity_id_for(&key).map_err(ApiError::internal)?;
+            crate::content_source_identity::identity_id_for(&key).map_err(ApiError::internal)?;
         let payload = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
         )

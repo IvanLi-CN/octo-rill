@@ -32,8 +32,8 @@ use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
 use crate::{
-    content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::{self, GLOBAL_PROTOCOL_VERSION},
+    content_source_identity::ContentWorkIdentity,
     postgres_content::{self, TranslationPublication},
     postgres_content_overlay::{self, ReleaseDetailOrigin},
     postgres_write,
@@ -425,7 +425,7 @@ async fn publish_candidate(pool: &PgPool, candidate: &Candidate) -> Result<RowOu
         source_hash: canonical_source_hash.clone(),
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&identity)
+    let identity_id = crate::content_source_identity::identity_id_for(&identity)
         .context("derive the projection identity id")?;
     if current_projection_exists(pool, &identity_id).await? {
         return Ok(RowOutcome::AlreadyCurrent { identity_id });

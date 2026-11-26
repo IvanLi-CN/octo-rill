@@ -361,3 +361,31 @@ pub(crate) fn announcement_smart_feed_source_hash(
         target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
     })
 }
+
+/// Canonical work identity shared by writers and readers.
+#[derive(Debug, Clone)]
+pub(crate) struct ContentWorkIdentity {
+    pub canonical_resource_type: String,
+    pub canonical_resource_id: String,
+    pub pipeline: String,
+    pub variant: String,
+    pub target_lang: String,
+    pub source_hash: String,
+    pub protocol_version: String,
+}
+
+pub(crate) fn identity_id_for(key: &ContentWorkIdentity) -> Result<String> {
+    let encoded = serde_json::to_string(&(
+        key.canonical_resource_type.as_str(),
+        key.canonical_resource_id.as_str(),
+        key.pipeline.as_str(),
+        key.variant.as_str(),
+        key.target_lang.as_str(),
+        key.source_hash.as_str(),
+        key.protocol_version.as_str(),
+    ))?;
+    Ok(format!(
+        "content-work-{}",
+        crate::content_source_identity::sha256_hex(&format!("content-work-identity.v1\n{encoded}"))
+    ))
+}

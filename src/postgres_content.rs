@@ -52,10 +52,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::AiConfig,
-    content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::{
         self, GLOBAL_MAX_TOKENS, GLOBAL_PROTOCOL_VERSION, RETRY_DELAYS_SECS, SourceSnapshot,
     },
+    content_source_identity::ContentWorkIdentity,
     local_id,
     postgres_translate::{self, ContentProviderAdmission},
     translations::{self, TranslationRequestItemInput, TranslationSourceBlock},
@@ -274,7 +274,7 @@ async fn ensure_identity_registered(
     identity: &ContentWorkIdentity,
     now: DateTime<Utc>,
 ) -> Result<String> {
-    let identity_id = content_identity_upgrade::identity_id_for(identity)?;
+    let identity_id = crate::content_source_identity::identity_id_for(identity)?;
     sqlx::query(
         "INSERT INTO public.content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) ON CONFLICT DO NOTHING",
     )
@@ -616,7 +616,7 @@ async fn publish_ready(
         source_hash: work.source_hash.clone(),
         protocol_version: work.protocol_version.clone(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
+    let identity_id = crate::content_source_identity::identity_id_for(&identity)?;
     ensure_identity_registered(&mut tx, &identity, now).await?;
     link_identity_member(&mut tx, &work.id, &identity_id, &identity, now).await?;
     let payload_json = output.to_string();
@@ -1203,7 +1203,7 @@ async fn admit_polish_variant(
         source_hash: source_hash.clone(),
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
+    let identity_id = crate::content_source_identity::identity_id_for(&identity)?;
     let has_projection: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM public.content_current_result_projections WHERE identity_id = $1)",
     )
@@ -1459,7 +1459,7 @@ fn detail_identity(
         source_hash,
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&identity)?;
+    let identity_id = crate::content_source_identity::identity_id_for(&identity)?;
     let snapshot_json = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
