@@ -75,9 +75,17 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(15);
 /// when a retry lands on a different routed model.
 const PUBLICATION_MODEL_PROFILE: &str = "translation-publish";
 const TARGET_LANG: &str = "zh-CN";
-/// Upper bound on polishing work one release sync may admit, mirroring the
-/// translation enqueue cap so a cold repository cannot create an unbounded
-/// provider burst.
+/// Upper bound on how many Releases one release sync may admit polishing work
+/// for, mirroring the translation enqueue cap so a cold repository cannot
+/// create an unbounded provider burst.
+///
+/// This bounds *Releases*, not work items. A Release that states a change is
+/// admitted with its whole variant set (`smart` plus both reading audiences),
+/// so counting inserted rows would let ~8 Releases exhaust the budget and starve
+/// every later Release in the batch of its reading variants. Such a truncated
+/// Release cannot catch up on a later sync either: its existing `smart` row does
+/// not block the missing variants, but every later sync applies the same cap
+/// again. See `admit_release_polish` for the residual gap this leaves.
 const POLISH_ADMISSION_CAP: usize = 25;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1355,6 +1363,26 @@ async fn admit_polish_variant(
 /// text does not state a change is not admitted as a reading variant: its
 /// reading would need compare evidence this producer does not collect, and a
 /// public projection must never fall back to the legacy `smart` row.
+///
+/// # Return value and cap
+///
+/// Returns the number of work items inserted, which is what the caller logs; an
+/// already-satisfied variant contributes zero. The cap is not applied to that
+/// number: at most [`POLISH_ADMISSION_CAP`] Releases are *considered* per call
+/// and each considered Release gets its whole variant set, so the return value
+/// can reach `3 * POLISH_ADMISSION_CAP`.
+///
+/// # Residual gap
+///
+/// `release_ids` is a single sync's newly inserted Releases, already ordered
+/// newest-first per repository and concatenated by ascending `repo_id`. A call
+/// considers only the first [`POLISH_ADMISSION_CAP`] entries, so on a large sync
+/// the remaining Releases are dropped for this call and nothing retries them:
+/// there is no queue and no background backfill. Dropped Releases therefore keep
+/// only whatever an earlier sync gave them — typically `smart` without the
+/// reading variants — and the next sync re-applies the same cap in the same
+/// order, so they stay truncated indefinitely. Closing that needs a resumable
+/// producer, which this function deliberately is not.
 pub(crate) async fn admit_release_polish(
     pool: &PgPool,
     release_ids: &[i64],
@@ -1368,9 +1396,15 @@ pub(crate) async fn admit_release_polish(
         return Ok(0);
     }
     let fingerprint = configuration_fingerprint(&route_models);
+    // `admitted` counts inserted work items and is what the caller logs; the cap
+    // below bounds `considered` Releases so one Release's variant set is never
+    // split. A Release whose variants all conflict still consumes its slot: the
+    // cap protects the provider burst, not the insert count, and every Release
+    // past the cap would otherwise be re-examined on every sync.
     let mut admitted = 0usize;
+    let mut considered = 0usize;
     for release_id in release_ids {
-        if admitted >= POLISH_ADMISSION_CAP {
+        if considered >= POLISH_ADMISSION_CAP {
             break;
         }
         let Ok(Some(row)) = sqlx::query(
@@ -1429,10 +1463,8 @@ pub(crate) async fn admit_release_polish(
             variants.push(translations::RELEASE_READING_PUBLIC_VARIANT);
             variants.push(translations::RELEASE_READING_AUTHORIZED_VARIANT);
         }
+        considered += 1;
         for variant in variants {
-            if admitted >= POLISH_ADMISSION_CAP {
-                break;
-            }
             let item = release_polish_item(*release_id, variant, &base_blocks);
             admitted += admit_polish_variant(
                 pool,
@@ -3082,6 +3114,164 @@ mod tests {
             assert_eq!(
                 queued.status, "queued",
                 "a callable route admits work for execution"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// Insert a Release whose published text states a change, so admission
+    /// offers it the full `smart` + both reading variants.
+    async fn insert_changed_release(
+        pool: &sqlx::PgPool,
+        release_id: i64,
+        tag: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO public.repo_releases (release_id, repo_id, html_url, tag_name, name, body, updated_at) VALUES ($1, 7, $2, $3, $4, $5, '2026-11-24T00:00:00Z')",
+        )
+        .bind(release_id)
+        .bind(format!("https://github.com/acme/demo/releases/tag/{tag}"))
+        .bind(tag)
+        .bind(tag)
+        .bind("- 每轮最多处理 10 批，此前为 5 批")
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn polished_variants(
+        pool: &sqlx::PgPool,
+        release_id: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut variants: Vec<String> = sqlx::query_scalar(
+            "SELECT variant FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing' ORDER BY variant",
+        )
+        .bind(release_id.to_string())
+        .fetch_all(pool)
+        .await?;
+        variants.sort();
+        Ok(variants)
+    }
+
+    /// The cap bounds Releases, not inserted variant rows. With more Releases
+    /// than the cap, every considered Release must carry its complete variant
+    /// set and the drop must happen at a Release boundary.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn polish_cap_counts_releases_and_keeps_each_variant_set_whole() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let total = POLISH_ADMISSION_CAP + 5;
+            let ids: Vec<i64> = (0..total).map(|index| 9_000 + index as i64).collect();
+            for (index, id) in ids.iter().enumerate() {
+                insert_changed_release(&pool, *id, &format!("v{index}")).await?;
+            }
+
+            let admitted = admit_release_polish(&pool, &ids, "m1").await?;
+            assert_eq!(
+                admitted,
+                POLISH_ADMISSION_CAP * 3,
+                "the cap bounds Releases, so the full considered batch inserts three variants each"
+            );
+
+            // Considered Releases each have all three variants; the rest have
+            // nothing. A variant-counting cap would leave the last considered
+            // Release with a partial set instead.
+            for id in ids.iter().take(POLISH_ADMISSION_CAP) {
+                let variants = polished_variants(&pool, *id).await?;
+                assert_eq!(
+                    variants,
+                    vec!["smart", "smart_authorized", "smart_public"],
+                    "considered Release {id} must keep its whole variant set"
+                );
+            }
+            for id in &ids[POLISH_ADMISSION_CAP..] {
+                assert!(
+                    polished_variants(&pool, *id).await?.is_empty(),
+                    "Release {id} past the cap is dropped whole, not partially admitted"
+                );
+            }
+
+            // The dropped count is Releases, not rows: the gap is
+            // `total - POLISH_ADMISSION_CAP` Releases, not 2 * that many variants.
+            let admitted_releases: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT canonical_resource_id) FROM public.content_work_items WHERE pipeline = 'polishing'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(admitted_releases, POLISH_ADMISSION_CAP as i64);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// An existing `smart` row must not block the audience variants: admission
+    /// is per variant, and a truncated Release has to be able to catch up.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn polish_admits_audience_variants_when_smart_already_exists() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            insert_changed_release(&pool, 9_100, "v1").await?;
+
+            // Admit only `smart`, the shape a cap-truncated Release is left in.
+            let base = {
+                let row = sqlx::query(
+                    "SELECT repo_id, html_url, tag_name, name, body, updated_at, detected_at FROM public.repo_releases WHERE release_id = 9_100",
+                )
+                .fetch_one(&pool)
+                .await?;
+                let repo_id: i64 = row.try_get("repo_id")?;
+                let html_url: String = row.try_get("html_url")?;
+                let tag_name: String = row.try_get("tag_name")?;
+                let name: Option<String> = row.try_get("name")?;
+                let body: Option<String> = row.try_get("body")?;
+                let observed_at: Option<String> = row.try_get("updated_at")?;
+                let repo_identity =
+                    crate::postgres_content_overlay::release_repo_identity(&html_url, repo_id);
+                release_polish_source_blocks(
+                    &repo_identity,
+                    &tag_name,
+                    name.as_deref().unwrap_or(&tag_name),
+                    body.as_deref().unwrap_or_default(),
+                    observed_at.as_deref(),
+                    "tiebreak",
+                )
+            };
+            let item = release_polish_item(9_100, "smart", &base);
+            let fingerprint = configuration_fingerprint(&["m1".to_owned()]);
+            let inserted = admit_polish_variant(
+                &pool,
+                9_100,
+                "smart",
+                &item,
+                ReleaseRevision {
+                    observed_at: None,
+                    tiebreak: "tiebreak",
+                },
+                &fingerprint,
+                16,
+            )
+            .await?;
+            assert_eq!(inserted, 1, "the truncated Release starts with smart only");
+            assert_eq!(polished_variants(&pool, 9_100).await?, vec!["smart"]);
+
+            // The next sync must fill in the missing audiences. `smart` itself
+            // contributes zero, so the return value counts only the new rows.
+            let admitted = admit_release_polish(&pool, &[9_100], "m1").await?;
+            assert_eq!(
+                admitted, 2,
+                "an existing smart row must not block the audience variants"
+            );
+            assert_eq!(
+                polished_variants(&pool, 9_100).await?,
+                vec!["smart", "smart_authorized", "smart_public"],
+                "the truncated Release catches up to its full variant set"
             );
             Ok::<_, anyhow::Error>(())
         }
