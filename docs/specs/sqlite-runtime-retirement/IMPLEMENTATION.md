@@ -98,6 +98,27 @@
 - **R4 已完成部分**：`server.rs` 的 SPA 回退拆成 `static_site` 后，4 个模块彻底不可达并删除（−12,170 行）：`server`、`admin_ai_records`、`auth`、`public_metrics`。剩余 25 个 `allow(dead_code)` 模块需要按上面的实测结论手工分片。
 - **R5 schema 收敛**：`migrations_pg/0023_public_schema_convergence.sql` 已落地并通过迁移器验证。它按序迁移 `_sqlx_migrations`、`tower_sessions`、`migration_manifests`，重建两个绑定 `octo_rill` 的 `search_vector` 生成列，将 `pg_trgm` 与文本搜索配置迁到 `public`，再 `DROP SCHEMA octo_rill`。`session_store` 与 `postgres_runtime` 已改读 `public.tower_sessions`。
 
+## 已完成（PR #420，合并于 `6a9f8735`）
+
+PR 序列 1、2、3 与 5 的 schema 部分已合并：CI PostgreSQL job、43 个共用符号抽取、原生 SQL、`public` schema 收敛。验证基线：22 个 PG 门禁用例、1275 个单元测试、18 个 seed 套件、77 条路由探针全部通过，CI 10/10 绿。
+
+导入套件的 schema 源已改为 `ops/fixtures/legacy-sqlite-schema.sql`（339 个对象与迁移构建结果逐一相同），因此删除 `migrations/` 不再会破坏 CI。
+
+## 待办：剩余工作清单
+
+实测依据见上文「R4 实测面」。以下六项全部未完成，按依赖顺序排列：
+
+| # | 任务 | 退出条件 | 阻塞原因 |
+| --- | --- | --- | --- |
+| 1 | 从 25 个退役模块搬出 44 个活符号 | 每个符号有活模块归属，同域测试随迁 | 模块间强连通，无法先删文件 |
+| 2 | 删除 25 个退役模块 | `grep -R 'allow(dead_code)' src/main.rs` 为空 | 依赖第 1 项 |
+| 3 | `allow(dead_code)` 归零 | `grep -R 'allow(dead_code)' src/` 空，`rust-source-quality.toml` 对应条目删除 | 依赖第 2 项 |
+| 4 | 打 `legacy-sqlite-final` 标签 | 标签指向删除提交的 base，且含完整 `migrations/` 与 SQLite 模块 | 需在第 2 项提交前创建 |
+| 5 | 删除 `migrations/` | Dockerfile 与 `include_str!`/`sqlx::migrate!` 引用全部消失 | 依赖第 2 项（退役模块的测试用 `include_str!` 绑定该目录） |
+| 6 | 删除 `/api/admin/jobs/migrations` 三条路由 | 路由、`admin_migrations`、pause/resume handler 与 `EXPECTED_NOT_RUN` 条目一并删除 | 无阻塞：PG 侧只有读与 pause/resume 写，没有任何 worker 创建或推进 migration；`web/` 零引用 |
+
+第 1 项的建议顺序按符号数从少到多：`release_links`(1) → `error`(1) → `session_store`(1) → `translations`(1) → `content_processing`(1) → `api_keys`(6) → `jobs`(2) → `admin_runtime`(3) → `github`(3) → `state`(4) → `metrics`(8) → `briefs`(11)。每步后跑 `bash scripts/pg_seed_suite.sh`，基线为 18/18。
+
 ## 固定门禁
 
 ```bash
