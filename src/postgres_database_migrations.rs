@@ -6,9 +6,30 @@ use sqlx::{PgPool, migrate::Migrator};
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg/");
 
 pub async fn run(pool: &PgPool) -> Result<()> {
+    // Baseline 0001 created the history table in `octo_rill` by setting
+    // `search_path` at the top of its own script. Later sessions run with the
+    // server default (`"$user", public`), where that table is invisible: SQLx
+    // would conclude no migration was ever applied and replay the baseline,
+    // colliding on the primary key. Name the legacy schema first so an existing
+    // history is found and reused; migration 23 then moves it to `public`.
     let mut tx = crate::postgres_write::begin(pool)
         .await
         .context("begin PostgreSQL migrations")?;
+    // `SET LOCAL` inside the transaction keeps the choice on the same
+    // connection the migrator will use.
+    sqlx::query(
+        "DO $$ BEGIN
+           IF to_regclass('public._sqlx_migrations') IS NULL
+              AND to_regclass('octo_rill._sqlx_migrations') IS NOT NULL THEN
+             EXECUTE 'SET LOCAL search_path TO octo_rill, public';
+           ELSE
+             EXECUTE 'SET LOCAL search_path TO public';
+           END IF;
+         END $$",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("point the migration session at the runtime history")?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('octo-rill:runtime-baseline', 0))")
         .execute(&mut *tx)
         .await
