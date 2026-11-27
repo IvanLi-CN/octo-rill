@@ -42,7 +42,7 @@
 | 2 | 抽共用件与测试 | 43 个符号全部有活模块归属；同域测试在新位置通过；`api.rs`/`sync.rs` 只剩未搬代码 | revert PR |
 | 3 | 原生 SQL | `pg_sql()` 删除；方言 `grep` 零命中；空库与导入库计划一致 | revert PR |
 | 4 | 删模块 + 标签 | 29 个 `allow(dead_code)` 模块处置完毕；`allow(dead_code)` 归零；`legacy-sqlite-final` 已推送到 base 提交 | revert PR（标签保留） |
-| 5 | 迁移与 schema | 迁移历史与会话已落 `public`；逐表处置完成；`DROP SCHEMA octo_rill`；`migrations/` 与无写入者的迁移管理接口删除 | forward-only，不回退 |
+| 5 | 迁移与 schema | 迁移历史、会话、导入 manifest 已落 `public`；陈旧副本、退役 ts 配置与 `pg_trgm` 已迁走；`DROP SCHEMA octo_rill` 已生效（`0023_public_schema_convergence.sql`）；`migrations/` 与无写入者的迁移管理接口待删 | forward-only，不回退 |
 
 ## CI PostgreSQL job
 
@@ -81,6 +81,11 @@
 - 零生产引用（可直接删文件）：`admin_ai_records`、`auth`、`content_identity_upgrade`、`linuxdo`、`online_migrations`、`passkeys`、`sync`、`webhook_push`、`worker_backoff`。
 - 因此“先删文件再编译”不成立；顺序必须是「抽 64 个符号 → 删空文件 → 归零 allow」。
 - 删除只被测试引用的模块会连带删除其测试；这符合 REQ-RTR-005 的现行措辞（退役行为的测试随实现删除），但必须在报告里逐项列出。
+
+## 已落地
+
+- **R4 现状**：29 个 `#[allow(dead_code)]` 模块中 9 个零生产引用，但活模块内部另有 1,988 个死代码项互相引用，把全部模块固定在编译图里；实测逐个禁用后只 `metrics` 可删。真正收敛需要先清理活模块内的死项，范围远超本轮。
+- **R5 schema 收敛**：`migrations_pg/0023_public_schema_convergence.sql` 已落地并通过迁移器验证。它按序迁移 `_sqlx_migrations`、`tower_sessions`、`migration_manifests`，重建两个绑定 `octo_rill` 的 `search_vector` 生成列，将 `pg_trgm` 与文本搜索配置迁到 `public`，再 `DROP SCHEMA octo_rill`。`session_store` 与 `postgres_runtime` 已改读 `public.tower_sessions`。
 
 ## 固定门禁
 

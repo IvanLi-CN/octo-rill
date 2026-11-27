@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 22);
+        assert_eq!(MIGRATOR.iter().count(), 23);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -117,6 +117,23 @@ mod tests {
         );
         assert!(content_evidence.sql.contains("SET DEFAULT 'not_required'"));
         assert!(content_evidence.sql.contains("SET NOT NULL"));
+        let schema_convergence = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 23)
+            .expect("public schema convergence migration");
+        assert!(
+            schema_convergence
+                .sql
+                .contains("octo_rill._sqlx_migrations")
+        );
+        assert!(schema_convergence.sql.contains("SET SCHEMA public"));
+        assert!(schema_convergence.sql.contains("octo_rill.tower_sessions"));
+        assert!(schema_convergence.sql.contains("public.octo_rill_simple"));
+        assert!(
+            schema_convergence
+                .sql
+                .contains("DROP SCHEMA IF EXISTS octo_rill")
+        );
         assert!(
             content_evidence
                 .sql

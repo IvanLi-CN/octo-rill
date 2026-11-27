@@ -488,9 +488,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         );
     }
     import_application_views(sqlite, pg).await?;
-    // Keep the runtime store's schema aligned with imported login sessions.
-    pg.batch_execute("INSERT INTO octo_rill.tower_sessions(id,data,expiry_date) SELECT id,data,expiry_date FROM public.tower_sessions ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,expiry_date=EXCLUDED.expiry_date;")
-        .await.context("migrate persisted login sessions to runtime store")?;
+    // Login sessions already land in `public.tower_sessions`, which is the
+    // single runtime session table after schema convergence; no second copy is
+    // needed and the retired `octo_rill` schema no longer exists.
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(sqlite)
         .await?;
@@ -510,7 +510,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         .with_context(|| format!("write manifest {}", args.manifest.display()))?;
     let manifest_json = serde_json::to_value(&manifest).context("serialize migration manifest")?;
     pg.execute(
-        "INSERT INTO octo_rill.migration_manifests (source_snapshot, manifest) VALUES ($1, $2)",
+        "INSERT INTO public.migration_manifests (source_snapshot, manifest) VALUES ($1, $2)",
         &[&args.sqlite_source, &manifest_json],
     )
     .await
@@ -526,7 +526,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 /// The SQLite SQLx history describes migrations that have no PostgreSQL
 /// equivalent; copying it makes the PostgreSQL migrator treat foreign versions
 /// as applied and abort. The source version is preserved in the migration
-/// manifest and `octo_rill.migration_manifests` instead.
+/// manifest and `public.migration_manifests` instead.
 fn skipped_source_table_reason(name: &str, fts_names: &HashSet<String>) -> Option<&'static str> {
     if fts_names.contains(name) {
         return Some("SQLite FTS5 is a rebuildable projection");
