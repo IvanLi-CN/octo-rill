@@ -73,18 +73,29 @@
 | `llm_recovery_flags` | 1 | 与 `public` 行比对；代码只读 `public`，确认后删除 |
 | 其余 15 张 | 0 | `briefs`、`brief_release_memberships`、`content_batch_items`、`content_batches`、`content_result_projections`、`content_work_items`、`llm_diagnostic_access_audit`、`llm_model_health`、`schema_migrations`、`translation_attempt_events`、`translation_attempt_llm_calls`、`translation_batch_items`、`translation_batches`、`translation_requests`、`translation_work_items`，全部删除 |
 
-## R4 实测面（2026-11-27，base c8b4be01）
+## R4 实测面（2026-11-27 两轮实测）
 
-按从 `main` 的传递可达性计算，排除 `#[cfg(test)]` 与注释：
+第一轮（base `c8b4be01`，纯文本引用统计，排除 `#[cfg(test)]` 与注释）：
+- 29 个 `#[allow(dead_code)]` 模块中 20 个仍被生产代码引用（44 个符号），9 个零生产引用。
+- 结论文档当时写成「抽符号 → 删空文件」，但该结论忽略了退役模块之间的互相引用。
 
-- 29 个 `#[allow(dead_code)]` 模块中，**20 个仍被生产代码引用**，共 64 个符号；只有 9 个零生产引用。
-- 零生产引用（可直接删文件）：`admin_ai_records`、`auth`、`content_identity_upgrade`、`linuxdo`、`online_migrations`、`passkeys`、`sync`、`webhook_push`、`worker_backoff`。
-- 因此“先删文件再编译”不成立；顺序必须是「抽 64 个符号 → 删空文件 → 归零 allow」。
-- 删除只被测试引用的模块会连带删除其测试；这符合 REQ-RTR-005 的现行措辞（退役行为的测试随实现删除），但必须在报告里逐项列出。
+第二轮（base `34ff145e`，以 `cargo check --all-targets` 为唯一判据）：
+- 移除 `server.rs` 后新增 4 个模块彻底不可达并已删除：`server`、`admin_ai_records`、`auth`、`public_metrics`；同时删除只被 `server` 用到的 `public_metrics_cors_origins_from_env` 与其测试。
+- 逐模块「试删 + 编译」循环（`/tmp/modrm.py`）在同一轮内再删 `database_migrations`、`runtime` 等，但只要被测或未删模块仍引用，编译器即点名要求恢复。
+- 批量法（一次删全部 25 个）确认：**退役模块构成强连通死代码团**。删任意一个都会断链，因此「删文件」必须同时抽走被活代码引用的 44 个符号。
+- 独立计算（跨模块闭包，含 `impl` 块并集）：222 个符号跨 21 个模块；其中 8 个模块零活引用（`jobs`、`linuxdo`、`online_migrations`、`passkeys`、`runtime`、`sync`、`webhook_push`、`worker_backoff`），但这 8 个仍被其他退役模块引用，不能单独删。
+- 活模块内另有 1,820–2,012 个死项（随删除进度浮动）。它们互相引用，任何单项删除都会断链；已实测四种自动策略（逐项贪心、按文件、全量一次性、闭包裁剪）均在同一处失败。
+
+因此 R4 的剩余工作是一个**必须手工分片的重构**：按领域把 44 个活符号搬进活模块并补测试，再整团删除退役模块；不能用脚本一次完成。本轮已完成其中可直接验证的部分（−12,170 行，0 错误 0 警告）。
+
+自动删除不可用的具体原因（供后续实现参考）：
+- `rustc` 的 `dead_code` 对一部分项报告的是**使用点**而非声明点（`ItemRange` 从该行回溯会吞掉前一个函数体），必须先过滤「首行必须匹配声明关键字」。
+- 即使过滤后，删除一个死函数仍会打断其被其他死函数引用的事实；必须按引用拓扑自内向外的顺序删，或一次性删掉整个闭包。
+- 一次性删闭包时，`impl` 块同时以类型名为键，闭包需显式并集；否则会切出半个 `impl`。
 
 ## 已落地
 
-- **R4 现状**：29 个 `#[allow(dead_code)]` 模块中 9 个零生产引用，但活模块内部另有 1,988 个死代码项互相引用，把全部模块固定在编译图里；实测逐个禁用后只 `metrics` 可删。真正收敛需要先清理活模块内的死项，范围远超本轮。
+- **R4 已完成部分**：`server.rs` 的 SPA 回退拆成 `static_site` 后，4 个模块彻底不可达并删除（−12,170 行）：`server`、`admin_ai_records`、`auth`、`public_metrics`。剩余 25 个 `allow(dead_code)` 模块需要按上面的实测结论手工分片。
 - **R5 schema 收敛**：`migrations_pg/0023_public_schema_convergence.sql` 已落地并通过迁移器验证。它按序迁移 `_sqlx_migrations`、`tower_sessions`、`migration_manifests`，重建两个绑定 `octo_rill` 的 `search_vector` 生成列，将 `pg_trgm` 与文本搜索配置迁到 `public`，再 `DROP SCHEMA octo_rill`。`session_store` 与 `postgres_runtime` 已改读 `public.tower_sessions`。
 
 ## 固定门禁
