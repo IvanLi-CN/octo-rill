@@ -2781,7 +2781,7 @@ async fn list_briefs(
         );
     };
     let rows = sqlx::query_as::<_, PgBriefRow>(
-        "SELECT id, date, window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary, content_markdown, created_at, updated_at FROM public.briefs WHERE user_id = $1 ORDER BY COALESCE(window_end_utc::text, created_at::text) DESC, created_at DESC, id DESC",
+        "SELECT id, date, window_start_utc::text, window_end_utc::text, effective_time_zone, effective_local_boundary, content_markdown, created_at::text, updated_at::text FROM public.briefs WHERE user_id = $1 ORDER BY COALESCE(window_end_utc::text, created_at::text) DESC, created_at DESC, id DESC",
     )
     .bind(&user_id)
     .fetch_all(&state.runtime.pool)
@@ -2831,7 +2831,7 @@ async fn get_brief(
             .into_response();
     };
     match sqlx::query_as::<_, PgBriefRow>(
-        "SELECT id, date, window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary, content_markdown, created_at, updated_at FROM public.briefs WHERE user_id = $1 AND id = $2",
+        "SELECT id, date, window_start_utc::text, window_end_utc::text, effective_time_zone, effective_local_boundary, content_markdown, created_at::text, updated_at::text FROM public.briefs WHERE user_id = $1 AND id = $2",
     )
     .bind(&user_id)
     .bind(&brief_id)
@@ -4231,7 +4231,7 @@ pub(crate) async fn admin_translation_status(
     }
     let result=async {
         let counts=sqlx::query("SELECT (SELECT COUNT(*) FROM public.translation_requests WHERE status='queued') AS queued_requests,(SELECT COUNT(*) FROM public.translation_work_items WHERE status='queued') AS queued_work_items,(SELECT COUNT(*) FROM public.translation_batches WHERE status='running') AS running_batches,(SELECT COUNT(*) FROM public.translation_requests WHERE created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()) AS requests_24h,(SELECT MAX(finished_at)::text FROM public.translation_batches) AS last_batch_finished_at").fetch_one(&state.runtime.pool).await?;
-        let batches=sqlx::query("SELECT id,status,item_count,error_text FROM public.translation_batches WHERE created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()").fetch_all(&state.runtime.pool).await?;
+        let batches=sqlx::query("SELECT id,status,item_count::bigint AS item_count,error_text FROM public.translation_batches WHERE created_at::timestamptz BETWEEN now()-interval '24 hours' AND now()").fetch_all(&state.runtime.pool).await?;
         let mut completed=0_i64;let mut clean=0_i64;let mut issues=0_i64;let mut failed=0_i64;
         let mut errors=0_i64;let mut missing=0_i64;
         for batch in batches {

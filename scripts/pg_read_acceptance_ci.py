@@ -46,23 +46,12 @@ EXPECTED_NOT_RUN = {
     '/api/auth/bind-context': 'needs a live OAuth callback context',
 }
 
-# Routes that currently return a server error because of a defect in `src/`,
-# not because CI cannot exercise them. Each entry names the exact mismatch so a
-# reader can verify it; both reproduce on `origin/main` and neither is covered by
-# any other suite. They are quarantined instead of skipped: a quarantined route
-# that starts passing fails the run so the entry gets removed.
-EXPECTED_FAILURES = {
-    '/api/briefs':
-        'PgBriefRow decodes briefs.created_at (timestamptz) as String; the two '
-        'sibling SELECTs in src/postgres_server.rs are missing ::text',
-    '/api/briefs/{brief_id}':
-        'same PgBriefRow decode mismatch as /api/briefs',
-    '/admin/jobs/translations/status':
-        'translation_batches.item_count is INT4 but status() reads it as i64 '
-        'without the ::bigint cast its sibling queries use',
-    '/api/admin/jobs/translations/status':
-        'same item_count INT4/i64 mismatch as /admin/jobs/translations/status',
-}
+# Routes that return a server error because of a defect in `src/`, not because
+# CI cannot exercise them. Empty: the two known decode mismatches (`briefs`
+# timestamptz read as `String`, `translation_batches.item_count` read as `i64`)
+# are fixed in the same change that emptied this map. Any new entry must name
+# the exact mismatch, and it is removed once the route passes.
+EXPECTED_FAILURES = {}
 
 
 def parse_args():
