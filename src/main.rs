@@ -3,8 +3,6 @@
 // (仓库外运维记录) removes them; nothing in them
 // is reachable from `main`, so their absence of callers is expected rather
 // than dead code to delete in the persistence cutover.
-#[allow(dead_code)]
-mod admin_ai_records;
 mod admin_job_groups;
 #[allow(dead_code)]
 mod admin_runtime;
@@ -14,8 +12,6 @@ mod ai;
 mod api;
 #[allow(dead_code)]
 mod api_keys;
-#[allow(dead_code)]
-mod auth;
 #[allow(dead_code)]
 mod briefs;
 mod config;
@@ -72,8 +68,6 @@ mod postgres_translation_backfill;
 mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
-#[allow(dead_code)]
-mod public_metrics;
 mod release_content;
 #[allow(dead_code)]
 mod release_links;
@@ -83,13 +77,12 @@ mod search;
 #[allow(dead_code)]
 mod search_index;
 #[allow(dead_code)]
-mod server;
-#[allow(dead_code)]
 mod session_store;
 #[allow(dead_code)]
 mod sqlite_write;
 #[allow(dead_code)]
 mod state;
+mod static_site;
 #[allow(dead_code)]
 mod sync;
 mod translation_admin_types;

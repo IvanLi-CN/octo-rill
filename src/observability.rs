@@ -44,11 +44,6 @@ impl Default for LoggingThresholds {
     }
 }
 
-pub fn set_logging_thresholds(thresholds: LoggingThresholds) {
-    let cell = LOGGING_THRESHOLDS.get_or_init(|| RwLock::new(LoggingThresholds::default()));
-    *cell.write().expect("logging thresholds lock poisoned") = thresholds;
-}
-
 pub fn logging_thresholds() -> LoggingThresholds {
     LOGGING_THRESHOLDS
         .get_or_init(|| RwLock::new(LoggingThresholds::default()))

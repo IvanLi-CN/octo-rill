@@ -678,7 +678,7 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
     let mut app = app.layer(session_layer);
     if let Some(static_dir) = config.static_dir.clone() {
-        app = crate::server::attach_static_site_routes(app, static_dir);
+        app = crate::static_site::attach_static_site_routes(app, static_dir);
     }
 
     let cors_origin = crate::state::normalize_origin(&config.public_base_url)?;
