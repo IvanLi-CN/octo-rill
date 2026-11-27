@@ -78,7 +78,7 @@ def session_flags(sql, url, cookie, tokens):
         f"position('{token.encode().hex()}' in encode(data, 'hex')) > 0" for token in tokens
     )
     row = sql(
-        f"SELECT {exprs} FROM octo_rill.tower_sessions WHERE id = '{session_id}'", url
+        f"SELECT {exprs} FROM public.tower_sessions WHERE id = '{session_id}'", url
     )
     return [value == 't' for value in row.split('|')]
 

@@ -349,9 +349,17 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         if let Some(ddl) = ddl {
             let translated = translate_ddl(&ddl, &name)?;
             let dependencies = referenced_tables(&name, &ddl);
-            tables.push((name, columns, translated, dependencies));
+            // `CREATE TABLE IF NOT EXISTS` is a no-op when the runtime already
+            // built the table, so the copied columns must still be filtered to
+            // what the target actually has.
+            let shared = shared_target_columns(pg, &name, columns).await?;
+            tables.push((name, shared, translated, dependencies));
         } else {
-            tables.push((name, columns, String::new(), Vec::new()));
+            // The target already owns this table (a view or a runtime-created
+            // one), so copy only the columns both sides share. Some legacy
+            // SQLite columns were never carried into the PostgreSQL schema.
+            let shared = shared_target_columns(pg, &name, columns).await?;
+            tables.push((name, shared, String::new(), Vec::new()));
         }
     }
     let tables = order_tables_by_dependencies(tables)?;
@@ -616,7 +624,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 .as_ref()
                 .is_none_or(|selected| selected == *name)
     }) {
-        let columns = column_names(sqlite, name).await?;
+        let columns = shared_target_columns(pg, name, column_names(sqlite, name).await?).await?;
 
         let verify_started = std::time::Instant::now();
         eprintln!("verifying table {name}");
@@ -1408,6 +1416,33 @@ async fn checksum_sqlite(
     }
     let _ = columns;
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+/// Columns present in both the SQLite source table and the PostgreSQL target.
+async fn shared_target_columns(
+    pg: &Client,
+    table: &str,
+    source_columns: Vec<String>,
+) -> Result<Vec<String>> {
+    let target: Vec<String> = pg
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1",
+            &[&table],
+        )
+        .await
+        .with_context(|| format!("read target columns for {table}"))?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let kept: Vec<String> = source_columns
+        .into_iter()
+        .filter(|column| target.contains(column))
+        .collect();
+    if kept.is_empty() {
+        bail!("table {table} shares no columns with its PostgreSQL target");
+    }
+    Ok(kept)
 }
 
 async fn column_names(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {
