@@ -106,7 +106,7 @@ PR 序列 1、2、3 与 5 的 schema 部分已合并：CI PostgreSQL job、43 �
 
 ## 待办：剩余工作清单
 
-实测依据见上文「R4 实测面」。以下六项全部未完成，按依赖顺序排列：
+实测依据见上文「R4 实测面」。第 6 项已完成，其余五项按依赖顺序排列：
 
 | # | 任务 | 退出条件 | 阻塞原因 |
 | --- | --- | --- | --- |
@@ -115,7 +115,7 @@ PR 序列 1、2、3 与 5 的 schema 部分已合并：CI PostgreSQL job、43 �
 | 3 | `allow(dead_code)` 归零 | `grep -R 'allow(dead_code)' src/` 空，`rust-source-quality.toml` 对应条目删除 | 依赖第 2 项 |
 | 4 | 打 `legacy-sqlite-final` 标签 | 标签指向删除提交的 base，且含完整 `migrations/` 与 SQLite 模块 | 需在第 2 项提交前创建 |
 | 5 | 删除 `migrations/` | Dockerfile 与 `include_str!`/`sqlx::migrate!` 引用全部消失 | 依赖第 2 项（退役模块的测试用 `include_str!` 绑定该目录） |
-| 6 | 删除 `/api/admin/jobs/migrations` 三条路由 | 路由、`admin_migrations`、pause/resume handler 与 `EXPECTED_NOT_RUN` 条目一并删除 | 无阻塞：PG 侧只有读与 pause/resume 写，没有任何 worker 创建或推进 migration；`web/` 零引用 |
+| 6 | ~~删除 `/api/admin/jobs/migrations` 三条路由~~ **已完成** | 路由、handler 与测试夹具已删除；三条路径现在断言 404/405 | — |
 
 第 1 项的建议顺序按符号数从少到多：`release_links`(1) → `error`(1) → `session_store`(1) → `translations`(1) → `content_processing`(1) → `api_keys`(6) → `jobs`(2) → `admin_runtime`(3) → `github`(3) → `state`(4) → `metrics`(8) → `briefs`(11)。每步后跑 `bash scripts/pg_seed_suite.sh`，基线为 18/18。
 
