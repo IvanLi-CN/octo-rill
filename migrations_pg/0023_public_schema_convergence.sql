@@ -25,6 +25,12 @@ BEGIN
     IF to_regclass('public.tower_sessions') IS NULL
        AND to_regclass('octo_rill.tower_sessions') IS NOT NULL THEN
         EXECUTE 'ALTER TABLE octo_rill.tower_sessions SET SCHEMA public';
+    ELSIF to_regclass('public.tower_sessions') IS NOT NULL
+          AND to_regclass('octo_rill.tower_sessions') IS NOT NULL THEN
+        -- The session store migrated to `public` first, so both copies exist.
+        -- They hold the same sessions; keep `public` and drop the duplicate so
+        -- the schema can go.
+        EXECUTE 'DROP TABLE octo_rill.tower_sessions CASCADE';
     END IF;
 
     IF to_regclass('public.migration_manifests') IS NULL
@@ -38,23 +44,28 @@ $$;
 -- `public` table that the runtime actually reads; `content_processing_control`
 -- and `llm_recovery_flags` were the two with rows, and both disagree with the
 -- authoritative `public` row, so they are dropped rather than merged.
-DROP TABLE IF EXISTS octo_rill.content_processing_control;
-DROP TABLE IF EXISTS octo_rill.llm_recovery_flags;
-DROP TABLE IF EXISTS octo_rill.llm_model_health;
-DROP TABLE IF EXISTS octo_rill.content_work_items;
-DROP TABLE IF EXISTS octo_rill.content_batches;
-DROP TABLE IF EXISTS octo_rill.content_batch_items;
-DROP TABLE IF EXISTS octo_rill.content_result_projections;
-DROP TABLE IF EXISTS octo_rill.translation_work_items;
-DROP TABLE IF EXISTS octo_rill.translation_requests;
-DROP TABLE IF EXISTS octo_rill.translation_batches;
-DROP TABLE IF EXISTS octo_rill.translation_batch_items;
-DROP TABLE IF EXISTS octo_rill.translation_attempt_events;
-DROP TABLE IF EXISTS octo_rill.translation_attempt_llm_calls;
-DROP TABLE IF EXISTS octo_rill.llm_diagnostic_access_audit;
-DROP TABLE IF EXISTS octo_rill.briefs;
-DROP TABLE IF EXISTS octo_rill.brief_release_memberships;
-DROP TABLE IF EXISTS octo_rill.schema_migrations;
+-- Children before parents. `content_batch_items` and
+-- `content_result_projections` reference `content_work_items` (which also
+-- references itself), and the translation tables form the same shape around
+-- `translation_work_items`. Dropping a parent first fails with "other objects
+-- depend on it". `CASCADE` also clears any dependent object a later schema adds.
+DROP TABLE IF EXISTS octo_rill.content_batch_items CASCADE;
+DROP TABLE IF EXISTS octo_rill.content_result_projections CASCADE;
+DROP TABLE IF EXISTS octo_rill.content_work_items CASCADE;
+DROP TABLE IF EXISTS octo_rill.content_batches CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_attempt_llm_calls CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_attempt_events CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_batch_items CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_requests CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_work_items CASCADE;
+DROP TABLE IF EXISTS octo_rill.translation_batches CASCADE;
+DROP TABLE IF EXISTS octo_rill.content_processing_control CASCADE;
+DROP TABLE IF EXISTS octo_rill.llm_recovery_flags CASCADE;
+DROP TABLE IF EXISTS octo_rill.llm_model_health CASCADE;
+DROP TABLE IF EXISTS octo_rill.llm_diagnostic_access_audit CASCADE;
+DROP TABLE IF EXISTS octo_rill.briefs CASCADE;
+DROP TABLE IF EXISTS octo_rill.brief_release_memberships CASCADE;
+DROP TABLE IF EXISTS octo_rill.schema_migrations CASCADE;
 
 -- Two generated columns still resolve their text search configuration through
 -- the retired schema: they were created while `search_path` was
