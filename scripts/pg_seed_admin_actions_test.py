@@ -202,8 +202,6 @@ def main():
                 ('POST', '/api/admin/jobs/release-reading/backfill', None),
                 ('PATCH', '/api/admin/jobs/llm/runtime-config', {'max_concurrency': 2}),
                 ('POST', f'/api/admin/jobs/llm/calls/{call_id}/diagnostic-access', {'action': 'reveal'}),
-                ('POST', '/api/admin/jobs/migrations/content-processing-online-v2/pause', None),
-                ('POST', '/api/admin/jobs/migrations/content-processing-online-v2/resume', None),
                 ('POST', '/api/admin/jobs/content-processing/freeze', {'switch_token': 'switch'}),
                 ('POST', '/api/admin/jobs/content-processing/cutover', {'switch_token': 'switch'}),
                 ('POST', '/api/admin/jobs/content-processing/identity-upgrade', {'action': 'pause'}),
@@ -306,16 +304,28 @@ def main():
             assert request('POST', '/api/admin/jobs/llm/calls/not-a-local-id/diagnostic-access',
                            {'action': 'reveal'})[0] == 400
 
-            # --- online migration pause / resume -------------------------------
-            code, body = request('POST', '/api/admin/jobs/migrations/content-processing-online-v2/pause')
-            assert code == 200 and body['run']['pause_requested'] is True, body
-            assert sql("SELECT pause_requested FROM public.online_migration_runs") == '1'
-            code, body = request('POST', '/api/admin/jobs/migrations/content-processing-online-v2/resume')
-            assert code == 200 and body['run']['pause_requested'] is False, body
-            assert body['run']['status'] == 'running'
-            assert body['operations'][0]['status'] == 'pending'
-            assert request('POST', '/api/admin/jobs/migrations/other-migration/pause')[0] == 404
-            assert request('POST', '/api/admin/jobs/migrations/other-migration/resume')[0] == 404
+            # --- retired online migration operator ------------------------------
+            # The PostgreSQL runtime has no writer that creates or advances an
+            # online migration, so the operator and its admin interface are
+            # retired. The observation rows stay readable; the controls must not
+            # come back as read-only theatre.
+            for retired in (
+                '/api/admin/jobs/migrations',
+                '/api/admin/jobs/migrations/content-processing-online-v2/pause',
+                '/api/admin/jobs/migrations/content-processing-online-v2/resume',
+            ):
+                # Axum's fallback answers an unknown route with an empty body,
+                # so the shared helper's `json.load` can raise instead of
+                # returning. Probe the status directly.
+                probe = urllib.request.Request(
+                    base + retired, headers={'Cookie': cookies[admin]}, method='GET'
+                )
+                try:
+                    with urllib.request.urlopen(probe, timeout=10) as response:
+                        status = response.status
+                except urllib.error.HTTPError as error:
+                    status = error.code
+                assert status in (404, 405), (retired, status)
 
             # --- content processing mode transitions ---------------------------
             assert request('POST', '/api/admin/jobs/content-processing/freeze',

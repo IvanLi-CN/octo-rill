@@ -24,7 +24,6 @@ QUERIES = {
     'record_kind': "SELECT 'release'",
     'record_id': "SELECT CAST(r.release_id AS TEXT) FROM public.repo_releases r JOIN public.user_release_visible_repos v ON v.repo_id = r.repo_id WHERE v.user_id = {user_id} AND r.is_draft = 0 ORDER BY r.release_id DESC LIMIT 1",
     'call_id': "SELECT id FROM public.llm_calls ORDER BY created_at DESC LIMIT 1",
-    'migration_id': "SELECT migration_id FROM public.online_migration_operations ORDER BY operation_order LIMIT 1",
     'usage_id': "SELECT id FROM public.public_repo_release_usage ORDER BY last_requested_at DESC NULLS LAST, id LIMIT 1",
     'request_id': "SELECT id FROM public.translation_requests ORDER BY created_at DESC LIMIT 1",
     'batch_id': "SELECT id FROM public.translation_batches ORDER BY created_at DESC LIMIT 1",

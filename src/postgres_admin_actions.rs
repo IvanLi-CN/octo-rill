@@ -23,15 +23,10 @@ use tracing::warn;
 use crate::{
     briefs, local_id,
     postgres_server::{
-        PostgresServerState, admin_identity_upgrade_status, admin_migrations,
-        admin_search_index_status, admin_translation_status, admin_user_profile,
-        public_release_repos_body, require_admin,
+        PostgresServerState, admin_identity_upgrade_status, admin_search_index_status,
+        admin_translation_status, admin_user_profile, public_release_repos_body, require_admin,
     },
 };
-
-/// The only online migration this build defines, mirrored from
-/// `src/online_migrations.rs`.
-const ONLINE_MIGRATION_ID: &str = "content-processing-online-v2";
 
 /// Legacy migration window for the recent-release reading backfill.
 const RELEASE_READING_BACKFILL_WINDOW_DAYS: i64 = 30;
@@ -927,77 +922,6 @@ pub(crate) async fn admin_audit_llm_diagnostic_access(
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(error) => database_error("llm_diagnostic_access_audit_insert", error),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Online migration control
-// ---------------------------------------------------------------------------
-
-pub(crate) async fn admin_pause_online_migration(
-    State(state): State<PostgresServerState>,
-    session: Session,
-    Path(migration_id): Path<String>,
-) -> Response {
-    if let Err(status) = require_admin(&state, &session).await {
-        return admin_required(status);
-    }
-    if migration_id != ONLINE_MIGRATION_ID {
-        return not_found("migration not found");
-    }
-    let now = Utc::now().to_rfc3339();
-    let applied = async {
-        let mut tx = state.runtime.pool.begin().await?;
-        sqlx::query(
-            "UPDATE public.online_migration_runs SET pause_requested = 1, updated_at = $2 WHERE migration_id = $1",
-        )
-        .bind(ONLINE_MIGRATION_ID)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await
-    }
-    .await;
-    if let Err(error) = applied {
-        return database_error("online_migration_pause", error);
-    }
-    admin_migrations(State(state), session).await
-}
-
-pub(crate) async fn admin_resume_online_migration(
-    State(state): State<PostgresServerState>,
-    session: Session,
-    Path(migration_id): Path<String>,
-) -> Response {
-    if let Err(status) = require_admin(&state, &session).await {
-        return admin_required(status);
-    }
-    if migration_id != ONLINE_MIGRATION_ID {
-        return not_found("migration not found");
-    }
-    let now = Utc::now().to_rfc3339();
-    let applied = async {
-        let mut tx = state.runtime.pool.begin().await?;
-        sqlx::query(
-            "UPDATE public.online_migration_runs SET pause_requested = 0, status = CASE WHEN status IN ('paused', 'failed') THEN 'running' ELSE status END, last_error = CASE WHEN status = 'failed' THEN NULL ELSE last_error END, updated_at = $2 WHERE migration_id = $1",
-        )
-        .bind(ONLINE_MIGRATION_ID)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE public.online_migration_operations SET status = 'pending', last_error = NULL, owner_id = NULL, lease_heartbeat_at = NULL, updated_at = $2 WHERE migration_id = $1 AND status = 'failed'",
-        )
-        .bind(ONLINE_MIGRATION_ID)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await
-    }
-    .await;
-    if let Err(error) = applied {
-        return database_error("online_migration_resume", error);
-    }
-    admin_migrations(State(state), session).await
 }
 
 // ---------------------------------------------------------------------------
