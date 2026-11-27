@@ -41,7 +41,7 @@
 | 1 | CI PostgreSQL job | 新 job 跑 `postgres_*`、`pg_seed_*`、`pg_read_acceptance.py`；无新增常驻 `#[ignore]` | 删除 job 定义 |
 | 2 | 抽共用件与测试 | 43 个符号全部有活模块归属；同域测试在新位置通过；`api.rs`/`sync.rs` 只剩未搬代码 | revert PR |
 | 3 | 原生 SQL | `pg_sql()` 删除；方言 `grep` 零命中；空库与导入库计划一致 | revert PR |
-| 4 | 删模块 + 标签 | 28 个模块删除；`allow(dead_code)` 归零；`legacy-sqlite-final` 已推送到 base 提交 | revert PR（标签保留） |
+| 4 | 删模块 + 标签 | 29 个 `allow(dead_code)` 模块处置完毕；`allow(dead_code)` 归零；`legacy-sqlite-final` 已推送到 base 提交 | revert PR（标签保留） |
 | 5 | 迁移与 schema | 迁移历史与会话已落 `public`；逐表处置完成；`DROP SCHEMA octo_rill`；`migrations/` 与无写入者的迁移管理接口删除 | forward-only，不回退 |
 
 ## CI PostgreSQL job
@@ -72,6 +72,15 @@
 | `content_processing_control` | 1 | 陈旧副本；`public` 为权威，删除 |
 | `llm_recovery_flags` | 1 | 与 `public` 行比对；代码只读 `public`，确认后删除 |
 | 其余 15 张 | 0 | `briefs`、`brief_release_memberships`、`content_batch_items`、`content_batches`、`content_result_projections`、`content_work_items`、`llm_diagnostic_access_audit`、`llm_model_health`、`schema_migrations`、`translation_attempt_events`、`translation_attempt_llm_calls`、`translation_batch_items`、`translation_batches`、`translation_requests`、`translation_work_items`，全部删除 |
+
+## R4 实测面（2026-11-27，base c8b4be01）
+
+按从 `main` 的传递可达性计算，排除 `#[cfg(test)]` 与注释：
+
+- 29 个 `#[allow(dead_code)]` 模块中，**20 个仍被生产代码引用**，共 64 个符号；只有 9 个零生产引用。
+- 零生产引用（可直接删文件）：`admin_ai_records`、`auth`、`content_identity_upgrade`、`linuxdo`、`online_migrations`、`passkeys`、`sync`、`webhook_push`、`worker_backoff`。
+- 因此“先删文件再编译”不成立；顺序必须是「抽 64 个符号 → 删空文件 → 归零 allow」。
+- 删除只被测试引用的模块会连带删除其测试；这符合 REQ-RTR-005 的现行措辞（退役行为的测试随实现删除），但必须在报告里逐项列出。
 
 ## 固定门禁
 

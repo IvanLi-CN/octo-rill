@@ -53,7 +53,8 @@
 
 - 每个抽取出的核心与每个 PostgreSQL 读模型 MUST 有直接测试；测试 MUST NOT 只存在于退役副本。
 - 一个独立的 PostgreSQL 18 service job MUST 先于测试迁移落地：一次性数据库、设置 `TEST_PG_TRANSLATE_URL`、取消常驻 `#[ignore]`，并运行 `postgres_*` 测试；seed 与读验收脚本按 `--admin-url` / `--base-url` 参数运行。该 job MUST 与主测试 job 分开，便于单独重跑与限时。
-- 删除后测试总数 MUST NOT 下降。
+- 删除后，覆盖仍在运行行为的测试 MUST 保留或随符号迁移；只覆盖退役行为（无生产调用方）的测试 MUST 随其实现一并删除，
+  MUST NOT 以保留这些测试为理由保留退役代码。测试总数因此可以下降，但下降必须能逐项归因到被删除的退役实现。
 
 ### REQ-RTR-006 迁移历史收敛
 
