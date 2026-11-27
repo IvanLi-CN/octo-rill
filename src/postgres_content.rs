@@ -86,7 +86,7 @@ const TARGET_LANG: &str = "zh-CN";
 /// Release cannot catch up on a later sync either: its existing `smart` row does
 /// not block the missing variants, but every later sync applies the same cap
 /// again. See `admit_release_polish` for the residual gap this leaves.
-const POLISH_ADMISSION_CAP: usize = 25;
+pub(crate) const POLISH_ADMISSION_CAP: usize = 25;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ClaimedWork {
@@ -669,6 +669,11 @@ async fn publish_ready(
 struct FailureOutcome {
     class: String,
     summary: Option<String>,
+    /// Why the upstream refused, when the class alone cannot say. Recorded on the
+    /// attempt event as `retry_disposition` so a later sweep can tell a quota
+    /// block (wait for the allowance) from a credential block (wait for an
+    /// operator), which share the configuration class and the same summary.
+    disposition: Option<&'static str>,
 }
 
 async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) -> Result<()> {
@@ -693,7 +698,7 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
         return Ok(());
     }
     sqlx::query(
-        "INSERT INTO public.content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, created_at) VALUES ($1, $2, $3, 'initial', 'attempt_completed', 'failed', $4, $5, $6, $7, $8, now()) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
+        "INSERT INTO public.content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_disposition, retry_eligible, next_retry_at, created_at) VALUES ($1, $2, $3, 'initial', 'attempt_completed', 'failed', $4, $5, $6, $7, $8, $9, now()) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
     )
     .bind(local_id::generate_local_id())
     .bind(&work.id)
@@ -701,6 +706,7 @@ async fn publish_failure(pool: &PgPool, claim: &Claim, failure: FailureOutcome) 
     .bind(&failure.class)
     .bind(failure.summary.as_deref())
     .bind(&failure.class)
+    .bind(failure.disposition)
     .bind(i64::from(next_retry.is_some()))
     .bind(next_retry)
     .execute(&mut *tx)
@@ -753,6 +759,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                     // only re-parse the same bytes.
                     class: "invalid_source_snapshot".to_owned(),
                     summary: Some(format!("invalid global source snapshot: {error}")),
+                    disposition: None,
                 },
             )
             .await;
@@ -801,6 +808,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                     summary: crate::translation_error::translation_error_summary(Some(
                         &failure.message,
                     )),
+                    disposition: failure.disposition,
                 },
             )
             .await;
@@ -845,6 +853,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                         summary: crate::translation_error::translation_error_summary(Some(
                             &failure.message,
                         )),
+                        disposition: failure.disposition,
                     },
                 )
                 .await;
@@ -857,6 +866,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                 FailureOutcome {
                     class: "output_truncated".to_owned(),
                     summary: Some("global content output was truncated".to_owned()),
+                    disposition: None,
                 },
             )
             .await;
@@ -878,6 +888,7 @@ async fn execute(pool: &PgPool, http: &Client, ai_config: &AiConfig, claim: &Cla
                     summary: crate::translation_error::translation_error_summary(Some(
                         &error.to_string(),
                     )),
+                    disposition: None,
                 },
             )
             .await;

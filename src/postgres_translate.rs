@@ -2837,6 +2837,12 @@ fn parse_json_translation(raw: &str) -> (Option<String>, Option<String>) {
 pub(crate) struct LlmFailure {
     pub(crate) class: crate::llm_contract::LlmFailureClass,
     pub(crate) message: String,
+    /// Why the upstream refused, when the raw body says something the failure
+    /// class cannot: `quota` and `credential` both land in the configuration
+    /// class, and only the credential one parks a model. The worker records this
+    /// on the attempt event so a later sweep can tell them apart; it is not part
+    /// of the class mapping.
+    pub(crate) disposition: Option<&'static str>,
 }
 
 impl LlmFailure {
@@ -2845,6 +2851,7 @@ impl LlmFailure {
         Self {
             class,
             message: class.safe_message().to_owned(),
+            disposition: None,
         }
     }
 
@@ -2853,6 +2860,7 @@ impl LlmFailure {
         Self {
             class,
             message: class.safe_message().to_owned(),
+            disposition: None,
         }
     }
 
@@ -2861,6 +2869,7 @@ impl LlmFailure {
         Self {
             class,
             message: class.safe_message().to_owned(),
+            disposition: None,
         }
     }
 }
@@ -3409,11 +3418,13 @@ impl AuditRecorder<'_> {
             } else {
                 truncate_chars(detail, 200)
             };
-            let class = classify_upstream_failure(status.as_u16(), detail.as_str());
+            let (class, disposition) =
+                classify_upstream_failure_with_reason(status.as_u16(), detail.as_str());
             return Err(CallFailure {
                 error: LlmFailure {
                     class,
                     message: class.safe_message().to_owned(),
+                    disposition,
                 },
                 detail,
                 http_status: Some(i64::from(status.as_u16())),
@@ -3472,19 +3483,57 @@ struct CallFailure {
     http_status: Option<i64>,
 }
 
+/// Class-only view of the classifier, kept for the class-mapping tests.
+#[cfg(test)]
 fn classify_upstream_failure(status: u16, detail: &str) -> crate::llm_contract::LlmFailureClass {
+    classify_upstream_failure_with_reason(status, detail).0
+}
+
+/// The failure class plus why the upstream refused, when the body names a cause
+/// the class cannot express.
+///
+/// `quota` and `credential` both map to the configuration class, but they mean
+/// opposite things to recovery: a credential rejection parks the model until an
+/// operator saves configuration, while a quota rejection only waits for the
+/// allowance to be restored. The class mapping is unchanged; the reason is
+/// carried alongside it so the attempt event can record it.
+pub(crate) fn classify_upstream_failure_with_reason(
+    status: u16,
+    detail: &str,
+) -> (crate::llm_contract::LlmFailureClass, Option<&'static str>) {
     let lowered = detail.to_ascii_lowercase();
     let model_rejected = lowered.contains("model not found")
         || lowered.contains("invalid_model_error")
         || lowered.contains("insufficient_quota")
         || lowered.contains("model_not_found");
+    // Several providers answer an exhausted allowance with 429 rather than 402
+    // or a 4xx quota body, so the body is checked before the status.
+    let quota = lowered.contains("insufficient_quota")
+        || lowered.contains("exceeds tpm/rpm")
+        || lowered.contains("quota");
     if status == 429 {
-        return crate::llm_contract::LlmFailureClass::RateLimited;
+        return (
+            crate::llm_contract::LlmFailureClass::RateLimited,
+            quota.then_some("quota"),
+        );
     }
     if model_rejected || matches!(status, 400..=499) {
-        return crate::llm_contract::LlmFailureClass::Configuration;
+        let disposition = if quota {
+            Some("quota")
+        } else if is_credential_rejection(Some(i64::from(status))) {
+            Some("credential")
+        } else {
+            None
+        };
+        return (
+            crate::llm_contract::LlmFailureClass::Configuration,
+            disposition,
+        );
     }
-    crate::llm_contract::LlmFailureClass::Transient
+    (
+        crate::llm_contract::LlmFailureClass::Transient,
+        quota.then_some("quota"),
+    )
 }
 
 fn is_credential_rejection(status: Option<i64>) -> bool {
@@ -3678,6 +3727,7 @@ impl CompletionFailure {
         Self::Provider(LlmFailure {
             class: crate::llm_contract::LlmFailureClass::Transient,
             message: format!("provider admission failed: {error}"),
+            disposition: None,
         })
     }
 }
@@ -3978,11 +4028,13 @@ async fn invoke_model(
         } else {
             truncate_chars(detail, 200)
         };
-        let class = classify_upstream_failure(status.as_u16(), detail.as_str());
+        let (class, disposition) =
+            classify_upstream_failure_with_reason(status.as_u16(), detail.as_str());
         return Err(CallFailure {
             error: LlmFailure {
                 class,
                 message: class.safe_message().to_owned(),
+                disposition,
             },
             detail,
             http_status: Some(i64::from(status.as_u16())),

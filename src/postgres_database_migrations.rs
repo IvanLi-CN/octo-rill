@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn postgres_migrator_has_an_independent_baseline() {
-        assert_eq!(MIGRATOR.iter().count(), 23);
+        assert_eq!(MIGRATOR.iter().count(), 24);
         assert_eq!(MIGRATOR.iter().next().expect("baseline").version, 1);
         let content = MIGRATOR
             .iter()
@@ -138,6 +138,19 @@ mod tests {
         );
         assert!(content_evidence.sql.contains("SET DEFAULT 'not_required'"));
         assert!(content_evidence.sql.contains("SET NOT NULL"));
+        let polish_cursor = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 24)
+            .expect("polish backfill cursor migration");
+        assert!(polish_cursor.sql.contains("polish_backfill_cursor"));
+        assert!(
+            polish_cursor
+                .sql
+                .contains("CREATE TABLE IF NOT EXISTS public.polish_backfill_cursor")
+        );
+        assert!(polish_cursor.sql.contains("last_release_id"));
+        assert!(polish_cursor.sql.contains("last_run_at"));
+        assert!(polish_cursor.sql.contains("ON CONFLICT (id) DO NOTHING"));
         let schema_convergence = MIGRATOR
             .iter()
             .find(|migration| migration.version == 23)

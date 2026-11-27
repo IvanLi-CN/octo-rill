@@ -32,6 +32,7 @@ pub(crate) const POSTGRES_TASK_EXECUTOR_TYPES: &[&str] = &[
     jobs::TASK_BRIEF_GENERATE,
     jobs::TASK_BRIEF_DAILY_SLOT,
     TASK_TRANSLATION_GENERATE,
+    crate::postgres_tasks::TASK_POLISH_BACKFILL,
 ];
 
 /// Imported SQLite task types the PostgreSQL runtime never writes.
@@ -98,6 +99,11 @@ pub(crate) const ADMIN_JOB_TASK_GROUPS: &[AdminJobTaskGroup] = &[
                 TASK_TRANSLATION_GENERATE,
                 "翻译生成",
                 AdminJobTaskLane::Realtime,
+            ),
+            spec(
+                crate::postgres_tasks::TASK_POLISH_BACKFILL,
+                "润色受众变体回填",
+                AdminJobTaskLane::Scheduled,
             ),
             spec(
                 jobs::TASK_TRANSLATE_RELEASE_BATCH,
