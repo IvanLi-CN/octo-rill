@@ -348,10 +348,12 @@ pub struct AdminTranslationWorkerStatus {
     pub error_detail: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct RequestRow {
     pub(crate) id: String,
+    // Selected by the row query so `sqlx::FromRow` keeps one mapping shape;
+    // the admin read model reports neither column today.
+    #[allow(dead_code)]
     pub(crate) mode: String,
     pub(crate) source: String,
     pub(crate) request_origin: String,
@@ -361,6 +363,7 @@ pub(crate) struct RequestRow {
     pub(crate) kind: String,
     pub(crate) variant: String,
     pub(crate) entity_id: String,
+    #[allow(dead_code)]
     pub(crate) target_lang: String,
     pub(crate) max_wait_ms: i64,
     pub(crate) work_item_id: Option<String>,

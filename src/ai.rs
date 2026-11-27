@@ -929,7 +929,7 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
         if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model.as_str()) {
             (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG)
         } else if let Some(limit) =
-            lookup_model_limit_in_map(&crate::llm_contract::builtin_model_limits(), model.as_str())
+            lookup_model_limit_in_map(crate::llm_contract::builtin_model_limits(), model.as_str())
         {
             (
                 limit.max(1),
