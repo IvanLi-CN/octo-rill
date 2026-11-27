@@ -37,7 +37,6 @@ TASK_ID = 'ci-read-task'
 CALL_ID = 'ci-read-call'
 REQUEST_ID = 'ci-read-request'
 BATCH_ID = 'ci-read-batch'
-MIGRATION_ID = 'content-processing-online-v2'
 USAGE_ID = 'ci-read-usage'
 API_KEY_ID = 'ci-read-api-key'
 PASSKEY_ID = 'ci-read-passkey'
@@ -160,23 +159,6 @@ def seed(url, log_path):
         " ON CONFLICT (id) DO NOTHING"
     )
 
-    # `online_migration_operations` references the run row, so the parent must
-    # exist before the operation the probe resolves as its fixture.
-    statements.append(
-        "INSERT INTO public.online_migration_runs (migration_id, definition_checksum,"
-        " status, pause_requested, created_at, updated_at)"
-        f" VALUES ('{MIGRATION_ID}', 'ci-checksum', 'running', 0,"
-        " '2026-11-19T00:00:00Z', '2026-11-19T00:00:00Z')"
-        " ON CONFLICT (migration_id) DO NOTHING"
-    )
-    statements.append(
-        "INSERT INTO public.online_migration_operations (migration_id, operation_id,"
-        " definition_checksum, operation_kind, operation_order, status, cursor,"
-        " rows_processed, updated_at)"
-        f" VALUES ('{MIGRATION_ID}', 'ci-operation', 'ci-checksum', 'backfill', 1,"
-        " 'pending', '', 0, '2026-11-19T00:00:00Z')"
-        " ON CONFLICT (migration_id, operation_id) DO NOTHING"
-    )
 
     statements.append(
         "INSERT INTO public.public_repo_release_usage (id, repo_id, owner_login, repo_name,"

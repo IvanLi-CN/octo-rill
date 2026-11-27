@@ -412,15 +412,6 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             "/api/admin/jobs/ai-records/{record_kind}/{record_id}",
             get(crate::postgres_admin_ai_records::admin_get_collection_record_detail),
         )
-        .route("/api/admin/jobs/migrations", get(admin_migrations))
-        .route(
-            "/api/admin/jobs/migrations/{migration_id}/pause",
-            axum::routing::post(crate::postgres_admin_actions::admin_pause_online_migration),
-        )
-        .route(
-            "/api/admin/jobs/migrations/{migration_id}/resume",
-            axum::routing::post(crate::postgres_admin_actions::admin_resume_online_migration),
-        )
         .route(
             "/api/admin/jobs/content-processing/cutover",
             axum::routing::post(crate::postgres_admin_actions::admin_content_processing_cutover),
@@ -4259,31 +4250,6 @@ pub(crate) async fn admin_translation_status(
         Ok(body) => Json(body).into_response(),
         Err(error) => {
             warn!(%error,"PostgreSQL translation status failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"code":"database_error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub(crate) async fn admin_migrations(
-    State(state): State<PostgresServerState>,
-    session: Session,
-) -> axum::response::Response {
-    if let Err(status) = require_admin(&state, &session).await {
-        return (status, Json(json!({"code":"admin_required"}))).into_response();
-    }
-    let result=async {
-        let run=sqlx::query_scalar::<_,serde_json::Value>("SELECT to_jsonb(r)-'last_error' || jsonb_build_object('last_error',CASE WHEN last_error IS NULL THEN NULL ELSE 'migration failed; consult protected service logs' END,'pause_requested',pause_requested<>0) FROM public.online_migration_runs r WHERE migration_id='content-processing-online-v2'").fetch_optional(&state.runtime.pool).await?;
-        let operations=sqlx::query_scalar::<_,serde_json::Value>("SELECT to_jsonb(o)-'last_error' || jsonb_build_object('last_error',CASE WHEN last_error IS NULL THEN NULL ELSE 'migration failed; consult protected service logs' END) FROM public.online_migration_operations o WHERE migration_id='content-processing-online-v2' ORDER BY operation_order").fetch_all(&state.runtime.pool).await?;
-        Ok::<_,sqlx::Error>(json!({"run":run,"operations":operations}))
-    }.await;
-    match result {
-        Ok(body) => Json(body).into_response(),
-        Err(error) => {
-            warn!(%error,"PostgreSQL online migration read failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"code":"database_error"})),

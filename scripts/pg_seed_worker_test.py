@@ -99,9 +99,20 @@ def main():
                 status = json.load(response)
                 assert status['queued_requests'] == 1 and status['queued_work_items'] == 1
                 assert status['worker_concurrency'] == 0 and status['effective_model_input_limit'] == 32768
-            request = urllib.request.Request(base + '/api/admin/jobs/migrations', headers={'Cookie': cookie.read_text().strip()})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                assert json.load(response) == {'run': None, 'operations': []}
+            # The online migration operator is retired; its admin surface must
+            # stay gone instead of returning an empty read-only shell.
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        base + '/api/admin/jobs/migrations',
+                        headers={'Cookie': cookie.read_text().strip()},
+                    ),
+                    timeout=5,
+                )
+            except urllib.error.HTTPError as error:
+                assert error.code in (404, 405), error.code
+            else:
+                raise AssertionError('retired migrations route still answers')
             request = urllib.request.Request(base + '/api/admin/jobs/webhook-push/runtime-config', headers={'Cookie': cookie.read_text().strip()})
             with urllib.request.urlopen(request, timeout=5) as response:
                 assert json.load(response)['next_started_at'] == '2026-01-08T00:00:00+00:00'
