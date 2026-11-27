@@ -3059,6 +3059,36 @@ pub(crate) async fn route_models_for_runtime(
     route_models(pool, fallback_model).await
 }
 
+/// The route a fresh attempt would take, and the models that can serve it now.
+///
+/// The persisted route is what an attempt snapshots and fingerprints. The
+/// callable subset applies the same health view the execution path uses
+/// ([`route_candidates`]), so a caller can tell "the administrator configured
+/// models" apart from "an attempt right now can reach a provider". Credential
+/// parks and cooldowns live only in `llm_model_health`, so reading the persisted
+/// list alone cannot answer the second question.
+pub(crate) struct AttemptRoute {
+    /// The administrator-ordered persisted route, including the runtime model
+    /// fallback. This is the route an attempt is bound to.
+    pub(crate) models: Vec<String>,
+    /// The models a fresh attempt could call now: ready models first, or the
+    /// earliest-expiring model as a probe when every usable model is cooling.
+    /// Empty means every routed model is credential-parked, so an attempt would
+    /// fail without issuing any provider request.
+    pub(crate) callable: Vec<String>,
+}
+
+/// Read the route a fresh attempt would use together with its callable models.
+pub(crate) async fn attempt_route_for_runtime(
+    pool: &PgPool,
+    fallback_model: &str,
+) -> Result<AttemptRoute, LlmFailure> {
+    let models = route_models(pool, fallback_model).await?;
+    let health = load_route_health(pool).await?;
+    let callable = route_candidates(&models, &health, Utc::now());
+    Ok(AttemptRoute { models, callable })
+}
+
 async fn record_model_health(
     pool: &PgPool,
     model: &str,
@@ -4190,6 +4220,7 @@ mod tests {
                 INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
                 CREATE TABLE public.admin_runtime_settings(id integer PRIMARY KEY, llm_models_json text NOT NULL);
                 INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '["m1"]');
+                CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count bigint NOT NULL DEFAULT 0, window_started_at timestamptz, cooldown_until timestamptz, last_failure_class text, last_failure_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
                 CREATE TABLE public.translation_work_items(id text PRIMARY KEY, dedupe_key text UNIQUE NOT NULL, scope_user_id text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, token_estimate integer NOT NULL, deadline_at text NOT NULL, status text NOT NULL, result_status text, error_text text, created_at text NOT NULL, finished_at text, updated_at text NOT NULL);
                 CREATE TABLE public.translation_requests(id text PRIMARY KEY, mode text NOT NULL, source text NOT NULL, request_origin text NOT NULL, requested_by text, scope_user_id text NOT NULL, producer_ref text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, max_wait_ms integer NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, work_item_id text, status text NOT NULL, result_status text, error_text text, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL);
                 CREATE TABLE public.job_tasks(id text PRIMARY KEY, task_type text NOT NULL, status text NOT NULL, source text NOT NULL, requested_by text, payload_json text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL);

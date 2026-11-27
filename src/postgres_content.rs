@@ -139,9 +139,18 @@ fn source_revision_json(raw_snapshot: &str) -> String {
 /// route snapshot the attempt is bound to, and only then makes it visible as
 /// `running`.
 async fn claim_next(pool: &PgPool, fallback_model: &str) -> Result<Option<Claim>> {
-    let route_models = postgres_translate::route_models_for_runtime(pool, fallback_model)
+    let route = postgres_translate::attempt_route_for_runtime(pool, fallback_model)
         .await
         .map_err(|failure| anyhow::anyhow!("{}: {}", failure.class.as_str(), failure.message))?;
+    // A claim increments `attempt_count` and, on a configuration failure, moves
+    // the item to `blocked_config`. With every routed model parked the attempt
+    // could not issue a provider request, so claiming would only spend attempt
+    // budget to record a block the recovery sweep then has to undo. Wait for a
+    // callable model instead.
+    if route.callable.is_empty() {
+        return Ok(None);
+    }
+    let route_models = route.models;
     if route_models.is_empty() {
         return Ok(None);
     }
@@ -898,22 +907,72 @@ pub(crate) async fn recover_expired_leases(pool: &PgPool) -> Result<u64> {
     Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
 }
 
-/// Requeue configuration-blocked work after the model route changes.
+/// Requeue configuration-blocked work once an attempt could make progress.
 ///
 /// `blocked_config` is terminal for the claim filter and counts as active work
 /// for producers, so without this sweep a repaired configuration would never
 /// resume the work it blocked.
+///
+/// The question the sweep must answer is "can this row get anywhere now?", not
+/// "did the persisted route change?". A credential park or cooldown lives only
+/// in `llm_model_health`; it removes every callable model while leaving the
+/// persisted route — and therefore its fingerprint — untouched, so a
+/// fingerprint comparison can never observe a park clearing. That is why work
+/// blocked during a provider outage stayed blocked after the outage ended, even
+/// after an operator cleared every `cooldown_until`: the stored fingerprint
+/// already equalled the live route, so `configuration_fingerprint <> $1` matched
+/// nothing and the blocked rows stayed stranded until they were requeued by hand.
+///
+/// The gate is therefore the callable set from [`AttemptRoute`], the same view
+/// the claim and execution paths use: while every routed model is parked nothing
+/// is requeued, and as soon as one can be called the blocked rows are released.
+///
+/// A non-empty callable set is necessary but not sufficient. Only a 401/403
+/// parks a model; a 400-class rejection leaves every candidate in place, so a
+/// bare callable gate would requeue such a row on every 15-second tick and spend
+/// an attempt and a provider call each time, without bound. The two cases are
+/// distinguishable from facts already recorded: an attempt blocked by an
+/// unreadable route never reached a provider, because `complete_with_audit`
+/// returns before writing any admission when it has no candidate, whereas an
+/// attempt the provider rejected has an admission row for that exact attempt.
+///
+/// So a row is released when its blocking attempt never reached a provider (the
+/// "nothing was callable" block a park produces), or when the persisted route
+/// changed since admission and a model can now be called.
 pub(crate) async fn unblock_reconfigured_work(pool: &PgPool, fallback_model: &str) -> Result<u64> {
-    let Ok(models) = postgres_translate::route_models_for_runtime(pool, fallback_model).await
+    let Ok(route) = postgres_translate::attempt_route_for_runtime(pool, fallback_model).await
     else {
         return Ok(0);
     };
-    if models.is_empty() {
+    if route.callable.is_empty() {
         return Ok(0);
     }
-    let fingerprint = configuration_fingerprint(&models);
+    let fingerprint = configuration_fingerprint(&route.models);
     let rows = sqlx::query_as::<_, (String, i32)>(
-        "UPDATE public.content_work_items SET status = 'queued', failure_class = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE id IN (SELECT id FROM public.content_work_items WHERE status = 'blocked_config' AND configuration_fingerprint <> $1 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, attempt_count::integer AS attempt_count",
+        r#"
+        UPDATE public.content_work_items
+        SET status = 'queued', failure_class = NULL, next_retry_at = NULL,
+            retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL,
+            lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE id IN (
+            SELECT blocked.id
+            FROM public.content_work_items blocked
+            WHERE blocked.status = 'blocked_config'
+              AND (
+                  blocked.configuration_fingerprint <> $1
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM public.content_attempt_provider_admissions admission
+                      WHERE admission.work_item_id = blocked.id
+                        AND admission.attempt_no = blocked.attempt_count::bigint
+                  )
+              )
+            ORDER BY blocked.updated_at
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, attempt_count::integer AS attempt_count
+        "#,
     )
     .bind(&fingerprint)
     .bind(RECOVERY_BATCH)
@@ -1550,9 +1609,16 @@ pub(crate) async fn admit_release_detail_translation(
 
     // Configuration validity only picks the initial status of *new* work; it
     // never rewrites existing work or a published projection.
+    //
+    // Validity is "an attempt could reach a model now", not "a model is
+    // configured": a route whose every model is credential-parked hands the
+    // worker nothing to call, so admitting `queued` would cost one wasted
+    // attempt per item before the block is recorded.
     let (configuration_valid, fingerprint) =
-        match postgres_translate::route_models_for_runtime(pool, fallback_model).await {
-            Ok(models) if !models.is_empty() => (true, configuration_fingerprint(&models)),
+        match postgres_translate::attempt_route_for_runtime(pool, fallback_model).await {
+            Ok(route) if !route.callable.is_empty() => {
+                (true, configuration_fingerprint(&route.models))
+            }
             _ => (false, cache_hit_fingerprint()),
         };
 
@@ -2507,6 +2573,8 @@ mod tests {
             INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
             CREATE TABLE public.admin_runtime_settings(id integer PRIMARY KEY, llm_models_json text NOT NULL);
             INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '["m1"]');
+            CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count bigint NOT NULL DEFAULT 0, window_started_at timestamptz, cooldown_until timestamptz, last_failure_class text, last_failure_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+            CREATE TABLE public.content_attempt_provider_admissions(id text PRIMARY KEY, attempt_event_id text NOT NULL, work_item_id text NOT NULL, attempt_no bigint NOT NULL, call_ordinal bigint NOT NULL, relation_role text NOT NULL, source_hash text NOT NULL, source_revision_json text NOT NULL DEFAULT '{}', admitted_at text NOT NULL, UNIQUE (attempt_event_id, call_ordinal));
             INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
               VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body', '2026-11-24T00:00:00Z');
             CREATE TABLE public.translation_work_items(id text PRIMARY KEY, dedupe_key text UNIQUE NOT NULL, scope_user_id text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, token_estimate integer NOT NULL, deadline_at text NOT NULL, status text NOT NULL, result_status text, title_zh text, summary_md text, body_md text, error_text text, cache_hit bigint NOT NULL DEFAULT 0, batch_id text, retry_count bigint NOT NULL DEFAULT 0, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL);
@@ -2792,5 +2860,233 @@ mod tests {
             crate::content_source_identity::source_hash_for_item(&item),
             reader.identity_hash("release_detail", "detail", reader.body)
         );
+    }
+
+    /// Marks every routed model as credential-parked, the state a provider
+    /// outage leaves behind: `route_candidates` excludes all of them while the
+    /// persisted route is untouched.
+    async fn park_every_model(pool: &sqlx::PgPool, models: &[&str]) -> anyhow::Result<()> {
+        for model in models {
+            sqlx::query(
+                "INSERT INTO public.llm_model_health (model, relevant_failure_count, cooldown_until, last_failure_class, created_at, updated_at) VALUES ($1, 2, now() + interval '24 hours', 'configuration', now(), now()) ON CONFLICT (model) DO UPDATE SET cooldown_until = excluded.cooldown_until, last_failure_class = excluded.last_failure_class, updated_at = now()",
+            )
+            .bind(model)
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// An operator saving the runtime configuration clears credential parks.
+    async fn clear_model_parks(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE public.llm_model_health SET cooldown_until = NULL, updated_at = now() WHERE last_failure_class = 'configuration'",
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_queued_work(
+        pool: &sqlx::PgPool,
+        id: &str,
+        fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ($1, 'release', '42', 'polishing', 'smart', 'zh-CN', 'source', $2, 'postgres-default', '{}', $3, 'queued', 0, now()::text, now()::text)",
+        )
+        .bind(id)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(fingerprint)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// (b) A claim must not spend an attempt on a route that cannot be called.
+    /// While every routed model is credential-parked the item stays queued with
+    /// its attempt count untouched; once a model is callable it is claimable.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn claim_waits_while_every_routed_model_is_parked() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            insert_queued_work(&pool, "claim-work", "fingerprint").await?;
+
+            park_every_model(&pool, &["m1"]).await?;
+            assert!(
+                claim_next(&pool, "m1").await?.is_none(),
+                "a fully parked route must not be claimed"
+            );
+            let untouched: (String, i32) = sqlx::query_as(
+                "SELECT status, attempt_count FROM public.content_work_items WHERE id = 'claim-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                untouched,
+                ("queued".to_owned(), 0),
+                "a skipped claim spends no attempt and records no start"
+            );
+            let events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_attempt_events WHERE work_item_id = 'claim-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(events, 0, "no attempt events may be written");
+
+            clear_model_parks(&pool).await?;
+            let claim = claim_next(&pool, "m1")
+                .await?
+                .expect("a callable route claims the queued work");
+            assert_eq!(claim.work.id, "claim-work");
+            assert_eq!(claim.work.attempt_count, 1);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// (d) Recovery must key on whether a model can be called now, not on
+    /// whether the persisted route changed. A park changes no persisted value,
+    /// so this is the exact case the fingerprint comparison missed.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn recovery_requeues_once_a_model_became_callable_again() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let live_route_fingerprint = configuration_fingerprint(&["m1".to_owned()]);
+            // Production shape: the stored fingerprint already equals the live
+            // route, so the old `<>` predicate matched nothing.
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, failure_class, created_at, updated_at) VALUES ('blocked-work', 'release', '42', 'polishing', 'smart', 'zh-CN', 'source', $1, 'postgres-default', '{}', $2, 'blocked_config', 1, 'configuration', now()::text, now()::text)",
+            )
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&live_route_fingerprint)
+            .execute(&pool)
+            .await?;
+
+            // Still parked: nothing may be requeued.
+            park_every_model(&pool, &["m1"]).await?;
+            assert_eq!(
+                unblock_reconfigured_work(&pool, "m1").await?,
+                0,
+                "a parked route must not requeue work it cannot serve"
+            );
+            let still_blocked: String = sqlx::query_scalar(
+                "SELECT status FROM public.content_work_items WHERE id = 'blocked-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(still_blocked, "blocked_config");
+
+            // Health cleared, route text unchanged: the fingerprint still
+            // equals the live route, and the row must now be released.
+            clear_model_parks(&pool).await?;
+            assert_eq!(
+                unblock_reconfigured_work(&pool, "m1").await?,
+                1,
+                "a callable route resumes work that was blocked waiting for one"
+            );
+            let resumed: (String, Option<String>) = sqlx::query_as(
+                "SELECT status, failure_class FROM public.content_work_items WHERE id = 'blocked-work'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(resumed.0, "queued");
+            assert_eq!(resumed.1, None, "the block reason is cleared on resume");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// (d), loop bound: an attempt the provider actually rejected must wait for a
+    /// route edit. Only 401/403 parks a model, so a 400-class rejection leaves
+    /// the route callable; without the admission check the sweep would retry it
+    /// every tick.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn recovery_does_not_retry_a_model_rejected_attempt() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            let live_route_fingerprint = configuration_fingerprint(&["m1".to_owned()]);
+            sqlx::query(
+                "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, failure_class, created_at, updated_at) VALUES ('rejected-work', 'release', '42', 'polishing', 'smart', 'zh-CN', 'source', $1, 'postgres-default', '{}', $2, 'blocked_config', 1, 'configuration', now()::text, now()::text)",
+            )
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&live_route_fingerprint)
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO public.content_attempt_provider_admissions (id, attempt_event_id, work_item_id, attempt_no, call_ordinal, relation_role, source_hash, admitted_at) VALUES ('admission-1', 'event-1', 'rejected-work', 1, 0, 'primary', 'source', now()::text)",
+            )
+            .execute(&pool)
+            .await?;
+
+            assert_eq!(
+                unblock_reconfigured_work(&pool, "m1").await?,
+                0,
+                "an upstream verdict is not recovered by the sweep timer"
+            );
+
+            // A genuine route edit still re-probes it.
+            sqlx::query(
+                "UPDATE public.admin_runtime_settings SET llm_models_json = '[\"m1\",\"m2\"]' WHERE id = 1",
+            )
+            .execute(&pool)
+            .await?;
+            assert_eq!(
+                unblock_reconfigured_work(&pool, "m1").await?,
+                1,
+                "a route edit re-probes work the previous route rejected"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
+    }
+
+    /// (c) Admission must not queue work it cannot run: with every model parked
+    /// the new item is admitted as `blocked_config` instead of burning an
+    /// attempt, and it is queued normally once the route is callable.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn detail_admission_blocks_new_work_while_every_model_is_parked() -> anyhow::Result<()> {
+        let (admin, pool, database, _) = create_admission_database().await?;
+        let result = async {
+            park_every_model(&pool, &["m1"]).await?;
+            let blocked = admit_release_detail_translation(&pool, 42, "m1", "seed").await?;
+            assert_eq!(blocked.outcome, DetailAdmission::Created);
+            assert_eq!(
+                blocked.status, "blocked_config",
+                "admission must not queue work while no model is callable"
+            );
+            let attempts: i64 = sqlx::query_scalar(
+                "SELECT attempt_count::bigint FROM public.content_work_items WHERE id = $1",
+            )
+            .bind(&blocked.work_item_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(attempts, 0, "admission never fabricates an attempt");
+
+            // The same source on a callable route queues normally.
+            clear_model_parks(&pool).await?;
+            sqlx::query("UPDATE public.repo_releases SET body = 'Second notes', tag_name = 'v2', html_url = 'https://github.com/acme/demo/releases/tag/v2' WHERE release_id = 42")
+                .execute(&pool)
+                .await?;
+            let queued = admit_release_detail_translation(&pool, 42, "m1", "seed").await?;
+            assert_eq!(
+                queued.status, "queued",
+                "a callable route admits work for execution"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop_admission_database(&admin, pool, &database).await?;
+        result
     }
 }
