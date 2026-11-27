@@ -20,9 +20,8 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
-    api,
-    content_identity_upgrade::{self, ContentWorkIdentity},
     content_processing::GLOBAL_PROTOCOL_VERSION,
+    content_source_identity::ContentWorkIdentity,
     translations::{self, TranslationRequestItemInput, TranslationSourceBlock},
 };
 
@@ -211,7 +210,8 @@ pub(crate) fn reading_state(payload: &Value) -> (Option<String>, bool) {
     let Some(raw) = payload.get("reading") else {
         return (None, false);
     };
-    let Ok(mut reading) = serde_json::from_value::<translations::ReleaseReadingResult>(raw.clone())
+    let Ok(mut reading) =
+        serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(raw.clone())
     else {
         return (None, true);
     };
@@ -229,60 +229,6 @@ fn normalize_body(body: &str) -> String {
     body.replace("\r\n", "\n")
 }
 
-/// Build the content-work identity source hash for one translated slot.
-///
-/// This is the legacy `global_source_hash_from_fields` construction: the
-/// projection identities are keyed by the translation item built from the
-/// metadata/title/body source blocks, so the read paths must rebuild exactly
-/// that item.
-fn global_source_hash_from_fields(
-    kind: &str,
-    variant: &str,
-    entity_id: &str,
-    metadata: String,
-    title: String,
-    body: Option<String>,
-) -> String {
-    let mut source_blocks = vec![
-        TranslationSourceBlock {
-            slot: "metadata".to_owned(),
-            text: metadata,
-        },
-        TranslationSourceBlock {
-            slot: "title".to_owned(),
-            text: title,
-        },
-    ];
-    let has_body = body
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-    if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
-        source_blocks.push(TranslationSourceBlock {
-            slot: "body_markdown".to_owned(),
-            text: body,
-        });
-    }
-    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
-        if has_body {
-            vec!["title_zh".to_owned(), "body_md".to_owned()]
-        } else {
-            vec!["title_zh".to_owned()]
-        }
-    } else {
-        vec!["title_zh".to_owned(), "summary_md".to_owned()]
-    };
-    crate::content_processing::source_hash_for_item(&TranslationRequestItemInput {
-        producer_ref: String::new(),
-        kind: kind.to_owned(),
-        variant: variant.to_owned(),
-        entity_id: entity_id.to_owned(),
-        target_lang: TARGET_LANG.to_owned(),
-        max_wait_ms: 0,
-        source_blocks,
-        target_slots,
-    })
-}
-
 /// Repository identity the legacy content-processing writer used for a
 /// release.
 ///
@@ -297,6 +243,148 @@ fn global_source_hash_from_fields(
 pub(crate) fn release_repo_identity(html_url: &str, repo_id: i64) -> String {
     crate::release_links::parse_repo_full_name_from_release_url(html_url)
         .unwrap_or_else(|| format!("unknown/{repo_id}"))
+}
+
+/// Source fields one canonical Release detail translation is built from.
+pub(crate) struct ReleaseDetailOrigin<'a> {
+    pub release_id: i64,
+    pub html_url: &'a str,
+    pub repo_id: i64,
+    pub tag_name: &'a str,
+    pub name: Option<&'a str>,
+    pub body: Option<&'a str>,
+    /// Authoritative source revision metadata. It is not part of the identity.
+    pub observed_at: Option<&'a str>,
+}
+
+/// One canonical Release detail translation request.
+///
+/// Admission mints the work identity from these fields and the detail read path
+/// rebuilds the same identity through [`ReleaseSource::identity_hash`], so both
+/// sides must agree byte for byte. Keeping the construction here is what makes
+/// that agreement checkable instead of re-derived at a call site.
+///
+/// `source_observed_at` and `source_revision_tiebreak` are source-revision
+/// metadata, not identity: `content_source_identity::source_hash_for_item` drops them
+/// while provider admission persists them for currency checks.
+pub(crate) fn release_detail_translation_item(
+    origin: &ReleaseDetailOrigin<'_>,
+    producer_ref: &str,
+) -> TranslationRequestItemInput {
+    let repo_identity = release_repo_identity(origin.html_url, origin.repo_id);
+    let title = origin
+        .name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(origin.tag_name)
+        .to_owned();
+    let body = origin.body.map(normalize_body).unwrap_or_default();
+    let tiebreak = crate::content_source_identity::release_source_revision_content_tiebreak(&[
+        origin.html_url,
+        origin.tag_name,
+        title.as_str(),
+        body.as_str(),
+    ]);
+    let mut item = identity_item(
+        "release_detail",
+        "detail",
+        &origin.release_id.to_string(),
+        format!("{repo_identity}\n{}", origin.tag_name),
+        title,
+        Some(body),
+    );
+    item.producer_ref = producer_ref.to_owned();
+    // Revision metadata belongs in front of the identity blocks, exactly where
+    // `with_source_revision` puts it for every other producer.
+    if let Some(observed_at) = origin.observed_at.filter(|value| !value.trim().is_empty()) {
+        item.source_blocks.insert(
+            0,
+            TranslationSourceBlock {
+                slot: "source_observed_at".to_owned(),
+                text: observed_at.to_owned(),
+            },
+        );
+        item.source_blocks.insert(
+            1,
+            TranslationSourceBlock {
+                slot: "source_revision_tiebreak".to_owned(),
+                text: tiebreak,
+            },
+        );
+    }
+    item
+}
+
+/// The translation request item a content-work identity is keyed by.
+///
+/// Projection identities are the canonical `source_hash_for_item` hash of this
+/// item. The reader rebuilds it from live release/announcement text; the single
+/// projection writer must derive it the same way, so both go through here
+/// instead of maintaining two hash constructions.
+///
+/// Line endings are normalized here rather than by each caller: the stored body
+/// keeps whatever an ingest wrote, and an identity that changed with `\r\n`
+/// would make a published projection unreadable.
+pub(crate) fn identity_item(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> TranslationRequestItemInput {
+    let body = body
+        .map(|value| value.replace("\r\n", "\n"))
+        .filter(|value| !value.trim().is_empty());
+    let has_body = body.is_some();
+    let mut source_blocks = vec![
+        TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        },
+        TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if let Some(body) = body {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
+        if has_body {
+            vec!["title_zh".to_owned(), "body_md".to_owned()]
+        } else {
+            vec!["title_zh".to_owned()]
+        }
+    } else {
+        vec!["title_zh".to_owned(), "summary_md".to_owned()]
+    };
+    TranslationRequestItemInput {
+        producer_ref: String::new(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: TARGET_LANG.to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    }
+}
+
+fn global_source_hash_from_fields(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> String {
+    crate::content_source_identity::source_hash_for_item(&identity_item(
+        kind, variant, entity_id, metadata, title, body,
+    ))
 }
 
 /// Release-side resources for one projection lookup.
@@ -330,10 +418,12 @@ impl ReleaseSource<'_> {
 
     /// Truncated feed body, as the feed translation cache hash uses it.
     fn feed_body(&self) -> Option<String> {
-        api::release_feed_body(self.body)
+        crate::release_content::release_feed_body(self.body)
     }
 
-    fn identity_hash(&self, kind: &str, variant: &str, body: Option<&str>) -> String {
+    /// Identity hash the read path looks a projection up by. The single
+    /// projection writer must reproduce it for a published row to be readable.
+    pub(crate) fn identity_hash(&self, kind: &str, variant: &str, body: Option<&str>) -> String {
         global_source_hash_from_fields(
             kind,
             variant,
@@ -360,7 +450,7 @@ impl AnnouncementSource<'_> {
             kind,
             variant,
             self.discussion_key,
-            api::announcement_translation_metadata_text(
+            crate::content_source_identity::announcement_translation_metadata_text(
                 self.repo_full_name,
                 Some(self.discussion_number),
             ),
@@ -468,7 +558,7 @@ pub(crate) async fn read_exact_projection(
             source_hash: expected_source_hash.to_owned(),
             protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
         };
-        let identity_id = content_identity_upgrade::identity_id_for(&key)
+        let identity_id = crate::content_source_identity::identity_id_for(&key)
             .expect("content work identity keys are serializable");
         let payload = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM public.content_current_result_projections WHERE identity_id = $1",
@@ -533,7 +623,7 @@ async fn identity_projection(
         source_hash: expected_source_hash.to_owned(),
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id = content_identity_upgrade::identity_id_for(&key)
+    let identity_id = crate::content_source_identity::identity_id_for(&key)
         .expect("content work identity keys are serializable");
     let exact = sqlx::query_scalar::<_, String>(
         "SELECT payload_json FROM public.content_current_result_projections WHERE identity_id = $1",
@@ -1040,17 +1130,18 @@ pub(crate) async fn release_feed_processing(
     )
     .await?;
     Ok(FeedProcessing {
-        translation_source_hash: api::release_feed_translation_source_hash(
-            source.repo_full_name,
-            &title,
-            feed_body.as_deref(),
-        ),
-        detail_source_hash: api::release_detail_source_hash(
+        translation_source_hash:
+            crate::content_source_identity::release_feed_translation_source_hash(
+                source.repo_full_name,
+                &title,
+                feed_body.as_deref(),
+            ),
+        detail_source_hash: crate::content_source_identity::release_detail_source_hash(
             source.repo_full_name,
             &title,
             source.body.unwrap_or(""),
         ),
-        smart_source_hash: translations::release_smart_feed_source_hash(
+        smart_source_hash: crate::content_source_identity::release_smart_feed_source_hash(
             &entity_id,
             source.repo_full_name,
             &title,
@@ -1071,7 +1162,7 @@ pub(crate) async fn announcement_feed_processing(
     source: &AnnouncementSource<'_>,
 ) -> Result<FeedProcessing, sqlx::Error> {
     let key = source.discussion_key;
-    let feed_body = api::release_feed_body(source.body);
+    let feed_body = crate::release_content::release_feed_body(source.body);
     let translation = read_first_projection(
         pool,
         state,
@@ -1119,19 +1210,20 @@ pub(crate) async fn announcement_feed_processing(
     )
     .await?;
     Ok(FeedProcessing {
-        translation_source_hash: api::announcement_feed_translation_source_hash(
-            source.repo_full_name,
-            Some(source.discussion_number),
-            source.title,
-            feed_body.as_deref(),
-        ),
-        detail_source_hash: api::announcement_detail_source_hash(
+        translation_source_hash:
+            crate::content_source_identity::announcement_feed_translation_source_hash(
+                source.repo_full_name,
+                Some(source.discussion_number),
+                source.title,
+                feed_body.as_deref(),
+            ),
+        detail_source_hash: crate::content_source_identity::announcement_detail_source_hash(
             source.repo_full_name,
             Some(source.discussion_number),
             source.title,
             source.body.unwrap_or(""),
         ),
-        smart_source_hash: translations::announcement_smart_feed_source_hash(
+        smart_source_hash: crate::content_source_identity::announcement_smart_feed_source_hash(
             key,
             source.repo_full_name,
             Some(source.discussion_number),
@@ -1209,6 +1301,46 @@ pub(crate) async fn announcement_detail_processing(
     )
     .await?;
     Ok(DetailProcessing { translation, smart })
+}
+
+/// Text of the current Release detail projection, if one exists.
+///
+/// The API adapter uses this so a cache-hit response carries the retained
+/// translation instead of an empty `ready`. It resolves the same exact identity
+/// the admission did.
+pub(crate) async fn release_detail_text(
+    pool: &PgPool,
+    release_id: i64,
+    work_status: &str,
+) -> (Option<String>, Option<String>) {
+    if work_status != "ready" {
+        return (None, None);
+    }
+    let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>)>(
+        "SELECT repo_id, html_url, tag_name, name, body FROM public.repo_releases WHERE release_id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    else {
+        return (None, None);
+    };
+    let (repo_id, html_url, tag_name, name, body) = row;
+    let repo_identity = release_repo_identity(&html_url, repo_id);
+    let source = ReleaseSource {
+        release_id,
+        repo_full_name: repo_identity.as_str(),
+        repo_identity: repo_identity.as_str(),
+        tag_name: tag_name.as_str(),
+        name: name.as_deref(),
+        body: body.as_deref(),
+        previous_tag_name: None,
+    };
+    let state = OverlayState::load(pool).await;
+    match public_release_translation(pool, state, &source).await {
+        Ok(Some(projection)) => (projection.title(), projection.translation_summary()),
+        _ => (None, None),
+    }
 }
 
 /// Public Release translation: the exact detail projection only.
@@ -1328,4 +1460,37 @@ pub(crate) async fn latest_translation_request_ids(
         }
     }
     Ok(requests)
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    /// Public readers resolve the public variant and nothing else: the legacy
+    /// `smart` row may describe a reading derived from private compare evidence.
+    #[test]
+    fn public_audience_never_falls_back_to_legacy_smart() {
+        assert_eq!(
+            ReleaseAudience::Public.polishing_variants(),
+            &[translations::RELEASE_READING_PUBLIC_VARIANT]
+        );
+        assert!(
+            !ReleaseAudience::Public
+                .polishing_variants()
+                .contains(&"smart")
+        );
+    }
+
+    /// Authorized viewers keep the audit reading variant first, with the
+    /// pre-cutover `smart` projection as the documented fallback.
+    #[test]
+    fn authorized_audience_reads_its_variant_then_legacy_smart() {
+        let variants = ReleaseAudience::Authorized.polishing_variants();
+        assert_eq!(
+            variants[0],
+            translations::RELEASE_READING_AUTHORIZED_VARIANT
+        );
+        assert_eq!(variants.last().copied(), Some("smart"));
+        assert!(!variants.contains(&translations::RELEASE_READING_PUBLIC_VARIANT));
+    }
 }

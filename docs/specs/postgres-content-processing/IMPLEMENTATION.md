@@ -39,6 +39,14 @@
 
 - 2026-11-24 第 2 分片：PostgreSQL 原生全局内容 worker。新增 `src/postgres_content.rs`：受限期认领（`FOR UPDATE SKIP LOCKED`）、attempt 事件与路由快照、每次 provider 请求前的 lease 续约与 provider admission、复用 `postgres_translate` 的模型路由/健康与 `llm_calls` 审计、复用 `content_processing::{build_prompt,validate_output}` 输出契约、发布结果投影与当前投影、过期 lease 恢复；Release 刷新在既有 `smart` 合约上限量准入润色工作（不伪造 reading evidence）。
 
+## 修复顺序
+
+1. 管理读真实状态：去掉无 observation 时对当前 legacy 工作行的 `legacy_conflict` 合成，按真实状态与尝试数展示（REQ-PGCP-010）。
+2. 翻译投影发布 + 受众润色变体：翻译完成写投影，producer 补 `smart_public`/`smart_authorized`（REQ-PGCP-011）。
+3. 既有 366 条输出回填为投影：零新增尝试、按 identity + `source_hash` 幂等写入。
+4. 翻译 admission 迁入全局生产者；按用户端点变适配器。
+5. 退役旧 `translation.generate` 自动入队（SQLite 退役 PR 4 的功能门禁）。
+
 ## Remaining Gaps
 
 - 契约抽取：`build_prompt`/`validate_output` 已共用，但失败分类仍分属于两条链路。
@@ -47,6 +55,10 @@
 - 润色/阅读：`smart_public`/`smart_authorized` 需要 PostgreSQL evidence producer；公告与通知未接入。
 - 指标：worker 目前只有结构化日志，未接 Prometheus 计数。
 - 退役 legacy `translation.generate` 自动入队尚未开始。
+- 管理读模型：切换后翻译只落按用户工作行且无 observation，管理端与活动图把它合成为 `legacy_conflict`；`REQ-PGCP-010` 未实现（2026-11-25 实测 48/48 活动 cell 为中性）。
+- 公开读：global 模式详情只读全局投影，翻译输出未投影，公开详情返回 `translated.status=missing`；切换后 366/366 条已完成翻译无缓存行。`REQ-PGCP-011` 未实现。
+- 受众变体：全局 producer 只 admit `smart`，公开受众只读 `smart_public`；公开 `smart.status=missing`。
+- 数据修复：需要把上述 366 条既有输出以零新增尝试转为投影，尚未开始。
 
 ## Related Changes
 

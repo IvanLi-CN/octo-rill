@@ -27,13 +27,12 @@ pub struct PostgresRuntime {
 /// MessagePack `tower_sessions::Record` and have a non-null expiry.
 pub async fn verify_session_store(pool: &PgPool, sample_limit: i64) -> Result<usize> {
     let sample_limit = sample_limit.max(1);
-    let rows = sqlx::query(
-        "SELECT id, data, expiry_date FROM octo_rill.tower_sessions ORDER BY id LIMIT $1",
-    )
-    .bind(sample_limit)
-    .fetch_all(pool)
-    .await
-    .context("read PostgreSQL session verification sample")?;
+    let rows =
+        sqlx::query("SELECT id, data, expiry_date FROM public.tower_sessions ORDER BY id LIMIT $1")
+            .bind(sample_limit)
+            .fetch_all(pool)
+            .await
+            .context("read PostgreSQL session verification sample")?;
 
     for row in &rows {
         let id: String = row.try_get("id").context("decode PostgreSQL session id")?;

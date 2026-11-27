@@ -185,6 +185,17 @@ def main():
             "('seed-admin',102,'admin','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',1)",
             url,
         )
+        # `route_models` fail-closes when the routing row is absent, so the AI
+        # phase needs the persisted model list. An empty list is intentional:
+        # `AI_MODEL` then supplies the single configured model.
+        sql(
+            "INSERT INTO public.admin_runtime_settings(id, llm_max_concurrency,"
+            " translation_general_worker_concurrency, translation_dedicated_worker_concurrency,"
+            " llm_models_json, created_at, updated_at)"
+            " VALUES (1, 1, 1, 1, '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+            " ON CONFLICT (id) DO UPDATE SET llm_models_json = '[]'",
+            url,
+        )
         sql(
             ""
             "DROP VIEW IF EXISTS public.user_release_visible_repos CASCADE; CREATE TABLE public.user_release_visible_repos(user_id text, repo_id bigint, full_name text, is_private bigint);"
@@ -253,6 +264,20 @@ def main():
             def post_json(path, body, user='seed-user'):
                 status, _, text = post(path, body, user)
                 return status, json.loads(text)
+
+            def patch_json(path, body, user='seed-admin'):
+                data = json.dumps(body).encode()
+                request = urllib.request.Request(
+                    base + path,
+                    data=data,
+                    headers={'content-type': 'application/json', 'Cookie': cookies[user]},
+                    method='PATCH',
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        return response.status, json.load(response)
+                except urllib.error.HTTPError as error:
+                    return error.code, json.load(error)
 
             def get_json(path, user='seed-admin'):
                 request = urllib.request.Request(base + path, headers={'Cookie': cookies[user]})
@@ -380,6 +405,28 @@ def main():
             status, body = post_json('/api/translate/releases/batch', {'release_ids': ['3']})
             assert status == 200 and body['items'][0]['status'] == 'error', body
             assert body['items'][0]['failure_class'] == 'configuration', body
+
+            # The 401 above parked the only model for 24h (`REQ-PGR-010`), so
+            # later calls fail-closed with `configuration` until an operator
+            # saves the LLM runtime configuration. Assert the park from the
+            # health row rather than spending another request row, then clear it
+            # so the `empty_content` classification below stays reachable.
+            assert sql(
+                "SELECT COALESCE(last_failure_class, '') || ':' || "
+                "CASE WHEN cooldown_until > now() THEN 'parked' ELSE 'clear' END "
+                "FROM public.llm_model_health WHERE model = 'stub-model'",
+                url,
+            ) == 'configuration:parked'
+            code, body = patch_json(
+                '/api/admin/jobs/llm/runtime-config',
+                {'max_concurrency': 1, 'llm_models': ['stub-model']},
+            )
+            assert code == 200, body
+            assert sql(
+                "SELECT COALESCE(cooldown_until::text, 'cleared') "
+                "FROM public.llm_model_health WHERE model = 'stub-model'",
+                url,
+            ) == 'cleared'
 
             # Empty model output is classified as empty_content.
             status, body = post_json('/api/translate/release', {'release_id': '4'})

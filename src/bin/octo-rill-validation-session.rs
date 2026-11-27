@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     .await?;
     ensure!(exists, "validation user is missing or disabled");
     let store = PostgresStore::new(pool.clone())
-        .with_schema_name("octo_rill")
+        .with_schema_name("public")
         .map_err(anyhow::Error::msg)?
         .with_table_name("tower_sessions")
         .map_err(anyhow::Error::msg)?;

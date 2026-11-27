@@ -3,8 +3,6 @@
 // (仓库外运维记录) removes them; nothing in them
 // is reachable from `main`, so their absence of callers is expected rather
 // than dead code to delete in the persistence cutover.
-#[allow(dead_code)]
-mod admin_ai_records;
 mod admin_job_groups;
 #[allow(dead_code)]
 mod admin_runtime;
@@ -15,14 +13,13 @@ mod api;
 #[allow(dead_code)]
 mod api_keys;
 #[allow(dead_code)]
-mod auth;
-#[allow(dead_code)]
 mod briefs;
 mod config;
 #[allow(dead_code)]
 mod content_identity_upgrade;
 #[allow(dead_code)]
 mod content_processing;
+mod content_source_identity;
 mod crypto;
 #[allow(dead_code)]
 mod database_migrations;
@@ -35,7 +32,9 @@ mod github_api;
 mod jobs;
 #[allow(dead_code)]
 mod linuxdo;
+mod llm_contract;
 mod local_id;
+mod markdown;
 #[allow(dead_code)]
 mod metrics;
 mod observability;
@@ -65,11 +64,11 @@ mod postgres_server;
 mod postgres_star_epochs;
 mod postgres_tasks;
 mod postgres_translate;
+mod postgres_translation_backfill;
 mod postgres_webhook;
 pub mod postgres_worker;
 mod postgres_write;
-#[allow(dead_code)]
-mod public_metrics;
+mod release_content;
 #[allow(dead_code)]
 mod release_links;
 #[allow(dead_code)]
@@ -78,15 +77,18 @@ mod search;
 #[allow(dead_code)]
 mod search_index;
 #[allow(dead_code)]
-mod server;
-#[allow(dead_code)]
 mod session_store;
 #[allow(dead_code)]
 mod sqlite_write;
 #[allow(dead_code)]
 mod state;
+mod static_site;
 #[allow(dead_code)]
 mod sync;
+mod translation_admin_types;
+mod translation_error;
+mod translation_runtime;
+mod translation_types;
 #[allow(dead_code)]
 mod translations;
 mod version;
@@ -149,6 +151,32 @@ async fn main() -> Result<()> {
             tracing::info!(lane = %lane, enqueued, "PostgreSQL scheduler lane tick applied");
         }
         tracing::info!("PostgreSQL runtime baseline and session store are ready");
+        runtime.pool.close().await;
+        return Ok(());
+    }
+    // One-shot repair: republish finished translation outputs as projections
+    // without running any new attempt, then exit without serving traffic.
+    if std::env::var(postgres_translation_backfill::MODE_ENV).as_deref() == Ok("1") {
+        if config.database_backend()? != config::DatabaseBackend::Postgres {
+            anyhow::bail!(
+                "{} requires a postgres DATABASE_URL",
+                postgres_translation_backfill::MODE_ENV
+            );
+        }
+        let runtime = postgres_runtime::connect_from_config(&config).await?;
+        let report = postgres_translation_backfill::run_from_env(&runtime.pool).await?;
+        tracing::info!(
+            scanned = report.scanned,
+            published = report.published,
+            already_current = report.already_current,
+            skipped_source_hash_mismatch = report.skipped_source_hash_mismatch,
+            skipped_output_contract = report.skipped_output_contract,
+            skipped_missing_release = report.skipped_missing_release,
+            skipped_incomplete_source = report.skipped_incomplete_source,
+            failed = report.failed,
+            out_of_scope = ?report.skipped_out_of_scope,
+            "translation projection backfill is complete"
+        );
         runtime.pool.close().await;
         return Ok(());
     }

@@ -33,6 +33,11 @@ def main():
     p.add_argument('--parameters', type=pathlib.Path, help='private JSON mapping route parameter names to fixture IDs')
     p.add_argument('--placeholder-reads', type=pathlib.Path, help='JSON list of known read paths among any() placeholders')
     p.add_argument('--output', type=pathlib.Path, required=True)
+    p.add_argument(
+        '--allow-unrunnable',
+        action='store_true',
+        help='accept not_run cases (auth routes, absent fixtures) as non-fatal in CI',
+    )
     args = p.parse_args()
     cookie = args.cookie_file.read_text().strip() if args.cookie_file else ''
     values = json.loads(args.parameters.read_text()) if args.parameters else {}
@@ -113,7 +118,14 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({k: v for k, v in report.items() if k not in ('cases', 'unclassified_placeholder_routes')}))
-    return 1 if report['failed'] or report['not_run'] else 0
+    # Real failures always fail. `not_run` is fatal only when the caller can
+    # supply every fixture; CI keeps the auth routes and private-fixture routes
+    # visible in the report without letting them mask a green read path.
+    if report['failed']:
+        return 1
+    if report['not_run'] and not args.allow_unrunnable:
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

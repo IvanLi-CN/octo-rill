@@ -349,9 +349,17 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         if let Some(ddl) = ddl {
             let translated = translate_ddl(&ddl, &name)?;
             let dependencies = referenced_tables(&name, &ddl);
-            tables.push((name, columns, translated, dependencies));
+            // `CREATE TABLE IF NOT EXISTS` is a no-op when the runtime already
+            // built the table, so the copied columns must still be filtered to
+            // what the target actually has.
+            let shared = shared_target_columns(pg, &name, columns).await?;
+            tables.push((name, shared, translated, dependencies));
         } else {
-            tables.push((name, columns, String::new(), Vec::new()));
+            // The target already owns this table (a view or a runtime-created
+            // one), so copy only the columns both sides share. Some legacy
+            // SQLite columns were never carried into the PostgreSQL schema.
+            let shared = shared_target_columns(pg, &name, columns).await?;
+            tables.push((name, shared, String::new(), Vec::new()));
         }
     }
     let tables = order_tables_by_dependencies(tables)?;
@@ -488,9 +496,9 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         );
     }
     import_application_views(sqlite, pg).await?;
-    // Keep the runtime store's schema aligned with imported login sessions.
-    pg.batch_execute("INSERT INTO octo_rill.tower_sessions(id,data,expiry_date) SELECT id,data,expiry_date FROM public.tower_sessions ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,expiry_date=EXCLUDED.expiry_date;")
-        .await.context("migrate persisted login sessions to runtime store")?;
+    // Login sessions already land in `public.tower_sessions`, which is the
+    // single runtime session table after schema convergence; no second copy is
+    // needed and the retired `octo_rill` schema no longer exists.
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(sqlite)
         .await?;
@@ -510,7 +518,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
         .with_context(|| format!("write manifest {}", args.manifest.display()))?;
     let manifest_json = serde_json::to_value(&manifest).context("serialize migration manifest")?;
     pg.execute(
-        "INSERT INTO octo_rill.migration_manifests (source_snapshot, manifest) VALUES ($1, $2)",
+        "INSERT INTO public.migration_manifests (source_snapshot, manifest) VALUES ($1, $2)",
         &[&args.sqlite_source, &manifest_json],
     )
     .await
@@ -526,7 +534,7 @@ async fn import(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
 /// The SQLite SQLx history describes migrations that have no PostgreSQL
 /// equivalent; copying it makes the PostgreSQL migrator treat foreign versions
 /// as applied and abort. The source version is preserved in the migration
-/// manifest and `octo_rill.migration_manifests` instead.
+/// manifest and `public.migration_manifests` instead.
 fn skipped_source_table_reason(name: &str, fts_names: &HashSet<String>) -> Option<&'static str> {
     if fts_names.contains(name) {
         return Some("SQLite FTS5 is a rebuildable projection");
@@ -616,7 +624,7 @@ async fn verify(sqlite: &SqlitePool, pg: &mut Client, args: &Args) -> Result<()>
                 .as_ref()
                 .is_none_or(|selected| selected == *name)
     }) {
-        let columns = column_names(sqlite, name).await?;
+        let columns = shared_target_columns(pg, name, column_names(sqlite, name).await?).await?;
 
         let verify_started = std::time::Instant::now();
         eprintln!("verifying table {name}");
@@ -1408,6 +1416,33 @@ async fn checksum_sqlite(
     }
     let _ = columns;
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+/// Columns present in both the SQLite source table and the PostgreSQL target.
+async fn shared_target_columns(
+    pg: &Client,
+    table: &str,
+    source_columns: Vec<String>,
+) -> Result<Vec<String>> {
+    let target: Vec<String> = pg
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1",
+            &[&table],
+        )
+        .await
+        .with_context(|| format!("read target columns for {table}"))?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let kept: Vec<String> = source_columns
+        .into_iter()
+        .filter(|column| target.contains(column))
+        .collect();
+    if kept.is_empty() {
+        bail!("table {table} shares no columns with its PostgreSQL target");
+    }
+    Ok(kept)
 }
 
 async fn column_names(sqlite: &SqlitePool, table: &str) -> Result<Vec<String>> {

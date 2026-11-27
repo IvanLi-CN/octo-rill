@@ -33,6 +33,17 @@ use crate::{
     local_id, search as search_service, sync, translations, webhook_push,
 };
 use crate::{
+    content_source_identity::{
+        announcement_detail_source_hash, announcement_discussion_key,
+        announcement_feed_translation_source_hash, announcement_translation_metadata_text,
+        parse_announcement_discussion_key, parse_discussion_number_from_github_url,
+        release_detail_source_hash, release_feed_translation_source_hash,
+    },
+    markdown::markdown_structure_preserved,
+    release_content::{RELEASE_FEED_BODY_MAX_CHARS, release_feed_body},
+    translation_error::SMART_NO_VALUABLE_VERSION_INFO,
+};
+use crate::{
     error::ApiError,
     passkeys::{
         PasskeySummary, PendingPasskeyCredentialSession, load_passkey_summaries,
@@ -45,7 +56,6 @@ const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
 const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ACCESS_SYNC_REASON_INACTIVE_OVER_1H: &str = "inactive_over_1h";
-const GITHUB_DISCUSSION_PATH_SEGMENT: &str = "/discussions/";
 const PUBLIC_RELEASE_HIGHLIGHT_ID_LIMIT: usize = 20;
 const PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT: i64 = 30;
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
@@ -62,58 +72,6 @@ async fn legacy_writer_available(
 
 fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
-}
-
-pub(crate) fn parse_discussion_number_from_github_url(html_url: &str) -> Option<i64> {
-    let parsed = url::Url::parse(html_url).ok()?;
-    if !matches!(parsed.host_str(), Some("github.com" | "www.github.com")) {
-        return None;
-    }
-    let (_, number_raw) = parsed.path().split_once(GITHUB_DISCUSSION_PATH_SEGMENT)?;
-    number_raw
-        .split('/')
-        .next()
-        .and_then(|value| value.trim().parse::<i64>().ok())
-}
-
-pub(crate) fn announcement_discussion_key(repo_full_name: &str, discussion_number: i64) -> String {
-    format!(
-        "{}#{discussion_number}",
-        repo_full_name.trim().to_ascii_lowercase()
-    )
-}
-
-pub(crate) fn parse_announcement_discussion_key(raw: &str) -> Option<(String, i64)> {
-    let (repo_full_name, discussion_number_raw) = raw.trim().rsplit_once('#')?;
-    let discussion_number = discussion_number_raw.trim().parse::<i64>().ok()?;
-    let repo_full_name = repo_full_name.trim().trim_matches('/').to_ascii_lowercase();
-    if repo_full_name.is_empty() || !repo_full_name.contains('/') {
-        return None;
-    }
-    Some((repo_full_name, discussion_number))
-}
-
-pub(crate) fn announcement_translation_metadata_text(
-    repo_full_name: &str,
-    discussion_number: Option<i64>,
-) -> String {
-    let mut metadata = repo_full_name.trim().to_owned();
-    if let Some(discussion_number) = discussion_number {
-        metadata.push('\n');
-        metadata.push_str("discussion_number=");
-        metadata.push_str(discussion_number.to_string().as_str());
-    }
-    metadata
-}
-
-pub(crate) fn parse_announcement_translation_metadata(raw: &str) -> (String, Option<i64>) {
-    let mut lines = raw.lines().map(str::trim).filter(|line| !line.is_empty());
-    let repo_full_name = lines.next().unwrap_or_default().to_owned();
-    let discussion_number = lines.find_map(|line| {
-        line.strip_prefix("discussion_number=")
-            .and_then(|value| value.trim().parse::<i64>().ok())
-    });
-    (repo_full_name, discussion_number)
 }
 
 fn graphql_string_literal(value: &str) -> String {
@@ -3138,7 +3096,6 @@ struct AdminDashboardReleaseTaskRow {
 }
 
 const ADMIN_DASHBOARD_DEFAULT_WINDOW_DAYS: i64 = 7;
-pub(crate) const ADMIN_DASHBOARD_PREAGGREGATE_DAYS: i64 = 30;
 const ADMIN_DASHBOARD_WINDOW_OPTIONS: [(&str, i64); 2] = [("7d", 7), ("30d", 30)];
 
 fn admin_dashboard_system_time_zone(state: &AppState) -> Tz {
@@ -4170,8 +4127,8 @@ pub async fn admin_list_realtime_tasks(
         .map(|task| (*task).to_owned())
         .collect::<Vec<_>>();
     let user_sync_tasks = [
-        jobs::TASK_SYNC_STARRED_DELTA.to_owned(),
-        jobs::TASK_SYNC_STARRED_RECONCILE.to_owned(),
+        crate::jobs::TASK_SYNC_STARRED_DELTA.to_owned(),
+        crate::jobs::TASK_SYNC_STARRED_RECONCILE.to_owned(),
     ];
     let mut total_query =
         QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
@@ -6580,7 +6537,7 @@ fn build_task_diagnostics(
                 sync_subscriptions: None,
             })
         }
-        jobs::TASK_SYNC_SUBSCRIPTIONS => {
+        crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS => {
             let (business_outcome, diagnostics) =
                 build_sync_subscriptions_diagnostics(task, events, subscription_events);
             Some(AdminTaskDiagnostics {
@@ -6605,7 +6562,7 @@ async fn attach_subscription_list_diagnostics(
 ) -> Result<(), ApiError> {
     let task_ids = items
         .iter()
-        .filter(|item| item.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .filter(|item| item.task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .map(|item| item.id.clone())
         .collect::<Vec<_>>();
     if task_ids.is_empty() {
@@ -6656,7 +6613,7 @@ async fn attach_subscription_list_diagnostics(
 
     for item in items
         .iter_mut()
-        .filter(|item| item.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .filter(|item| item.task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
     {
         let Some(task) = tasks.get(item.id.as_str()) else {
             continue;
@@ -6893,13 +6850,13 @@ async fn load_realtime_task_detail_response(
         truncated: event_total > returned,
     };
 
-    let subscription_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
+    let subscription_events = if task.task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS {
         load_recent_sync_subscription_events(state, task_id).await?
     } else {
         Vec::new()
     };
 
-    let diagnostic_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
+    let diagnostic_events = if task.task_type == crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS {
         load_subscription_diagnostic_progress_events(state, task_id).await?
     } else {
         events.clone()
@@ -8862,7 +8819,7 @@ async fn build_release_detail_response(
     let source_hash =
         release_detail_source_hash(&resolved_full_name, &original_title, &original_body);
     let smart_body = release_feed_body(row.body.as_deref());
-    let smart_source_hash = crate::translations::release_smart_feed_source_hash(
+    let smart_source_hash = crate::content_source_identity::release_smart_feed_source_hash(
         row.release_id.to_string().as_str(),
         &resolved_full_name,
         &original_title,
@@ -8920,7 +8877,7 @@ async fn build_release_detail_response(
             "api.release_detail.smart",
         )
         .await?;
-        let global_smart_hash = content_processing::source_hash_for_item(&smart_input);
+        let global_smart_hash = crate::content_source_identity::source_hash_for_item(&smart_input);
         let legacy_global_smart_hash = global_release_source_hash(
             row.release_id,
             &resolved_full_name,
@@ -9848,7 +9805,7 @@ async fn build_announcement_detail_response(
         source.title.as_str(),
         original_body.as_str(),
     );
-    let smart_source_hash = crate::translations::announcement_smart_feed_source_hash(
+    let smart_source_hash = crate::content_source_identity::announcement_smart_feed_source_hash(
         discussion_key.as_str(),
         source.repo_full_name.as_str(),
         Some(source.discussion_number),
@@ -11634,7 +11591,7 @@ fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<SmartItem>
         };
     }
     let smart_body = release_feed_body(row.body.as_deref());
-    let source_hash = crate::translations::release_smart_feed_source_hash(
+    let source_hash = crate::content_source_identity::release_smart_feed_source_hash(
         row.release_id.to_string().as_str(),
         &row.repo_full_name,
         &original_title,
@@ -15016,7 +14973,10 @@ fn build_dashboard_list_update(
 }
 
 fn dashboard_update_signature_digest(signature: &str) -> String {
-    ai::sha256_hex(signature).chars().take(16).collect()
+    crate::content_source_identity::sha256_hex(signature)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 fn compact_dashboard_signatures(signatures: &[String]) -> Vec<String> {
@@ -15198,7 +15158,8 @@ async fn load_dashboard_feed_signatures(
         .into_iter()
         .map(|row| {
             let key = format!("{}:{}", row.kind, row.entity_id);
-            let state_hash = ai::sha256_hex(&format!("sort={}\n", row.sort_ts));
+            let state_hash =
+                crate::content_source_identity::sha256_hex(&format!("sort={}\n", row.sort_ts));
             format!("{key}|{state_hash}")
         })
         .collect())
@@ -15512,7 +15473,7 @@ pub async fn sync_starred(
         state,
         mode,
         jobs::NewTask {
-            task_type: jobs::TASK_SYNC_STARRED.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_STARRED.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_starred".to_owned(),
             requested_by: Some(user_id.clone()),
@@ -15634,7 +15595,7 @@ pub async fn sync_releases(
         state,
         mode,
         jobs::NewTask {
-            task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_releases".to_owned(),
             requested_by: Some(user_id.clone()),
@@ -15664,7 +15625,7 @@ pub async fn sync_notifications(
         state,
         mode,
         jobs::NewTask {
-            task_type: jobs::TASK_SYNC_NOTIFICATIONS.to_owned(),
+            task_type: crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_notifications".to_owned(),
             requested_by: Some(user_id.clone()),
@@ -16972,32 +16933,6 @@ pub async fn list_following_repos(
     }))
 }
 
-pub(crate) fn release_detail_source_hash(
-    repo_full_name: &str,
-    original_title: &str,
-    original_body: &str,
-) -> String {
-    let normalized_body = original_body.replace("\r\n", "\n");
-    let source = format!(
-        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
-        repo_full_name.trim(),
-        original_title.trim(),
-        normalized_body.trim(),
-    );
-    ai::sha256_hex(&source)
-}
-
-pub(crate) const RELEASE_FEED_BODY_MAX_CHARS: usize = 3_000;
-
-pub(crate) fn release_feed_body(body: Option<&str>) -> Option<String> {
-    let normalized = body?.replace("\r\n", "\n");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(truncate_chars(trimmed, RELEASE_FEED_BODY_MAX_CHARS).into_owned())
-}
-
 /// Decide whether the Release body already contains human-readable change
 /// facts. This gate is deliberately conservative: compare evidence is only
 /// fetched for empty, template-only, version-only, or machine-metadata-only
@@ -17172,55 +17107,6 @@ fn release_body_has_actionable_content(title: &str, body: &str) -> bool {
         }
     }
     meaningful_lines > 0
-}
-
-pub(crate) fn release_feed_translation_source_hash(
-    repo_full_name: &str,
-    title: &str,
-    body: Option<&str>,
-) -> String {
-    ai::sha256_hex(&format!(
-        "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
-        repo_full_name.trim(),
-        title.trim(),
-        body.unwrap_or("").trim(),
-    ))
-}
-
-pub(crate) fn announcement_detail_source_hash(
-    repo_full_name: &str,
-    discussion_number: Option<i64>,
-    original_title: &str,
-    original_body: &str,
-) -> String {
-    let normalized_body = original_body.replace("\r\n", "\n");
-    let source = format!(
-        "v=1\nkind=announcement_detail\nrepo={}\ndiscussion_number={}\ntitle={}\nbody={}\n",
-        repo_full_name.trim().to_ascii_lowercase(),
-        discussion_number
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        original_title.trim(),
-        normalized_body.trim(),
-    );
-    ai::sha256_hex(&source)
-}
-
-pub(crate) fn announcement_feed_translation_source_hash(
-    repo_full_name: &str,
-    discussion_number: Option<i64>,
-    title: &str,
-    body: Option<&str>,
-) -> String {
-    ai::sha256_hex(&format!(
-        "v=1\nkind=announcement\nrepo={}\ndiscussion_number={}\ntitle={}\nbody={}\n",
-        repo_full_name.trim().to_ascii_lowercase(),
-        discussion_number
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        title.trim(),
-        body.unwrap_or("").trim(),
-    ))
 }
 
 pub(crate) fn release_feed_body_is_over_limit(body: Option<&str>) -> bool {
@@ -18031,17 +17917,18 @@ async fn load_feed_release_evidence_snapshot(
         .as_deref()
         .unwrap_or_default()
         .replace("\r\n", "\n");
-    let observed_at = content_processing::authoritative_release_revision(
+    let observed_at = crate::content_source_identity::authoritative_release_revision(
         release_source.0.as_str(),
         release_source.1.as_deref(),
     )
     .unwrap_or(release_source.0.as_str());
-    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
-        release_source.2.as_str(),
-        release_source.3.as_str(),
-        title,
-        body.as_str(),
-    ]);
+    let revision_tiebreak =
+        crate::content_source_identity::release_source_revision_content_tiebreak(&[
+            release_source.2.as_str(),
+            release_source.3.as_str(),
+            title,
+            body.as_str(),
+        ]);
     let request = jobs::ReleaseEvidenceRequest {
         release_id,
         repo_id,
@@ -18136,7 +18023,7 @@ async fn admit_feed_release_evidence_work(
         .as_ref()
         .ok_or_else(|| ApiError::internal("ready release evidence snapshot has no payload"))?;
     let evidence_text = serde_json::to_string(snapshot).map_err(ApiError::internal)?;
-    let reading_evidence = vec![translations::ReleaseReadingEvidence {
+    let reading_evidence = vec![crate::translation_types::ReleaseReadingEvidence {
         kind: "github_compare".to_owned(),
         reference: format!(
             "{}...{}",
@@ -18165,12 +18052,13 @@ async fn admit_feed_release_evidence_work(
                 .unwrap_or("unknown")
         )),
     }];
-    let revision_tiebreak = content_processing::release_source_revision_content_tiebreak(&[
-        source.0.as_str(),
-        source.1.as_str(),
-        title.as_str(),
-        body.as_str(),
-    ]);
+    let revision_tiebreak =
+        crate::content_source_identity::release_source_revision_content_tiebreak(&[
+            source.0.as_str(),
+            source.1.as_str(),
+            title.as_str(),
+            body.as_str(),
+        ]);
     let mut source_blocks = vec![
         translations::TranslationSourceBlock {
             slot: "metadata".to_owned(),
@@ -18209,9 +18097,11 @@ async fn admit_feed_release_evidence_work(
             .map_err(ApiError::internal)?,
         },
     ]);
-    let observed_at =
-        content_processing::authoritative_release_revision(source.4.as_str(), source.5.as_deref())
-            .unwrap_or(source.4.as_str());
+    let observed_at = crate::content_source_identity::authoritative_release_revision(
+        source.4.as_str(),
+        source.5.as_deref(),
+    )
+    .unwrap_or(source.4.as_str());
     let variant = if evidence.reference.audience == "public" {
         translations::RELEASE_READING_PUBLIC_VARIANT
     } else {
@@ -18486,7 +18376,7 @@ async fn overlay_global_feed_processing(
             release_detail_source_hash(repo, title, row.release_body.as_deref().unwrap_or(""))
         };
         let smart_hash = if row.kind == "announcement" {
-            crate::translations::announcement_smart_feed_source_hash(
+            crate::content_source_identity::announcement_smart_feed_source_hash(
                 resource_id.as_str(),
                 repo,
                 row.discussion_number,
@@ -18494,7 +18384,7 @@ async fn overlay_global_feed_processing(
                 row.release_body.as_deref(),
             )
         } else {
-            crate::translations::release_smart_feed_source_hash(
+            crate::content_source_identity::release_smart_feed_source_hash(
                 row.entity_id.as_str(),
                 repo,
                 title,
@@ -19109,7 +18999,6 @@ async fn build_feed_reaction_refresh_item(
     ))
 }
 
-pub(crate) const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
 const RELEASE_FEED_MARKDOWN_MISMATCH_ERROR: &str =
     "release translation failed to preserve markdown structure";
 const RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
@@ -19120,7 +19009,7 @@ const ANNOUNCEMENT_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
 fn translation_error_metadata(
     error_text: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let classified = crate::translations::classify_translation_error(error_text);
+    let classified = crate::translation_error::classify_translation_error(error_text);
     (
         classified.as_ref().map(|value| value.code.to_owned()),
         classified.as_ref().map(|value| value.summary.to_owned()),
@@ -19175,9 +19064,9 @@ fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>
     let Some(raw_reading) = payload.get("reading") else {
         return (None, false);
     };
-    let Ok(reading) =
-        serde_json::from_value::<translations::ReleaseReadingResult>(raw_reading.clone())
-    else {
+    let Ok(reading) = serde_json::from_value::<crate::translation_types::ReleaseReadingResult>(
+        raw_reading.clone(),
+    ) else {
         return (None, true);
     };
     let mut reading = reading;
@@ -19199,7 +19088,8 @@ fn release_reading_payload_state(payload: &Value) -> (Option<ReleaseReadingView>
                         .references
                         .into_iter()
                         .filter_map(|reference| {
-                            let number = translations::release_reading_pr_number(&reference.url);
+                            let number =
+                                crate::translation_types::release_reading_pr_number(&reference.url);
                             let label = reference
                                 .label
                                 .or_else(|| number.map(|number| format!("PR#{number}")))?;
@@ -19581,7 +19471,7 @@ fn feed_item_from_row(
     };
 
     let smart_current_hash = match kind.as_str() {
-        "announcement" => crate::translations::announcement_smart_feed_source_hash(
+        "announcement" => crate::content_source_identity::announcement_smart_feed_source_hash(
             translation_entity_id
                 .as_deref()
                 .unwrap_or_else(|| discussion_key.as_deref().unwrap_or(r.entity_id.as_str())),
@@ -19590,7 +19480,7 @@ fn feed_item_from_row(
             r.title.as_deref().unwrap_or(""),
             r.release_body.as_deref(),
         ),
-        _ => crate::translations::release_smart_feed_source_hash(
+        _ => crate::content_source_identity::release_smart_feed_source_hash(
             r.entity_id.as_str(),
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
@@ -19701,7 +19591,7 @@ fn encode_dashboard_readable_section_cursor(date: &str) -> String {
 }
 
 fn dashboard_readable_cursor_subject(user_id: &str) -> String {
-    ai::sha256_hex(&format!("dashboard-readable:{user_id}"))
+    crate::content_source_identity::sha256_hex(&format!("dashboard-readable:{user_id}"))
         .chars()
         .take(24)
         .collect()
@@ -21020,8 +20910,8 @@ async fn send_batch_stream_event(
 
 fn translate_batch_item_for_public(mut item: TranslateBatchItem) -> TranslateBatchItem {
     if item.status == "error" {
-        item.error =
-            crate::translations::translation_error_summary(item.error.as_deref()).or(item.error);
+        item.error = crate::translation_error::translation_error_summary(item.error.as_deref())
+            .or(item.error);
     }
     item
 }
@@ -21262,7 +21152,7 @@ fn translate_response_from_batch_item(
         }
         "error" => {
             return Err(ApiError::internal(
-                crate::translations::translation_error_summary(item.error.as_deref())
+                crate::translation_error::translation_error_summary(item.error.as_deref())
                     .or(item.error)
                     .unwrap_or_else(|| "translation failed".to_owned()),
             ));
@@ -21702,72 +21592,6 @@ fn parse_batch_release_detail_translation_payload(
     }
 }
 
-fn line_prefix_kind(line: &str) -> &'static str {
-    let t = line.trim();
-    if t.is_empty() {
-        return "blank";
-    }
-    if t.starts_with('#') {
-        return "heading";
-    }
-    if t.starts_with("> ") || t == ">" {
-        return "blockquote";
-    }
-    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
-        return "ul";
-    }
-    if let Some((head, tail)) = t.split_once('.')
-        && !head.is_empty()
-        && head.chars().all(|c| c.is_ascii_digit())
-        && tail.starts_with(' ')
-    {
-        return "ol";
-    }
-    "plain"
-}
-
-pub(crate) fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
-    let normalized_source = source.replace("\r\n", "\n");
-    let src_lines: Vec<&str> = normalized_source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    let normalized_translated = translated.replace("\r\n", "\n");
-    let dst_lines: Vec<&str> = normalized_translated
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    if src_lines.is_empty() {
-        return true;
-    }
-    if dst_lines.is_empty() || src_lines.len() != dst_lines.len() {
-        return false;
-    }
-
-    src_lines.iter().zip(dst_lines.iter()).all(|(s, d)| {
-        if line_prefix_kind(s) != line_prefix_kind(d) {
-            return false;
-        }
-
-        let src_bold_pairs = s.matches("**").count() / 2;
-        let dst_bold_pairs = d.matches("**").count() / 2;
-        if src_bold_pairs > 0 && dst_bold_pairs == 0 {
-            return false;
-        }
-
-        let src_code_pairs = s.matches('`').count() / 2;
-        let dst_code_pairs = d.matches('`').count() / 2;
-        if src_code_pairs > 0 && dst_code_pairs == 0 {
-            return false;
-        }
-        true
-    })
-}
-
 fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
     if input.is_empty() {
         return vec![String::new()];
@@ -22015,7 +21839,7 @@ const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
-    if ai::llm_failure_class(err) == Some(ai::LlmFailureClass::Configuration) {
+    if ai::llm_failure_class(err) == Some(crate::llm_contract::LlmFailureClass::Configuration) {
         return true;
     }
     let msg = err.to_string().to_ascii_lowercase();
@@ -22127,16 +21951,18 @@ fn global_source_hash_from_fields(
     } else {
         vec!["title_zh".to_owned(), "summary_md".to_owned()]
     };
-    content_processing::source_hash_for_item(&translations::TranslationRequestItemInput {
-        producer_ref: String::new(),
-        kind: kind.to_owned(),
-        variant: variant.to_owned(),
-        entity_id: entity_id.to_owned(),
-        target_lang: "zh-CN".to_owned(),
-        max_wait_ms: 0,
-        source_blocks,
-        target_slots,
-    })
+    crate::content_source_identity::source_hash_for_item(
+        &translations::TranslationRequestItemInput {
+            producer_ref: String::new(),
+            kind: kind.to_owned(),
+            variant: variant.to_owned(),
+            entity_id: entity_id.to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks,
+            target_slots,
+        },
+    )
 }
 
 fn with_source_revision(
@@ -22216,7 +22042,7 @@ fn public_release_reading_source_hash(
     if !release_body_has_actionable_content(title.as_str(), body.as_str()) {
         return None;
     }
-    let evidence = vec![translations::ReleaseReadingEvidence {
+    let evidence = vec![crate::translation_types::ReleaseReadingEvidence {
         kind: "release_text".to_owned(),
         reference: release_id.to_string(),
         scope: Some("title/body selected before compare fallback".to_owned()),
@@ -22256,13 +22082,14 @@ fn public_release_reading_source_hash(
         body.clone(),
         evidence_text.to_owned(),
     ];
-    let source_revision_tiebreak = content_processing::release_source_revision_content_tiebreak(
-        &source_revision_parts
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
-    Some(content_processing::source_hash_for_item(
+    let source_revision_tiebreak =
+        crate::content_source_identity::release_source_revision_content_tiebreak(
+            &source_revision_parts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+    Some(crate::content_source_identity::source_hash_for_item(
         &translations::TranslationRequestItemInput {
             producer_ref: String::new(),
             kind: "release_smart".to_owned(),
@@ -22272,7 +22099,7 @@ fn public_release_reading_source_hash(
             max_wait_ms: 0,
             source_blocks: with_source_revision(
                 source_blocks,
-                content_processing::authoritative_release_revision(
+                crate::content_source_identity::authoritative_release_revision(
                     revision.updated_at,
                     revision.detected_at,
                 ),
@@ -22336,7 +22163,7 @@ async fn release_compare_candidate_set_fingerprint(
         })
         .collect::<Vec<_>>();
     let serialized = serde_json::to_string(&canonical).map_err(ApiError::internal)?;
-    Ok(ai::sha256_hex(&format!(
+    Ok(crate::content_source_identity::sha256_hex(&format!(
         "release-compare-candidates\n{serialized}"
     )))
 }
@@ -22353,7 +22180,7 @@ fn public_release_projection_matches_source_snapshot(
     let Ok(snapshot) = serde_json::from_str::<Value>(source_snapshot_json) else {
         return false;
     };
-    let Some(observed_at) = content_processing::authoritative_release_revision(
+    let Some(observed_at) = crate::content_source_identity::authoritative_release_revision(
         revision.updated_at,
         revision.detected_at,
     ) else {
@@ -22501,13 +22328,14 @@ async fn public_release_reading_source_hash_for_release(
         reading_compare,
         candidate_set_fingerprint,
     ];
-    let source_revision_tiebreak = content_processing::release_source_revision_content_tiebreak(
-        &source_revision_parts
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
-    Ok(Some(content_processing::source_hash_for_item(
+    let source_revision_tiebreak =
+        crate::content_source_identity::release_source_revision_content_tiebreak(
+            &source_revision_parts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+    Ok(Some(crate::content_source_identity::source_hash_for_item(
         &translations::TranslationRequestItemInput {
             producer_ref: String::new(),
             kind: "release_smart".to_owned(),
@@ -22517,7 +22345,7 @@ async fn public_release_reading_source_hash_for_release(
             max_wait_ms: 0,
             source_blocks: with_source_revision(
                 source_blocks,
-                content_processing::authoritative_release_revision(
+                crate::content_source_identity::authoritative_release_revision(
                     request.revision.updated_at,
                     request.revision.detected_at,
                 ),
@@ -22652,7 +22480,7 @@ pub(crate) async fn global_release_request_item(
             (
                 "Release title/body selected as the primary evidence; compare was not required."
                     .to_owned(),
-                vec![translations::ReleaseReadingEvidence {
+                vec![crate::translation_types::ReleaseReadingEvidence {
                     kind: "release_text".to_owned(),
                     reference: release_id.to_string(),
                     scope: Some("title/body selected before compare fallback".to_owned()),
@@ -22735,7 +22563,9 @@ pub(crate) async fn global_release_request_item(
         source_revision_parts.push(reading_evidence_text.as_str());
     }
     let source_revision_tiebreak =
-        content_processing::release_source_revision_content_tiebreak(&source_revision_parts);
+        crate::content_source_identity::release_source_revision_content_tiebreak(
+            &source_revision_parts,
+        );
     Ok(translations::TranslationRequestItemInput {
         producer_ref: producer_ref.to_owned(),
         kind: kind.to_owned(),
@@ -22745,7 +22575,7 @@ pub(crate) async fn global_release_request_item(
         max_wait_ms: 60_000,
         source_blocks: with_source_revision(
             source_blocks,
-            content_processing::authoritative_release_revision(
+            crate::content_source_identity::authoritative_release_revision(
                 row.updated_at.as_str(),
                 row.detected_at.as_deref(),
             ),
@@ -22809,13 +22639,14 @@ async fn global_notification_request_item(
         .unwrap_or_else(|| "(unknown repo)".to_owned());
     let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
     let subject_type = row.subject_type.unwrap_or_default();
-    let source_revision_tiebreak = content_processing::notification_source_revision_tiebreak(
-        row.thread_id.as_str(),
-        Some(repo.as_str()),
-        Some(title.as_str()),
-        row.reason.as_deref(),
-        Some(subject_type.as_str()),
-    );
+    let source_revision_tiebreak =
+        crate::content_source_identity::notification_source_revision_tiebreak(
+            row.thread_id.as_str(),
+            Some(repo.as_str()),
+            Some(title.as_str()),
+            row.reason.as_deref(),
+            Some(subject_type.as_str()),
+        );
     Ok(translations::TranslationRequestItemInput {
         producer_ref: "api.translate_notification".to_owned(),
         kind: "notification".to_owned(),
@@ -25046,7 +24877,7 @@ fn release_feed_projection_result(
 }
 
 fn release_reading_evidence_is_unavailable(
-    evidence: &[translations::ReleaseReadingEvidence],
+    evidence: &[crate::translation_types::ReleaseReadingEvidence],
 ) -> bool {
     evidence.iter().any(|item| {
         matches!(
@@ -25066,7 +24897,13 @@ fn release_reading_evidence_unavailable_error() -> ApiError {
 
 async fn prepare_release_reading_evidence(
     request: ReleaseReadingEvidenceRequest<'_>,
-) -> Result<(String, Vec<translations::ReleaseReadingEvidence>), ApiError> {
+) -> Result<
+    (
+        String,
+        Vec<crate::translation_types::ReleaseReadingEvidence>,
+    ),
+    ApiError,
+> {
     let mut verified_snapshot = None;
     let mut baseline = select_release_compare_baseline_from_db(
         request.state,
@@ -25137,7 +24974,7 @@ async fn prepare_release_reading_evidence(
                     request.tag_name,
                     error.code()
                 ),
-                vec![translations::ReleaseReadingEvidence {
+                vec![crate::translation_types::ReleaseReadingEvidence {
                     kind: "compare_unavailable".to_owned(),
                     reference: request.tag_name.to_owned(),
                     scope: Some(error.code().to_owned()),
@@ -25153,7 +24990,7 @@ async fn prepare_release_reading_evidence(
         };
         return Ok((
             reason.to_owned(),
-            vec![translations::ReleaseReadingEvidence {
+            vec![crate::translation_types::ReleaseReadingEvidence {
                 kind: "baseline_unavailable".to_owned(),
                 reference: request.tag_name.to_owned(),
                 scope: Some("semver baseline selection completed".to_owned()),
@@ -25190,7 +25027,7 @@ async fn prepare_release_reading_evidence(
                         "Compare completed for {}...{}, but it contained no readable changes after noise filtering. Do not invent a user-facing change.",
                         baseline.tag_name, request.tag_name
                     ),
-                    vec![translations::ReleaseReadingEvidence {
+                    vec![crate::translation_types::ReleaseReadingEvidence {
                         kind: "github_compare_empty".to_owned(),
                         reference: format!("{}...{}", baseline.tag_name, request.tag_name),
                         scope: Some("compare completed; filtered digest was empty".to_owned()),
@@ -25205,7 +25042,7 @@ async fn prepare_release_reading_evidence(
                         request.tag_name,
                         error.code()
                     ),
-                    vec![translations::ReleaseReadingEvidence {
+                    vec![crate::translation_types::ReleaseReadingEvidence {
                         kind: "compare_unavailable".to_owned(),
                         reference: format!("{}...{}", baseline.tag_name, request.tag_name),
                         scope: Some(error.code().to_owned()),
@@ -25220,7 +25057,7 @@ async fn prepare_release_reading_evidence(
                 "Compare evidence for {}...{} was not an ahead relationship ({}); do not infer a code change.",
                 snapshot.base_tag, snapshot.head_tag, snapshot.relationship_status
             ),
-            vec![translations::ReleaseReadingEvidence {
+            vec![crate::translation_types::ReleaseReadingEvidence {
                 kind: "github_evidence_insufficient".to_owned(),
                 reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
                 scope: Some(format!(
@@ -25236,7 +25073,7 @@ async fn prepare_release_reading_evidence(
                 "Compare evidence for {}...{} was truncated or paginated; keep the Release reading pending or failed and do not infer a change.",
                 snapshot.base_tag, snapshot.head_tag
             ),
-            vec![translations::ReleaseReadingEvidence {
+            vec![crate::translation_types::ReleaseReadingEvidence {
                 kind: "github_compare_incomplete".to_owned(),
                 reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
                 scope: Some("compare coverage incomplete".to_owned()),
@@ -25250,7 +25087,7 @@ async fn prepare_release_reading_evidence(
         "Compare base tag: {}\nCompare head tag: {}\nBase SHA: {base_sha}\nMerge-base SHA: {merge_base_sha}\nHead SHA: {head_sha}\n\n{}",
         snapshot.base_tag, snapshot.head_tag, snapshot.digest
     );
-    let evidence = vec![translations::ReleaseReadingEvidence {
+    let evidence = vec![crate::translation_types::ReleaseReadingEvidence {
         kind: "github_compare".to_owned(),
         reference: format!("{}...{}", snapshot.base_tag, snapshot.head_tag),
         scope: Some(format!(
@@ -25588,7 +25425,7 @@ async fn prepare_release_smart_batch(
             .unwrap_or(&row.tag_name)
             .to_owned();
         let body = release_feed_body(row.body.as_deref()).unwrap_or_default();
-        let source_hash = crate::translations::release_smart_feed_source_hash(
+        let source_hash = crate::content_source_identity::release_smart_feed_source_hash(
             entity_id.as_str(),
             row.full_name.as_str(),
             title.as_str(),
@@ -26035,7 +25872,7 @@ pub async fn summarize_releases_smart_batch_for_user(
 #[derive(Debug)]
 pub(crate) struct GlobalReleaseReadingState {
     pub status: String,
-    pub reading: Option<translations::ReleaseReadingResult>,
+    pub reading: Option<crate::translation_types::ReleaseReadingResult>,
     pub legacy_summary: Option<String>,
     pub reading_present: bool,
     pub reading_incompatible: bool,
@@ -26055,8 +25892,10 @@ fn release_reading_state_from_result(status: String, result: Value) -> GlobalRel
                 .get("reading")
                 .cloned()
                 .and_then(|raw| {
-                    let mut reading =
-                        serde_json::from_value::<translations::ReleaseReadingResult>(raw).ok()?;
+                    let mut reading = serde_json::from_value::<
+                        crate::translation_types::ReleaseReadingResult,
+                    >(raw)
+                    .ok()?;
                     reading.normalize_references().ok()?;
                     Some(reading)
                 })
@@ -26227,7 +26066,7 @@ pub(crate) async fn read_global_release_reading_batch_for_user(
         };
         let (_, response) =
             content_processing::submit_item(state, user_id, "async", &input).await?;
-        let source_hash = content_processing::source_hash_for_item(&input);
+        let source_hash = crate::content_source_identity::source_hash_for_item(&input);
         let legacy_source_hash = legacy_release_smart_source_hash(&input);
         let legacy_projection = if let Some(legacy_source_hash) = legacy_source_hash.as_deref() {
             read_global_release_smart_with_legacy_fallback(
@@ -26349,7 +26188,7 @@ pub(crate) async fn read_release_smart_translation_batch_for_user(
                         };
                     }
                     if work_item.result_status.as_deref() == Some("error") {
-                        let classified = translations::classify_translation_error(
+                        let classified = crate::translation_error::classify_translation_error(
                             work_item.error_text.as_deref(),
                         );
                         return TranslateBatchItem {
@@ -26386,7 +26225,8 @@ pub(crate) async fn read_release_smart_translation_batch_for_user(
                     failure_class: None,
                 };
             };
-            let classified = translations::classify_translation_error(row.error_text.as_deref());
+            let classified =
+                crate::translation_error::classify_translation_error(row.error_text.as_deref());
             TranslateBatchItem {
                 id,
                 lang: "zh-CN".to_owned(),
@@ -27938,7 +27778,7 @@ async fn summarize_announcement_smart_internal(
         ));
     }
 
-    let source_hash = crate::translations::announcement_smart_feed_source_hash(
+    let source_hash = crate::content_source_identity::announcement_smart_feed_source_hash(
         discussion_key.as_str(),
         source.repo_full_name.as_str(),
         Some(source.discussion_number),
@@ -28328,7 +28168,9 @@ async fn translate_notification_candidates_with_ai(
                             NotificationTranslationError {
                                 message: "AI response missing content".to_owned(),
                                 failure_class: Some(
-                                    ai::LlmFailureClass::EmptyContent.as_str().to_owned(),
+                                    crate::llm_contract::LlmFailureClass::EmptyContent
+                                        .as_str()
+                                        .to_owned(),
                                 ),
                             },
                         );
@@ -28355,7 +28197,11 @@ async fn translate_notification_candidates_with_ai(
                 .cloned()
                 .unwrap_or_else(|| NotificationTranslationError {
                     message: "LLM configuration or request rejected".to_owned(),
-                    failure_class: Some(ai::LlmFailureClass::Configuration.as_str().to_owned()),
+                    failure_class: Some(
+                        crate::llm_contract::LlmFailureClass::Configuration
+                            .as_str()
+                            .to_owned(),
+                    ),
                 });
         for item in pending {
             errors
@@ -28450,7 +28296,7 @@ async fn translate_notifications_batch_internal(
                 .unwrap_or_else(|| "(no title)".to_owned()),
             reason: row.reason.clone().unwrap_or_default(),
             subject_type: row.subject_type.clone().unwrap_or_default(),
-            source_hash: ai::sha256_hex(&source),
+            source_hash: crate::content_source_identity::sha256_hex(&source),
         });
     }
 
@@ -29004,8 +28850,8 @@ mod tests {
             ..first.clone()
         };
         assert_eq!(
-            crate::content_processing::source_hash_for_item(&first),
-            crate::content_processing::source_hash_for_item(&second)
+            crate::content_source_identity::source_hash_for_item(&first),
+            crate::content_source_identity::source_hash_for_item(&second)
         );
     }
 
@@ -29263,9 +29109,11 @@ mod tests {
 
     use chrono::{Datelike, TimeZone};
 
+    use crate::postgres_admin_dashboard::ADMIN_DASHBOARD_PREAGGREGATE_DAYS;
+
     #[rustfmt::skip]
     use super::{
-        ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
+        ACCESS_SYNC_REASON_INACTIVE_OVER_1H,
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
         AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
@@ -29318,7 +29166,7 @@ mod tests {
         load_admin_dashboard_today_live_snapshot, load_admin_llm_activity_response,
         load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
         map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
+        me, me_create_api_key, me_delete_api_key, me_delete_passkey,
         me_get_api_keys, me_resume, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -29342,7 +29190,6 @@ mod tests {
         translate_release_detail_for_user, translate_releases_batch, translate_releases_batch_for_user,
         translate_response_from_batch_item, unpublish_repo_public_release, upsert_translation,
     };
-    use crate::ai;
     use crate::error::ApiError;
     use crate::search::SearchRequest;
     use std::{
@@ -29803,7 +29650,7 @@ mod tests {
         .await
         .expect("seed compare-only release bodies");
         let source_revision_tiebreak =
-            crate::content_processing::release_source_revision_content_tiebreak(&[
+            crate::content_source_identity::release_source_revision_content_tiebreak(&[
                 "https://github.com/openai/codex/releases/tag/v1.2.3",
                 "v1.2.3",
                 "v1.2.3",
@@ -30286,7 +30133,7 @@ mod tests {
         let task = jobs::enqueue_task(
             state.as_ref(),
             jobs::NewTask {
-                task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
                 payload: serde_json::json!({}),
                 source: "test".to_owned(),
                 requested_by: Some(test_user_id(1)),
@@ -30321,7 +30168,7 @@ mod tests {
         let task = jobs::enqueue_task(
             state.as_ref(),
             jobs::NewTask {
-                task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
                 payload: serde_json::json!({}),
                 source: "test".to_owned(),
                 requested_by: Some(test_user_id(1)),
@@ -31297,7 +31144,7 @@ mod tests {
             "#,
         )
         .bind(user_id.as_str())
-        .bind(jobs::TASK_SYNC_STARRED)
+        .bind(crate::postgres_tasks::TASK_SYNC_STARRED)
         .fetch_one(&pool)
         .await
         .expect("count sync starred tasks");
@@ -31350,7 +31197,7 @@ mod tests {
             "#,
         )
         .bind(user_id.as_str())
-        .bind(jobs::TASK_SYNC_RELEASES)
+        .bind(crate::postgres_tasks::TASK_SYNC_RELEASES)
         .fetch_one(&pool)
         .await
         .expect("count sync releases tasks");
@@ -31403,7 +31250,7 @@ mod tests {
             "#,
         )
         .bind(user_id.as_str())
-        .bind(jobs::TASK_SYNC_NOTIFICATIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS)
         .fetch_one(&pool)
         .await
         .expect("count sync notifications tasks");
@@ -33805,7 +33652,7 @@ mod tests {
             (
                 "task-skipped-subscriptions",
                 "succeeded",
-                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
                 r#"{"skipped":true,"skip_reason":"previous_run_active"}"#,
                 "2026-02-26T04:00:00Z",
             ),
@@ -33916,7 +33763,7 @@ mod tests {
             "#,
         )
         .bind("task-subscription-partial")
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(test_user_id(1))
         .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
         .bind(
@@ -33937,7 +33784,7 @@ mod tests {
             session,
             Query(AdminRealtimeTasksQuery {
                 status: Some("all".to_owned()),
-                task_type: Some(jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned()),
+                task_type: Some(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned()),
                 exclude_task_type: None,
                 task_group: None,
                 page: Some(1),
@@ -33970,7 +33817,7 @@ mod tests {
         seed_admin_dashboard_task(
             &pool,
             "task-subscription-event-limit",
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             &test_user_id(1),
             "2026-03-06T14:30:00Z",
@@ -34144,7 +33991,7 @@ mod tests {
         );
 
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             r#"{"trigger":"schedule","schedule_key":"interval:10:1777954200"}"#,
             None,
@@ -34167,7 +34014,7 @@ mod tests {
         seed_admin_dashboard_task(
             &pool,
             "unrelated-task",
-            jobs::TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             jobs::STATUS_SUCCEEDED,
             &test_user_id(1),
             "2026-03-06T13:59:00Z",
@@ -34176,7 +34023,7 @@ mod tests {
         seed_admin_dashboard_task(
             &pool,
             "target-task",
-            jobs::TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             jobs::STATUS_SUCCEEDED,
             &test_user_id(1),
             "2026-03-06T14:00:00Z",
@@ -34273,7 +34120,7 @@ mod tests {
         seed_admin_dashboard_task(
             &pool,
             "task-starred-delta",
-            jobs::TASK_SYNC_STARRED_DELTA,
+            crate::jobs::TASK_SYNC_STARRED_DELTA,
             jobs::STATUS_SUCCEEDED,
             test_user_id(1).as_str(),
             created_at,
@@ -34282,7 +34129,7 @@ mod tests {
         seed_admin_dashboard_task(
             &pool,
             "task-starred-reconcile",
-            jobs::TASK_SYNC_STARRED_RECONCILE,
+            crate::jobs::TASK_SYNC_STARRED_RECONCILE,
             jobs::STATUS_RUNNING,
             test_user_id(1).as_str(),
             "2026-03-06T14:31:00Z",
@@ -34321,7 +34168,7 @@ mod tests {
         assert!(user_sync.items.iter().all(|item| {
             matches!(
                 item.task_type.as_str(),
-                jobs::TASK_SYNC_STARRED_DELTA | jobs::TASK_SYNC_STARRED_RECONCILE
+                crate::jobs::TASK_SYNC_STARRED_DELTA | crate::jobs::TASK_SYNC_STARRED_RECONCILE
             )
         }));
 
@@ -34357,7 +34204,7 @@ mod tests {
         for (id, task_type, status, created_at) in [
             (
                 "task-list-realtime-old",
-                jobs::TASK_SYNC_RELEASES,
+                crate::postgres_tasks::TASK_SYNC_RELEASES,
                 jobs::STATUS_SUCCEEDED,
                 "2026-03-06T14:30:00Z",
             ),
@@ -34375,13 +34222,13 @@ mod tests {
             ),
             (
                 "task-list-user-sync",
-                jobs::TASK_SYNC_STARRED_DELTA,
+                crate::jobs::TASK_SYNC_STARRED_DELTA,
                 jobs::STATUS_RUNNING,
                 "2026-03-06T14:31:00Z",
             ),
             (
                 "task-list-realtime-new",
-                jobs::TASK_SYNC_RELEASES,
+                crate::postgres_tasks::TASK_SYNC_RELEASES,
                 jobs::STATUS_FAILED,
                 "2026-03-06T14:33:00Z",
             ),
@@ -34434,7 +34281,7 @@ mod tests {
             setup_session(1).await,
             Query(AdminRealtimeTasksQuery {
                 status: Some(jobs::STATUS_FAILED.to_owned()),
-                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                task_type: Some(crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned()),
                 exclude_task_type: Some(jobs::TASK_SYNC_ACCESS_REFRESH.to_owned()),
                 task_group: Some("realtime".to_owned()),
                 page: Some(1),
@@ -34453,8 +34300,8 @@ mod tests {
             setup_session(1).await,
             Query(AdminRealtimeTasksQuery {
                 status: Some(jobs::STATUS_RUNNING.to_owned()),
-                task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
-                exclude_task_type: Some(jobs::TASK_SYNC_RELEASES.to_owned()),
+                task_type: Some(crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned()),
+                exclude_task_type: Some(crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned()),
                 task_group: Some("all".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
@@ -34550,7 +34397,7 @@ mod tests {
             let task = jobs::enqueue_task(
                 state.as_ref(),
                 jobs::NewTask {
-                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
                     payload: json!({"cancel_fixture": index}),
                     source: "latency-acceptance-fixture".to_owned(),
                     requested_by: Some(test_user_id(1)),
@@ -34574,7 +34421,7 @@ mod tests {
             seed_admin_dashboard_task(
                 &pool,
                 task_id,
-                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
                 jobs::STATUS_SUCCEEDED,
                 &test_user_id(1),
                 &format!("2999-01-01T00:0{index}:00Z"),
@@ -34762,7 +34609,7 @@ mod tests {
             let outcome = jobs::enqueue_task(
                 enqueue_state.as_ref(),
                 jobs::NewTask {
-                    task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                    task_type: crate::postgres_tasks::TASK_SYNC_RELEASES.to_owned(),
                     payload: json!({"latency_sample": index}),
                     source: "latency-acceptance".to_owned(),
                     requested_by: Some(test_user_id(1)),
@@ -34883,7 +34730,7 @@ mod tests {
         seed_admin_dashboard_task(
             pool,
             &task_id,
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             &test_user_id(1),
             &created_at,
@@ -35974,7 +35821,7 @@ mod tests {
             LIMIT ? OFFSET ?
             "#,
         )
-        .bind(jobs::TASK_SYNC_RELEASES)
+        .bind(crate::postgres_tasks::TASK_SYNC_RELEASES)
         .bind(20_i64)
         .bind(0_i64)
         .fetch_all(&pool)
@@ -37854,7 +37701,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_warning_events_do_not_force_partial_outcome() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
             Some(
@@ -37893,7 +37740,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_retry_is_not_reported_as_empty() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"retry"}"#,
             Some(
@@ -37911,7 +37758,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_running_uses_progress_events() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             r#"{"trigger":"schedule","schedule_key":"interval:10:1777954200"}"#,
             None,
@@ -37962,7 +37809,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_running_uses_release_attached_progress() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             r#"{"trigger":"schedule","schedule_key":"interval:10:1777954800"}"#,
             None,
@@ -37999,7 +37846,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_running_uses_release_progress() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_RUNNING,
             r#"{"trigger":"schedule","schedule_key":"interval:10:1777955400"}"#,
             None,
@@ -38037,7 +37884,7 @@ mod tests {
     #[test]
     fn task_diagnostics_sync_subscriptions_result_overrides_stale_release_progress() {
         let task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"schedule","schedule_key":"interval:10:1777956000"}"#,
             Some(
@@ -38077,7 +37924,7 @@ mod tests {
         .expect("write task log");
 
         let mut task = test_task_detail_item(
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
             Some(
@@ -38801,7 +38648,7 @@ mod tests {
             "#,
         )
         .bind(task_id.as_str())
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(jobs::STATUS_SUCCEEDED)
         .bind("tests")
         .bind(test_user_id(2))
@@ -38893,7 +38740,7 @@ mod tests {
             seed_admin_dashboard_task(
                 &pool,
                 task_id,
-                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
                 jobs::STATUS_SUCCEEDED,
                 &test_user_id(1),
                 "2026-03-06T14:30:00Z",
@@ -38986,7 +38833,7 @@ mod tests {
             "#,
         )
         .bind(task_id.as_str())
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(jobs::STATUS_RUNNING)
         .bind("tests")
         .bind(Option::<String>::None)
@@ -39114,7 +38961,7 @@ mod tests {
             "#,
         )
         .bind(crate::local_id::test_local_id("task-log-download"))
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(jobs::STATUS_SUCCEEDED)
         .bind("scheduler")
         .bind(test_user_id(2))
@@ -39389,7 +39236,7 @@ mod tests {
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("missing".to_owned());
 
         let item = feed_item_from_row(row, true, None);
@@ -39411,7 +39258,7 @@ mod tests {
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("error".to_owned());
         row.trans_error_text =
             Some("release translation failed to preserve markdown structure".to_owned());
@@ -39447,7 +39294,7 @@ mod tests {
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("error".to_owned());
         row.trans_error_text =
             Some("AI returned 403 Forbidden: Chat upstream returned 403".to_owned());
@@ -39497,7 +39344,7 @@ mod tests {
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("ready".to_owned());
         row.trans_title = Some("旧译文标题".to_owned());
         row.trans_summary = Some("- 旧译文".to_owned());
@@ -39528,7 +39375,7 @@ mod tests {
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("ready".to_owned());
         row.trans_title = Some("旧译文标题".to_owned());
         row.trans_summary = Some("- 旧译文".to_owned());
@@ -39568,7 +39415,7 @@ body={}
             row.title.as_deref().unwrap_or(""),
             body,
         );
-        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_source_hash = Some(crate::content_source_identity::sha256_hex(&source));
         row.trans_status = Some("ready".to_owned());
         row.trans_title = Some("旧译文标题".to_owned());
         row.trans_summary = Some("- 旧译文".to_owned());
@@ -39652,14 +39499,16 @@ body={}
         row.release_previous_tag_name = Some("v1.2.3".to_owned());
         row.title = Some("Release v1.2.4".to_owned());
         row.release_body = Some("See full changelog below.".to_owned());
-        row.smart_source_hash = Some(crate::translations::release_smart_feed_source_hash(
-            row.entity_id.as_str(),
-            row.repo_full_name.as_deref().unwrap_or(""),
-            row.title.as_deref().unwrap_or(""),
-            row.release_body.as_deref(),
-            row.release_tag_name.as_deref().unwrap_or(""),
-            row.release_previous_tag_name.as_deref(),
-        ));
+        row.smart_source_hash = Some(
+            crate::content_source_identity::release_smart_feed_source_hash(
+                row.entity_id.as_str(),
+                row.repo_full_name.as_deref().unwrap_or(""),
+                row.title.as_deref().unwrap_or(""),
+                row.release_body.as_deref(),
+                row.release_tag_name.as_deref().unwrap_or(""),
+                row.release_previous_tag_name.as_deref(),
+            ),
+        );
         row.smart_status = Some("missing".to_owned());
         row.smart_error_text = Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned());
 
@@ -39692,14 +39541,16 @@ body={}
         row.release_previous_tag_name = Some("v1.2.3".to_owned());
         row.title = Some("Release v1.2.4".to_owned());
         row.release_body = Some("See full changelog below.".to_owned());
-        row.smart_source_hash = Some(crate::translations::release_smart_feed_source_hash(
-            row.entity_id.as_str(),
-            row.repo_full_name.as_deref().unwrap_or(""),
-            row.title.as_deref().unwrap_or(""),
-            row.release_body.as_deref(),
-            row.release_tag_name.as_deref().unwrap_or(""),
-            row.release_previous_tag_name.as_deref(),
-        ));
+        row.smart_source_hash = Some(
+            crate::content_source_identity::release_smart_feed_source_hash(
+                row.entity_id.as_str(),
+                row.repo_full_name.as_deref().unwrap_or(""),
+                row.title.as_deref().unwrap_or(""),
+                row.release_body.as_deref(),
+                row.release_tag_name.as_deref().unwrap_or(""),
+                row.release_previous_tag_name.as_deref(),
+            ),
+        );
         row.smart_status = Some("error".to_owned());
         row.smart_error_text =
             Some("AI returned 403 Forbidden: Chat upstream returned 403".to_owned());
@@ -40495,31 +40346,6 @@ body={}
         assert!(release_detail_translation_ready(Some(""), None));
         assert!(release_detail_translation_ready(Some("   \n"), None));
         assert!(release_detail_translation_ready(None, None));
-    }
-
-    #[test]
-    fn release_detail_source_hash_changes_with_content() {
-        let hash1 = release_detail_source_hash("acme/repo", "v1.0.0", "line one");
-        let hash2 = release_detail_source_hash("acme/repo", "v1.0.0", "line two");
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn release_detail_source_hash_normalizes_line_endings_and_whitespace() {
-        let hash1 = release_detail_source_hash(
-            " acme/repo ",
-            " v1.0.0 ",
-            "line one
-line two
-",
-        );
-        let hash2 = release_detail_source_hash(
-            "acme/repo",
-            "v1.0.0",
-            "line one
-line two",
-        );
-        assert_eq!(hash1, hash2);
     }
 
     #[tokio::test]
@@ -41651,11 +41477,11 @@ line two",
         let tied_signatures = [
             format!(
                 "release:120|{}",
-                ai::sha256_hex(&format!("sort={tied_at}\n"))
+                crate::content_source_identity::sha256_hex(&format!("sort={tied_at}\n"))
             ),
             format!(
                 "repo_star_received:tie-social-event|{}",
-                ai::sha256_hex(&format!("sort={tied_at}\n"))
+                crate::content_source_identity::sha256_hex(&format!("sort={tied_at}\n"))
             ),
         ];
         assert_eq!(
@@ -45676,7 +45502,7 @@ line two",
         seed_star(&pool, 42).await;
 
         let legacy_body = release_feed_body(Some("- item")).expect("legacy feed body");
-        let legacy_hash = crate::api::release_feed_translation_source_hash(
+        let legacy_hash = crate::content_source_identity::release_feed_translation_source_hash(
             "openai/codex",
             "Release v1.2.3",
             Some(&legacy_body),
@@ -46339,15 +46165,6 @@ echo should_not_be_in_excerpt
     }
 
     #[test]
-    fn markdown_structure_requires_inline_markers() {
-        let source = "- **Nightly** build from `main`\n- Keep **bold** marker";
-        let translated_missing = "- 夜间构建来自 main\n- 请保留强调";
-        let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
-        assert!(!markdown_structure_preserved(source, translated_missing));
-        assert!(markdown_structure_preserved(source, translated_ok));
-    }
-
-    #[test]
     fn split_markdown_chunks_preserves_order() {
         let md = "line1\nline2\nline3\nline4";
         let chunks = split_markdown_chunks(md, 12);
@@ -46999,7 +46816,7 @@ echo should_not_be_in_excerpt
             "#,
         )
         .bind(skipped_task_id.as_str())
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind(r#"{"skipped":true,"skip_reason":"previous_run_active"}"#)
         .bind("2026-04-27T08:40:00Z")
         .bind("2026-04-27T08:40:01Z")
@@ -47022,7 +46839,7 @@ echo should_not_be_in_excerpt
             .bind(crate::local_id::test_local_id(&format!(
                 "subscription-history-skipped-{idx}"
             )))
-            .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+            .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
             .bind(format!("2026-04-27T08:41:{idx:02}Z"))
             .bind("2026-04-27T08:41:59Z")
             .execute(&pool)
@@ -47042,7 +46859,7 @@ echo should_not_be_in_excerpt
         .bind(crate::local_id::test_local_id(
             "subscription-history-malformed-result",
         ))
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
         .bind("2026-04-27T08:35:00Z")
         .bind("2026-04-27T08:35:00Z")
         .execute(&pool)
@@ -47097,7 +46914,7 @@ echo should_not_be_in_excerpt
                 "#,
             )
             .bind(task_id.as_str())
-            .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+            .bind(crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS)
             .bind(format!("2026-04-27T08:{:02}:00Z", idx * 10 - 10))
             .bind(started_at)
             .bind(finished_at)

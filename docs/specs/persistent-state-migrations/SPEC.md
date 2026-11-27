@@ -1,38 +1,43 @@
 # Persistent State Migrations
 
+> SQLite 运行时的 SQLx 迁移历史与 writer coordinator 已进入退役队列，见 [SQLite 退役运行时删除](../sqlite-runtime-retirement/SPEC.md)。本主题保留与存储引擎无关的持久事实契约：控制记录修复、旧事实观察、有界回填与前向修复；迁移操作租约与在线 operator 在退役前有效。
+
 ## Context And Scope
 
-This topic governs release-to-release changes to OctoRill's durable SQLite state. It covers SQLx migration history, the online migration operator, the global content-processing control record, legacy observations, and runtime-owner leases.
+- Context: 运行时权威存储是 PostgreSQL（ADR 0023）。内容处理有一个可在线修复的控制记录、只读旧事实观察，以及需要可暂停、可重入的历史回填。SQLite 时代的 SQLx 迁移历史不再演进。
+- In scope: `content_processing_control` 修复、`content_legacy_observations` 身份与只读性、历史回填的有界游标、前向修复与管理员只读面；迁移操作命名租约仅在 operator 退役前有效。
+- Out of scope: SQLite SQLx 历史与 `_sqlx_migrations` 兼容、`SqliteWriteCoordinator` 后台 lane、内容处理业务语义（由 `postgres-content-processing` 拥有）、旧事实迁移为全局工作或尝试。
 
 ## Requirements
 
-- `REQ-PSM-ORDER`: DDL, current-state DML, and historical backfill are separate ordered operations with independent status, checksum, progress, and failure signals.
-- `REQ-PSM-COMPATIBILITY`: Fresh databases finish SQLx initialization before HTTP listen. Existing databases validate applied version, checksum, dirty state, and internal gaps, then apply pending SQLx migrations through SQLx before HTTP listen; migration 81 remains accepted only with its exact legacy checksum.
-- `REQ-PSM-ADMISSION`: Valid global content admission remains available during every online operation. A `legacy` or `rollback_freeze` control value is atomically repaired to `global` inside the foreground admission transaction before unique work identity lookup or insertion.
-- `REQ-PSM-OBSERVATION`: Legacy rows remain read-only observations. The observation identity includes `(legacy_table, legacy_primary_key, legacy_source_hash)` so a deleted and reused legacy key creates a new incarnation.
-- `REQ-PSM-PAUSE`: Historical backfill commits at most 100 rows per batch, persists its cursor before releasing the writer permit, and resumes from durable progress after pause or interruption.
-- `REQ-PSM-LEASE`: Only the current named migration lease owner may advance an operation. A live runtime owner is never reclaimed; stale ownership is recoverable.
-- `REQ-PSM-REPAIR`: Deployed durable state is immutable with respect to migration identity. Failures use forward repair; no down migration, blue-green switch, or migration-specific freeze window is part of the protocol.
+以下 ORDER / PAUSE / LEASE 与迁移管理接口只在在线迁移 operator 尚未退役时有效；退役边界与接口删除由 [SQLite 退役运行时删除](../sqlite-runtime-retirement/SPEC.md) 的 `REQ-RTR-009` 拥有。退役后只保留 ADMISSION、OBSERVATION 与 REPAIR。
+
+- `REQ-PSM-ORDER`: DDL、当前状态修复与历史回填是独立排序的操作，拥有各自的状态、校验和、进度与失败信号。
+- `REQ-PSM-ADMISSION`: 每个在线操作期间有效的内容 admission 必须保持可用。`legacy` 或 `rollback_freeze` 控制值必须在准入事务内原子修复为 `global`，且发生在唯一工作身份查询或插入之前。
+- `REQ-PSM-OBSERVATION`: 旧行保持只读观察。观察身份包含 `(legacy_table, legacy_primary_key, legacy_source_hash)`，使被删除后复用的旧主键产生新化身。
+- `REQ-PSM-PAUSE`: 历史回填每批最多提交 100 行，在提交事务前持久化游标，并在暂停或中断后从持久进度恢复。
+- `REQ-PSM-LEASE`: 只有当前的命名迁移租约持有者可以推进操作。存活的 runtime owner 永不被回收；陈旧所有权必须可恢复。
+- `REQ-PSM-REPAIR`: 已部署的持久状态对迁移身份不可变。失败使用前向修复；协议不包含 down migration、蓝绿切换或迁移专属冻结窗口。
 
 ## Interfaces
 
-The administrator authentication boundary exposes `GET /admin/jobs/migrations`, `POST /admin/jobs/migrations/{migration_id}/pause`, and `POST /admin/jobs/migrations/{migration_id}/resume`. The read endpoint returns the run together with every operation in `operation_order`; it is the only migration read surface, because the runtime defines exactly one migration. These endpoints expose redacted state only and do not create user-facing migration APIs.
+在线迁移 operator 退役前，管理员认证边界暴露 `GET /admin/jobs/migrations`、`POST /admin/jobs/migrations/{migration_id}/pause` 与 `POST /admin/jobs/migrations/{migration_id}/resume`。读接口按 `operation_order` 返回运行与全部操作；它是唯一迁移读面，因为运行时恰好定义一次迁移。接口只暴露脱敏状态，不创建面向用户的迁移 API。
 
 ## Verification
 
-- `VER-PSM-HISTORY`: Fresh initialization, a real v90-to-v91 existing-database upgrade, checksum/dirty/gap rejection, legacy version 81 compatibility, and transactional failure diagnostics cover the SQLx compatibility contract.
-- `VER-PSM-OPERATIONS`: Operation checksums and ordering are immutable; the named lease, live-owner protection, and stale-owner recovery are tested.
-- `VER-PSM-RESUME`: Bounded cursor batches, pause/resume, interruption re-entry, duplicate suppression, source-hash incarnations, and redacted failure state are tested.
-- `VER-PSM-ADMISSION`: Valid submissions in `legacy`, `rollback_freeze`, and `global` preserve `202` and active-work `409` semantics. API adapters do not route `rollback_freeze` submissions into the compatibility writer's migration `503` path.
-- `VER-PSM-COORDINATOR`: Migration writes use the SQLite background lane, yield to foreground writes, and retry transient background admission, busy, and deadline errors without recording a permanent migration failure.
+- `VER-PSM-OPERATIONS`: 操作校验和与顺序不可变；命名租约、存活所有者保护与陈旧所有者恢复有测试。
+- `VER-PSM-RESUME`: 有界游标批次、暂停/恢复、中断重入、重复抑制、source-hash 化身与脱敏失败状态有测试。
+- `VER-PSM-ADMISSION`: `legacy`、`rollback_freeze` 与 `global` 下的有效提交保持 `202` 与活动工作 `409` 语义；API 适配器不得把 `rollback_freeze` 提交路由进兼容写入者的迁移 `503` 路径。
+- `VER-PSM-OBSERVATION`: 旧事实不被改写或提升为全局工作、结果或尝试历史；删除并复用旧主键产生新观察化身。
 
 ## Acceptance
 
-- Existing SQLx history is validated before pending SQLx migrations are applied transactionally by SQLx; the listener is not bound until the upgrade succeeds.
-- DDL, current-state repair, and observation backfill remain independently observable, pauseable, and resumable.
-- Legacy facts are never rewritten or promoted into global work, result, or attempt history.
-- Foreground content admission retains its existing `202` or active-work `409` response while migration work yields.
+- DDL、当前状态修复与观察回填保持独立可观察、可暂停、可恢复。
+- 旧事实永不改写、永不提升为全局工作/结果/尝试历史。
+- 内容 admission 在迁移工作让出写事务期间保持既有 `202` 或活动工作 `409` 响应。
+- operator 退役后，ORDER / PAUSE / LEASE 与迁移管理接口随其删除；ADMISSION、OBSERVATION 与 REPAIR 契约不变。
 
 ## Related ADRs
 
-- [ADR 0019: Validated SQLx Migrations Apply Before Startup](../../adr/0019-sqlx-startup-migration-compatibility.md)
+- [ADR 0018: Online Persistent State Migrations](../../adr/0018-online-persistent-state-migrations.md)
+- [ADR 0023: PostgreSQL 作为运行时持久化权威](../../adr/0023-postgresql-runtime-authority.md)

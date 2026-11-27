@@ -1099,7 +1099,10 @@ async fn overlay_global_feed_processing(
                 continue;
             };
             let discussion_key = row.translation_entity_id.clone().unwrap_or_else(|| {
-                crate::api::announcement_discussion_key(repo_full_name, discussion_number)
+                crate::content_source_identity::announcement_discussion_key(
+                    repo_full_name,
+                    discussion_number,
+                )
             });
             let source = postgres_content_overlay::AnnouncementSource {
                 discussion_key: discussion_key.as_str(),
@@ -1324,7 +1327,7 @@ fn normalize_translation_fields(
 fn translation_error_metadata(
     error_text: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let classified = crate::translations::classify_translation_error(error_text);
+    let classified = crate::translation_error::classify_translation_error(error_text);
     (
         classified.as_ref().map(|value| value.code.to_owned()),
         classified.as_ref().map(|value| value.summary.to_owned()),
@@ -1431,7 +1434,7 @@ fn translated_release_feed_ready_item(
     }
     if status == "ready"
         && let (Some(src), Some(s)) = (body, summary.as_deref())
-        && !crate::api::markdown_structure_preserved(src, s)
+        && !crate::markdown::markdown_structure_preserved(src, s)
     {
         status = "error";
         title = None;
@@ -1465,7 +1468,9 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
     match status {
         "disabled" => Some(smart_item("disabled", None, None, None, None)),
         "insufficient" => Some(smart_item("insufficient", None, None, Some(false), None)),
-        "missing" if error_text == Some(crate::api::SMART_NO_VALUABLE_VERSION_INFO) => {
+        "missing"
+            if error_text == Some(crate::translation_error::SMART_NO_VALUABLE_VERSION_INFO) =>
+        {
             Some(smart_item("insufficient", None, None, Some(false), None))
         }
         "missing" | "error" | "incompatible" => {
@@ -1573,7 +1578,10 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
     let kind = r.kind.clone();
     let discussion_key = r.repo_full_name.as_deref().zip(r.discussion_number).map(
         |(repo_full_name, discussion_number)| {
-            crate::api::announcement_discussion_key(repo_full_name, discussion_number)
+            crate::content_source_identity::announcement_discussion_key(
+                repo_full_name,
+                discussion_number,
+            )
         },
     );
     let is_release_like = matches!(kind.as_str(), "release" | "announcement");
@@ -1620,26 +1628,28 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         Some(translated_item("disabled", None, None, None, None))
     } else {
         let current_hash = match kind.as_str() {
-            "announcement" => crate::api::announcement_feed_translation_source_hash(
-                r.repo_full_name.as_deref().unwrap_or(""),
-                r.discussion_number,
-                r.title.as_deref().unwrap_or(""),
-                body.as_deref(),
-            ),
-            _ => crate::api::release_feed_translation_source_hash(
+            "announcement" => {
+                crate::content_source_identity::announcement_feed_translation_source_hash(
+                    r.repo_full_name.as_deref().unwrap_or(""),
+                    r.discussion_number,
+                    r.title.as_deref().unwrap_or(""),
+                    body.as_deref(),
+                )
+            }
+            _ => crate::content_source_identity::release_feed_translation_source_hash(
                 r.repo_full_name.as_deref().unwrap_or(""),
                 r.title.as_deref().unwrap_or(""),
                 body.as_deref(),
             ),
         };
         let detail_current_hash = match kind.as_str() {
-            "announcement" => crate::api::announcement_detail_source_hash(
+            "announcement" => crate::content_source_identity::announcement_detail_source_hash(
                 r.repo_full_name.as_deref().unwrap_or(""),
                 r.discussion_number,
                 r.title.as_deref().unwrap_or(""),
                 r.release_body.as_deref().unwrap_or(""),
             ),
-            _ => crate::api::release_detail_source_hash(
+            _ => crate::content_source_identity::release_detail_source_hash(
                 r.repo_full_name.as_deref().unwrap_or(""),
                 r.title.as_deref().unwrap_or(""),
                 r.release_body.as_deref().unwrap_or(""),
@@ -1750,7 +1760,7 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
     };
 
     let smart_current_hash = match kind.as_str() {
-        "announcement" => crate::translations::announcement_smart_feed_source_hash(
+        "announcement" => crate::content_source_identity::announcement_smart_feed_source_hash(
             translation_entity_id
                 .as_deref()
                 .unwrap_or_else(|| discussion_key.as_deref().unwrap_or(r.entity_id.as_str())),
@@ -1759,7 +1769,7 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
             r.title.as_deref().unwrap_or(""),
             r.release_body.as_deref(),
         ),
-        _ => crate::translations::release_smart_feed_source_hash(
+        _ => crate::content_source_identity::release_smart_feed_source_hash(
             r.entity_id.as_str(),
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
@@ -2887,7 +2897,7 @@ struct DashboardReadableItemsCursor {
 }
 
 fn dashboard_readable_cursor_subject(user_id: &str) -> String {
-    crate::ai::sha256_hex(&format!("dashboard-readable:{user_id}"))
+    crate::content_source_identity::sha256_hex(&format!("dashboard-readable:{user_id}"))
         .chars()
         .take(24)
         .collect()
@@ -3242,7 +3252,10 @@ fn encode_dashboard_updates_token(token: &DashboardUpdatesToken) -> Result<Strin
 }
 
 fn dashboard_update_signature_digest(signature: &str) -> String {
-    crate::ai::sha256_hex(signature).chars().take(16).collect()
+    crate::content_source_identity::sha256_hex(signature)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 fn compact_dashboard_signatures(signatures: &[String]) -> Vec<String> {
@@ -3469,7 +3482,8 @@ async fn load_dashboard_feed_signatures(
         .into_iter()
         .map(|row| {
             let key = format!("{}:{}", row.kind, row.entity_id);
-            let state_hash = crate::ai::sha256_hex(&format!("sort={}\n", row.sort_ts));
+            let state_hash =
+                crate::content_source_identity::sha256_hex(&format!("sort={}\n", row.sort_ts));
             format!("{key}|{state_hash}")
         })
         .collect())

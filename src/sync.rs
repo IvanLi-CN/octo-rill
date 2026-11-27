@@ -2615,7 +2615,7 @@ async fn enqueue_global_announcement_work(
         else {
             continue;
         };
-        let entity_id = crate::api::announcement_discussion_key(repo, number);
+        let entity_id = crate::content_source_identity::announcement_discussion_key(repo, number);
         for (kind, variant) in [
             ("announcement_detail", "detail"),
             ("announcement_smart", "smart"),
@@ -13410,7 +13410,7 @@ pub async fn load_star_sync_runtime_status(state: &AppState) -> Result<StarSyncR
           AND status = ?
         "#,
     )
-    .bind(jobs::TASK_SYNC_STARRED_DELTA)
+    .bind(crate::jobs::TASK_SYNC_STARRED_DELTA)
     .bind(jobs::STATUS_SUCCEEDED)
     .fetch_one(&state.pool)
     .await
@@ -26199,7 +26199,7 @@ mod tests {
         seed_realtime_task_with_log_path(
             &state,
             task_id.as_str(),
-            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
             &log_path,
         )
         .await;
@@ -26473,7 +26473,12 @@ mod tests {
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
-        seed_realtime_task(state, task_id, jobs::TASK_SYNC_SUBSCRIPTIONS).await;
+        seed_realtime_task(
+            state,
+            task_id,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
+        )
+        .await;
     }
 
     async fn seed_access_refresh_task(state: &Arc<AppState>, task_id: &str) {

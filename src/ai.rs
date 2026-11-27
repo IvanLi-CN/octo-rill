@@ -14,14 +14,16 @@ use rand::RngExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+
 use url::Url;
 
 use crate::{
     admin_runtime, api,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    content_processing, local_id, observability,
+    content_processing,
+    llm_contract::{LlmFailureClass, lookup_model_limit_in_map},
+    local_id, observability,
     release_links::{
         InternalReleaseRef, build_internal_brief_release_href_from_html_url,
         parse_internal_release_ref, parse_release_locator_from_github_release_url,
@@ -32,7 +34,6 @@ use crate::{
     translations,
 };
 
-const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MODEL_LIMIT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MODEL_LIMIT_SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -43,8 +44,7 @@ const MODEL_LIMIT_SOURCE_LITELLM: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE: &str = "admin_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
-const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
-const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
+
 const LLM_REQUEST_MAX_ATTEMPTS: usize = 8;
 const LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS: usize = 2;
 const LLM_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
@@ -60,55 +60,8 @@ const LLM_MODEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// upstream problem, so retrying the same model soon only burns attempts.
 /// Operators clear it earlier by saving the LLM runtime configuration.
 const LLM_MODEL_CREDENTIAL_REJECTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
-const AI_RESPONSE_MISSING_CONTENT_ERROR: &str = "AI response missing content";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmFailureClass {
-    EmptyContent,
-    Transient,
-    RateLimited,
-    Configuration,
-}
-
-impl LlmFailureClass {
-    pub(crate) fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "empty_content" => Some(Self::EmptyContent),
-            "transient" => Some(Self::Transient),
-            "rate_limited" => Some(Self::RateLimited),
-            "configuration" => Some(Self::Configuration),
-            _ => None,
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::EmptyContent => "empty_content",
-            Self::Transient => "transient",
-            Self::RateLimited => "rate_limited",
-            Self::Configuration => "configuration",
-        }
-    }
-
-    pub(crate) const fn is_recoverable(self) -> bool {
-        !matches!(self, Self::Configuration)
-    }
-
-    pub(crate) const fn safe_message(self) -> &'static str {
-        match self {
-            Self::EmptyContent => AI_RESPONSE_MISSING_CONTENT_ERROR,
-            Self::Transient => "LLM upstream temporarily unavailable",
-            Self::RateLimited => "LLM upstream rate limited",
-            Self::Configuration => "LLM configuration or request rejected",
-        }
-    }
-}
-
-impl std::fmt::Display for LlmFailureClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+const AI_RESPONSE_MISSING_CONTENT_ERROR: &str =
+    crate::llm_contract::AI_RESPONSE_MISSING_CONTENT_ERROR;
 
 #[derive(Debug)]
 pub(crate) struct LlmCallFailure {
@@ -153,7 +106,6 @@ struct OpenRouterModelItem {
 }
 
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
-static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
 
 tokio::task_local! {
     static LLM_CALL_CONTEXT: LlmCallContext;
@@ -786,109 +738,6 @@ fn normalize_model_name(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn is_date_suffix(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    if bytes.len() != 11 {
-        return false;
-    }
-    if bytes[0] != b'-' || bytes[5] != b'-' || bytes[8] != b'-' {
-        return false;
-    }
-    bytes
-        .iter()
-        .enumerate()
-        .all(|(idx, b)| matches!(idx, 0 | 5 | 8) || b.is_ascii_digit())
-}
-
-fn strip_model_suffix(raw: &str) -> String {
-    let mut out = raw.to_owned();
-    if let Some(stripped) = out.strip_suffix("-latest") {
-        out = stripped.to_owned();
-    }
-    if let Some(stripped) = out.strip_suffix("-preview") {
-        out = stripped.to_owned();
-    }
-    if out.len() > 11 {
-        let suffix = &out[out.len() - 11..];
-        if is_date_suffix(suffix) {
-            out.truncate(out.len() - 11);
-        }
-    }
-    out
-}
-
-fn model_aliases(raw: &str) -> Vec<String> {
-    let normalized = normalize_model_name(raw);
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-
-    let mut aliases = Vec::new();
-    aliases.push(normalized.clone());
-
-    if let Some(tail) = normalized.rsplit('/').next() {
-        aliases.push(tail.to_owned());
-    }
-    if let Some(tail) = normalized.rsplit('.').next() {
-        aliases.push(tail.to_owned());
-    }
-
-    let mut expanded = Vec::new();
-    for alias in aliases {
-        let stripped = strip_model_suffix(&alias);
-        expanded.push(alias);
-        if !stripped.is_empty() {
-            expanded.push(stripped);
-        }
-    }
-
-    let mut uniq = HashSet::new();
-    expanded
-        .into_iter()
-        .filter(|alias| !alias.is_empty())
-        .filter(|alias| uniq.insert(alias.clone()))
-        .collect()
-}
-
-fn insert_model_limit(map: &mut HashMap<String, u32>, raw_model: &str, limit: u32) {
-    if limit == 0 {
-        return;
-    }
-    for alias in model_aliases(raw_model) {
-        let entry = map.entry(alias).or_insert(limit);
-        if limit < *entry {
-            *entry = limit;
-        }
-    }
-}
-
-fn builtin_model_limits() -> &'static HashMap<String, u32> {
-    BUILTIN_MODEL_LIMITS.get_or_init(|| {
-        let mut out = HashMap::new();
-        for (model, limit) in [
-            ("openai/gpt-5", 272_000u32),
-            ("openai/gpt-5-mini", 272_000),
-            ("openai/gpt-5-nano", 272_000),
-            ("openai/gpt-4o", 128_000),
-            ("openai/gpt-4o-mini", 128_000),
-            ("openai/gpt-4.1", 1_047_576),
-            ("openai/gpt-4.1-mini", 1_047_576),
-            ("anthropic/claude-3.5-haiku", 200_000),
-            ("anthropic/claude-3.7-sonnet", 200_000),
-            ("anthropic/claude-sonnet-4", 200_000),
-            ("google/gemini-2.5-flash-lite", 1_048_576),
-            ("google/gemini-2.5-flash", 1_048_576),
-            ("google/gemini-2.5-pro", 1_048_576),
-            ("deepseek/deepseek-chat-v3.1", 32_768),
-            ("deepseek/deepseek-r1-0528", 128_000),
-            ("qwen/qwen3-coder", 262_144),
-        ] {
-            insert_model_limit(&mut out, model, limit);
-        }
-        out
-    })
-}
-
 fn json_value_u32(value: &Value, key: &str) -> Option<u32> {
     let raw = value.get(key)?;
     if let Some(v) = raw.as_u64() {
@@ -916,7 +765,7 @@ async fn fetch_openrouter_model_limits(state: &AppState) -> Result<HashMap<Strin
     let mut out = HashMap::new();
     for item in body.data {
         if let Some(limit) = item.context_length {
-            insert_model_limit(&mut out, &item.id, limit);
+            crate::llm_contract::insert_model_limit(&mut out, &item.id, limit);
         }
     }
     Ok(out)
@@ -943,7 +792,7 @@ async fn fetch_litellm_model_limits(state: &AppState) -> Result<HashMap<String, 
     let mut out = HashMap::new();
     for (raw_model, payload) in map {
         if let Some(limit) = json_value_u32(payload, "max_input_tokens") {
-            insert_model_limit(&mut out, raw_model, limit);
+            crate::llm_contract::insert_model_limit(&mut out, raw_model, limit);
         }
     }
     Ok(out)
@@ -975,7 +824,7 @@ async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
     match fetch_openrouter_model_limits(state).await {
         Ok(values) => {
             for (key, value) in values {
-                insert_model_limit(&mut merged, &key, value);
+                crate::llm_contract::insert_model_limit(&mut merged, &key, value);
             }
         }
         Err(err) => errors.push(format!("openrouter: {err}")),
@@ -984,7 +833,7 @@ async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
     match fetch_litellm_model_limits(state).await {
         Ok(values) => {
             for (key, value) in values {
-                insert_model_limit(&mut merged, &key, value);
+                crate::llm_contract::insert_model_limit(&mut merged, &key, value);
             }
         }
         Err(err) => errors.push(format!("litellm: {err}")),
@@ -1011,33 +860,6 @@ async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn lookup_model_limit_in_map(map: &HashMap<String, u32>, model: &str) -> Option<u32> {
-    for alias in model_aliases(model) {
-        if let Some(limit) = map.get(&alias) {
-            return Some(*limit);
-        }
-    }
-    None
-}
-
-pub(crate) fn resolve_model_input_limit_for_model(model: &str) -> (u32, &'static str) {
-    if model.is_empty() {
-        return (
-            MODEL_LIMIT_UNKNOWN_FALLBACK,
-            MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
-        );
-    }
-
-    if let Some(limit) = lookup_model_limit_in_map(builtin_model_limits(), model) {
-        return (limit.max(1), MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG);
-    }
-
-    (
-        MODEL_LIMIT_UNKNOWN_FALLBACK,
-        MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
-    )
-}
-
 pub(crate) async fn resolve_model_input_limit_for_status(
     state: &AppState,
     model: &str,
@@ -1061,7 +883,7 @@ pub(crate) async fn resolve_model_input_limit_for_status(
         if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model) {
             (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG)
         } else {
-            resolve_model_input_limit_for_model(model)
+            crate::llm_contract::resolve_model_input_limit_for_model(model)
         }
     };
     (limit, source)
@@ -1107,13 +929,16 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
         if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model.as_str()) {
             (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG)
         } else if let Some(limit) =
-            lookup_model_limit_in_map(builtin_model_limits(), model.as_str())
+            lookup_model_limit_in_map(crate::llm_contract::builtin_model_limits(), model.as_str())
         {
-            (limit.max(1), MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG)
+            (
+                limit.max(1),
+                crate::llm_contract::MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG,
+            )
         } else {
             (
-                MODEL_LIMIT_UNKNOWN_FALLBACK,
-                MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
+                crate::llm_contract::MODEL_LIMIT_UNKNOWN_FALLBACK,
+                crate::llm_contract::MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
             )
         }
     };
@@ -1417,11 +1242,11 @@ struct ReleaseRendered {
 struct BriefReleaseChange {
     text: String,
     versions: Vec<String>,
-    references: Vec<translations::ReleaseReadingReference>,
+    references: Vec<crate::translation_types::ReleaseReadingReference>,
 }
 
 fn brief_release_changes_from_reading(
-    reading: &translations::ReleaseReadingResult,
+    reading: &crate::translation_types::ReleaseReadingResult,
 ) -> Vec<BriefReleaseChange> {
     reading
         .changes
@@ -1907,18 +1732,6 @@ fn parse_chat_completion_sse_output(
         None,
         first_token_wait_ms,
     ))
-}
-
-pub fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        write!(&mut out, "{:02x}", b).expect("sha256 hex");
-    }
-    out
 }
 
 #[allow(dead_code)]
@@ -5461,8 +5274,8 @@ fn legacy_release_reading_result(
     release: &ReleaseDigest,
     item: &api::TranslateBatchItem,
     bullets: Vec<String>,
-) -> translations::ReleaseReadingResult {
-    translations::ReleaseReadingResult {
+) -> crate::translation_types::ReleaseReadingResult {
+    crate::translation_types::ReleaseReadingResult {
         version: release.title.clone(),
         outcome: "changes".to_owned(),
         title: item
@@ -5473,14 +5286,14 @@ fn legacy_release_reading_result(
             .map(str::to_owned),
         changes: bullets
             .into_iter()
-            .map(|text| translations::ReleaseReadingChange {
+            .map(|text| crate::translation_types::ReleaseReadingChange {
                 text,
                 versions: Vec::new(),
                 references: Vec::new(),
             })
             .collect(),
         machine_materials: Vec::new(),
-        evidence: vec![translations::ReleaseReadingEvidence {
+        evidence: vec![crate::translation_types::ReleaseReadingEvidence {
             kind: "legacy_summary".to_owned(),
             reference: release.release_id.to_string(),
             scope: Some("legacy compatibility projection".to_owned()),
@@ -5556,7 +5369,10 @@ async fn load_brief_release_summary_states(
                         }
                     }
                 }
-                "missing" if item.error.as_deref() == Some(api::SMART_NO_VALUABLE_VERSION_INFO) => {
+                "missing"
+                    if item.error.as_deref()
+                        == Some(crate::translation_error::SMART_NO_VALUABLE_VERSION_INFO) =>
+                {
                     BriefReleaseSummaryState::NoValue
                 }
                 "missing" => BriefReleaseSummaryState::Unavailable,
@@ -7856,12 +7672,12 @@ mod tests {
 
     #[test]
     fn brief_reading_keeps_all_structured_changes_for_daily_rendering() {
-        let reading = translations::ReleaseReadingResult {
+        let reading = crate::translation_types::ReleaseReadingResult {
             version: "v1.2.3".to_owned(),
             outcome: "changes".to_owned(),
             title: Some("具体改动".to_owned()),
             changes: (1..=6)
-                .map(|index| translations::ReleaseReadingChange {
+                .map(|index| crate::translation_types::ReleaseReadingChange {
                     text: format!("变更 {index}"),
                     versions: vec!["v1.2.3".to_owned()],
                     references: Vec::new(),
@@ -8157,11 +7973,11 @@ mod tests {
         now: &str,
     ) {
         let entity_id = release.release_id.to_string();
-        let source_hash = crate::translations::release_smart_feed_source_hash(
+        let source_hash = crate::content_source_identity::release_smart_feed_source_hash(
             entity_id.as_str(),
             release.full_name.as_str(),
             release.title.as_str(),
-            crate::api::release_feed_body(Some(release.body.as_str())).as_deref(),
+            crate::release_content::release_feed_body(Some(release.body.as_str())).as_deref(),
             release
                 .html_url
                 .rsplit('/')

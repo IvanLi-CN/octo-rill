@@ -48,7 +48,8 @@ use crate::{
     config::AiConfig,
     local_id,
     postgres_server::PostgresServerState,
-    translations::{TranslationSourceBlock, translation_error_summary},
+    translation_error::translation_error_summary,
+    translations::{TranslationRequestItemInput, TranslationSourceBlock},
 };
 
 const TARGET_LANG: &str = "zh-CN";
@@ -57,15 +58,6 @@ const RELEASE_DETAIL_BATCH_MAX_ITEMS: usize = 20;
 const NOTIFICATION_BATCH_MAX_ITEMS: usize = 60;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
 const RELEASE_TITLE_MAX_TOKENS: u32 = 120;
-/// Upper bound on the releases one release-sync task hands to the automatic
-/// translation enqueue. A cold repository can add many releases at once and
-/// every queued work item becomes an LLM call, so the sync lane must not turn
-/// one GitHub refresh into an unbounded provider burst.
-const AUTO_RELEASE_TRANSLATION_CAP: usize = 25;
-/// Total attempts one release source revision may make, including the first.
-/// Automatic recovery stops here so a permanently failing release cannot burn
-/// provider calls on every sync cycle.
-const AUTO_TRANSLATION_MAX_ATTEMPTS: i32 = 3;
 const RELEASE_BODY_MAX_TOKENS: u32 = 4_000;
 const NOTIFICATION_MAX_TOKENS: u32 = 1_100;
 const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -187,6 +179,7 @@ impl TargetKind {
 struct Target {
     entity_id: String,
     kind: TargetKind,
+    variant: String,
     source: String,
     title: String,
     body: String,
@@ -1352,17 +1345,21 @@ async fn load_release_targets(
             .map(|value| value.trim().to_owned())
             .unwrap_or_default();
 
-        let tiebreak = crate::content_processing::release_source_revision_content_tiebreak(&[
+        let tiebreak = crate::content_source_identity::release_source_revision_content_tiebreak(&[
             html_url.as_str(),
             tag_name.as_str(),
             title.as_str(),
             body.as_str(),
         ]);
-        let observed_at = crate::content_processing::authoritative_release_revision(
+        let observed_at = crate::content_source_identity::authoritative_release_revision(
             updated_at.as_deref().unwrap_or_default(),
             detected_at.as_deref(),
         );
-        let source_hash = crate::api::release_detail_source_hash(&repo_full_name, &title, &body);
+        let source_hash = crate::content_source_identity::release_detail_source_hash(
+            &repo_full_name,
+            &title,
+            &body,
+        );
         let mut source_blocks = vec![
             TranslationSourceBlock {
                 slot: "metadata".to_owned(),
@@ -1391,6 +1388,7 @@ async fn load_release_targets(
             Target {
                 entity_id: release_id.to_string(),
                 kind,
+                variant: kind.work_variant().to_owned(),
                 source: source.to_owned(),
                 title,
                 body,
@@ -1446,14 +1444,14 @@ async fn load_notification_targets(
         let reason = reason.unwrap_or_default();
         let subject_type = subject_type.unwrap_or_default();
 
-        let tiebreak = crate::content_processing::notification_source_revision_tiebreak(
+        let tiebreak = crate::content_source_identity::notification_source_revision_tiebreak(
             thread_id.as_str(),
             Some(repo_full_name.as_str()),
             Some(title.as_str()),
             Some(reason.as_str()),
             Some(subject_type.as_str()),
         );
-        let source_hash = crate::ai::sha256_hex(&format!(
+        let source_hash = crate::content_source_identity::sha256_hex(&format!(
             "kind=notification\nrepo={repo_full_name}\ntitle={title}\nreason={reason}\nsubject_type={subject_type}\n"
         ));
         let source_blocks = with_source_revision(
@@ -1475,6 +1473,7 @@ async fn load_notification_targets(
             Target {
                 entity_id: thread_id,
                 kind: TargetKind::Notification,
+                variant: TargetKind::Notification.work_variant().to_owned(),
                 source: source.to_owned(),
                 title,
                 body: String::new(),
@@ -1488,6 +1487,176 @@ async fn load_notification_targets(
         );
     }
     Ok(targets)
+}
+
+/// Publish the projection for a finished translation attempt.
+///
+/// The projection identity is rebuilt twice with the same construction the
+/// global read path uses (`postgres_content_overlay::identity_item`):
+///
+/// * from the attempt's persisted source blocks — the text that was actually
+///   translated;
+/// * from the stored release row — the text readers will look up.
+///
+/// Equal identities publish; a mismatch means the release changed after the
+/// work item was enqueued, so the output describes text no reader can resolve
+/// and publishing it would strand an unreachable row. A mismatch therefore
+/// logs and skips instead of writing a projection.
+///
+/// Results the shared output contract rejects are also skipped. Neither skip
+/// rewrites the attempt state, which stays the honest record of what ran.
+async fn publish_finished_translation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &Target,
+    title: Option<&str>,
+    summary: Option<&str>,
+) -> anyhow::Result<()> {
+    // Release detail is the only lane kind whose read path consumes a release
+    // content projection. Notifications read through their translation request,
+    // and the release feed body has its own truncated identity, so neither may
+    // publish under the detail identity.
+    if target.kind != TargetKind::ReleaseDetail {
+        return Ok(());
+    }
+    let Some(attempted) = attempted_identity_item(target) else {
+        return Ok(());
+    };
+    let Some(current) = release_publication_item(tx, target).await? else {
+        return Ok(());
+    };
+    let attempted_hash = crate::content_source_identity::source_hash_for_item(&attempted);
+    let current_hash = crate::content_source_identity::source_hash_for_item(&current);
+    if attempted_hash != current_hash {
+        warn!(
+            release_id = %target.entity_id,
+            attempted_source_hash = %attempted_hash,
+            canonical_source_hash = %current_hash,
+            "release content changed after the attempt was enqueued; projection not published"
+        );
+        return Ok(());
+    }
+    let raw = translations_payload_json(title, summary, &current.target_slots);
+    let output = match crate::content_processing::validate_output(
+        &raw,
+        &current.target_slots,
+        &current.source_blocks,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                release_id = %target.entity_id,
+                variant = %current.variant,
+                error = %error,
+                "translation result failed the global output contract; projection not published"
+            );
+            return Ok(());
+        }
+    };
+    crate::postgres_content::publish_translation_result(
+        tx,
+        crate::postgres_content::TranslationPublication {
+            canonical_resource_type: "release",
+            pipeline: "translation",
+            item: &current,
+            source_hash: &current_hash,
+            payload: &output,
+        },
+    )
+    .await
+    .context("publish translation projection")?;
+    Ok(())
+}
+
+/// Projection identity rebuilt from the attempt's persisted source blocks.
+///
+/// The metadata block carries `repository\ntag`; the reader builds the same
+/// metadata text from the release row, so this reproduces its identity for the
+/// text that was actually translated.
+fn attempted_identity_item(target: &Target) -> Option<TranslationRequestItemInput> {
+    let metadata = source_block_text(&target.source_blocks, "metadata")?.to_owned();
+    let title = source_block_text(&target.source_blocks, "title")?.to_owned();
+    let body = source_block_text(&target.source_blocks, "body_markdown").map(str::to_owned);
+    let mut item = crate::postgres_content_overlay::identity_item(
+        "release_detail",
+        "detail",
+        &target.entity_id,
+        metadata,
+        title,
+        body,
+    );
+    item.producer_ref = "postgres.translate".to_owned();
+    Some(item)
+}
+
+/// Rebuild the projection identity item for a release from its stored row.
+///
+/// Mirrors `postgres_content_overlay::ReleaseSource::identity_hash` for the
+/// release-detail identity: repository identity from the release URL (with the
+/// `unknown/<repo_id>` fallback), the tag line in metadata, the display title,
+/// and the body with line endings normalized but not trimmed.
+async fn release_publication_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &Target,
+) -> anyhow::Result<Option<TranslationRequestItemInput>> {
+    let entity_id = target.entity_id.as_str();
+    let Some(release_id) = entity_id.parse::<i64>().ok() else {
+        return Ok(None);
+    };
+    let Some(row) = sqlx::query(
+        "SELECT repo_id, html_url, tag_name, name, body FROM public.repo_releases WHERE release_id = $1",
+    )
+    .bind(release_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load release row for projection publication")?
+    else {
+        return Ok(None);
+    };
+    let repo_id: i64 = row.try_get("repo_id")?;
+    let html_url: String = row.try_get("html_url")?;
+    let tag_name: String = row.try_get("tag_name")?;
+    let name: Option<String> = row.try_get("name")?;
+    let body: Option<String> = row.try_get("body")?;
+    let repo_identity = crate::postgres_content_overlay::release_repo_identity(&html_url, repo_id);
+    let title = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(tag_name.as_str())
+        .to_owned();
+    let mut item = crate::postgres_content_overlay::identity_item(
+        "release_detail",
+        "detail",
+        entity_id,
+        format!("{repo_identity}\n{tag_name}"),
+        title,
+        body,
+    );
+    item.producer_ref = "postgres.translate".to_owned();
+    Ok(Some(item))
+}
+
+/// Render stored translation fields as the JSON object the output contract
+/// validates.
+///
+/// `validate_output` reads a model response; the lane stores the parsed slots in
+/// columns, so this rebuilds the same object for contract validation instead of
+/// duplicating the slot rules.
+fn translations_payload_json(
+    title: Option<&str>,
+    summary: Option<&str>,
+    target_slots: &[String],
+) -> String {
+    let mut object = serde_json::Map::new();
+    for slot in target_slots {
+        let value = match slot.as_str() {
+            "title_zh" => title.map(str::to_owned).map(Value::String),
+            "body_md" | "summary_md" => summary.map(str::to_owned).map(Value::String),
+            _ => continue,
+        };
+        object.insert(slot.clone(), value.unwrap_or(Value::Null));
+    }
+    Value::Object(object).to_string()
 }
 
 fn with_source_revision(
@@ -1525,6 +1694,7 @@ struct RequestScope {
     /// persisted request row.
     request_id: Option<String>,
     work_item_id: String,
+    variant: String,
     attempt_no: i32,
 }
 
@@ -1603,6 +1773,7 @@ async fn begin_request(
             Some(&request_id),
             user_id,
             target.kind,
+            &target.variant,
             &target.entity_id,
             now,
         )
@@ -1613,116 +1784,97 @@ async fn begin_request(
     Ok(RequestScope {
         request_id: Some(request_id),
         work_item_id,
+        variant: target.variant.clone(),
         attempt_no,
     })
 }
 
-/// Queue the release-body translation of freshly stored releases.
+/// Admit Release detail translation for the Releases one sync inserted.
 ///
-/// A release sync only reports the releases it inserted, so this is the one
-/// place that turns a stored release into `translation.generate` work in the
-/// PostgreSQL runtime. Each release is enqueued in its own transaction with the
-/// same request/work-item/task shape as the HTTP translate handler:
+/// This is the Release producer of the global content model: a sync no longer
+/// writes per-user `translation_work_items`/`translation_requests` rows or
+/// `translation.generate` tasks, it hands each new Release to
+/// [`crate::postgres_content::admit_release_detail_translation`], and the single
+/// global content worker owns the attempt and the projection (REQ-PGCP-006).
 ///
-/// - a work item keyed by [`dedupe_key`], so a second sync of the same source
-///   revision reuses it;
-/// - a work item whose result is already `ready` queues nothing;
-/// - a work item that already has a queued or running `translation.generate`
-///   task queues nothing (single flight);
-/// - a terminal work item without a live task is re-queued like an authorized
-///   retry, otherwise the new task would fail on its finished state.
+/// Admission is keyed by the canonical identity, so a second sync of the same
+/// source revision creates nothing and the count only reports work this call
+/// actually created. The sync already committed its Release writes, so a failure
+/// for one Release is logged and swallowed: the Release stays stored and the
+/// next sync or explicit request re-admits it.
 ///
-/// At most [`AUTO_RELEASE_TRANSLATION_CAP`] releases get a task from one call.
-/// Every other translatable release still gets its work item, which
-/// [`enqueue_pending_translation_tasks`] drains on a later cycle, so a cold
-/// repository does not lose translations to the cap. A failure for one release
-/// is logged and never aborts the others or the calling sync task. Returns the
-/// number of tasks queued.
-pub(crate) async fn enqueue_release_translations(
+/// Returns how many Releases got new global translation work.
+pub(crate) async fn admit_release_detail_translations(
     pool: &PgPool,
-    user_id: &str,
     release_ids: &[i64],
-    source: &str,
-) -> anyhow::Result<usize> {
+    fallback_model: &str,
+    producer_ref: &str,
+) -> usize {
     let release_ids = deduped_release_ids(release_ids);
     if release_ids.is_empty() {
-        return Ok(0);
+        return 0;
     }
-    let rows = sqlx::query(
+    let Ok(rows) = sqlx::query(
         "SELECT release_id, name, body FROM public.repo_releases WHERE release_id = ANY($1)",
     )
     .bind(&release_ids)
     .fetch_all(pool)
     .await
-    .context("load release content for automatic translation")?;
+    else {
+        warn!(
+            event = "content.admission",
+            producer_ref,
+            releases = release_ids.len(),
+            "could not load Release content for global translation admission"
+        );
+        return 0;
+    };
     let mut translatable = HashSet::with_capacity(rows.len());
     for row in rows {
-        let release_id: i64 = row.try_get("release_id")?;
-        let name: Option<String> = row.try_get("name")?;
-        let body: Option<String> = row.try_get("body")?;
+        let release_id: i64 = match row.try_get("release_id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let name: Option<String> = row.try_get("name").ok().flatten();
+        let body: Option<String> = row.try_get("body").ok().flatten();
         if release_has_translatable_content(name.as_deref(), body.as_deref()) {
             translatable.insert(release_id);
         }
     }
-    // Preserve the caller's order so repeated syncs enqueue deterministically.
-    let entities = release_ids
-        .iter()
-        .filter(|release_id| translatable.contains(release_id))
-        .map(i64::to_string)
-        .collect::<Vec<_>>();
-    if entities.is_empty() {
-        return Ok(0);
-    }
-    let targets = load_targets(pool, user_id, TargetKind::ReleaseDetail, source, &entities)
-        .await
-        .context("load PostgreSQL release translation targets")?;
-    let mut queued = 0usize;
-    let mut backlog = Vec::new();
-    for entity_id in &entities {
-        // The release row exists, but this user may no longer see it: the
-        // translation read path applies the same visibility filter, so queueing
-        // would only produce a guaranteed `missing` attempt.
-        let Some(target) = targets.get(entity_id) else {
+    let mut admitted = 0usize;
+    for release_id in release_ids {
+        if !translatable.contains(&release_id) {
             continue;
-        };
-        if queued < AUTO_RELEASE_TRANSLATION_CAP {
-            match enqueue_one_release_translation(pool, user_id, target, source).await {
-                Ok(true) => queued += 1,
-                Ok(false) => {}
-                Err(error) => warn!(
-                    event = "translation.enqueue",
-                    user_id,
-                    release_id = entity_id.as_str(),
-                    source,
-                    error = %error,
-                    "automatic release translation could not be enqueued"
-                ),
+        }
+        match crate::postgres_content::admit_release_detail_translation(
+            pool,
+            release_id,
+            fallback_model,
+            producer_ref,
+        )
+        .await
+        {
+            Ok(work) => {
+                if work.outcome == crate::postgres_content::DetailAdmission::Created {
+                    admitted += 1;
+                }
             }
-        } else {
-            backlog.push(target);
-        }
-    }
-    if !backlog.is_empty() {
-        let deferred = backlog.len();
-        match persist_release_translation_backlog(pool, user_id, &backlog).await {
-            Ok(persisted) => info!(
-                event = "translation.enqueue",
-                user_id,
-                source,
-                deferred = persisted,
-                "automatic release translation deferred to the backlog"
-            ),
             Err(error) => warn!(
-                event = "translation.enqueue",
-                user_id,
-                source,
-                deferred,
+                event = "content.admission",
+                producer_ref,
+                release_id,
                 error = %error,
-                "automatic release translation backlog could not be persisted"
+                "global Release detail translation admission failed"
             ),
         }
     }
-    Ok(queued)
+    if admitted > 0 {
+        info!(
+            event = "content.admission",
+            producer_ref, admitted, "global Release detail translation work admitted"
+        );
+    }
+    admitted
 }
 
 /// Deduplicate the caller's release ids while keeping the caller's order.
@@ -1743,441 +1895,6 @@ fn release_has_translatable_content(name: Option<&str>, body: Option<&str>) -> b
     filled(name) || filled(body)
 }
 
-/// What the automatic enqueue does with an existing work item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoTranslationDecision {
-    /// The work item already holds a translation for this source revision.
-    SkipReady,
-    /// A `translation.generate` task for the work item is queued or running.
-    SkipInFlight,
-    /// The work item is terminal; only the scheduled retry lane may reopen it.
-    SkipTerminal,
-    /// Queue an already-admitted queued work item.
-    Enqueue { reset_work_item: bool },
-}
-
-fn auto_translation_decision(
-    work_status: &str,
-    result_status: Option<&str>,
-    task_in_flight: bool,
-) -> AutoTranslationDecision {
-    if result_status == Some("ready") {
-        return AutoTranslationDecision::SkipReady;
-    }
-    if task_in_flight || work_status == "running" {
-        return AutoTranslationDecision::SkipInFlight;
-    }
-    if work_status != "queued" {
-        return AutoTranslationDecision::SkipTerminal;
-    }
-    AutoTranslationDecision::Enqueue {
-        reset_work_item: false,
-    }
-}
-
-/// Delay before the next automatic attempt; `None` retires the work item.
-///
-/// The delays grow per attempt so a provider incident recovers without a retry
-/// storm, and [`AUTO_TRANSLATION_MAX_ATTEMPTS`] stops permanent failures.
-fn automatic_retry_delay(attempt_no: i32) -> Option<chrono::Duration> {
-    if attempt_no <= 0 || attempt_no >= AUTO_TRANSLATION_MAX_ATTEMPTS {
-        return None;
-    }
-    Some(match attempt_no {
-        1 => chrono::Duration::minutes(10),
-        _ => chrono::Duration::hours(1),
-    })
-}
-
-/// The persisted columns a queued release translation needs to become a task.
-struct AutomaticWorkItem {
-    id: String,
-    source_hash: String,
-    source_blocks_json: String,
-    target_slots_json: String,
-}
-
-/// The work item after the dedupe upsert, with the state the decision needs.
-struct UpsertedWorkItem {
-    work_item: AutomaticWorkItem,
-    status: String,
-    result_status: Option<String>,
-}
-
-/// Upsert the dedupe-keyed work item for one release target.
-///
-/// The conflict branch only extends `updated_at`: the existing row keeps its
-/// status, result and frozen source snapshot, so a repeat sync cannot rewind a
-/// running or finished translation.
-async fn upsert_translation_work_item(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: &str,
-    target: &Target,
-    now: chrono::DateTime<Utc>,
-) -> anyhow::Result<UpsertedWorkItem> {
-    let key = dedupe_key(user_id, target);
-    let source_blocks_json = serde_json::to_string(&target.source_blocks)
-        .context("serialize automatic translation source blocks")?;
-    let target_slots_json = serde_json::to_string(&target.target_slots)
-        .context("serialize automatic translation target slots")?;
-    let (id, status, result_status) = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "INSERT INTO public.translation_work_items (id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version, model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate, deadline_at, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'translation-request.v1','postgres-default',$8,$9,$10,0,$11,'queued',$12,$12) ON CONFLICT (dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id, status, result_status",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(&key)
-    .bind(user_id)
-    .bind(target.kind.work_kind())
-    .bind(target.kind.work_variant())
-    .bind(&target.entity_id)
-    .bind(TARGET_LANG)
-    .bind(&target.source_hash)
-    .bind(&source_blocks_json)
-    .bind(&target_slots_json)
-    .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await
-    .context("upsert automatic release translation work item")?;
-    Ok(UpsertedWorkItem {
-        work_item: AutomaticWorkItem {
-            id,
-            source_hash: target.source_hash.clone(),
-            source_blocks_json,
-            target_slots_json,
-        },
-        status,
-        result_status,
-    })
-}
-
-/// Enqueue one release body translation. `Ok(false)` means the existing work
-/// item or task already covers it, so no task was written.
-async fn enqueue_one_release_translation(
-    pool: &PgPool,
-    user_id: &str,
-    target: &Target,
-    source: &str,
-) -> anyhow::Result<bool> {
-    let now = Utc::now();
-    let mut tx = pool
-        .begin()
-        .await
-        .context("begin automatic release translation enqueue")?;
-    let upserted = upsert_translation_work_item(&mut tx, user_id, target, now).await?;
-    let task_in_flight = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM public.job_tasks WHERE task_type = 'translation.generate' AND status IN ('queued', 'running') AND pg_input_is_valid(payload_json, 'jsonb') AND payload_json::jsonb ->> 'work_item_id' = $1)",
-    )
-    .bind(&upserted.work_item.id)
-    .fetch_one(&mut *tx)
-    .await
-    .context("check in-flight automatic release translation task")?;
-    let decision = auto_translation_decision(
-        &upserted.status,
-        upserted.result_status.as_deref(),
-        task_in_flight,
-    );
-    let AutoTranslationDecision::Enqueue { reset_work_item } = decision else {
-        tx.rollback()
-            .await
-            .context("roll back skipped automatic translation enqueue")?;
-        return Ok(false);
-    };
-    if reset_work_item {
-        sqlx::query(
-            "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, updated_at = $1 WHERE id = $2",
-        )
-        .bind(now)
-        .bind(&upserted.work_item.id)
-        .execute(&mut *tx)
-        .await
-        .context("requeue automatic release translation work item")?;
-    }
-    insert_translation_request(
-        &mut tx,
-        user_id,
-        source,
-        &target.entity_id,
-        TargetKind::ReleaseDetail,
-        &upserted.work_item,
-        now,
-    )
-    .await?;
-    insert_translation_task(&mut tx, user_id, source, &upserted.work_item.id, now).await?;
-    tx.commit()
-        .await
-        .context("commit automatic release translation enqueue")?;
-    Ok(true)
-}
-
-/// Persist work items only, without a task, for releases the batch cap left out.
-///
-/// The drain turns them into tasks on a later cycle, so the sync never queues an
-/// unbounded provider burst and no release is dropped.
-async fn persist_release_translation_backlog(
-    pool: &PgPool,
-    user_id: &str,
-    targets: &[&Target],
-) -> anyhow::Result<usize> {
-    let now = Utc::now();
-    let mut tx = pool
-        .begin()
-        .await
-        .context("begin automatic release translation backlog")?;
-    for target in targets {
-        upsert_translation_work_item(&mut tx, user_id, target, now).await?;
-    }
-    tx.commit()
-        .await
-        .context("commit automatic release translation backlog")?;
-    Ok(targets.len())
-}
-
-async fn insert_translation_request(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: &str,
-    source: &str,
-    entity_id: &str,
-    kind: TargetKind,
-    work_item: &AutomaticWorkItem,
-    now: chrono::DateTime<Utc>,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO public.translation_requests (id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json, target_slots_json, work_item_id, status, created_at, updated_at) VALUES ($1,'async','postgres','system',$2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'queued',$13,$13) ON CONFLICT (mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, source_hash) DO UPDATE SET work_item_id = EXCLUDED.work_item_id, status = 'queued', result_status = NULL, error_text = NULL, started_at = NULL, finished_at = NULL, updated_at = EXCLUDED.updated_at",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(user_id)
-    .bind(source)
-    .bind(kind.request_kind())
-    .bind(kind.request_variant())
-    .bind(entity_id)
-    .bind(TARGET_LANG)
-    .bind(TRANSLATION_MAX_WAIT_MS)
-    .bind(&work_item.source_hash)
-    .bind(&work_item.source_blocks_json)
-    .bind(&work_item.target_slots_json)
-    .bind(&work_item.id)
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .context("insert automatic release translation request")?;
-    Ok(())
-}
-
-async fn insert_translation_task(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: &str,
-    source: &str,
-    work_item_id: &str,
-    now: chrono::DateTime<Utc>,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO public.job_tasks (id, task_type, status, source, requested_by, payload_json, created_at, updated_at) VALUES ($1, 'translation.generate', 'queued', $2, $3, $4, $5, $5)",
-    )
-    .bind(local_id::generate_local_id())
-    .bind(source)
-    .bind(user_id)
-    .bind(json!({"work_item_id": work_item_id}).to_string())
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .context("insert automatic release translation task")?;
-    Ok(())
-}
-
-/// Queue `translation.generate` tasks for the work items the batch cap and the
-/// failure policy left behind.
-///
-/// One call handles at most [`AUTO_RELEASE_TRANSLATION_CAP`] work items. Due
-/// automatic retries go first; the rest of the budget drains the queued backlog.
-/// The account release sync runs on the scheduler interval, so a large cold
-/// start or a provider incident recovers over several cycles instead of flooding
-/// the single PostgreSQL task worker.
-///
-/// Retries only match work items whose last completed attempt was recoverable,
-/// whose scheduled `next_retry_at` has passed, and that have no queued or running
-/// task. [`automatic_retry_delay`] stops scheduling after
-/// [`AUTO_TRANSLATION_MAX_ATTEMPTS`] and `finish_request` never schedules a
-/// configuration failure, so a permanently broken release cannot retry forever.
-pub(crate) async fn enqueue_pending_translation_tasks(
-    pool: &PgPool,
-    user_id: &str,
-    source: &str,
-) -> anyhow::Result<usize> {
-    let now = Utc::now();
-    let cap = i64::try_from(AUTO_RELEASE_TRANSLATION_CAP).unwrap_or(i64::MAX);
-    let mut tx = pool
-        .begin()
-        .await
-        .context("begin automatic translation backlog drain")?;
-    // `FOR UPDATE OF wi SKIP LOCKED` makes two concurrent lanes for the same
-    // user skip each other's work items instead of queueing one twice.
-    let retries = sqlx::query(
-        r#"
-        SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
-        FROM public.translation_work_items AS wi
-        JOIN LATERAL (
-          SELECT event.retry_eligible,
-                 CASE
-                   WHEN pg_input_is_valid(event.next_retry_at::text, 'timestamptz')
-                   THEN event.next_retry_at::text::timestamptz
-                 END AS next_retry_at
-          FROM public.translation_attempt_events AS event
-          WHERE event.work_item_id = wi.id
-            AND event.event_type = 'attempt_completed'
-          ORDER BY event.attempt_no DESC
-          LIMIT 1
-        ) AS last ON true
-        WHERE wi.scope_user_id = $1
-          AND wi.kind = 'release_detail'
-          AND wi.variant = 'detail'
-          AND wi.status = 'failed'
-          AND wi.result_status = 'error'
-          AND last.retry_eligible <> 0
-          AND last.next_retry_at IS NOT NULL
-          AND last.next_retry_at <= $2
-          AND NOT EXISTS (
-            SELECT 1
-            FROM public.job_tasks AS task
-            WHERE task.task_type = 'translation.generate'
-              AND task.status IN ('queued', 'running')
-              AND pg_input_is_valid(task.payload_json, 'jsonb')
-              AND task.payload_json::jsonb ->> 'work_item_id' = wi.id
-          )
-        ORDER BY last.next_retry_at ASC, wi.id ASC
-        LIMIT $3
-        FOR UPDATE OF wi SKIP LOCKED
-        "#,
-    )
-    .bind(user_id)
-    .bind(now)
-    .bind(cap)
-    .fetch_all(&mut *tx)
-    .await
-    .context("select automatic translation retries")?;
-    let mut queued = 0usize;
-    let mut retried = 0usize;
-    for row in retries {
-        let work_item = AutomaticWorkItem {
-            id: row.try_get("id")?,
-            source_hash: row.try_get("source_hash")?,
-            source_blocks_json: row.try_get("source_blocks_json")?,
-            target_slots_json: row.try_get("target_slots_json")?,
-        };
-        // Reuse the authorized-retry reset: the next attempt starts from a clean
-        // queued state and the executor accepts it again.
-        sqlx::query(
-            "UPDATE public.translation_work_items SET status = 'queued', result_status = NULL, error_text = NULL, deadline_at = $1, updated_at = $1 WHERE id = $2",
-        )
-        .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
-        .bind(&work_item.id)
-        .execute(&mut *tx)
-        .await
-        .context("requeue automatic translation retry")?;
-        let entity_id = row.try_get::<String, _>("entity_id")?;
-        insert_translation_request(
-            &mut tx,
-            user_id,
-            source,
-            &entity_id,
-            TargetKind::ReleaseDetail,
-            &work_item,
-            now,
-        )
-        .await?;
-        insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
-        retried += 1;
-    }
-    queued += retried;
-    let remaining = AUTO_RELEASE_TRANSLATION_CAP.saturating_sub(retried);
-    if remaining == 0 {
-        tx.commit()
-            .await
-            .context("commit automatic translation backlog drain")?;
-        log_drain(user_id, source, retried, 0);
-        return Ok(queued);
-    }
-    let rows = sqlx::query(
-        r#"
-        SELECT wi.id, wi.entity_id, wi.source_hash, wi.source_blocks_json, wi.target_slots_json
-        FROM public.translation_work_items AS wi
-        WHERE wi.scope_user_id = $1
-          AND wi.status = 'queued'
-          AND wi.result_status IS NULL
-          AND wi.kind = 'release_detail'
-          AND wi.variant = 'detail'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM public.job_tasks AS task
-            WHERE task.task_type = 'translation.generate'
-              AND task.status IN ('queued', 'running')
-              AND pg_input_is_valid(task.payload_json, 'jsonb')
-              AND task.payload_json::jsonb ->> 'work_item_id' = wi.id
-          )
-        ORDER BY wi.created_at ASC, wi.id ASC
-        LIMIT $2
-        FOR UPDATE SKIP LOCKED
-        "#,
-    )
-    .bind(user_id)
-    .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
-    .fetch_all(&mut *tx)
-    .await
-    .context("select automatic translation backlog")?;
-    let mut drained = 0usize;
-    for row in rows {
-        let work_item = AutomaticWorkItem {
-            id: row.try_get("id")?,
-            source_hash: row.try_get("source_hash")?,
-            source_blocks_json: row.try_get("source_blocks_json")?,
-            target_slots_json: row.try_get("target_slots_json")?,
-        };
-        // The stored deadline bounded the original request wait; a backlog item
-        // is drained later, so extend it before the task becomes claimable.
-        sqlx::query(
-            "UPDATE public.translation_work_items SET deadline_at = $1, updated_at = $1 WHERE id = $2",
-        )
-        .bind(now + chrono::Duration::milliseconds(TRANSLATION_MAX_WAIT_MS))
-        .bind(&work_item.id)
-        .execute(&mut *tx)
-        .await
-        .context("refresh automatic translation backlog deadline")?;
-        let entity_id = row.try_get::<String, _>("entity_id")?;
-        insert_translation_request(
-            &mut tx,
-            user_id,
-            source,
-            &entity_id,
-            TargetKind::ReleaseDetail,
-            &work_item,
-            now,
-        )
-        .await?;
-        insert_translation_task(&mut tx, user_id, source, &work_item.id, now).await?;
-        drained += 1;
-    }
-    tx.commit()
-        .await
-        .context("commit automatic translation backlog drain")?;
-    log_drain(user_id, source, retried, drained);
-    Ok(queued + drained)
-}
-
-/// Emit one line per drain so operators can see recovery progress.
-fn log_drain(user_id: &str, source: &str, retried: usize, drained: usize) {
-    if retried > 0 {
-        info!(
-            event = "translation.retry",
-            user_id, source, retried, "automatic translation retried recoverable failures"
-        );
-    }
-    if drained > 0 {
-        info!(
-            event = "translation.enqueue",
-            user_id, source, drained, "automatic translation backlog drained"
-        );
-    }
-}
-
 /// Open the next attempt on an existing work item.
 ///
 /// Shared by [`begin_request`] (new work item) and
@@ -2190,6 +1907,7 @@ async fn start_attempt(
     request_id: Option<&str>,
     user_id: &str,
     kind: TargetKind,
+    variant: &str,
     entity_id: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<i32, sqlx::Error> {
@@ -2205,6 +1923,7 @@ async fn start_attempt(
         request_id,
         user_id,
         kind,
+        variant,
         entity_id,
         attempt_no,
         "attempt_queued",
@@ -2212,7 +1931,6 @@ async fn start_attempt(
         None,
         None,
         false,
-        None,
         "[]",
         now,
     )
@@ -2239,6 +1957,7 @@ async fn start_attempt(
         request_id,
         user_id,
         kind,
+        variant,
         entity_id,
         attempt_no,
         "attempt_started",
@@ -2246,7 +1965,6 @@ async fn start_attempt(
         None,
         None,
         false,
-        None,
         "[]",
         now,
     )
@@ -2261,6 +1979,7 @@ async fn insert_attempt_event(
     request_id: Option<&str>,
     user_id: &str,
     kind: TargetKind,
+    variant: &str,
     entity_id: &str,
     attempt_no: i32,
     event_type: &str,
@@ -2268,7 +1987,6 @@ async fn insert_attempt_event(
     error_code: Option<&str>,
     error_summary: Option<&str>,
     retry_eligible: bool,
-    next_retry_at: Option<chrono::DateTime<Utc>>,
     llm_call_ids_json: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
@@ -2278,14 +1996,14 @@ async fn insert_attempt_event(
         None
     };
     sqlx::query(
-        "INSERT INTO public.translation_attempt_events (id, work_item_id, request_id, scope_user_id, kind, variant, entity_id, target_lang, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, llm_call_ids_json, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'initial',$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
+        "INSERT INTO public.translation_attempt_events (id, work_item_id, request_id, scope_user_id, kind, variant, entity_id, target_lang, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, llm_call_ids_json, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'initial',$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (work_item_id, attempt_no, event_type) DO NOTHING",
     )
     .bind(local_id::generate_local_id())
     .bind(work_item_id)
     .bind(request_id)
     .bind(user_id)
     .bind(kind.work_kind())
-    .bind(kind.work_variant())
+    .bind(variant)
     .bind(entity_id)
     .bind(TARGET_LANG)
     .bind(attempt_no)
@@ -2295,7 +2013,6 @@ async fn insert_attempt_event(
     .bind(error_summary)
     .bind(failure_class)
     .bind(i64::from(retry_eligible))
-    .bind(next_retry_at)
     .bind(llm_call_ids_json)
     .bind(now)
     .execute(&mut **tx)
@@ -2391,6 +2108,7 @@ async fn translate_target(
                 user_id,
                 target.kind,
                 &target.entity_id,
+                Some(target),
                 &scope,
                 AttemptOutcome {
                     result_status: "ready",
@@ -2412,6 +2130,7 @@ async fn translate_target(
                 user_id,
                 target.kind,
                 &target.entity_id,
+                Some(target),
                 &scope,
                 AttemptOutcome {
                     result_status: "error",
@@ -2450,6 +2169,7 @@ async fn finish_request(
     user_id: &str,
     kind: TargetKind,
     entity_id: &str,
+    publication: Option<&Target>,
     scope: &RequestScope,
     outcome: AttemptOutcome<'_>,
     call_ids_json: &str,
@@ -2458,6 +2178,13 @@ async fn finish_request(
     let summary_slot = outcome.summary.filter(|value| !value.trim().is_empty());
     let mut tx = pool.begin().await?;
     if outcome.result_status == "ready" {
+        // The projection commits with the terminal attempt state, so a stored
+        // `ready` translation is always readable through the global projection.
+        if let Some(target) = publication {
+            publish_finished_translation(&mut tx, target, outcome.title, summary_slot)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
         sqlx::query(
             "UPDATE public.translation_work_items SET status = 'completed', result_status = 'ready', title_zh = $1, summary_md = $2, body_md = $2, error_text = NULL, finished_at = $3, updated_at = $3 WHERE id = $4",
         )
@@ -2501,18 +2228,13 @@ async fn finish_request(
             .await?;
         }
     }
-    // Only a recoverable failure is scheduled for automatic recovery; the
-    // attempt cap and the per-attempt delay live in `automatic_retry_delay`.
-    let next_retry_at = (outcome.result_status != "ready" && outcome.retry_eligible)
-        .then(|| automatic_retry_delay(scope.attempt_no))
-        .flatten()
-        .map(|delay| now + delay);
     insert_attempt_event(
         &mut tx,
         &scope.work_item_id,
         scope.request_id.as_deref(),
         user_id,
         kind,
+        &scope.variant,
         entity_id,
         scope.attempt_no,
         "attempt_completed",
@@ -2520,7 +2242,6 @@ async fn finish_request(
         outcome.error_code,
         outcome.error_summary,
         outcome.retry_eligible,
-        next_retry_at,
         call_ids_json,
         now,
     )
@@ -2728,7 +2449,7 @@ pub(crate) async fn translate_work_item_for_task(
     source: &str,
 ) -> anyhow::Result<TaskTranslationOutcome> {
     let row = sqlx::query(
-        "SELECT scope_user_id, kind, entity_id, status, source_blocks_json, target_slots_json FROM public.translation_work_items WHERE id = $1",
+        "SELECT scope_user_id, kind, variant, entity_id, status, source_blocks_json, target_slots_json FROM public.translation_work_items WHERE id = $1",
     )
     .bind(work_item_id)
     .fetch_optional(pool)
@@ -2743,6 +2464,7 @@ pub(crate) async fn translate_work_item_for_task(
     }
     let user_id: String = row.try_get("scope_user_id")?;
     let work_kind: String = row.try_get("kind")?;
+    let variant: String = row.try_get("variant")?;
     let entity_id: String = row.try_get("entity_id")?;
     let source_blocks_json: String = row.try_get("source_blocks_json")?;
     let target_slots_json: String = row.try_get("target_slots_json")?;
@@ -2783,6 +2505,7 @@ pub(crate) async fn translate_work_item_for_task(
             request_id.as_deref(),
             &user_id,
             kind,
+            &variant,
             &entity_id,
             now,
         )
@@ -2792,6 +2515,7 @@ pub(crate) async fn translate_work_item_for_task(
         RequestScope {
             request_id,
             work_item_id: work_item_id.to_owned(),
+            variant: variant.to_owned(),
             attempt_no,
         }
     };
@@ -2803,6 +2527,7 @@ pub(crate) async fn translate_work_item_for_task(
             &user_id,
             kind,
             &entity_id,
+            None,
             &scope,
             AttemptOutcome {
                 result_status: "missing",
@@ -2848,6 +2573,7 @@ pub(crate) async fn translate_work_item_for_task(
                 &user_id,
                 kind,
                 &entity_id,
+                Some(&target),
                 &scope,
                 AttemptOutcome {
                     result_status: "ready",
@@ -2873,6 +2599,7 @@ pub(crate) async fn translate_work_item_for_task(
                 &user_id,
                 kind,
                 &entity_id,
+                Some(&target),
                 &scope,
                 AttemptOutcome {
                     result_status: "error",
@@ -3108,13 +2835,13 @@ fn parse_json_translation(raw: &str) -> (Option<String>, Option<String>) {
 
 #[derive(Debug)]
 pub(crate) struct LlmFailure {
-    pub(crate) class: crate::ai::LlmFailureClass,
+    pub(crate) class: crate::llm_contract::LlmFailureClass,
     pub(crate) message: String,
 }
 
 impl LlmFailure {
     fn empty_content() -> Self {
-        let class = crate::ai::LlmFailureClass::EmptyContent;
+        let class = crate::llm_contract::LlmFailureClass::EmptyContent;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3122,7 +2849,7 @@ impl LlmFailure {
     }
 
     fn transient() -> Self {
-        let class = crate::ai::LlmFailureClass::Transient;
+        let class = crate::llm_contract::LlmFailureClass::Transient;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3130,7 +2857,7 @@ impl LlmFailure {
     }
 
     fn configuration() -> Self {
-        let class = crate::ai::LlmFailureClass::Configuration;
+        let class = crate::llm_contract::LlmFailureClass::Configuration;
         Self {
             class,
             message: class.safe_message().to_owned(),
@@ -3298,18 +3025,30 @@ async fn body_chunk_chars_for_route(
     let candidates = route_candidates(&models, &health, Utc::now());
     let input_limit = candidates
         .iter()
-        .map(|model| crate::ai::resolve_model_input_limit_for_model(model).0)
+        .map(|model| crate::llm_contract::resolve_model_input_limit_for_model(model).0)
         .min()
-        .unwrap_or_else(|| crate::ai::resolve_model_input_limit_for_model(fallback_model.trim()).0);
+        .unwrap_or_else(|| {
+            crate::llm_contract::resolve_model_input_limit_for_model(fallback_model.trim()).0
+        });
     Ok(chunk_chars_for_input_limit(input_limit))
 }
 
-async fn record_model_failure(pool: &PgPool, model: &str, class: crate::ai::LlmFailureClass) {
+async fn record_model_failure(
+    pool: &PgPool,
+    model: &str,
+    class: crate::llm_contract::LlmFailureClass,
+) {
     record_model_health(pool, model, class, false).await;
 }
 
 async fn park_model(pool: &PgPool, model: &str) {
-    record_model_health(pool, model, crate::ai::LlmFailureClass::Configuration, true).await;
+    record_model_health(
+        pool,
+        model,
+        crate::llm_contract::LlmFailureClass::Configuration,
+        true,
+    )
+    .await;
 }
 
 /// Read the administrator-ordered model list for a caller outside this module.
@@ -3323,7 +3062,7 @@ pub(crate) async fn route_models_for_runtime(
 async fn record_model_health(
     pool: &PgPool,
     model: &str,
-    class: crate::ai::LlmFailureClass,
+    class: crate::llm_contract::LlmFailureClass,
     park: bool,
 ) {
     if model.trim().is_empty() {
@@ -3475,7 +3214,7 @@ impl AuditRecorder<'_> {
         let mut last_failure: Option<LlmFailure> = None;
         for (candidate_index, model) in candidates.into_iter().enumerate() {
             let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
-            let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
+            let mut retry_class: Option<crate::llm_contract::LlmFailureClass> = None;
             for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
                 if remaining == 0 {
                     break;
@@ -3560,13 +3299,13 @@ impl AuditRecorder<'_> {
                         let class = failure.error.class;
                         let http_status = failure.http_status;
                         last_failure = Some(failure.error);
-                        if class == crate::ai::LlmFailureClass::Configuration {
+                        if class == crate::llm_contract::LlmFailureClass::Configuration {
                             if is_credential_rejection(http_status) {
                                 park_model(self.pool, model.as_str()).await;
                             }
                             break;
                         }
-                        if class == crate::ai::LlmFailureClass::EmptyContent {
+                        if class == crate::llm_contract::LlmFailureClass::EmptyContent {
                             retry_class = Some(class);
                             break;
                         }
@@ -3703,19 +3442,19 @@ struct CallFailure {
     http_status: Option<i64>,
 }
 
-fn classify_upstream_failure(status: u16, detail: &str) -> crate::ai::LlmFailureClass {
+fn classify_upstream_failure(status: u16, detail: &str) -> crate::llm_contract::LlmFailureClass {
     let lowered = detail.to_ascii_lowercase();
     let model_rejected = lowered.contains("model not found")
         || lowered.contains("invalid_model_error")
         || lowered.contains("insufficient_quota")
         || lowered.contains("model_not_found");
     if status == 429 {
-        return crate::ai::LlmFailureClass::RateLimited;
+        return crate::llm_contract::LlmFailureClass::RateLimited;
     }
     if model_rejected || matches!(status, 400..=499) {
-        return crate::ai::LlmFailureClass::Configuration;
+        return crate::llm_contract::LlmFailureClass::Configuration;
     }
-    crate::ai::LlmFailureClass::Transient
+    crate::llm_contract::LlmFailureClass::Transient
 }
 
 fn is_credential_rejection(status: Option<i64>) -> bool {
@@ -3907,7 +3646,7 @@ pub(crate) enum CompletionFailure {
 impl CompletionFailure {
     fn from_admission(error: anyhow::Error) -> Self {
         Self::Provider(LlmFailure {
-            class: crate::ai::LlmFailureClass::Transient,
+            class: crate::llm_contract::LlmFailureClass::Transient,
             message: format!("provider admission failed: {error}"),
         })
     }
@@ -4035,7 +3774,7 @@ pub(crate) async fn complete_with_audit(
             "fallback"
         };
         let fallback_count = i64::try_from(candidate_index).unwrap_or(i64::MAX);
-        let mut retry_class: Option<crate::ai::LlmFailureClass> = None;
+        let mut retry_class: Option<crate::llm_contract::LlmFailureClass> = None;
         for model_attempt in 0..ROUTE_ATTEMPTS_PER_MODEL {
             if remaining == 0 {
                 break;
@@ -4128,13 +3867,13 @@ pub(crate) async fn complete_with_audit(
                     let class = failure.error.class;
                     let http_status = failure.http_status;
                     last_failure = Some(failure.error);
-                    if class == crate::ai::LlmFailureClass::Configuration {
+                    if class == crate::llm_contract::LlmFailureClass::Configuration {
                         if is_credential_rejection(http_status) {
                             park_model(pool, model.as_str()).await;
                         }
                         break;
                     }
-                    if class == crate::ai::LlmFailureClass::EmptyContent {
+                    if class == crate::llm_contract::LlmFailureClass::EmptyContent {
                         retry_class = Some(class);
                         break;
                     }
@@ -4388,72 +4127,45 @@ fn db_failure(error: sqlx::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_RELEASE_TRANSLATION_CAP, AUTO_TRANSLATION_MAX_ATTEMPTS, AutoTranslationDecision,
-        AutomaticWorkItem, ModelRouteHealth, TargetKind, audit_recorder, auto_translation_decision,
-        automatic_retry_delay, chunk_chars_for_input_limit, classify_upstream_failure,
-        deduped_release_ids, enqueue_pending_translation_tasks, enqueue_release_translations,
-        insert_translation_request, is_credential_rejection, load_route_health, park_model,
+        ModelRouteHealth, Target, TargetKind, admit_release_detail_translations, audit_recorder,
+        chunk_chars_for_input_limit, classify_upstream_failure, deduped_release_ids,
+        is_credential_rejection, load_route_health, park_model, publish_finished_translation,
         record_model_failure, release_has_translatable_content, route_candidates, route_models,
         start_attempt,
     };
+    use crate::translations::TranslationSourceBlock;
 
     type LlmCallAuditRow = (String, String, Option<String>, i64, Option<String>);
 
     #[test]
-    fn automatic_retry_backs_off_and_stops_at_the_attempt_cap() {
-        assert_eq!(
-            automatic_retry_delay(1),
-            Some(chrono::Duration::minutes(10))
-        );
-        assert_eq!(automatic_retry_delay(2), Some(chrono::Duration::hours(1)));
-        assert_eq!(automatic_retry_delay(3), None);
-        assert_eq!(automatic_retry_delay(0), None);
-        assert_eq!(automatic_retry_delay(9), None);
-        assert_eq!(AUTO_TRANSLATION_MAX_ATTEMPTS, 3);
-    }
-
-    #[test]
-    fn automatic_enqueue_deduplicates_release_ids_in_caller_order() {
+    fn release_admission_deduplicates_release_ids_in_caller_order() {
         assert_eq!(deduped_release_ids(&[9, 9, 7, 9]), vec![9, 7]);
         assert_eq!(deduped_release_ids(&[]), Vec::<i64>::new());
-        // The backlog keeps every id; only the task batch is capped.
         let ids = (1..=40).collect::<Vec<i64>>();
         assert_eq!(deduped_release_ids(&ids), ids);
-        assert_eq!(AUTO_RELEASE_TRANSLATION_CAP, 25);
     }
 
     #[test]
-    fn automatic_enqueue_skips_releases_without_translatable_content() {
+    fn release_admission_skips_releases_without_translatable_content() {
         assert!(!release_has_translatable_content(None, None));
         assert!(!release_has_translatable_content(Some(""), Some("  \n")));
         assert!(release_has_translatable_content(Some("v1.2.0"), None));
         assert!(release_has_translatable_content(None, Some("## Notes")));
     }
 
-    #[test]
-    fn automatic_enqueue_skips_ready_work_items_and_live_tasks() {
-        assert_eq!(
-            auto_translation_decision("completed", Some("ready"), false),
-            AutoTranslationDecision::SkipReady
-        );
-        // A live task wins even when the work item row was not marked ready.
-        assert_eq!(
-            auto_translation_decision("running", Some("error"), true),
-            AutoTranslationDecision::SkipInFlight
-        );
-        assert_eq!(
-            auto_translation_decision("queued", None, true),
-            AutoTranslationDecision::SkipInFlight
-        );
-    }
-
+    /// REQ-RTR-008 functional gate: a Release sync that inserts a new Release
+    /// admits exactly one global translation work item and writes no legacy
+    /// `translation_work_items`/`translation_requests`/`translation.generate`
+    /// row for it. A second pass for the same source revision creates nothing,
+    /// which is what makes the counter meaningful.
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    async fn postgres_backlog_retries_only_due_recoverable_failures() -> anyhow::Result<()> {
+    async fn postgres_release_sync_admits_global_translation_without_legacy_rows()
+    -> anyhow::Result<()> {
         use sqlx::PgPool;
         let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
         let admin = PgPool::connect(&admin_url).await?;
-        let database = format!("translate_retry_{}", crate::local_id::generate_local_id());
+        let database = format!("translate_admit_{}", crate::local_id::generate_local_id());
         sqlx::query(&format!("CREATE DATABASE {database}"))
             .execute(&admin)
             .await?;
@@ -4463,58 +4175,75 @@ mod tests {
         let result = async {
             sqlx::raw_sql(
                 r#"
-                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at text NOT NULL,status text NOT NULL,result_status text,error_text text,created_at text NOT NULL,finished_at text,updated_at text NOT NULL);
-                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no bigint NOT NULL,event_type text NOT NULL,retry_eligible bigint NOT NULL DEFAULT 0,next_retry_at text,created_at text NOT NULL);
-                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,error_text text,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL,UNIQUE(mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, source_hash));
-                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at text NOT NULL,updated_at text NOT NULL);
+                CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text, updated_at text, detected_at text);
+                CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', next_retry_at text, retry_expires_at text, retry_after_at text, failure_class text, lease_owner text, lease_expires_at text, started_at text, finished_at text, cancelled_at text, supersedes_work_item_id text, batch_id text, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+                CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+                CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+                CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+                CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+                CREATE TABLE public.content_work_admission_events(id text PRIMARY KEY, work_item_id text NOT NULL, event_type text NOT NULL, replaced_by_work_item_id text, source_hash text NOT NULL, source_revision_json text NOT NULL DEFAULT '{}', producer_ref text NOT NULL DEFAULT '', requester_id text, reason_code text NOT NULL DEFAULT '', created_at text NOT NULL, UNIQUE (work_item_id, event_type, source_hash));
+                CREATE TABLE public.content_attempt_events(id text PRIMARY KEY, work_item_id text NOT NULL, attempt_no bigint NOT NULL, trigger text NOT NULL, event_type text NOT NULL, result_status text, error_code text, error_summary text, failure_class text, retry_eligible bigint NOT NULL DEFAULT 0, next_retry_at text, duration_ms bigint, token_count bigint, cost_microunits bigint, created_at text NOT NULL, configuration_snapshot_json text, route_snapshot_json text, configuration_fingerprint text, UNIQUE (work_item_id, attempt_no, event_type));
+                CREATE TABLE public.content_request_links(id text PRIMARY KEY, request_id text NOT NULL UNIQUE, work_item_id text NOT NULL, requester_type text NOT NULL, requester_id text, authorization_snapshot_json text NOT NULL, producer_ref text NOT NULL, request_source text NOT NULL, delivery_mode text NOT NULL, response_status text, created_at text NOT NULL, updated_at text NOT NULL);
+                CREATE TABLE public.content_processing_control(id integer PRIMARY KEY, mode text NOT NULL, switch_token text, updated_at text NOT NULL);
+                INSERT INTO public.content_processing_control(id, mode, updated_at) VALUES (1, 'global', now()::text);
+                CREATE TABLE public.content_identity_upgrade_control(id bigint PRIMARY KEY, status text NOT NULL, phase text NOT NULL);
+                INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
+                CREATE TABLE public.admin_runtime_settings(id integer PRIMARY KEY, llm_models_json text NOT NULL);
+                INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '["m1"]');
+                CREATE TABLE public.translation_work_items(id text PRIMARY KEY, dedupe_key text UNIQUE NOT NULL, scope_user_id text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, token_estimate integer NOT NULL, deadline_at text NOT NULL, status text NOT NULL, result_status text, error_text text, created_at text NOT NULL, finished_at text, updated_at text NOT NULL);
+                CREATE TABLE public.translation_requests(id text PRIMARY KEY, mode text NOT NULL, source text NOT NULL, request_origin text NOT NULL, requested_by text, scope_user_id text NOT NULL, producer_ref text NOT NULL, kind text NOT NULL, variant text NOT NULL, entity_id text NOT NULL, target_lang text NOT NULL, max_wait_ms integer NOT NULL, source_hash text NOT NULL, source_blocks_json text NOT NULL, target_slots_json text NOT NULL, work_item_id text, status text NOT NULL, result_status text, error_text text, created_at text NOT NULL, started_at text, finished_at text, updated_at text NOT NULL);
+                CREATE TABLE public.job_tasks(id text PRIMARY KEY, task_type text NOT NULL, status text NOT NULL, source text NOT NULL, requested_by text, payload_json text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL);
+                INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body, updated_at)
+                  VALUES (9001, 7, 'https://github.com/acme/demo/releases/tag/v1.0.0', 'v1.0.0', 'v1.0.0', 'Release notes body', '2026-11-24T00:00:00Z');
                 "#,
             )
             .execute(&pool)
             .await?;
-            let now = chrono::Utc::now();
-            for (work_item_id, eligible, due_minutes) in
-                [("due", true, -10_i64), ("later", true, 60), ("permanent", false, -10)]
-            {
-                sqlx::query("INSERT INTO translation_work_items(id,dedupe_key,scope_user_id,kind,variant,entity_id,target_lang,protocol_version,model_profile,source_hash,source_blocks_json,target_slots_json,token_estimate,deadline_at,status,result_status,error_text,created_at,finished_at,updated_at) VALUES($1,$1,'user-a','release_detail','detail',$1,'zh-CN','translation-request.v1','postgres-default',$1,'[]','[]',0,$2,'failed','error','boom',$2,$2,$2)")
-                    .bind(work_item_id)
-                    .bind(now - chrono::Duration::minutes(5))
-                    .execute(&pool)
-                    .await?;
-                sqlx::query("INSERT INTO translation_attempt_events(id,work_item_id,attempt_no,event_type,retry_eligible,next_retry_at,created_at) VALUES($1,$2,1,'attempt_completed',$3,$4,$5)")
-                    .bind(format!("event-{work_item_id}"))
-                    .bind(work_item_id)
-                    .bind(if eligible { 1_i64 } else { 0_i64 })
-                    .bind(now + chrono::Duration::minutes(due_minutes))
-                    .bind(now - chrono::Duration::minutes(5))
-                    .execute(&pool)
-                    .await?;
-            }
-            let retried = enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?;
-            assert_eq!(retried, 1, "only the due recoverable failure is retried");
-            let due_status: String =
-                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='due'")
+
+            let admitted =
+                admit_release_detail_translations(&pool, &[9001], "m1", "sync.releases.auto_translate")
+                    .await;
+            assert_eq!(admitted, 1, "one new Release becomes one global work item");
+            let work_items: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = '9001' AND pipeline = 'translation' AND variant = 'detail'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(work_items, 1, "exactly one global translation work item");
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM public.content_work_items WHERE canonical_resource_id = '9001'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(status, "queued", "new work is queued for the global worker");
+
+            let legacy_work: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.translation_work_items")
                     .fetch_one(&pool)
                     .await?;
-            assert_eq!(due_status, "queued");
-            let later_status: String =
-                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='later'")
+            assert_eq!(legacy_work, 0, "no per-user work item is written");
+            let legacy_requests: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.translation_requests")
                     .fetch_one(&pool)
                     .await?;
-            assert_eq!(later_status, "failed", "backoff has not elapsed");
-            let permanent_status: String =
-                sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id='permanent'")
-                    .fetch_one(&pool)
-                    .await?;
-            assert_eq!(permanent_status, "failed", "non-recoverable errors stay failed");
-            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
-                .fetch_one(&pool)
-                .await?;
-            assert_eq!(tasks, 1);
-            assert_eq!(
-                enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?,
-                0,
-                "a live retry task is single-flight"
-            );
+            assert_eq!(legacy_requests, 0, "no per-user request row is written");
+            let legacy_tasks: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.job_tasks WHERE task_type = 'translation.generate'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(legacy_tasks, 0, "no legacy translation.generate task is queued");
+
+            let again =
+                admit_release_detail_translations(&pool, &[9001], "m1", "sync.releases.auto_translate")
+                    .await;
+            assert_eq!(again, 0, "the same source revision admits nothing twice");
+            let work_items: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_work_items WHERE canonical_resource_id = '9001'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(work_items, 1);
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4526,13 +4255,71 @@ mod tests {
         result
     }
 
+    fn release_target_for_test(release_id: i64, body: &str) -> Target {
+        let source_blocks = vec![
+            TranslationSourceBlock {
+                slot: "metadata".to_owned(),
+                text: "acme/demo\nv1".to_owned(),
+            },
+            TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "v1".to_owned(),
+            },
+            TranslationSourceBlock {
+                slot: "body_markdown".to_owned(),
+                text: body.to_owned(),
+            },
+        ];
+        Target {
+            entity_id: release_id.to_string(),
+            kind: TargetKind::ReleaseDetail,
+            variant: TargetKind::ReleaseDetail.work_variant().to_owned(),
+            source: "test".to_owned(),
+            title: "v1".to_owned(),
+            body: body.to_owned(),
+            repo_full_name: "acme/demo".to_owned(),
+            reason: String::new(),
+            subject_type: String::new(),
+            source_blocks,
+            target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+            source_hash: crate::content_source_identity::release_detail_source_hash(
+                "acme/demo",
+                "v1",
+                body,
+            ),
+        }
+    }
+
+    async fn create_publication_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text);
+            CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', finished_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+            CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+            CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+            CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+            CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+            CREATE TABLE public.content_processing_control(id integer PRIMARY KEY, mode text NOT NULL, switch_token text, updated_at timestamptz NOT NULL);
+            INSERT INTO public.content_processing_control(id, mode, updated_at) VALUES (1, 'global', now());
+            CREATE TABLE public.content_identity_upgrade_control(id bigint PRIMARY KEY, status text NOT NULL, phase text NOT NULL);
+            INSERT INTO public.content_identity_upgrade_control(id, status, phase) VALUES (1, 'completed', 'complete');
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A finished release translation publishes a projection that the public
+    /// detail read resolves as `ready`, and a republish of the same source
+    /// revision does not duplicate it.
     #[tokio::test]
     #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    async fn postgres_backlog_drains_every_release_across_bounded_cycles() -> anyhow::Result<()> {
+    async fn postgres_release_completion_publishes_a_readable_projection() -> anyhow::Result<()> {
         use sqlx::PgPool;
         let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
         let admin = PgPool::connect(&admin_url).await?;
-        let database = format!("translate_backlog_{}", crate::local_id::generate_local_id());
+        let database = format!("translate_publish_{}", crate::local_id::generate_local_id());
         sqlx::query(&format!("CREATE DATABASE {database}"))
             .execute(&admin)
             .await?;
@@ -4540,65 +4327,113 @@ mod tests {
         url.set_path(&database);
         let pool = PgPool::connect(url.as_str()).await?;
         let result = async {
-            sqlx::raw_sql(
-                r#"
-                CREATE TABLE repo_releases(id text PRIMARY KEY,repo_id bigint,release_id bigint UNIQUE,node_id text,tag_name text,name text,body text,html_url text,published_at text,created_at text,is_prerelease bigint,is_draft bigint,updated_at text,detected_at text,react_plus1 bigint,react_laugh bigint,react_heart bigint,react_hooray bigint,react_rocket bigint,react_eyes bigint);
-                CREATE TABLE user_release_visible_repos(user_id text,repo_id bigint,full_name text);
-                CREATE TABLE briefs(id text PRIMARY KEY,user_id text);
-                CREATE TABLE brief_release_memberships(brief_id text,release_id bigint);
-                CREATE TABLE translation_work_items(id text PRIMARY KEY,dedupe_key text UNIQUE NOT NULL,scope_user_id text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,protocol_version text NOT NULL,model_profile text NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,token_estimate integer NOT NULL,deadline_at text NOT NULL,status text NOT NULL,batch_id text,result_status text,title_zh text,summary_md text,body_md text,error_text text,cache_hit bigint NOT NULL DEFAULT 0,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL);
-                CREATE TABLE translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms integer NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,title_zh text,summary_md text,body_md text,error_text text,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL,UNIQUE(mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, source_hash));
-                CREATE TABLE translation_attempt_events(id text PRIMARY KEY,work_item_id text NOT NULL,attempt_no bigint NOT NULL,event_type text NOT NULL,retry_eligible bigint NOT NULL DEFAULT 0,next_retry_at text,created_at text NOT NULL);
-                CREATE TABLE job_tasks(id text PRIMARY KEY,task_type text NOT NULL,status text NOT NULL,source text NOT NULL,requested_by text,payload_json text NOT NULL,created_at text NOT NULL,updated_at text NOT NULL);
-                "#,
+            create_publication_schema(&pool).await?;
+            sqlx::query(
+                "INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Release notes body')",
             )
             .execute(&pool)
             .await?;
-            sqlx::query("INSERT INTO user_release_visible_repos(user_id,repo_id,full_name) VALUES('user-a',7,'owner/repo')")
-                .execute(&pool)
-                .await?;
-            let mut ids = Vec::new();
-            for release_id in 1000_i64..1030 {
-                ids.push(release_id);
-                sqlx::query("INSERT INTO repo_releases(id,repo_id,release_id,tag_name,name,body,html_url,updated_at,detected_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)")
-                    .bind(format!("rel-{release_id}"))
-                    .bind(7_i64)
-                    .bind(release_id)
-                    .bind(format!("v{release_id}"))
-                    .bind(format!("Release {release_id}"))
-                    .bind(format!("Notes {release_id}"))
-                    .bind(format!("https://example.invalid/{release_id}"))
-                    .bind("2026-11-20T00:00:00Z")
-                    .execute(&pool)
-                    .await?;
-            }
-            let queued = enqueue_release_translations(&pool, "user-a", &ids, "test.auto").await?;
-            assert_eq!(queued, AUTO_RELEASE_TRANSLATION_CAP);
-            let work_items: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items WHERE scope_user_id='user-a'")
+            let target = release_target_for_test(42, "Release notes body");
+
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("发布说明正文"),
+            )
+            .await?;
+            tx.commit().await?;
+
+            let overlay = crate::postgres_content_overlay::OverlayState::load(&pool).await;
+            let source = crate::postgres_content_overlay::ReleaseSource {
+                release_id: 42,
+                repo_full_name: "acme/demo",
+                repo_identity: "acme/demo",
+                tag_name: "v1",
+                name: Some("v1"),
+                body: Some("Release notes body"),
+                previous_tag_name: None,
+            };
+            let projection =
+                crate::postgres_content_overlay::public_release_translation(&pool, overlay, &source)
+                    .await?
+                    .expect("public detail resolves the published projection");
+            assert_eq!(projection.status, "ready");
+            assert_eq!(projection.title().as_deref(), Some("项目 v1 发布"));
+
+            // Republishing the same source revision stays a single row.
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("发布说明正文"),
+            )
+            .await?;
+            tx.commit().await?;
+            let projection_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
                     .fetch_one(&pool)
                     .await?;
-            assert_eq!(work_items, 30, "every release keeps a work item");
-            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
-                .fetch_one(&pool)
-                .await?;
-            assert_eq!(tasks, 25, "one call queues at most the batch cap");
-            let drained = enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?;
-            assert_eq!(drained, 5);
-            let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
-                .fetch_one(&pool)
-                .await?;
-            assert_eq!(tasks, 30);
-            assert_eq!(
-                enqueue_pending_translation_tasks(&pool, "user-a", "test.backlog").await?,
-                0,
-                "a drained backlog is idempotent"
-            );
-            assert_eq!(
-                enqueue_release_translations(&pool, "user-a", &ids, "test.auto").await?,
-                0,
-                "live tasks are not queued twice"
-            );
+            assert_eq!(projection_rows, 1, "a retry must not duplicate the projection");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    /// A release edited after the attempt was enqueued describes text the
+    /// reader can no longer resolve, so its output is not published.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_stale_release_source_is_not_published() -> anyhow::Result<()> {
+        use sqlx::PgPool;
+        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("translate_stale_{}", crate::local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_publication_schema(&pool).await?;
+            // The attempt translated the old body; the row now holds new text.
+            sqlx::query(
+                "INSERT INTO public.repo_releases(release_id, repo_id, html_url, tag_name, name, body) VALUES (42, 7, 'https://github.com/acme/demo/releases/tag/v1', 'v1', 'v1', 'Edited body')",
+            )
+            .execute(&pool)
+            .await?;
+            let target = release_target_for_test(42, "Original body");
+
+            let mut tx = pool.begin().await?;
+            publish_finished_translation(
+                &mut tx,
+                &target,
+                Some("项目 v1 发布"),
+                Some("旧正文译文"),
+            )
+            .await?;
+            tx.commit().await?;
+
+            let projections: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM public.content_result_projections")
+                    .fetch_one(&pool)
+                    .await?;
+            let currents: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM public.content_current_result_projections",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(projections, 0, "a stale release must not publish a projection");
+            assert_eq!(currents, 0, "a stale release must not publish a current projection");
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4654,6 +4489,7 @@ mod tests {
                 Some("request-a"),
                 "user-a",
                 TargetKind::ReleaseDetail,
+                "detail",
                 "release-a",
                 now,
             )
@@ -4688,28 +4524,6 @@ mod tests {
             .await?;
         admin.close().await;
         result
-    }
-
-    #[test]
-    fn automatic_enqueue_requeues_only_terminal_work_items() {
-        assert_eq!(
-            auto_translation_decision("queued", None, false),
-            AutoTranslationDecision::Enqueue {
-                reset_work_item: false
-            }
-        );
-        assert_eq!(
-            auto_translation_decision("running", None, false),
-            AutoTranslationDecision::SkipInFlight
-        );
-        assert_eq!(
-            auto_translation_decision("failed", Some("error"), false),
-            AutoTranslationDecision::SkipTerminal
-        );
-        assert_eq!(
-            auto_translation_decision("completed", Some("missing"), false),
-            AutoTranslationDecision::SkipTerminal
-        );
     }
 
     #[test]
@@ -4849,15 +4663,15 @@ mod tests {
         assert!(!is_credential_rejection(Some(400)));
         assert_eq!(
             classify_upstream_failure(429, "rate limited"),
-            crate::ai::LlmFailureClass::RateLimited
+            crate::llm_contract::LlmFailureClass::RateLimited
         );
         assert_eq!(
             classify_upstream_failure(401, "unauthorized"),
-            crate::ai::LlmFailureClass::Configuration
+            crate::llm_contract::LlmFailureClass::Configuration
         );
         assert_eq!(
             classify_upstream_failure(500, "upstream error"),
-            crate::ai::LlmFailureClass::Transient
+            crate::llm_contract::LlmFailureClass::Transient
         );
     }
 
@@ -4892,13 +4706,13 @@ mod tests {
             record_model_failure(
                 &pool,
                 "model-a",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             record_model_failure(
                 &pool,
                 "model-a",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             let (count, cooldown, class): (
@@ -4936,7 +4750,7 @@ mod tests {
             record_model_failure(
                 &pool,
                 "model-c",
-                crate::ai::LlmFailureClass::RateLimited,
+                crate::llm_contract::LlmFailureClass::RateLimited,
             )
             .await;
             let (count, cooldown): (i64, Option<chrono::DateTime<chrono::Utc>>) =
@@ -4998,7 +4812,7 @@ mod tests {
                 .expect_err("a missing routing settings row must fail closed");
             assert_eq!(
                 missing_error.class,
-                crate::ai::LlmFailureClass::Configuration
+                crate::llm_contract::LlmFailureClass::Configuration
             );
             sqlx::query(
                 "INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '[]')",
@@ -5024,7 +4838,7 @@ mod tests {
                 .expect_err("malformed routing settings must fail closed");
             assert_eq!(
                 parse_error.class,
-                crate::ai::LlmFailureClass::Configuration
+                crate::llm_contract::LlmFailureClass::Configuration
             );
             sqlx::query("DROP TABLE public.admin_runtime_settings")
                 .execute(&pool)
@@ -5032,7 +4846,7 @@ mod tests {
             let read_error = route_models(&pool, "fallback")
                 .await
                 .expect_err("unreadable routing settings must fail closed");
-            assert_eq!(read_error.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(read_error.class, crate::llm_contract::LlmFailureClass::Transient);
             sqlx::raw_sql(
                 "CREATE TABLE public.llm_model_health(model text PRIMARY KEY, cooldown_until timestamptz, last_failure_class text);",
             )
@@ -5044,7 +4858,7 @@ mod tests {
             let health_error = load_route_health(&pool)
                 .await
                 .expect_err("unreadable health must fail closed");
-            assert_eq!(health_error.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(health_error.class, crate::llm_contract::LlmFailureClass::Transient);
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -5203,7 +5017,7 @@ mod tests {
                 .complete("body", "system", "user", 64)
                 .await
                 .expect_err("all failing candidates must exhaust the attempt budget");
-            assert_eq!(failure.class, crate::ai::LlmFailureClass::RateLimited);
+            assert_eq!(failure.class, crate::llm_contract::LlmFailureClass::RateLimited);
             let observed_after_budget = observed.lock().await.clone();
             assert_eq!(observed_after_budget.len(), 11);
             assert_eq!(
@@ -5317,7 +5131,7 @@ mod tests {
                 .complete("body", "system", "user", 64)
                 .await
                 .expect_err("malformed health must fail closed");
-            assert_eq!(failure.class, crate::ai::LlmFailureClass::Transient);
+            assert_eq!(failure.class, crate::llm_contract::LlmFailureClass::Transient);
             assert_eq!(observed.lock().await.len(), before_health_failure);
             let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.llm_calls")
                 .fetch_one(&pool)
@@ -5327,89 +5141,6 @@ mod tests {
         }
         .await;
         server.abort();
-        pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
-            .execute(&admin)
-            .await?;
-        admin.close().await;
-        result
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TEST_PG_TRANSLATE_URL pointing at an isolated PostgreSQL 18 cluster"]
-    async fn postgres_translation_request_reenqueue_is_idempotent() -> anyhow::Result<()> {
-        use sqlx::PgPool;
-        let admin_url = std::env::var("TEST_PG_TRANSLATE_URL")?;
-        let admin = PgPool::connect(&admin_url).await?;
-        let database = format!("translate_requeue_{}", crate::local_id::generate_local_id());
-        sqlx::query(&format!("CREATE DATABASE {database}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(&admin_url)?;
-        url.set_path(&database);
-        let pool = PgPool::connect(url.as_str()).await?;
-        let result = async {
-            sqlx::raw_sql(
-                r#"
-                CREATE TABLE public.translation_requests(id text PRIMARY KEY,mode text NOT NULL,source text NOT NULL,request_origin text NOT NULL,requested_by text,scope_user_id text NOT NULL,producer_ref text NOT NULL,kind text NOT NULL,variant text NOT NULL,entity_id text NOT NULL,target_lang text NOT NULL,max_wait_ms bigint NOT NULL,source_hash text NOT NULL,source_blocks_json text NOT NULL,target_slots_json text NOT NULL,work_item_id text,status text NOT NULL,result_status text,error_text text,created_at text NOT NULL,started_at text,finished_at text,updated_at text NOT NULL,UNIQUE(mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id, target_lang, source_hash));
-                "#,
-            )
-            .execute(&pool)
-            .await?;
-            let work = AutomaticWorkItem {
-                id: "work-a".to_owned(),
-                source_hash: "hash-a".to_owned(),
-                source_blocks_json: "[]".to_owned(),
-                target_slots_json: "[]".to_owned(),
-            };
-            let mut tx = pool.begin().await?;
-            insert_translation_request(
-                &mut tx,
-                "user-a",
-                "test.auto",
-                "1000",
-                TargetKind::ReleaseDetail,
-                &work,
-                chrono::Utc::now(),
-            )
-            .await?;
-            tx.commit().await?;
-            sqlx::query(
-                "UPDATE translation_requests SET status='failed', result_status='error', error_text='boom', started_at='x', finished_at='y'",
-            )
-            .execute(&pool)
-            .await?;
-            let mut tx = pool.begin().await?;
-            insert_translation_request(
-                &mut tx,
-                "user-a",
-                "test.auto",
-                "1000",
-                TargetKind::ReleaseDetail,
-                &work,
-                chrono::Utc::now(),
-            )
-            .await?;
-            tx.commit().await?;
-            let (count, status, result_status, error_text, work_item_id): (
-                i64,
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ) = sqlx::query_as(
-                "SELECT COUNT(*), MAX(status), MAX(result_status), MAX(error_text), MAX(work_item_id) FROM translation_requests",
-            )
-            .fetch_one(&pool)
-            .await?;
-            assert_eq!(count, 1, "the request key stays unique");
-            assert_eq!(status, "queued", "re-enqueue resets the stored request");
-            assert_eq!(result_status, None);
-            assert_eq!(error_text, None);
-            assert_eq!(work_item_id.as_deref(), Some("work-a"));
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
         pool.close().await;
         sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
             .execute(&admin)

@@ -1,3 +1,5 @@
+> Superseded: 生产已固定 PostgreSQL；本文件描述历史实现，代码在 [SQLite 退役运行时删除](../sqlite-runtime-retirement/SPEC.md) 中删除。
+
 # SQLite 单写入调度层实现状态
 
 > 当前有效规范仍以 `./SPEC.md` 为准；这里记录实现覆盖、交付进度与 rollout 相关事实，避免这些细节散落到 PR / Git 历史里。

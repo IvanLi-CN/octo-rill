@@ -33,6 +33,9 @@ use crate::postgres_scheduler::{
 use crate::postgres_server::{PostgresServerState, require_admin};
 
 const ADMIN_DASHBOARD_DEFAULT_WINDOW_DAYS: i64 = 7;
+/// Window the pre-aggregated dashboard rollups cover. Shared with the refresh
+/// path so the writer and the reader cannot disagree on the horizon.
+pub(crate) const ADMIN_DASHBOARD_PREAGGREGATE_DAYS: i64 = 30;
 const ADMIN_DASHBOARD_WINDOW_OPTIONS: [(&str, i64); 2] = [("7d", 7), ("30d", 30)];
 
 // ---------------------------------------------------------------------------
@@ -826,7 +829,7 @@ mod tests {
         let task_types = admin_dashboard_task_types();
         assert!(task_types.contains(&admin_job_groups::TASK_TRANSLATION_GENERATE));
         assert!(task_types.contains(&jobs::TASK_BRIEF_DAILY_SLOT));
-        assert!(!task_types.contains(&jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!task_types.contains(&crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS));
         assert!(!task_types.contains(&jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH));
         assert_eq!(
             task_types.len(),
@@ -849,7 +852,12 @@ mod tests {
             2,
             0,
         ));
-        point.apply_status_item(&status_item(jobs::TASK_SYNC_RELEASES, "sync", 4, 2));
+        point.apply_status_item(&status_item(
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
+            "sync",
+            4,
+            2,
+        ));
         assert_eq!(point.translations_total, 5);
         assert_eq!(point.translations_failed, 1);
         assert_eq!(point.sync_total, 4);

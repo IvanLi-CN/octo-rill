@@ -8,7 +8,8 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tower_sessions::Session;
 
 use crate::{
-    ai, api,
+    api,
+    content_source_identity::{ContentWorkIdentity, identity_id_for},
     error::ApiError,
     local_id,
     sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_retryable_write_error},
@@ -104,17 +105,6 @@ struct UpgradeControl {
     completed_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ContentWorkIdentity {
-    pub canonical_resource_type: String,
-    pub canonical_resource_id: String,
-    pub pipeline: String,
-    pub variant: String,
-    pub target_lang: String,
-    pub source_hash: String,
-    pub protocol_version: String,
-}
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct IdentityWorkRow {
     id: String,
@@ -188,22 +178,6 @@ pub struct UpgradeControlRequest {
 pub(crate) struct CurrentProjection {
     pub work_item_id: String,
     pub payload_json: String,
-}
-
-pub(crate) fn identity_id_for(key: &ContentWorkIdentity) -> Result<String> {
-    let encoded = serde_json::to_string(&(
-        key.canonical_resource_type.as_str(),
-        key.canonical_resource_id.as_str(),
-        key.pipeline.as_str(),
-        key.variant.as_str(),
-        key.target_lang.as_str(),
-        key.source_hash.as_str(),
-        key.protocol_version.as_str(),
-    ))?;
-    Ok(format!(
-        "content-work-{}",
-        ai::sha256_hex(&format!("content-work-identity.v1\n{encoded}"))
-    ))
 }
 
 pub(crate) async fn ensure_identity_registered(

@@ -54,3 +54,6 @@ web/*.tsbuildinfo
 # Python caches from validation scripts
 __pycache__/
 *.pyc
+
+# CI read-acceptance scratch output
+.ci/

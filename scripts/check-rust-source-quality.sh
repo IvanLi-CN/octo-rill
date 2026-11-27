@@ -11,3 +11,4 @@ cargo check --manifest-path "$repo_root/Cargo.toml" --locked --all-targets --all
 cargo clippy --manifest-path "$checker_manifest" --locked --all-targets -- -D warnings
 cargo test --manifest-path "$checker_manifest" --locked
 cargo run --manifest-path "$checker_manifest" --locked -- "$repo_root"
+bash "$repo_root/scripts/check-spec-lifecycle.sh"

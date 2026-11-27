@@ -1,3 +1,5 @@
+> Superseded detail: SQLite SQLx 历史与 writer coordinator 已由 [SQLite 退役运行时删除](../sqlite-runtime-retirement/SPEC.md) 接管；下列在线迁移操作实现为历史事实。
+
 # Persistent State Migration Implementation
 
 ## Runtime Lifecycle

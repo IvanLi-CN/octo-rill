@@ -54,7 +54,7 @@ const SESSION_WRITE_MAX_ATTEMPTS: usize = 4;
 /// back to the SQLite session table.
 pub fn postgres_session_store(pool: PgPool) -> anyhow::Result<PostgresStore> {
     PostgresStore::new(pool)
-        .with_schema_name("octo_rill")
+        .with_schema_name("public")
         .map_err(|error| anyhow::anyhow!("configure PostgreSQL session schema: {error}"))?
         .with_table_name(SESSION_TABLE_NAME)
         .map_err(|error| anyhow::anyhow!("configure PostgreSQL session table: {error}"))

@@ -33,11 +33,9 @@ use tracing::warn;
 
 use crate::{
     admin_job_groups::{self, AdminJobTaskLane},
-    jobs::{
-        STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED,
-        TASK_SYNC_SUBSCRIPTIONS,
-    },
+    jobs::{STATUS_CANCELED, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED},
     postgres_server::{PostgresServerState, require_admin},
+    postgres_tasks::TASK_SYNC_SUBSCRIPTIONS,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 20;
@@ -49,10 +47,9 @@ const STREAM_TEXT_SOURCE_TICK_INTERVAL: u64 = 4;
 const STREAM_BATCH_LIMIT: i64 = 200;
 const SYNC_SUBSCRIPTION_EVENT_LIMIT: usize = 20;
 
-/// `result_json` is written as SQLite JSON text. Only a value that PostgreSQL
-/// can parse as JSONB, and whose `skipped` member is a valid boolean, counts as
-/// skipped; anything else degrades to `false` exactly like the legacy
-/// `json_extract(...) = 1` predicate.
+/// `result_json` is JSON text written by the job center. Only a value that
+/// PostgreSQL can parse as JSONB, and whose `skipped` member is a valid
+/// boolean, counts as skipped; anything else degrades to `false`.
 const SKIPPED_EXPRESSION: &str = r#"CASE
     WHEN pg_input_is_valid(result_json, 'jsonb')
      AND jsonb_typeof(result_json::jsonb -> 'skipped') = 'boolean'
@@ -376,8 +373,8 @@ fn push_in_list<'a>(
 /// as standalone runs, and normalizes imported `sync.subscriptions` rows into
 /// the same run shape so the history never splits by migration era.
 const SUBSCRIPTION_RUN_TASK_TYPES: [&str; 2] = [
-    crate::jobs::TASK_SYNC_RELEASES,
-    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+    crate::postgres_tasks::TASK_SYNC_RELEASES,
+    crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -490,7 +487,7 @@ async fn load_subscription_runs(
     offset: i64,
 ) -> Result<(Vec<SubscriptionRunItem>, i64), sqlx::Error> {
     let task_types = SUBSCRIPTION_RUN_TASK_TYPES.to_vec();
-    let imported_task_type = crate::jobs::TASK_SYNC_SUBSCRIPTIONS;
+    let imported_task_type = crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS;
     let total = sqlx::query_scalar::<_, i64>(
         "SELECT \
              (SELECT COUNT(DISTINCT CASE WHEN pg_input_is_valid(payload_json, 'jsonb') \
@@ -624,7 +621,7 @@ fn summarize_subscription_run(
         if let Some(value) = row.finished_at {
             finished_at = Some(finished_at.map_or(value, |current| current.max(value)));
         }
-        if row.task_type == crate::jobs::TASK_SYNC_RELEASES {
+        if row.task_type == crate::postgres_tasks::TASK_SYNC_RELEASES {
             releases.tasks += 1;
             if succeeded {
                 let repositories = json_get_i64(result_object, "repositories").unwrap_or(0);
@@ -2031,14 +2028,14 @@ mod tests {
         assert!(task_group_task_types("unknown-group").is_none());
 
         let user_sync = task_group_task_types("user_sync").expect("user_sync lane");
-        assert_eq!(user_sync, vec![crate::jobs::TASK_SYNC_STARRED]);
+        assert_eq!(user_sync, vec![crate::postgres_tasks::TASK_SYNC_STARRED]);
 
         let sync = task_group_task_types("sync").expect("sync group");
-        assert!(sync.contains(&crate::jobs::TASK_SYNC_RELEASES));
-        assert!(!sync.contains(&crate::jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(sync.contains(&crate::postgres_tasks::TASK_SYNC_RELEASES));
+        assert!(!sync.contains(&crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS));
 
         let legacy = task_group_task_types("legacy").expect("legacy filter");
-        assert!(legacy.contains(&crate::jobs::TASK_SYNC_SUBSCRIPTIONS));
+        assert!(legacy.contains(&crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS));
         assert!(!legacy.contains(&admin_job_groups::TASK_TRANSLATION_GENERATE));
     }
 
@@ -2090,7 +2087,7 @@ mod tests {
             vec![
                 run_task_row(
                     "release-a",
-                    crate::jobs::TASK_SYNC_RELEASES,
+                    crate::postgres_tasks::TASK_SYNC_RELEASES,
                     STATUS_SUCCEEDED,
                     r#"{"user_id":"user-a"}"#,
                     Some(
@@ -2101,7 +2098,7 @@ mod tests {
                 ),
                 run_task_row(
                     "notifications-a",
-                    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+                    crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
                     STATUS_SUCCEEDED,
                     r#"{"user_id":"user-a"}"#,
                     Some(r#"{"notifications":139,"user_id":"user-a"}"#),
@@ -2110,7 +2107,7 @@ mod tests {
                 ),
                 run_task_row(
                     "release-b",
-                    crate::jobs::TASK_SYNC_RELEASES,
+                    crate::postgres_tasks::TASK_SYNC_RELEASES,
                     STATUS_FAILED,
                     r#"{"user_id":"user-b"}"#,
                     None,
@@ -2137,7 +2134,7 @@ mod tests {
     fn subscription_run_status_prefers_pending_work_over_failures() {
         let mut queued = run_task_row(
             "release-a",
-            crate::jobs::TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_QUEUED,
             r#"{"user_id":"user-a"}"#,
             None,
@@ -2146,7 +2143,7 @@ mod tests {
         );
         let failed = run_task_row(
             "release-b",
-            crate::jobs::TASK_SYNC_RELEASES,
+            crate::postgres_tasks::TASK_SYNC_RELEASES,
             STATUS_FAILED,
             r#"{"user_id":"user-b"}"#,
             None,
@@ -2179,7 +2176,7 @@ mod tests {
             vec![
                 run_task_row(
                     "release-a",
-                    crate::jobs::TASK_SYNC_RELEASES,
+                    crate::postgres_tasks::TASK_SYNC_RELEASES,
                     STATUS_FAILED,
                     r#"{"user_id":"user-a"}"#,
                     None,
@@ -2188,7 +2185,7 @@ mod tests {
                 ),
                 run_task_row(
                     "notifications-a",
-                    crate::jobs::TASK_SYNC_NOTIFICATIONS,
+                    crate::postgres_tasks::TASK_SYNC_NOTIFICATIONS,
                     "cancelled",
                     r#"{"user_id":"user-a"}"#,
                     None,
@@ -2208,7 +2205,7 @@ mod tests {
             created,
             SubscriptionRunTaskRow {
                 id: "sub-1".to_owned(),
-                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
                 status: STATUS_SUCCEEDED.to_owned(),
                 schedule_key: Some("daily-06".to_owned()),
                 payload_json: Some(
@@ -2231,7 +2228,10 @@ mod tests {
         assert_eq!(run.releases.failed_repositories, 1);
         assert_eq!(run.releases.degraded_tasks, 1);
         assert_eq!(run.notifications.notifications, 12);
-        assert_eq!(run.tasks[0].task_type, crate::jobs::TASK_SYNC_SUBSCRIPTIONS);
+        assert_eq!(
+            run.tasks[0].task_type,
+            crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS
+        );
         assert_eq!(run.tasks[0].repositories, Some(3));
         assert_eq!(run.finished_at, Some(run_timestamp(31)));
     }
@@ -2244,7 +2244,7 @@ mod tests {
             created,
             SubscriptionRunTaskRow {
                 id: "sub-skipped".to_owned(),
-                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
                 status: STATUS_SUCCEEDED.to_owned(),
                 schedule_key: None,
                 payload_json: Some(
@@ -2270,7 +2270,7 @@ mod tests {
             created,
             SubscriptionRunTaskRow {
                 id: "sub-legacy".to_owned(),
-                task_type: crate::jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                task_type: crate::postgres_tasks::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
                 status: STATUS_SUCCEEDED.to_owned(),
                 schedule_key: Some("2026-03-08T11:30".to_owned()),
                 payload_json: Some(

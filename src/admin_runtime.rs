@@ -10,10 +10,11 @@ use crate::{
     config::AppConfig,
     sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
     state::AppState,
-    translations::{
+    translation_runtime::{
         DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-        DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY, TranslationRuntimeConfig,
+        DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
     },
+    translations::TranslationRuntimeConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

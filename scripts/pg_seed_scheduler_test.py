@@ -18,6 +18,21 @@ from pg_seed_common import psql
 ACTIVE_USERS = "is_disabled = 0 AND paused_at IS NULL"
 
 
+SOURCE = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'admin_job_groups.rs'
+
+
+def runtime_task_type_count():
+    """Task types the rollup lane must write one row for.
+
+    `ADMIN_JOB_TASK_GROUPS` is the single source of truth for the dashboard
+    task taxonomy, so the expected row count follows it instead of a hardcoded
+    list that silently goes stale when a new task type is registered.
+    """
+    text = SOURCE.read_text()
+    groups = text.split('pub(crate) const ADMIN_JOB_TASK_GROUPS', 1)[1]
+    return groups.count('spec(')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--admin-url', required=True)
@@ -380,7 +395,7 @@ def main():
                 "SELECT COUNT(*) FROM public.admin_dashboard_daily_rollups "
                 "WHERE rollup_date = '2026-06-04' AND time_zone = 'UTC'"
             ),
-            3,
+            runtime_task_type_count(),
             'rollup writes one row per dashboard task type',
         )
         expect(
@@ -389,7 +404,7 @@ def main():
                 "WHERE rollup_date = '2026-06-04' AND time_zone = 'UTC' "
                 "AND total_users > 0 AND active_users >= 1"
             ),
-            3,
+            runtime_task_type_count(),
             'rollup counts users and their activity window',
         )
         expect(
@@ -407,7 +422,7 @@ def main():
                 "SELECT COUNT(*) FROM public.admin_dashboard_daily_rollups "
                 "WHERE rollup_date = '2026-06-04' AND time_zone = 'UTC'"
             ),
-            3,
+            runtime_task_type_count(),
             'rollup refresh is idempotent',
         )
 

@@ -3,13 +3,11 @@
 # update in the same change.
 
 [legacy_suppressions]
-"src/admin_ai_records.rs|allow|clippy::too_many_arguments" = 3
 "src/admin_runtime.rs|allow|clippy::await_holding_lock" = 4
 "src/ai.rs|allow|clippy::too_many_arguments" = 2
 "src/ai.rs|allow|dead_code" = 20
 "src/api.rs|allow|clippy::too_many_arguments" = 4
 "src/api.rs|allow|dead_code" = 27
-"src/auth.rs|allow|clippy::too_many_arguments" = 1
 "src/briefs.rs|allow|clippy::too_many_arguments" = 1
 "src/briefs.rs|allow|dead_code" = 1
 "src/content_processing.rs|allow|clippy::too_many_arguments" = 1
@@ -21,14 +19,17 @@
 "src/sync.rs|allow|clippy::too_many_arguments" = 1
 "src/sync.rs|allow|dead_code" = 14
 "src/translations.rs|allow|clippy::too_many_arguments" = 1
-"src/translations.rs|allow|dead_code" = 5
+"src/translations.rs|allow|dead_code" = 4
 "src/webhook_push.rs|allow|clippy::too_many_arguments" = 3
+# `RequestRow` maps one wide row query; the admin read model reports
+# neither `mode` nor `target_lang`, so each field carries its own waiver.
+"src/translation_admin_types.rs|allow|dead_code" = 2
 
 # Runtime persistence cutover: the legacy SQLite modules stay readable until the
 # deletion backlog removes them, so their module declarations no longer have
 # callers. The PostgreSQL transport modules return `Response` by design and
 # carry a few explicit-argument loaders.
-"src/main.rs|allow|dead_code" = 29
+"src/main.rs|allow|dead_code" = 25
 "src/postgres_dashboard.rs|allow|clippy::result_large_err" = 1
 "src/postgres_dashboard.rs|allow|clippy::too_many_arguments" = 2
 "src/postgres_translate.rs|allow|clippy::result_large_err" = 1
