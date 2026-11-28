@@ -111,12 +111,12 @@ def main():
         today = now.date().isoformat()
         yesterday = (now.date() - dt.timedelta(days=1)).isoformat()
         yesterday_point = (now.date() - dt.timedelta(days=1)).isoformat()
-        # Anchor seeded "today" rows just after the UTC day boundary instead of
-        # one hour before `now`: a run shortly after midnight would otherwise
-        # date them to the previous day, and the day-scoped dashboard breakdown
-        # would find none of them.
-        created_today = iso(dt.datetime.combine(now.date(), dt.time(0, 0), tzinfo=dt.timezone.utc)
-                                 + dt.timedelta(seconds=1))
+        # Seeded "today" rows sit an hour before `now`, which a run shortly after
+        # UTC midnight would date to the previous day; the day-scoped dashboard
+        # breakdown then finds none of them. Clamp to the day boundary so the
+        # original spacing is kept whenever the day has an hour to spare.
+        day_start = dt.datetime.combine(now.date(), dt.time(0, 0), tzinfo=dt.timezone.utc)
+        created_today = iso(max(day_start, now - dt.timedelta(hours=1)))
 
         sql(
             "INSERT INTO public.users(id,github_user_id,login,created_at,updated_at,is_admin,is_disabled,"
