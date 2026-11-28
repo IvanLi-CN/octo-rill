@@ -28,6 +28,7 @@ TASK_TYPES = ('translation.generate', 'sync.releases', 'brief.daily_slot')
 # breakdown lists every current PostgreSQL runtime type, not the legacy triple.
 RUNTIME_TASK_TYPES = (
     'translation.generate',
+    'polish.backfill',
     'translate.release.batch',
     'translate.release',
     'translate.release_detail',
