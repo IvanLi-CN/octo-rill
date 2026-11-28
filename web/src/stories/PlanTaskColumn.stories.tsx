@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fn, screen, userEvent, within } from "storybook/test";
 
 import type { AdminPlanTaskType } from "@/api";
 import { PlanTaskColumn } from "@/admin/PlanTaskColumn";
@@ -82,8 +82,9 @@ export const TriggerPopupShowsParams: Story = {
 		await userEvent.click(
 			canvas.getByRole("button", { name: "触发 润色受众变体回填" }),
 		);
-		await expect(await canvas.findByText("单次扫描 Release 数")).toBeTruthy();
-		await expect(canvas.getByText("允许范围 25–100")).toBeTruthy();
+		// The popover renders in a portal outside the story canvas.
+		await expect(await screen.findByText("单次扫描 Release 数")).toBeTruthy();
+		await expect(screen.getByText("允许范围 25–100")).toBeTruthy();
 	},
 };
 
