@@ -355,6 +355,14 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             axum::routing::post(crate::postgres_admin_actions::admin_enqueue_polish_backfill),
         )
         .route(
+            "/api/admin/jobs/trigger",
+            axum::routing::post(crate::postgres_admin_actions::admin_trigger_plan_task),
+        )
+        .route(
+            "/api/admin/jobs/plan-tasks",
+            axum::routing::get(crate::postgres_admin_jobs::admin_plan_tasks),
+        )
+        .route(
             "/api/admin/jobs/webhook-push/runtime-config",
             get(admin_webhook_runtime_config),
         )

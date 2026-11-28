@@ -438,9 +438,15 @@ impl TaskExecutor for PolishBackfillExecutor {
         let quota_scanned = quota_candidates.len();
         let quota_requeued = Self::requeue_quota_blocked(&self.pool, &quota_candidates).await?;
 
+        // A hand trigger may cover more Releases than the scheduled page: the
+        // operator is asking for progress now. The declared bound keeps one click
+        // from admitting a burst the provider cannot absorb, because each Release
+        // expands into up to three audience variants.
+        let page = crate::admin_job_groups::polish_backfill_page_from_payload_json(Some(
+            task.payload_json.as_str(),
+        ));
         let after = Self::load_cursor(&self.pool).await?;
-        let candidates =
-            Self::polish_backfill_candidates(&self.pool, after, POLISH_BACKFILL_PAGE).await?;
+        let candidates = Self::polish_backfill_candidates(&self.pool, after, page).await?;
         let scanned = candidates.len();
         if scanned == 0 {
             if after != 0 {
@@ -462,7 +468,7 @@ impl TaskExecutor for PolishBackfillExecutor {
         let last = candidates.last().copied().unwrap_or(after);
         // A short page means this run reached the tail of the candidate set, so
         // the next run should start over rather than ask for ids above the tail.
-        let complete = scanned < POLISH_BACKFILL_PAGE;
+        let complete = scanned < page;
         let cursor = if complete { 0 } else { last };
         Self::store_cursor(&self.pool, cursor, Utc::now()).await?;
         info!(
