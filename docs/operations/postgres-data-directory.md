@@ -17,9 +17,24 @@ volumes:
   - /path/to/postgres-data:/var/lib/postgresql
 ```
 
-Docker 不会为 bind mount 调整所有者。官方 `postgres` 镜像的 entrypoint 只在**数据目录为空**时执行 `initdb` 并 chown；已有数据时它完全跳过所有权处理，直接 `exec` 成 postgres 用户。
+Docker 不会为 bind mount 调整所有者，但官方 `postgres` 镜像并非完全不处理。它的 entrypoint 在 `_main` 里先调 `docker_create_db_directories`，再判断 `DATABASE_ALREADY_EXISTS`：
 
-因此所有权是部署方的责任，镜像不提供兜底。
+```bash
+# /usr/local/bin/docker-entrypoint.sh
+if [ "$user" = '0' ]; then
+	find "$PGDATA" \! -user postgres -exec chown postgres '{}' +
+fi
+```
+
+也就是说，**以 root 启动时它会 chown 存量文件，包括已有数据**；只有 `initdb` 限于是空目录。当容器用 `--user` 以非 root 身份启动时，这条路径被跳过。
+
+### 但那次 chown 只在启动瞬间执行一次
+
+这是这条约定仍然必要的原因。chown 修完存量后 PostgreSQL 立刻以 `postgres` 身份运行并创建新文件（`postmaster.pid`、`pg_xact/*`、新的 `_fsm` 段）。这些新文件的属主由**目录权限位**决定，而不是由那次 chown 决定。
+
+线上实证：2026-11-27 17:46 的一次容器重启，entrypoint 的 chown 正常执行，但 11 秒后仍开始报 `could not open file "base/16384/16683": Permission denied`，该次运行累计 **51,682 次**失败。而在容器停止状态下手工递归 chown 后的 2026-11-28 02:58 启动，同样负载下为 **0 次**。
+
+所以「重启一次就会修好」是错的：它以 chown 是否真正覆盖了当前树、以及树的权限位是否让新文件继续继承正确属主为前提。
 
 ## uid 由镜像决定
 
@@ -60,7 +75,8 @@ healthcheck:
 
 ```bash
 # 先取容器内真实 uid，不要猜
-UID_IN_CONTAINER=$(docker run --rm postgres:18-alpine id -u postgres)
+# 从**实际在跑的那个**镜像/服务取，不要写死基底
+UID_IN_CONTAINER=$(docker compose exec -T postgres id -u postgres)
 
 # 停库，再改，避免并发写
 docker compose stop postgres
@@ -71,6 +87,8 @@ docker compose start postgres
 
 注意数据根是 `<mount>/<major>/docker`（例如 `/var/lib/postgresql/18/docker`），不是挂载点本身。
 
+不要用固定的镜像标签取 uid：仓库里 `compose.postgres.yml` 使用 `postgres:18`（uid 999），而生产使用的是 `postgres:18-alpine`（uid 70）。从错误的镜像取值会把数据目录改错，恰好违反本文的约定。
+
 ### 注意保持所有权的操作
 
 `mv`、`cp -a`、从备份解包、以其他用户身份创建目录，都会保留或引入非预期 uid。**移动数据目录后必须重新核对所有权。**
@@ -78,8 +96,10 @@ docker compose start postgres
 ### 校验
 
 ```bash
-docker exec <pg-container> sh -c 'test -w /var/lib/postgresql/18/docker && echo writable'
+docker exec -u postgres <pg-container> sh -c 'test -w /var/lib/postgresql/18/docker && echo writable'
 ```
+
+`-u postgres` 不能省。官方镜像没有 `USER` 指令，`docker exec` 默认以 **root** 进入；root 的 `test -w` 总是成功，即使文件属于别人。不加 `-u` 的探针在最应该报警的那个状态下仍然打印 `writable`。
 
 以及比较宿主与容器两侧：
 
@@ -118,14 +138,16 @@ healthcheck:
 任何需要手工干预的操作前后，都必须检查实际运行的 digest：
 
 ```bash
-docker inspect <app-container> --format '{{.Image}}'
+docker inspect <app-container> --format '{{.Config.Image}}'
 ```
+
+用 `{{.Config.Image}}` 而不是 `{{.Image}}`：后者是本地镜像 ID，无法与 compose 源文件里的 registry digest 比对，而前者才是容器被要求运行的镜像引用（含 `@sha256:…`）。
 
 ## 排查顺序
 
 看到 `Permission denied` 时：
 
 1. 取容器内 uid 与数据目录属主，先比较这两个数
-2. 不要只重启容器——重启不改所有权，只是重新撞墙
+2. 不要只重启容器：entrypoint 只修启动瞬间的存量，且新文件仍由目录权限位决定属主（见上文实证）
 3. 确认没有其他进程正在写该目录，再执行 chown
 4. chown 后观察日志里是否还有 `Permission denied`，不能只看容器状态
