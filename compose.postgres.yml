@@ -12,7 +12,15 @@ services:
     volumes:
       - pg-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      # `pg_isready` only proves the socket accepts a connection. A data
+      # directory owned by the wrong uid keeps serving cached file descriptors
+      # for a while and then fails every read/write while still reporting
+      # healthy, so probe an actual query as well.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB &&
+          psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc 'SELECT 1' >/dev/null
       interval: 5s
       timeout: 5s
       retries: 30
