@@ -21,6 +21,15 @@ pub(crate) const TASK_SYNC_STARRED: &str = "sync.starred";
 pub(crate) const TASK_SYNC_RELEASES: &str = "sync.releases";
 pub(crate) const TASK_SYNC_NOTIFICATIONS: &str = "sync.notifications";
 pub(crate) const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
+/// Repair sweep for Releases that were admitted before polishing learned to
+/// emit the audience reading variants.
+///
+/// Such a Release keeps its `smart` work item forever because admission only
+/// runs for newly inserted Releases, so no sync will ever re-offer it. This task
+/// re-drives the existing admission over the historical backlog, one bounded
+/// page per run, and carries a cursor forward so successive runs make progress
+/// instead of re-scanning the same rows.
+pub(crate) const TASK_POLISH_BACKFILL: &str = "polish.backfill";
 
 use crate::{
     config::AiConfig,
@@ -90,6 +99,24 @@ pub struct TranslationExecutor {
     pool: PgPool,
     http: Client,
     ai: Option<AiConfig>,
+}
+
+/// Repair sweep for polished Releases that are missing their audience variants.
+///
+/// A Release admitted before polishing emitted `smart_public`/`smart_authorized`
+/// keeps only `smart`, and admission only runs for newly inserted Releases, so
+/// nothing re-offers it. This executor walks the backlog in Release-id order,
+/// admitting one bounded page per run and recording where the next run starts.
+#[derive(Clone)]
+pub struct PolishBackfillExecutor {
+    pool: PgPool,
+    ai: Option<AiConfig>,
+}
+
+impl PolishBackfillExecutor {
+    pub fn new(pool: PgPool, ai: Option<AiConfig>) -> Self {
+        Self { pool, ai }
+    }
 }
 
 impl ReleasesExecutor {
@@ -209,6 +236,248 @@ impl TaskExecutor for TranslationExecutor {
             );
         }
         Ok(json!({"work_item_id": work_item_id, "status": "completed"}).to_string())
+    }
+}
+
+/// Releases one run may consider. This is the same bound
+/// `admit_release_polish` applies, so a run considers at most this many
+/// Releases and every considered Release gets its whole variant set.
+const POLISH_BACKFILL_PAGE: usize = crate::postgres_content::POLISH_ADMISSION_CAP;
+
+impl PolishBackfillExecutor {
+    /// Quota-blocked work: `blocked_config` rows whose blocking attempt recorded
+    /// a quota refusal rather than a credential rejection.
+    ///
+    /// Both land in the configuration class with the same summary, so the class
+    /// and summary cannot discriminate. The durable marker is
+    /// `content_attempt_events.retry_disposition = 'quota'`, written by the
+    /// content worker at failure time from the raw provider body, because
+    /// `llm_calls.error_text` is not joinable back to the attempt: the content
+    /// worker passes no `parent_task`, and `content_attempt_llm_calls` is only
+    /// written when a call succeeds, so a failed attempt leaves no link.
+    ///
+    /// Rows written before this marker existed carry no disposition and are
+    /// deliberately not matched: without evidence they could be credential
+    /// rejections, and requeueing those would reintroduce the unbounded retry
+    /// loop the route-health gate prevents.
+    async fn quota_blocked_candidates(pool: &PgPool, limit: usize) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT blocked.id
+            FROM public.content_work_items blocked
+            JOIN public.content_attempt_events event
+              ON event.work_item_id = blocked.id
+             AND event.attempt_no = blocked.attempt_count::bigint
+             AND event.event_type = 'attempt_completed'
+            WHERE blocked.status = 'blocked_config'
+              AND blocked.failure_class = 'configuration'
+              AND event.retry_disposition = 'quota'
+            ORDER BY blocked.updated_at, blocked.id
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await
+        .context("scan quota-blocked content work")?;
+        Ok(rows)
+    }
+
+    /// Requeue quota-blocked rows with the same reset the route-health sweep
+    /// uses, so a requeued item looks exactly like one that sweep released.
+    ///
+    /// The reset also clears `retry_disposition` on the attempt event it consumed:
+    /// the row has left `blocked_config`, so the marker must not survive to
+    /// requeue it again on the next run without new evidence.
+    async fn requeue_quota_blocked(pool: &PgPool, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = pool.begin().await.context("begin quota requeue")?;
+        // Re-admit only while the item is still blocked *and* still marked, so a
+        // concurrent route-health release cannot be double-counted.
+        let mut requeued = 0u64;
+        for id in ids {
+            let updated = sqlx::query_scalar::<_, i32>(
+                r#"
+                UPDATE public.content_work_items
+                SET status = 'queued', failure_class = NULL, next_retry_at = NULL,
+                    retry_expires_at = NULL, retry_after_at = NULL, finished_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                WHERE id = $1
+                  AND status = 'blocked_config'
+                  AND failure_class = 'configuration'
+                RETURNING attempt_count::integer
+                "#,
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("requeue quota-blocked content work")?;
+            let Some(attempt_count) = updated else {
+                continue;
+            };
+            sqlx::query(
+                "UPDATE public.content_attempt_events SET retry_disposition = NULL WHERE work_item_id = $1 AND attempt_no = $2 AND event_type = 'attempt_completed'",
+            )
+            .bind(id)
+            .bind(i64::from(attempt_count))
+            .execute(&mut *tx)
+            .await
+            .context("clear the consumed quota marker")?;
+            requeued += 1;
+        }
+        tx.commit().await.context("commit quota requeue")?;
+        Ok(requeued)
+    }
+
+    /// Releases with `smart` polishing work but no `smart_public` work, ordered
+    /// by `repo_releases.release_id` and strictly after the cursor.
+    ///
+    /// The scan is keyed on the shared Release table rather than on the work
+    /// items alone so the cursor is a single monotonic integer: work-item ids are
+    /// text, and ordering by them would not give the sweep a resumable sequence.
+    /// A Release whose `smart` row exists but that has no stored source row is
+    /// not admissable anyway, so joining the source table loses no candidate.
+    async fn polish_backfill_candidates(
+        pool: &PgPool,
+        after_release_id: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT DISTINCT r.release_id
+            FROM public.repo_releases r
+            JOIN public.content_work_items smart
+              ON smart.canonical_resource_type = 'release'
+             AND smart.canonical_resource_id = r.release_id::text
+             AND smart.pipeline = 'polishing'
+             AND smart.variant = 'smart'
+            WHERE r.release_id > $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM public.content_work_items audience
+                  WHERE audience.canonical_resource_type = 'release'
+                    AND audience.canonical_resource_id = r.release_id::text
+                    AND audience.pipeline = 'polishing'
+                    AND audience.variant = 'smart_public'
+              )
+            ORDER BY r.release_id
+            LIMIT $2
+            "#,
+        )
+        .bind(after_release_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await
+        .context("scan Releases missing audience polishing variants")?;
+        Ok(rows)
+    }
+
+    async fn load_cursor(pool: &PgPool) -> Result<i64> {
+        let cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT last_release_id FROM public.polish_backfill_cursor WHERE id = 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .context("read polishing backfill cursor")?;
+        Ok(cursor.unwrap_or(0).max(0))
+    }
+
+    async fn store_cursor(pool: &PgPool, release_id: i64, now: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO public.polish_backfill_cursor (id, last_release_id, last_run_at, updated_at)
+            VALUES (1, $1, $2, $2)
+            ON CONFLICT (id) DO UPDATE SET
+              last_release_id = EXCLUDED.last_release_id,
+              last_run_at = EXCLUDED.last_run_at,
+              updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(release_id.max(0))
+        .bind(now)
+        .execute(pool)
+        .await
+        .context("store polishing backfill cursor")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for PolishBackfillExecutor {
+    /// One bounded sweep page, resumable across runs.
+    ///
+    /// The cursor is the highest `repo_releases.release_id` this run *examined*,
+    /// not the highest it admitted. A Release that legitimately admits nothing —
+    /// its stored text states no change, so it keeps only `smart` — must not pin
+    /// the sweep on itself, and a crash mid-run resumes after the last examined
+    /// id instead of restarting from zero.
+    ///
+    /// A page shorter than the limit means the scan reached the end of the id
+    /// space, so the run is complete and the cursor rewinds to `0`. That is
+    /// deliberate: a completed sweep must leave the next manual trigger able to
+    /// find gaps that appeared afterwards, otherwise the finished state would
+    /// permanently suppress repairs for new work. Automatic lane ticks then
+    /// no-op until a candidate exists again, because the scan from zero finds
+    /// nothing to scan.
+    async fn execute(&self, task: &ClaimedTask) -> Result<String> {
+        if task.task_type != TASK_POLISH_BACKFILL {
+            bail!("polish backfill executor received {}", task.task_type);
+        }
+        let ai = self
+            .ai
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI provider is not configured"))?;
+        // Quota-blocked rows are independent of the variant cursor: a different
+        // failure, bounded separately per run, and consuming their marker is what
+        // makes them one-shot. This runs first so a page of repairs never starves
+        // the rows waiting on a restored allowance.
+        let quota_candidates =
+            Self::quota_blocked_candidates(&self.pool, POLISH_BACKFILL_PAGE).await?;
+        let quota_scanned = quota_candidates.len();
+        let quota_requeued = Self::requeue_quota_blocked(&self.pool, &quota_candidates).await?;
+
+        let after = Self::load_cursor(&self.pool).await?;
+        let candidates =
+            Self::polish_backfill_candidates(&self.pool, after, POLISH_BACKFILL_PAGE).await?;
+        let scanned = candidates.len();
+        if scanned == 0 {
+            if after != 0 {
+                Self::store_cursor(&self.pool, 0, Utc::now()).await?;
+            }
+            return Ok(json!({
+                "scanned": 0,
+                "admitted": 0,
+                "cursor": 0,
+                "complete": true,
+                "quota_scanned": quota_scanned,
+                "quota_requeued": quota_requeued,
+            })
+            .to_string());
+        }
+        let admitted =
+            crate::postgres_content::admit_release_polish(&self.pool, &candidates, &ai.model)
+                .await?;
+        let last = candidates.last().copied().unwrap_or(after);
+        // A short page means this run reached the tail of the candidate set, so
+        // the next run should start over rather than ask for ids above the tail.
+        let complete = scanned < POLISH_BACKFILL_PAGE;
+        let cursor = if complete { 0 } else { last };
+        Self::store_cursor(&self.pool, cursor, Utc::now()).await?;
+        info!(
+            scanned,
+            admitted, cursor, complete, "polishing audience backfill page finished"
+        );
+        Ok(json!({
+            "scanned": scanned,
+            "admitted": admitted,
+            "cursor": cursor,
+            "complete": complete,
+            "quota_scanned": quota_scanned,
+            "quota_requeued": quota_requeued,
+        })
+        .to_string())
     }
 }
 
@@ -1952,7 +2221,8 @@ fn task_user_id(payload: &Value, task: &ClaimedTask) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimedTask, ReleaseUpsert, push_inserted_release, summarize_release_run, task_user_id,
+        ClaimedTask, PgPool, ReleaseUpsert, push_inserted_release, summarize_release_run,
+        task_user_id,
     };
     use serde_json::json;
 
@@ -2127,5 +2397,354 @@ mod tests {
             task_user_id(&json!({}), &task).as_deref(),
             Some("legacy-user")
         );
+    }
+
+    /// Tables the polishing backfill touches: the shared Release cache, the
+    /// global work items it scans, the projection tables admission writes, the
+    /// runtime route, and the dispatch-state row the cursor lives in.
+    async fn create_polish_backfill_schema(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE public.repo_releases(release_id bigint PRIMARY KEY, repo_id bigint NOT NULL, html_url text NOT NULL, tag_name text NOT NULL, name text, body text, updated_at text, detected_at text);
+            CREATE TABLE public.admin_runtime_settings(id integer PRIMARY KEY, llm_models_json text NOT NULL);
+            INSERT INTO public.admin_runtime_settings(id, llm_models_json) VALUES (1, '["m1"]');
+            CREATE TABLE public.llm_model_health(model text PRIMARY KEY, relevant_failure_count bigint NOT NULL DEFAULT 0, window_started_at timestamptz, cooldown_until timestamptz, last_failure_class text, last_failure_at timestamptz, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+            CREATE TABLE public.content_work_items(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_snapshot_json text NOT NULL, configuration_fingerprint text NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0, cache_hit boolean NOT NULL DEFAULT false, token_estimate integer NOT NULL DEFAULT 0, attempt_count integer NOT NULL DEFAULT 0, evidence_status text NOT NULL DEFAULT 'not_required', next_retry_at text, retry_expires_at text, retry_after_at text, failure_class text, lease_owner text, lease_expires_at text, started_at text, finished_at text, cancelled_at text, supersedes_work_item_id text, batch_id text, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile));
+            CREATE TABLE public.content_work_identities(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, created_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version));
+            CREATE TABLE public.content_work_identity_members(work_item_id text PRIMARY KEY, identity_id text NOT NULL, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, source_hash text NOT NULL, protocol_version text NOT NULL, linked_at text NOT NULL, UNIQUE (identity_id, work_item_id));
+            CREATE TABLE public.content_result_projections(id text PRIMARY KEY, canonical_resource_type text NOT NULL, canonical_resource_id text NOT NULL, pipeline text NOT NULL, variant text NOT NULL, target_lang text NOT NULL, protocol_version text NOT NULL, model_profile text NOT NULL, source_hash text NOT NULL, work_item_id text NOT NULL, active_work_item_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL, UNIQUE (canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash));
+            CREATE TABLE public.content_current_result_projections(identity_id text PRIMARY KEY, work_item_id text NOT NULL, active_work_item_id text, source_projection_id text, payload_json text NOT NULL, published_at text NOT NULL, updated_at text NOT NULL);
+            CREATE TABLE public.content_attempt_events(id text PRIMARY KEY, work_item_id text NOT NULL, attempt_no bigint NOT NULL, trigger text NOT NULL, event_type text NOT NULL, result_status text, error_code text, error_summary text, failure_class text, retry_disposition text, retry_eligible bigint NOT NULL DEFAULT 0, next_retry_at text, duration_ms bigint, token_count bigint, cost_microunits bigint, created_at text NOT NULL, configuration_snapshot_json text, route_snapshot_json text, configuration_fingerprint text, UNIQUE (work_item_id, attempt_no, event_type));
+            CREATE TABLE public.polish_backfill_cursor(id bigint PRIMARY KEY CHECK (id = 1), last_release_id bigint NOT NULL DEFAULT 0 CHECK (last_release_id >= 0), last_run_at timestamptz, updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            INSERT INTO public.polish_backfill_cursor (id, last_release_id, last_run_at, updated_at) VALUES (1, 0, NULL, CURRENT_TIMESTAMP);
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A Release stored with a stated change, plus the `smart`-only polishing
+    /// work an older admission left behind.
+    async fn seed_smart_only_release(pool: &PgPool, release_id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO public.repo_releases (release_id, repo_id, html_url, tag_name, name, body, updated_at) VALUES ($1, 7, $2, $3, $4, $5, '2026-11-24T00:00:00Z')",
+        )
+        .bind(release_id)
+        .bind(format!("https://github.com/acme/demo/releases/tag/v{release_id}"))
+        .bind(format!("v{release_id}"))
+        .bind(format!("v{release_id}"))
+        .bind("- 每轮最多处理 10 批，此前为 5 批")
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', 'zh-CN', 'seeded', 'content-processing.v1', 'postgres-default', '{}', 'seeded', 'ready', 1, now()::text, now()::text)",
+        )
+        .bind(format!("smart-{release_id}"))
+        .bind(release_id.to_string())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A Release whose published text states no change: admission offers it only
+    /// `smart`, so it stays eligible for the sweep forever.
+    async fn seed_smart_only_release_without_stated_change(
+        pool: &PgPool,
+        release_id: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO public.repo_releases (release_id, repo_id, html_url, tag_name, name, body, updated_at) VALUES ($1, 7, $2, $3, $4, 'See full changelog below.', '2026-11-24T00:00:00Z')",
+        )
+        .bind(release_id)
+        .bind(format!("https://github.com/acme/demo/releases/tag/v{release_id}"))
+        .bind(format!("v{release_id}"))
+        .bind(format!("v{release_id}"))
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', 'zh-CN', 'seeded', 'content-processing.v1', 'postgres-default', '{}', 'seeded', 'ready', 1, now()::text, now()::text)",
+        )
+        .bind(format!("smart-{release_id}"))
+        .bind(release_id.to_string())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn polish_variants_for(pool: &PgPool, release_id: i64) -> anyhow::Result<Vec<String>> {
+        let mut variants: Vec<String> = sqlx::query_scalar(
+            "SELECT variant FROM public.content_work_items WHERE canonical_resource_type = 'release' AND canonical_resource_id = $1 AND pipeline = 'polishing'",
+        )
+        .bind(release_id.to_string())
+        .fetch_all(pool)
+        .await?;
+        variants.sort();
+        Ok(variants)
+    }
+
+    fn backfill_task() -> ClaimedTask {
+        ClaimedTask {
+            id: "polish-backfill-1".to_owned(),
+            task_type: super::TASK_POLISH_BACKFILL.to_owned(),
+            source: "scheduler.polish_backfill".to_owned(),
+            requested_by: None,
+            payload_json: "{}".to_owned(),
+            cancel_requested: 0,
+        }
+    }
+
+    /// Three `smart`-only Releases are repaired by one run, and a repeat run
+    /// finds nothing left and reports the sweep complete.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_polish_backfill_admits_missing_audience_variants_once() -> anyhow::Result<()>
+    {
+        use super::*;
+        use crate::postgres_worker::TaskExecutor;
+
+        let admin_url = std::env::var("TEST_PG_TASKS_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("polish_backfill_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_polish_backfill_schema(&pool).await?;
+            for release_id in [101_i64, 102, 103] {
+                seed_smart_only_release(&pool, release_id).await?;
+            }
+
+            let executor = PolishBackfillExecutor::new(
+                pool.clone(),
+                Some(AiConfig {
+                    base_url: url::Url::parse("http://127.0.0.1:1/")?,
+                    model: "m1".to_owned(),
+                    api_key: "test-key".to_owned(),
+                }),
+            );
+            let summary: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(summary["scanned"], json!(3));
+            assert_eq!(
+                summary["admitted"],
+                json!(6),
+                "two new variants per Release"
+            );
+            assert_eq!(summary["complete"], json!(true));
+            for release_id in [101_i64, 102, 103] {
+                assert_eq!(
+                    polish_variants_for(&pool, release_id).await?,
+                    vec!["smart", "smart_authorized", "smart_public"],
+                    "Release {release_id} must gain both audience variants"
+                );
+            }
+
+            // Second run: nothing left to do, and it says so.
+            let repeat: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(repeat["scanned"], json!(0));
+            assert_eq!(repeat["admitted"], json!(0));
+            assert_eq!(repeat["complete"], json!(true));
+            assert_eq!(repeat["cursor"], json!(0));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    /// More backlog than one page, in the case the cursor actually exists for:
+    /// candidates that stay candidates. A Release that states no change in its
+    /// stored text legitimately keeps only `smart`, so `admit_release_polish`
+    /// skips it and it remains eligible forever. Without the cursor the scan
+    /// would re-read the same page on every run and the tail would never be
+    /// reached; the second run must continue past the first page.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_polish_backfill_advances_its_cursor_across_pages() -> anyhow::Result<()> {
+        use super::*;
+        use crate::postgres_worker::TaskExecutor;
+
+        let admin_url = std::env::var("TEST_PG_TASKS_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("polish_backfill_cursor_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_polish_backfill_schema(&pool).await?;
+            let total = POLISH_BACKFILL_PAGE + 5;
+            let ids: Vec<i64> = (0..total).map(|index| 200 + index as i64).collect();
+            for release_id in &ids {
+                // The stored text states no change, so admission legitimately
+                // leaves this Release with `smart` only and it stays a candidate.
+                // This is the shape that exercises the cursor: a shrinking
+                // candidate set would hide a missing cursor.
+                seed_smart_only_release_without_stated_change(&pool, *release_id).await?;
+            }
+
+            let executor = PolishBackfillExecutor::new(
+                pool.clone(),
+                Some(AiConfig {
+                    base_url: url::Url::parse("http://127.0.0.1:1/")?,
+                    model: "m1".to_owned(),
+                    api_key: "test-key".to_owned(),
+                }),
+            );
+            let first: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(first["scanned"], json!(POLISH_BACKFILL_PAGE));
+            assert_eq!(first["admitted"], json!(0));
+            assert_eq!(first["complete"], json!(false));
+            assert_eq!(
+                first["cursor"],
+                json!(ids[POLISH_BACKFILL_PAGE - 1]),
+                "the run must advance past the page it could not repair"
+            );
+
+            // The second run starts after the cursor: it sees only the tail, so
+            // the sweep does not loop over the same unreachable head forever.
+            let second: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(
+                second["scanned"],
+                json!(5),
+                "the next run must continue from the cursor, not restart at the head"
+            );
+            assert_eq!(second["complete"], json!(true));
+            assert_eq!(second["cursor"], json!(0), "a short page resets the sweep");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    /// A quota-blocked row is requeued once; a credential-blocked row with the
+    /// same class and summary is left alone. This is the discriminator the sweep
+    /// depends on.
+    #[tokio::test]
+    #[ignore = "requires TEST_PG_TASKS_URL pointing at an isolated PostgreSQL 18 cluster"]
+    async fn postgres_polish_backfill_requeues_only_quota_blocked_work() -> anyhow::Result<()> {
+        use super::*;
+        use crate::postgres_worker::TaskExecutor;
+
+        let admin_url = std::env::var("TEST_PG_TASKS_URL")?;
+        let admin = PgPool::connect(&admin_url).await?;
+        let database = format!("polish_quota_{}", local_id::generate_local_id());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let mut url = url::Url::parse(&admin_url)?;
+        url.set_path(&database);
+        let pool = PgPool::connect(url.as_str()).await?;
+        let result = async {
+            create_polish_backfill_schema(&pool).await?;
+
+            // Two blocked rows that are indistinguishable by class and summary,
+            // exactly as production has them.
+            for (index, id, disposition) in [
+                (900_i64, "quota-work", Some("quota")),
+                (901, "credential-work", Some("credential")),
+                (902, "legacy-work", None),
+            ] {
+                sqlx::query(
+                    "INSERT INTO public.content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, failure_class, created_at, updated_at) VALUES ($1, 'release', $2, 'polishing', 'smart', 'zh-CN', 'source', 'content-processing.v1', 'postgres-default', '{}', 'fp', 'blocked_config', 1, 'configuration', now()::text, now()::text)",
+                )
+                .bind(id)
+                .bind(index.to_string())
+                .execute(&pool)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO public.content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_disposition, created_at) VALUES ($1, $2, 1, 'initial', 'attempt_completed', 'failed', 'configuration', '模型配置或请求被拒绝', 'configuration', $3, now()::text)",
+                )
+                .bind(format!("event-{id}"))
+                .bind(id)
+                .bind(disposition)
+                .execute(&pool)
+                .await?;
+            }
+
+            let executor = PolishBackfillExecutor::new(
+                pool.clone(),
+                Some(AiConfig {
+                    base_url: url::Url::parse("http://127.0.0.1:1/")?,
+                    model: "m1".to_owned(),
+                    api_key: "test-key".to_owned(),
+                }),
+            );
+            let first: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(first["quota_scanned"], json!(1));
+            assert_eq!(first["quota_requeued"], json!(1));
+
+            let statuses: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, status FROM public.content_work_items ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await?;
+            assert_eq!(
+                statuses,
+                vec![
+                    ("credential-work".to_owned(), "blocked_config".to_owned()),
+                    ("legacy-work".to_owned(), "blocked_config".to_owned()),
+                    ("quota-work".to_owned(), "queued".to_owned()),
+                ],
+                "only the quota-marked row is released; a credential block and an unmarked legacy row stay put"
+            );
+
+            // The marker was consumed, so a second run cannot requeue it again
+            // without new evidence.
+            let second: Value = serde_json::from_str(&executor.execute(&backfill_task()).await?)?;
+            assert_eq!(second["quota_scanned"], json!(0));
+            assert_eq!(second["quota_requeued"], json!(0));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+
+    /// The classifier marks an exhausted allowance as `quota` whether the
+    /// provider reports it as 429 or as a 4xx body, and keeps credentials
+    /// distinct. Without this the sweep would have nothing to select on.
+    #[test]
+    fn quota_and_credential_dispositions_are_distinct() {
+        use crate::llm_contract::LlmFailureClass;
+        use crate::postgres_translate::classify_upstream_failure_with_reason as classify;
+
+        let (class, disposition) = classify(
+            429,
+            r#"{"error":{"code":"insufficient_quota","message":"inference exceeds tpm/rpm limit"}}"#,
+        );
+        assert_eq!(class, LlmFailureClass::RateLimited);
+        assert_eq!(disposition, Some("quota"));
+
+        let (class, disposition) = classify(400, r#"{"error":{"code":"insufficient_quota"}}"#);
+        assert_eq!(class, LlmFailureClass::Configuration);
+        assert_eq!(disposition, Some("quota"));
+
+        let (class, disposition) = classify(401, "unauthorized");
+        assert_eq!(class, LlmFailureClass::Configuration);
+        assert_eq!(disposition, Some("credential"));
+
+        // A plain 400 is a configuration failure with no quota/credential cause.
+        let (class, disposition) = classify(400, "bad request");
+        assert_eq!(class, LlmFailureClass::Configuration);
+        assert_eq!(disposition, None);
     }
 }

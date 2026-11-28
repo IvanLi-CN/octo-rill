@@ -50,6 +50,7 @@ pub(crate) const LANE_WEBHOOK_PUSH: &str = "webhook_push";
 pub(crate) const LANE_ACCOUNT_PAUSE: &str = "account_pause";
 pub(crate) const LANE_ADMIN_ROLLUP: &str = "admin_rollup";
 pub(crate) const LANE_TRANSLATION_RECONCILE: &str = "translation_reconcile";
+pub(crate) const LANE_POLISH_BACKFILL: &str = "polish_backfill";
 
 const DAILY_BRIEF_INTERVAL: Duration = Duration::from_secs(45);
 const SUBSCRIPTION_INTERVAL: Duration = Duration::from_secs(20);
@@ -59,6 +60,15 @@ const WEBHOOK_PUSH_INTERVAL: Duration = Duration::from_secs(60);
 const ACCOUNT_PAUSE_INTERVAL: Duration = Duration::from_secs(45);
 const ADMIN_ROLLUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const TRANSLATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+/// One backfill page per hour.
+///
+/// This is a repair sweep over historical rows, not a hot path: a page admits at
+/// most `POLISH_ADMISSION_CAP` Releases, and each admitted Release queues three
+/// provider-backed work items, so a fast cadence would only flood the content
+/// worker. Hourly works through the whole production backlog in roughly
+/// `ceil(8849 / 25)` hours (~15 days) while leaving the worker's normal traffic
+/// untouched, and the sweep stops costing anything once the candidate set drains.
+const POLISH_BACKFILL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
 const STAR_SYNC_DELTA_SCHEDULE_NAME_PREFIX: &str = "sync.starred.delta";
@@ -188,10 +198,18 @@ pub(crate) fn spawn(state: PostgresServerState, shutdown: watch::Receiver<bool>)
     spawn_lane!(
         LANE_TRANSLATION_RECONCILE,
         TRANSLATION_RECONCILE_INTERVAL,
+        pool.clone(),
+        defaults.clone(),
+        shutdown.clone(),
+        lane_translation_reconcile
+    );
+    spawn_lane!(
+        LANE_POLISH_BACKFILL,
+        POLISH_BACKFILL_INTERVAL,
         pool,
         defaults,
         shutdown,
-        lane_translation_reconcile
+        lane_polish_backfill
     );
 }
 
@@ -233,6 +251,7 @@ pub(crate) async fn run_lane_once(
         LANE_ACCOUNT_PAUSE => lane_account_pause(pool, defaults, now).await,
         LANE_ADMIN_ROLLUP => lane_admin_rollup(pool, defaults, now).await,
         LANE_TRANSLATION_RECONCILE => lane_translation_reconcile(pool, defaults, now).await,
+        LANE_POLISH_BACKFILL => lane_polish_backfill(pool, defaults, now).await,
         other => Err(anyhow!("unknown PostgreSQL scheduler lane {other}")),
     }
 }
@@ -318,6 +337,32 @@ async fn lane_translation_reconcile(
         );
     }
     Ok(usize::try_from(closed).unwrap_or(usize::MAX))
+}
+
+/// Repair sweep for Releases that still lack their audience polishing variants.
+///
+/// Enqueue-only, like every other lane: it inserts at most one `polish.backfill`
+/// task and never calls a provider. `insert_single_flight` keeps overlapping
+/// ticks from double-enqueueing while a run is queued or executing, and the
+/// executor's own cursor carries progress between runs.
+async fn lane_polish_backfill(
+    pool: &PgPool,
+    _defaults: &SchedulerDefaults,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let inserted = insert_single_flight_pool(
+        pool,
+        ScheduledTask {
+            task_type: crate::postgres_tasks::TASK_POLISH_BACKFILL,
+            source: "scheduler.polish_backfill",
+            requested_by: None,
+            payload: json!({ "trigger": "schedule.polish_backfill" }),
+            scope: None,
+        },
+        now,
+    )
+    .await?;
+    Ok(usize::from(inserted.is_some()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,4 +1754,87 @@ async fn load_runtime_settings_in(
             .context("load PostgreSQL scheduler runtime settings")?
             .unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("postgres_scheduler.rs");
+
+    /// The run_lane_once body, from its signature to its final `map_err` arm.
+    fn lane_dispatch() -> &'static str {
+        let start = SOURCE
+            .find("pub(crate) async fn run_lane_once(")
+            .expect("run_lane_once exists");
+        let rest = &SOURCE[start..];
+        let end = rest.find("async fn lane_daily_brief(").expect("next lane");
+        &rest[..end]
+    }
+
+    #[test]
+    fn polish_backfill_lane_is_dispatched_and_ticked() {
+        let dispatch = lane_dispatch();
+        for lane in [
+            "LANE_DAILY_BRIEF",
+            "LANE_TRANSLATION_RECONCILE",
+            "LANE_POLISH_BACKFILL",
+        ] {
+            assert!(
+                dispatch.contains(&format!("{lane} =>")),
+                "lane {lane} is missing from the run_lane_once dispatch"
+            );
+        }
+        assert!(
+            SOURCE.contains("async fn lane_polish_backfill"),
+            "the polish backfill lane needs a tick function"
+        );
+        assert!(
+            SOURCE.contains("LANE_POLISH_BACKFILL,\n        POLISH_BACKFILL_INTERVAL,"),
+            "the lane must be spawned with its own interval"
+        );
+    }
+
+    /// Enqueue-only discipline: this lane inserts a task and must never reach a
+    /// provider or the GitHub API from the scheduler.
+    #[test]
+    fn polish_backfill_lane_stays_enqueue_only() {
+        let start = SOURCE
+            .find("async fn lane_polish_backfill(")
+            .expect("lane body");
+        let body = &SOURCE[start..];
+        let end = body.find("\n}\n").expect("lane body ends");
+        let body = &body[..end];
+        for forbidden in [
+            "reqwest",
+            "Client",
+            "fetch_releases",
+            "GITHUB_API",
+            "admit_release",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the polish backfill lane must stay enqueue-only, found {forbidden}"
+            );
+        }
+        assert!(
+            body.contains("insert_single_flight_pool"),
+            "the lane enqueues through the single-flight helper"
+        );
+    }
+
+    #[test]
+    fn polish_backfill_interval_is_conservative() {
+        // A repair sweep admits up to POLISH_ADMISSION_CAP Releases per page and
+        // each Release queues three provider-backed items, so the lane must not
+        // run on the same cadence as the sync lanes.
+        assert!(
+            POLISH_BACKFILL_INTERVAL >= Duration::from_secs(30 * 60),
+            "the polishing backfill is a repair sweep, not a hot path"
+        );
+        assert!(
+            POLISH_BACKFILL_INTERVAL <= Duration::from_secs(6 * 60 * 60),
+            "an hourly-to-six-hourly cadence should drain the backlog in days, not months"
+        );
+    }
 }

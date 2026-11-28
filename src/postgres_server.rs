@@ -178,6 +178,13 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             crate::admin_job_groups::TASK_TRANSLATION_GENERATE,
             TranslationExecutor::new(runtime.pool.clone(), http.clone(), config.ai.clone()),
         )
+        .register(
+            crate::postgres_tasks::TASK_POLISH_BACKFILL,
+            crate::postgres_tasks::PolishBackfillExecutor::new(
+                runtime.pool.clone(),
+                config.ai.clone(),
+            ),
+        )
         .build();
     let state = PostgresServerState {
         runtime: runtime.clone(),
@@ -342,6 +349,10 @@ pub async fn serve_postgres(config: AppConfig) -> Result<()> {
             axum::routing::post(
                 crate::postgres_admin_actions::admin_enqueue_release_reading_backfill,
             ),
+        )
+        .route(
+            "/api/admin/jobs/polish-backfill",
+            axum::routing::post(crate::postgres_admin_actions::admin_enqueue_polish_backfill),
         )
         .route(
             "/api/admin/jobs/webhook-push/runtime-config",

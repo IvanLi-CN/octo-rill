@@ -298,6 +298,74 @@ pub(crate) async fn admin_enqueue_release_reading_backfill(
     }
 }
 
+/// Queue one page of the polishing audience-variant repair sweep.
+///
+/// Single-flight like the scheduled lane: while a `polish.backfill` task is
+/// queued or running this returns that task instead of creating a second one, so
+/// an operator clicking twice cannot double-advance the cursor. The executor
+/// itself decides what the page is; this handler only enqueues.
+pub(crate) async fn admin_enqueue_polish_backfill(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return admin_required(status);
+    }
+    let pool = &state.runtime.pool;
+    let inflight = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.job_tasks WHERE task_type = $1 AND status IN ('queued', 'running') ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(crate::postgres_tasks::TASK_POLISH_BACKFILL)
+    .fetch_optional(pool)
+    .await;
+    let task_id = match inflight {
+        Ok(Some(task_id)) => Some(task_id),
+        Ok(None) => {
+            let enqueued = sqlx::query_scalar::<_, String>(
+                r#"
+                INSERT INTO public.job_tasks (
+                  id, task_type, status, source, requested_by, payload_json, created_at, updated_at
+                )
+                SELECT $1, $2, 'queued', 'admin.polish_backfill', $3, $4, $5, $5
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM public.job_tasks pending
+                  WHERE pending.task_type = $2
+                    AND pending.status IN ('queued', 'running')
+                )
+                RETURNING id
+                "#,
+            )
+            .bind(crate::local_id::generate_local_id())
+            .bind(crate::postgres_tasks::TASK_POLISH_BACKFILL)
+            .bind(Option::<String>::None)
+            .bind(json!({"trigger": "admin.polish_backfill"}).to_string())
+            .bind(Utc::now())
+            .fetch_optional(pool)
+            .await;
+            match enqueued {
+                Ok(task_id) => task_id,
+                Err(error) => return database_error("polish_backfill_enqueue", error),
+            }
+        }
+        Err(error) => return database_error("polish_backfill_inflight", error),
+    };
+    let cursor = sqlx::query_scalar::<_, i64>(
+        "SELECT last_release_id FROM public.polish_backfill_cursor WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await;
+    match cursor {
+        Ok(cursor) => Json(json!({
+            "task_id": task_id,
+            "status": if task_id.is_some() { "queued" } else { "idle" },
+            "cursor": cursor.unwrap_or(0),
+        }))
+        .into_response(),
+        Err(error) => database_error("polish_backfill_cursor", error),
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct BackfillRunRow {
     id: String,

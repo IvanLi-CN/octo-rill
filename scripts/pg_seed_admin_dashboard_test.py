@@ -28,6 +28,7 @@ TASK_TYPES = ('translation.generate', 'sync.releases', 'brief.daily_slot')
 # breakdown lists every current PostgreSQL runtime type, not the legacy triple.
 RUNTIME_TASK_TYPES = (
     'translation.generate',
+    'polish.backfill',
     'translate.release.batch',
     'translate.release',
     'translate.release_detail',
@@ -110,7 +111,12 @@ def main():
         today = now.date().isoformat()
         yesterday = (now.date() - dt.timedelta(days=1)).isoformat()
         yesterday_point = (now.date() - dt.timedelta(days=1)).isoformat()
-        created_today = iso(now - dt.timedelta(hours=1))
+        # Seeded "today" rows sit an hour before `now`, which a run shortly after
+        # UTC midnight would date to the previous day; the day-scoped dashboard
+        # breakdown then finds none of them. Clamp to the day boundary so the
+        # original spacing is kept whenever the day has an hour to spare.
+        day_start = dt.datetime.combine(now.date(), dt.time(0, 0), tzinfo=dt.timezone.utc)
+        created_today = iso(max(day_start, now - dt.timedelta(hours=1)))
 
         sql(
             "INSERT INTO public.users(id,github_user_id,login,created_at,updated_at,is_admin,is_disabled,"
