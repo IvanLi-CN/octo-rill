@@ -64,6 +64,26 @@ pub(crate) struct AdminJobTaskTypeSpec {
     pub(crate) task_type: &'static str,
     pub(crate) label: &'static str,
     pub(crate) lane: AdminJobTaskLane,
+    /// Parameter form the job center renders before a manual trigger.
+    pub(crate) trigger_params: &'static [AdminJobTriggerParam],
+}
+
+/// One field of a manual-trigger form.
+///
+/// The declaration is the contract: the server validates the submitted value
+/// against the same bounds the form shows, so a form and its validation cannot
+/// drift apart the way the frontend task-type lists did.
+#[derive(Debug)]
+pub(crate) struct AdminJobTriggerParam {
+    pub(crate) name: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) kind: AdminJobTriggerParamKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum AdminJobTriggerParamKind {
+    /// Bounded integer. Both ends are inclusive.
+    Integer { min: i64, max: i64, default: i64 },
 }
 
 #[derive(Debug)]
@@ -78,12 +98,57 @@ const fn spec(
     label: &'static str,
     lane: AdminJobTaskLane,
 ) -> AdminJobTaskTypeSpec {
+    spec_with_params(task_type, label, lane, &[])
+}
+
+/// Declare a task type that an operator may also trigger by hand.
+///
+/// `NO_TRIGGER_PARAMS` is the common case: the task takes no input, so the job
+/// center renders a confirmation instead of a form.
+const fn spec_with_params(
+    task_type: &'static str,
+    label: &'static str,
+    lane: AdminJobTaskLane,
+    trigger_params: &'static [AdminJobTriggerParam],
+) -> AdminJobTaskTypeSpec {
     AdminJobTaskTypeSpec {
         task_type,
         label,
         lane,
+        trigger_params,
     }
 }
+
+const fn int_param(
+    name: &'static str,
+    label: &'static str,
+    min: i64,
+    max: i64,
+    default: i64,
+) -> AdminJobTriggerParam {
+    AdminJobTriggerParam {
+        name,
+        label,
+        kind: AdminJobTriggerParamKind::Integer { min, max, default },
+    }
+}
+
+/// Page bound for one manual `polish.backfill` trigger.
+///
+/// The scheduled lane advances one small page per hour; a hand trigger is the
+/// operator asking for progress now, so it may cover more Releases in one run.
+/// The ceiling keeps a single click from admitting a burst the provider cannot
+/// absorb: each Release expands into up to three audience variants.
+const POLISH_BACKFILL_TRIGGER_MAX_PAGE: i64 = 100;
+const POLISH_BACKFILL_TRIGGER_DEFAULT_PAGE: i64 = 25;
+
+const POLISH_BACKFILL_TRIGGER_PARAMS: &[AdminJobTriggerParam] = &[int_param(
+    "page_size",
+    "单次扫描 Release 数",
+    POLISH_BACKFILL_TRIGGER_DEFAULT_PAGE,
+    POLISH_BACKFILL_TRIGGER_MAX_PAGE,
+    POLISH_BACKFILL_TRIGGER_DEFAULT_PAGE,
+)];
 
 /// Group -> label -> task types for the current PostgreSQL runtime.
 ///
@@ -100,10 +165,11 @@ pub(crate) const ADMIN_JOB_TASK_GROUPS: &[AdminJobTaskGroup] = &[
                 "翻译生成",
                 AdminJobTaskLane::Realtime,
             ),
-            spec(
+            spec_with_params(
                 crate::postgres_tasks::TASK_POLISH_BACKFILL,
                 "润色受众变体回填",
                 AdminJobTaskLane::Scheduled,
+                POLISH_BACKFILL_TRIGGER_PARAMS,
             ),
             spec(
                 jobs::TASK_TRANSLATE_RELEASE_BATCH,
@@ -250,9 +316,136 @@ pub(crate) fn is_legacy_task_type(task_type: &str) -> bool {
     LEGACY_TASK_TYPES.contains(&task_type)
 }
 
+/// Task types an operator may start by hand.
+///
+/// Kept as an explicit allowlist rather than "any type with a form": a global
+/// sync reachable from one misplaced click costs far more than the convenience
+/// of exposing every type.
+pub(crate) const TRIGGERABLE_TASK_TYPES: &[&str] = &[crate::postgres_tasks::TASK_POLISH_BACKFILL];
+
+pub(crate) fn task_type_is_triggerable(task_type: &str) -> bool {
+    TRIGGERABLE_TASK_TYPES.contains(&task_type)
+}
+
+/// Page bound a `polish.backfill` task should use.
+///
+/// Reads the validated `page_size` the trigger handler wrote into the task
+/// payload, falling back to the scheduled page when absent or out of range. The
+/// clamp lives here as well as in validation so a row written by anything other
+/// than the trigger handler cannot widen the bound.
+pub(crate) fn polish_backfill_page_from_payload_json(payload_json: Option<&str>) -> usize {
+    let parsed: serde_json::Value = payload_json
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let requested = parsed
+        .get("params")
+        .and_then(|params| params.get("page_size"))
+        .and_then(serde_json::Value::as_i64);
+    let resolved = requested.unwrap_or(POLISH_BACKFILL_TRIGGER_DEFAULT_PAGE);
+    let clamped = resolved.clamp(
+        POLISH_BACKFILL_TRIGGER_DEFAULT_PAGE,
+        POLISH_BACKFILL_TRIGGER_MAX_PAGE,
+    );
+    usize::try_from(clamped).unwrap_or(crate::postgres_content::POLISH_ADMISSION_CAP)
+}
+
+/// Validate a submitted trigger form against the type's declaration.
+///
+/// Returns the resolved parameters (defaults applied) or a message naming the
+/// offending field. Unknown keys are rejected so a stale form cannot silently
+/// submit a parameter the server would ignore.
+pub(crate) fn validate_trigger_params(
+    spec: &AdminJobTaskTypeSpec,
+    submitted: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let empty = serde_json::Map::new();
+    let submitted = submitted.unwrap_or(&empty);
+    for key in submitted.keys() {
+        if !spec.trigger_params.iter().any(|param| param.name == key) {
+            return Err(format!("unknown parameter: {key}"));
+        }
+    }
+    let mut resolved = serde_json::Map::new();
+    for param in spec.trigger_params {
+        let AdminJobTriggerParamKind::Integer { min, max, default } = &param.kind;
+        let value = match submitted.get(param.name) {
+            None => *default,
+            Some(raw) => raw
+                .as_i64()
+                .ok_or_else(|| format!("{} must be an integer", param.name))?,
+        };
+        if value < *min || value > *max {
+            return Err(format!("{} must be between {min} and {max}", param.name));
+        }
+        resolved.insert(param.name.to_owned(), serde_json::Value::from(value));
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_params_apply_defaults_and_clamp() {
+        let spec = runtime_task_specs()
+            .find(|spec| spec.task_type == crate::postgres_tasks::TASK_POLISH_BACKFILL)
+            .expect("polish backfill spec");
+        let resolved = validate_trigger_params(spec, None).expect("defaults accepted");
+        assert_eq!(resolved.get("page_size").and_then(|v| v.as_i64()), Some(25));
+
+        let mut submitted = serde_json::Map::new();
+        submitted.insert("page_size".to_owned(), serde_json::Value::from(100));
+        let resolved = validate_trigger_params(spec, Some(&submitted)).expect("max accepted");
+        assert_eq!(
+            resolved.get("page_size").and_then(|v| v.as_i64()),
+            Some(100)
+        );
+
+        submitted.insert("page_size".to_owned(), serde_json::Value::from(101));
+        assert!(validate_trigger_params(spec, Some(&submitted)).is_err());
+
+        submitted.insert("page_size".to_owned(), serde_json::Value::from(0));
+        assert!(validate_trigger_params(spec, Some(&submitted)).is_err());
+
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("nope".to_owned(), serde_json::Value::from(1));
+        assert!(validate_trigger_params(spec, Some(&unknown)).is_err());
+    }
+
+    #[test]
+    fn only_declared_types_are_triggerable() {
+        assert!(task_type_is_triggerable(
+            crate::postgres_tasks::TASK_POLISH_BACKFILL
+        ));
+        assert!(!task_type_is_triggerable(
+            crate::postgres_tasks::TASK_SYNC_RELEASES
+        ));
+        for task_type in TRIGGERABLE_TASK_TYPES {
+            assert!(
+                runtime_task_specs().any(|spec| spec.task_type == *task_type),
+                "{task_type} is triggerable but not a runtime task type"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_page_falls_back_and_clamps() {
+        assert_eq!(polish_backfill_page_from_payload_json(None), 25);
+        assert_eq!(
+            polish_backfill_page_from_payload_json(Some(r#"{"params":{"page_size":5000}}"#)),
+            100
+        );
+        assert_eq!(
+            polish_backfill_page_from_payload_json(Some(r#"{"params":{"page_size":1}}"#)),
+            25
+        );
+        assert_eq!(
+            polish_backfill_page_from_payload_json(Some(r#"{"params":{"page_size":80}}"#)),
+            80
+        );
+        assert_eq!(polish_backfill_page_from_payload_json(Some("not json")), 25);
+    }
 
     #[test]
     fn registered_executors_appear_in_exactly_one_group() {

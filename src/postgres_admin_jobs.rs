@@ -148,6 +148,77 @@ pub(super) async fn overview(
     }
 }
 
+// ------------------------------------------------------- plan task catalogue
+
+/// One task type as the job center's plan-task column needs it.
+#[derive(Debug, Serialize)]
+pub(super) struct PlanTaskTypeView {
+    task_type: &'static str,
+    label: &'static str,
+    group_key: &'static str,
+    group_label: &'static str,
+    lane: &'static str,
+    triggerable: bool,
+    trigger_params: Vec<PlanTaskTriggerParamView>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PlanTaskTriggerParamView {
+    name: &'static str,
+    label: &'static str,
+    kind: &'static str,
+    min: Option<i64>,
+    max: Option<i64>,
+    default: Option<i64>,
+}
+
+/// Every runtime task type with its group, lane and trigger contract.
+///
+/// The plan-task column renders itself from this instead of keeping another
+/// literal list: a task type added on the server then appears without a second
+/// edit, which is exactly what the frontend literals failed to do.
+pub(super) async fn admin_plan_tasks(
+    State(state): State<PostgresServerState>,
+    session: Session,
+) -> Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return require_admin_response(status);
+    }
+    let mut items = Vec::new();
+    for spec in crate::admin_job_groups::runtime_task_specs() {
+        let Some(group) = crate::admin_job_groups::group_for_task_type(spec.task_type) else {
+            continue;
+        };
+        let mut trigger_params = Vec::new();
+        for param in spec.trigger_params {
+            let crate::admin_job_groups::AdminJobTriggerParamKind::Integer { min, max, default } =
+                &param.kind;
+            trigger_params.push(PlanTaskTriggerParamView {
+                name: param.name,
+                label: param.label,
+                kind: "integer",
+                min: Some(*min),
+                max: Some(*max),
+                default: Some(*default),
+            });
+        }
+        items.push(PlanTaskTypeView {
+            task_type: spec.task_type,
+            label: spec.label,
+            group_key: group.key,
+            group_label: group.label,
+            lane: match spec.lane {
+                crate::admin_job_groups::AdminJobTaskLane::Scheduled => "scheduled",
+                crate::admin_job_groups::AdminJobTaskLane::UserSync => "user_sync",
+                crate::admin_job_groups::AdminJobTaskLane::Realtime => "realtime",
+            },
+            triggerable: crate::admin_job_groups::task_type_is_triggerable(spec.task_type),
+            trigger_params,
+        });
+    }
+    Json(json!({ "items": items })).into_response()
+}
+
 // ------------------------------------------------------------ task listing
 
 #[derive(Debug, Deserialize)]

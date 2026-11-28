@@ -31,6 +31,7 @@ export default defineConfig((env) =>
 									"demo-inspector",
 									"version-update-notice",
 									"repo-refresh-deferred",
+									"plan-task-column",
 								],
 								exclude: [],
 								skip: [],

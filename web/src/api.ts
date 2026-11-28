@@ -1590,6 +1590,47 @@ export async function apiPutReactionToken(
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
 }
+export type AdminPlanTaskTriggerParam = {
+	name: string;
+	label: string;
+	kind: "integer";
+	min: number | null;
+	max: number | null;
+	default: number | null;
+};
+
+export type AdminPlanTaskType = {
+	task_type: string;
+	label: string;
+	group_key: string;
+	group_label: string;
+	lane: "scheduled" | "user_sync" | "realtime";
+	triggerable: boolean;
+	trigger_params: AdminPlanTaskTriggerParam[];
+};
+
+export type AdminPlanTasksResponse = { items: AdminPlanTaskType[] };
+
+export type AdminTriggerPlanTaskResponse = {
+	task_id: string;
+	task_type: string;
+	status: string;
+};
+
+export async function apiGetAdminPlanTasks(): Promise<AdminPlanTasksResponse> {
+	return apiGet<AdminPlanTasksResponse>("/api/admin/jobs/plan-tasks");
+}
+
+export async function apiTriggerAdminPlanTask(
+	taskType: string,
+	params: Record<string, number>,
+): Promise<AdminTriggerPlanTaskResponse> {
+	return apiPostJson<AdminTriggerPlanTaskResponse>("/api/admin/jobs/trigger", {
+		task_type: taskType,
+		params,
+	});
+}
+
 export async function apiGetAdminRealtimeTasks(
 	params: URLSearchParams,
 ): Promise<AdminRealtimeTasksResponse> {
