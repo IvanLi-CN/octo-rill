@@ -2731,7 +2731,7 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByRole("combobox", { name: "计划任务状态筛选" }),
 	).toBeVisible();
 	await expect(page.getByRole("heading", { name: "计划任务" })).toBeVisible();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	await expect(
 		page.getByText("brief.daily_slot", { exact: true }).first(),
 	).toBeVisible();
@@ -4930,12 +4930,12 @@ test("admin refresh keeps scheduled runs visible", async ({ page }) => {
 	await page.goto("/admin/jobs");
 
 	await page.getByRole("tab", { name: "计划任务" }).click();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 
 	await expect(refreshButton).toBeDisabled();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	await expect(page.getByText("运行记录更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载运行记录...")).toHaveCount(0);
 	await expect(refreshButton).toBeEnabled();

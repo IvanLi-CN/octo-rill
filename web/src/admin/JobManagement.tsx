@@ -6750,7 +6750,9 @@ export function JobManagement({
 					<div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
 						<Card className="hidden lg:block">
 							<CardHeader className="pb-3">
-								<CardTitle className="text-sm">计划任务</CardTitle>
+								{/* Not "计划任务": the records card owns that heading and a
+								    second one makes every heading query ambiguous. */}
+								<CardTitle className="text-sm">任务类型</CardTitle>
 							</CardHeader>
 							<CardContent className="pt-0">
 								<PlanTaskColumn
@@ -6780,7 +6782,7 @@ export function JobManagement({
 										</SheetTrigger>
 										<SheetContent side="left" className="w-80 overflow-y-auto">
 											<SheetHeader>
-												<SheetTitle>计划任务</SheetTitle>
+												<SheetTitle>任务类型</SheetTitle>
 											</SheetHeader>
 											<div className="px-4 pb-6">
 												<PlanTaskColumn
