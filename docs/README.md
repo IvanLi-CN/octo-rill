@@ -32,8 +32,14 @@
 - [`product.md`](./product.md)：产品语义、界面职责、权限与数据边界
 - [`architecture.md`](./architecture.md)：系统组成、运行边界、模块职责与排查入口
 - [`repository-governance.md`](./repository-governance.md)：GitHub 仓库保护、PR 门禁与质量规则事实源
-- [`operations/postgres-data-directory.md`](./operations/postgres-data-directory.md)：PostgreSQL 数据目录的所有权契约、静默故障形态与校验时机
 - 适合回答“项目现在怎么工作、从哪里改、谁是事实源”
+
+### 部署与运维契约
+
+- [`operations/postgres-data-directory.md`](./operations/postgres-data-directory.md)：PostgreSQL 数据目录的所有权契约、静默故障形态与校验时机
+- 适合回答“部署时必须满足什么前提、坏了怎么确认根因”
+
+这一层记录的是**部署方的责任边界**，不是应用行为。应用自己该做什么写在 `architecture.md` 与对应 spec 里；这里写的是镜像、挂载、宿主机所有权这些应用管不到的前提。
 
 ### Agent memory / 长期工程记忆
 
@@ -55,5 +61,6 @@
 
 - 公开口径改动，优先同步 `docs-site/` 与仓库入口 `README.md`
 - 稳定的项目当前真相，优先回写 `docs/*.md`
+- 部署前提与运维契约回写 `docs/operations/*.md`，并与实际部署配置保持同步
 - 主题级约束、实现轨迹与历史原因，继续保留在 `docs/specs/**`
 - 不要把 task log、PR 对话或临时排查过程直接堆进项目文档
