@@ -77,7 +77,10 @@ import {
 	apiGetAdminLlmSchedulerStatus,
 	apiGetAdminJobsOverview,
 	apiGetAdminRealtimeTaskDetail,
+	apiGetAdminPlanTasks,
 	apiGetAdminRealtimeTasks,
+	apiTriggerAdminPlanTask,
+	type AdminPlanTaskType,
 	apiGetAdminSubscriptionRuns,
 	apiGetAdminTranslationBatchDetail,
 	apiGetAdminTranslationBatches,
@@ -92,6 +95,11 @@ import {
 	apiPatchAdminTranslationRuntimeConfig,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
+import { PlanTaskColumn } from "./PlanTaskColumn";
+import {
+	PLAN_TASK_RUN_RENDERERS,
+	parsePlanTaskResult,
+} from "./planTaskRenderers";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -119,6 +127,7 @@ import {
 	SheetDescription,
 	SheetHeader,
 	SheetTitle,
+	SheetTrigger,
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -1361,8 +1370,8 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 			return {
 				title: "本轮已跳过",
 				description: skipReason
-					? `定时任务未执行，原因：${skipReason}`
-					: "定时任务被跳过。",
+					? `计划任务未执行，原因：${skipReason}`
+					: "计划任务被跳过。",
 				level: "warning",
 				payload,
 			};
@@ -4267,6 +4276,13 @@ export function JobManagement({
 	);
 	const [scheduledRunTotal, setScheduledRunTotal] = useState(0);
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
+	const [planTasks, setPlanTasks] = useState<AdminPlanTaskType[]>([]);
+	const [selectedPlanTaskType, setSelectedPlanTaskType] = useState<
+		string | null
+	>(null);
+	const [planTaskTriggerBusy, setPlanTaskTriggerBusy] = useState<string | null>(
+		null,
+	);
 	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
 		useState<ListLoadPhase>("idle");
 	const [userSyncRunStatusFilter, setUserSyncRunStatusFilter] =
@@ -4881,6 +4897,48 @@ export function JobManagement({
 		[statusFilter, taskPage],
 	);
 
+	const loadPlanTasks = useCallback(async () => {
+		try {
+			const res = await apiGetAdminPlanTasks();
+			setPlanTasks(res.items);
+			setSelectedPlanTaskType(
+				(current) => current ?? res.items[0]?.task_type ?? null,
+			);
+		} catch {
+			// The column degrades to empty rather than blocking the records list;
+			// the records themselves come from a different endpoint.
+		}
+	}, []);
+
+	useEffect(() => {
+		void loadPlanTasks();
+	}, [loadPlanTasks]);
+
+	const selectPlanTaskType = useCallback((taskType: string) => {
+		setSelectedPlanTaskType(taskType);
+		setScheduledRunPage(1);
+	}, []);
+
+	const planTaskInflight = useMemo(() => {
+		const inflight: Record<string, string> = {};
+		for (const task of scheduledRuns) {
+			if (task.status === "running" || task.status === "queued") {
+				inflight[task.task_type] = task.status;
+			}
+		}
+		return inflight;
+	}, [scheduledRuns]);
+
+	const visibleScheduledRuns = useMemo(
+		() =>
+			selectedPlanTaskType
+				? scheduledRuns.filter(
+						(task) => task.task_type === selectedPlanTaskType,
+					)
+				: scheduledRuns,
+		[scheduledRuns, selectedPlanTaskType],
+	);
+
 	const loadScheduledRuns = useCallback(
 		async (options?: LoadOptions) => {
 			if (
@@ -4930,6 +4988,18 @@ export function JobManagement({
 			}
 		},
 		[scheduledRunPage, scheduledRunStatusFilter],
+	);
+	const triggerPlanTask = useCallback(
+		async (taskType: string, params: Record<string, number>) => {
+			setPlanTaskTriggerBusy(taskType);
+			try {
+				await apiTriggerAdminPlanTask(taskType, params);
+				await loadScheduledRuns({ background: true });
+			} finally {
+				setPlanTaskTriggerBusy(null);
+			}
+		},
+		[loadScheduledRuns],
 	);
 
 	const loadUserSyncRuns = useCallback(
@@ -6417,7 +6487,7 @@ export function JobManagement({
 							value="scheduled"
 							className="!h-8 font-mono text-[11px] sm:text-xs"
 						>
-							定时任务
+							计划任务
 						</TabsTrigger>
 						<TabsTrigger
 							value="user_sync"
@@ -6593,6 +6663,16 @@ export function JobManagement({
 																失败原因：{task.error_message}
 															</p>
 														) : null}
+														{(() => {
+															const renderer =
+																PLAN_TASK_RUN_RENDERERS[task.task_type];
+															if (!renderer) return null;
+															const summary = parsePlanTaskResult(
+																(task as { result_json?: string | null })
+																	.result_json,
+															);
+															return summary ? renderer(summary) : null;
+														})()}
 													</div>
 													<div className="flex flex-wrap gap-2">
 														<Button
@@ -6667,205 +6747,252 @@ export function JobManagement({
 				</TabsContent>
 
 				<TabsContent value="scheduled">
-					<Card>
-						<CardHeader className="flex flex-row items-start justify-between gap-4">
-							<div className="space-y-1.5">
-								<CardTitle>定时任务</CardTitle>
-							</div>
-							<Button
-								type="button"
-								variant="outline"
-								size="icon"
-								aria-label="配置定时任务间隔"
-								onClick={openTaskIntervalSettingsDialog}
-								disabled={
-									!syncRuntimeConfig ||
-									!webhookPushRuntimeConfig ||
-									syncRuntimeConfigSaving
-								}
-							>
-								<Settings2 />
-							</Button>
-						</CardHeader>
-						<CardContent className="space-y-4">
-							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-								<FilterSelect
-									value={scheduledRunStatusFilter}
-									onValueChange={(nextValue) => {
-										setScheduledRunPage(1);
-										setScheduledRunStatusFilter(nextValue);
-									}}
-									options={REALTIME_STATUS_FILTER_OPTIONS}
-									placeholder="状态筛选"
-									ariaLabel="定时任务状态筛选"
-									className="w-full sm:w-[220px]"
+					<div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+						<Card className="hidden lg:block">
+							<CardHeader className="pb-3">
+								{/* Not "计划任务": the records card owns that heading and a
+								    second one makes every heading query ambiguous. */}
+								<CardTitle className="text-sm">任务类型</CardTitle>
+							</CardHeader>
+							<CardContent className="pt-0">
+								<PlanTaskColumn
+									tasks={planTasks}
+									selectedTaskType={selectedPlanTaskType}
+									onSelect={selectPlanTaskType}
+									inflightTaskTypes={planTaskInflight}
+									onTrigger={triggerPlanTask}
+									triggerBusyTaskType={planTaskTriggerBusy}
 								/>
-								<p className="text-muted-foreground text-xs">
-									共 {formatCount(scheduledRunTotal)} 条
-								</p>
-							</div>
+							</CardContent>
+						</Card>
+						<Card>
+							<CardHeader className="flex flex-row items-start justify-between gap-4">
+								<div className="space-y-1.5">
+									<CardTitle>计划任务</CardTitle>
+									<Sheet>
+										<SheetTrigger asChild>
+											<Button
+												type="button"
+												variant="outline"
+												size="sm"
+												className="lg:hidden"
+											>
+												选择任务类型
+											</Button>
+										</SheetTrigger>
+										<SheetContent side="left" className="w-80 overflow-y-auto">
+											<SheetHeader>
+												<SheetTitle>任务类型</SheetTitle>
+											</SheetHeader>
+											<div className="px-4 pb-6">
+												<PlanTaskColumn
+													tasks={planTasks}
+													selectedTaskType={selectedPlanTaskType}
+													onSelect={selectPlanTaskType}
+													inflightTaskTypes={planTaskInflight}
+													onTrigger={triggerPlanTask}
+													triggerBusyTaskType={planTaskTriggerBusy}
+												/>
+											</div>
+										</SheetContent>
+									</Sheet>
+								</div>
+								<Button
+									type="button"
+									variant="outline"
+									size="icon"
+									aria-label="配置计划任务间隔"
+									onClick={openTaskIntervalSettingsDialog}
+									disabled={
+										!syncRuntimeConfig ||
+										!webhookPushRuntimeConfig ||
+										syncRuntimeConfigSaving
+									}
+								>
+									<Settings2 />
+								</Button>
+							</CardHeader>
+							<CardContent className="space-y-4">
+								<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+									<FilterSelect
+										value={scheduledRunStatusFilter}
+										onValueChange={(nextValue) => {
+											setScheduledRunPage(1);
+											setScheduledRunStatusFilter(nextValue);
+										}}
+										options={REALTIME_STATUS_FILTER_OPTIONS}
+										placeholder="状态筛选"
+										ariaLabel="计划任务状态筛选"
+										className="w-full sm:w-[220px]"
+									/>
+									<p className="text-muted-foreground text-xs">
+										共 {formatCount(scheduledRunTotal)} 条
+									</p>
+								</div>
 
-							<ListSurfaceShell
-								state={scheduledListSurface.state}
-								refreshing={scheduledListSurface.showRefreshing}
-								className="space-y-3"
-							>
-								{scheduledListSurface.showRefreshing ? (
-									<ListRefreshingNotice label="运行记录更新中..." />
-								) : null}
-								{listError && scheduledRuns.length > 0 ? (
-									<ListInlineError
-										title="定时任务刷新失败"
-										summary={listError}
-										actionLabel="重试"
-										onAction={() =>
-											void loadScheduledRuns({ background: true })
-										}
-									/>
-								) : null}
-								{scheduledListSurface.state === "blocking-error" ? (
-									<ListBlockingErrorState
-										title="定时任务加载失败"
-										summary={listError ?? "当前无法读取定时任务记录。"}
-										actionLabel="重试"
-										onAction={() => void loadScheduledRuns()}
-									/>
-								) : scheduledListSurface.state === "initial-loading" ? (
-									<CardListSkeleton count={4} />
-								) : scheduledListSurface.state === "empty" ? (
-									<ListEmptyState
-										title="暂无运行记录"
-										description="当前筛选条件下没有匹配的定时任务记录。"
-									/>
-								) : (
-									<div className="space-y-2">
-										{scheduledRuns.map((task) => {
-											const busy = taskActionBusyId === task.id;
-											const displayStatus = realtimeTaskDisplayStatus(task);
-											const tone = taskStatusTone(displayStatus);
-											return (
-												<div
-													key={task.id}
-													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
-												>
-													<div className="min-w-0">
-														<div className="flex flex-wrap items-center gap-2">
-															<p className="font-medium text-sm">
-																{taskTypeLabel(task.task_type)}
-															</p>
-															<StatusBadge
-																label={taskStatusLabel(displayStatus)}
-																tone={tone}
-															/>
-															{task.cancel_requested ? (
-																<FlagBadge
-																	label="已请求取消"
-																	className={cancelRequestedBadgeClass}
+								<ListSurfaceShell
+									state={scheduledListSurface.state}
+									refreshing={scheduledListSurface.showRefreshing}
+									className="space-y-3"
+								>
+									{scheduledListSurface.showRefreshing ? (
+										<ListRefreshingNotice label="运行记录更新中..." />
+									) : null}
+									{listError && scheduledRuns.length > 0 ? (
+										<ListInlineError
+											title="计划任务刷新失败"
+											summary={listError}
+											actionLabel="重试"
+											onAction={() =>
+												void loadScheduledRuns({ background: true })
+											}
+										/>
+									) : null}
+									{scheduledListSurface.state === "blocking-error" ? (
+										<ListBlockingErrorState
+											title="计划任务加载失败"
+											summary={listError ?? "当前无法读取计划任务记录。"}
+											actionLabel="重试"
+											onAction={() => void loadScheduledRuns()}
+										/>
+									) : scheduledListSurface.state === "initial-loading" ? (
+										<CardListSkeleton count={4} />
+									) : scheduledListSurface.state === "empty" ? (
+										<ListEmptyState
+											title="暂无运行记录"
+											description="当前筛选条件下没有匹配的计划任务记录。"
+										/>
+									) : (
+										<div className="space-y-2">
+											{visibleScheduledRuns.map((task) => {
+												const busy = taskActionBusyId === task.id;
+												const displayStatus = realtimeTaskDisplayStatus(task);
+												const tone = taskStatusTone(displayStatus);
+												return (
+													<div
+														key={task.id}
+														className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+													>
+														<div className="min-w-0">
+															<div className="flex flex-wrap items-center gap-2">
+																<p className="font-medium text-sm">
+																	{taskTypeLabel(task.task_type)}
+																</p>
+																<StatusBadge
+																	label={taskStatusLabel(displayStatus)}
+																	tone={tone}
 																/>
+																{task.cancel_requested ? (
+																	<FlagBadge
+																		label="已请求取消"
+																		className={cancelRequestedBadgeClass}
+																	/>
+																) : null}
+															</div>
+															<p className="text-muted-foreground mt-1 text-xs">
+																类型：
+																<span className="font-mono">
+																	{task.task_type}
+																</span>
+															</p>
+															<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+																ID: {task.id}
+															</p>
+															<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+																<span className="bg-muted/60 rounded px-2 py-0.5">
+																	创建 {formatLocalHm(task.created_at)}
+																</span>
+																<span className="bg-muted/60 rounded px-2 py-0.5">
+																	完成 {formatLocalHm(task.finished_at)}
+																</span>
+															</div>
+															{task.error_message ? (
+																<p className="text-destructive mt-1 text-xs font-medium">
+																	失败原因：{task.error_message}
+																</p>
 															) : null}
 														</div>
-														<p className="text-muted-foreground mt-1 text-xs">
-															类型：
-															<span className="font-mono">
-																{task.task_type}
-															</span>
-														</p>
-														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-															ID: {task.id}
-														</p>
-														<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-															<span className="bg-muted/60 rounded px-2 py-0.5">
-																创建 {formatLocalHm(task.created_at)}
-															</span>
-															<span className="bg-muted/60 rounded px-2 py-0.5">
-																完成 {formatLocalHm(task.finished_at)}
-															</span>
-														</div>
-														{task.error_message ? (
-															<p className="text-destructive mt-1 text-xs font-medium">
-																失败原因：{task.error_message}
-															</p>
-														) : null}
-													</div>
-													<div className="flex flex-wrap gap-2">
-														<Button
-															variant="outline"
-															disabled={scheduledRunActionsDisabled}
-															onClick={() => void onOpenTaskDetail(task.id)}
-														>
-															详情
-														</Button>
-														{task.task_type !== "webhook.push.audit" ? (
+														<div className="flex flex-wrap gap-2">
 															<Button
 																variant="outline"
+																disabled={scheduledRunActionsDisabled}
+																onClick={() => void onOpenTaskDetail(task.id)}
+															>
+																详情
+															</Button>
+															{task.task_type !== "webhook.push.audit" ? (
+																<Button
+																	variant="outline"
+																	disabled={
+																		scheduledRunActionsDisabled ||
+																		busy ||
+																		task.status === "queued" ||
+																		task.status === "running"
+																	}
+																	onClick={() => void onRetryTask(task.id)}
+																>
+																	重试
+																</Button>
+															) : null}
+															<Button
+																variant="destructive"
 																disabled={
 																	scheduledRunActionsDisabled ||
 																	busy ||
-																	task.status === "queued" ||
-																	task.status === "running"
+																	task.status === "succeeded" ||
+																	task.status === "failed" ||
+																	task.status === "canceled"
 																}
-																onClick={() => void onRetryTask(task.id)}
+																onClick={() => void onCancelTask(task.id)}
 															>
-																重试
+																取消
 															</Button>
-														) : null}
-														<Button
-															variant="destructive"
-															disabled={
-																scheduledRunActionsDisabled ||
-																busy ||
-																task.status === "succeeded" ||
-																task.status === "failed" ||
-																task.status === "canceled"
-															}
-															onClick={() => void onCancelTask(task.id)}
-														>
-															取消
-														</Button>
+														</div>
 													</div>
-												</div>
-											);
-										})}
-									</div>
-								)}
-							</ListSurfaceShell>
+												);
+											})}
+										</div>
+									)}
+								</ListSurfaceShell>
 
-							<div className="flex items-center justify-between">
-								<p className="text-muted-foreground text-xs">
-									第 {scheduledRunPage}/{scheduledRunTotalPages} 页
-								</p>
-								<div className="flex gap-2">
-									<Button
-										variant="outline"
-										size="sm"
-										disabled={
-											scheduledRunPage <= 1 || scheduledRunsLoadPhase !== "idle"
-										}
-										onClick={() =>
-											setScheduledRunPage((prev) => Math.max(1, prev - 1))
-										}
-									>
-										上一页
-									</Button>
-									<Button
-										variant="outline"
-										size="sm"
-										disabled={
-											scheduledRunPage >= scheduledRunTotalPages ||
-											scheduledRunsLoadPhase !== "idle"
-										}
-										onClick={() =>
-											setScheduledRunPage((prev) =>
-												Math.min(scheduledRunTotalPages, prev + 1),
-											)
-										}
-									>
-										下一页
-									</Button>
+								<div className="flex items-center justify-between">
+									<p className="text-muted-foreground text-xs">
+										第 {scheduledRunPage}/{scheduledRunTotalPages} 页
+									</p>
+									<div className="flex gap-2">
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												scheduledRunPage <= 1 ||
+												scheduledRunsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setScheduledRunPage((prev) => Math.max(1, prev - 1))
+											}
+										>
+											上一页
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												scheduledRunPage >= scheduledRunTotalPages ||
+												scheduledRunsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setScheduledRunPage((prev) =>
+													Math.min(scheduledRunTotalPages, prev + 1),
+												)
+											}
+										>
+											下一页
+										</Button>
+									</div>
 								</div>
-							</div>
-						</CardContent>
-					</Card>
+							</CardContent>
+						</Card>
+					</div>
 				</TabsContent>
 
 				<TabsContent value="user_sync">
@@ -8077,7 +8204,7 @@ export function JobManagement({
 						</div>
 						<DialogDescription>
 							只调整失败数据重试、日报和 Webhook
-							定时任务；订阅同步间隔请在订阅同步设置中修改。
+							计划任务；订阅同步间隔请在订阅同步设置中修改。
 						</DialogDescription>
 					</DialogHeader>
 

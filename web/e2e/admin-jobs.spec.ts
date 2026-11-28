@@ -2649,7 +2649,7 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
 	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
-	const scheduledTab = page.getByRole("tab", { name: "定时任务" });
+	const scheduledTab = page.getByRole("tab", { name: "计划任务" });
 	const subscriptionsTab = page.getByRole("tab", { name: "订阅同步" });
 	const llmTab = page.getByRole("tab", { name: "LLM调度" });
 
@@ -2728,10 +2728,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
 	await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
 	await expect(
-		page.getByRole("combobox", { name: "定时任务状态筛选" }),
+		page.getByRole("combobox", { name: "计划任务状态筛选" }),
 	).toBeVisible();
-	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByRole("heading", { name: "计划任务" })).toBeVisible();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	await expect(
 		page.getByText("brief.daily_slot", { exact: true }).first(),
 	).toBeVisible();
@@ -2971,7 +2971,7 @@ test("admin task interval drafts validate only when saved", async ({
 
 	await page.goto("/admin/jobs/scheduled", { waitUntil: "domcontentloaded" });
 	const settingsButton = page.getByRole("button", {
-		name: "配置定时任务间隔",
+		name: "配置计划任务间隔",
 	});
 	await expect(settingsButton).toBeEnabled();
 	await settingsButton.click();
@@ -3089,11 +3089,11 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 
 	await page.goto("/admin/jobs/scheduled", { waitUntil: "domcontentloaded" });
 	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
-	await expect(page.getByRole("tab", { name: "定时任务" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "计划任务" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
-	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
+	await expect(page.getByRole("heading", { name: "计划任务" })).toBeVisible();
 
 	await page.goto("/admin/jobs/translations", {
 		waitUntil: "domcontentloaded",
@@ -4929,13 +4929,13 @@ test("admin refresh keeps scheduled runs visible", async ({ page }) => {
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("tab", { name: "定时任务" }).click();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await page.getByRole("tab", { name: "计划任务" }).click();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 
 	await expect(refreshButton).toBeDisabled();
-	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("定时日报").first()).toBeVisible();
 	await expect(page.getByText("运行记录更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载运行记录...")).toHaveCount(0);
 	await expect(refreshButton).toBeEnabled();

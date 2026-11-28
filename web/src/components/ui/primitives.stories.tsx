@@ -289,7 +289,7 @@ export const TabsState: Story = {
 		<Tabs defaultValue="realtime" className="w-[420px]">
 			<TabsList>
 				<TabsTrigger value="realtime">实时异步任务</TabsTrigger>
-				<TabsTrigger value="scheduled">定时任务</TabsTrigger>
+				<TabsTrigger value="scheduled">计划任务</TabsTrigger>
 				<TabsTrigger value="llm">LLM 调度</TabsTrigger>
 			</TabsList>
 			<TabsContent value="realtime" className="rounded-xl border bg-card p-4">

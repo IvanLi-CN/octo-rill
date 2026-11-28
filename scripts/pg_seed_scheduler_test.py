@@ -30,7 +30,11 @@ def runtime_task_type_count():
     """
     text = SOURCE.read_text()
     groups = text.split('pub(crate) const ADMIN_JOB_TASK_GROUPS', 1)[1]
-    return groups.count('spec(')
+    # Both constructors declare one task type: `spec` for the common case and
+    # `spec_with_params` for a type that also accepts manual-trigger input.
+    # Counting only `spec(` silently undercounts the moment a type moves to the
+    # parameterised constructor.
+    return groups.count('spec(') + groups.count('spec_with_params(')
 
 
 def main():

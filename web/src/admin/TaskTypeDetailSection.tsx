@@ -674,7 +674,7 @@ function buildTaskDetailPageModel(
 			return {
 				pageTitle: "日报定时槽详情页",
 				pageSummary:
-					"展示日报定时任务在指定 UTC 小时槽的串行执行进度，以及每个用户的自动出报时间、时区与自然日窗口。",
+					"展示日报计划任务在指定 UTC 小时槽的串行执行进度，以及每个用户的自动出报时间、时区与自然日窗口。",
 				fields: buildFields(
 					field(
 						"UTC 小时槽",

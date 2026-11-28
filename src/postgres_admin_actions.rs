@@ -298,6 +298,106 @@ pub(crate) async fn admin_enqueue_release_reading_backfill(
     }
 }
 
+/// Trigger one plan-task type on demand.
+///
+/// The job center renders a form from [`crate::admin_job_groups`]; this handler
+/// validates the submitted values against that same declaration, so a form and
+/// its validation cannot drift apart. Only types that declare trigger
+/// parameters, or that are explicitly listed as triggerable, are accepted:
+/// everything else is rejected rather than silently enqueued, because a global
+/// sync triggered by a stray click costs far more than a failed request.
+pub(crate) async fn admin_trigger_plan_task(
+    State(state): State<PostgresServerState>,
+    session: Session,
+    Json(request): Json<TriggerPlanTaskRequest>,
+) -> Response {
+    if let Err(status) = require_admin(&state, &session).await {
+        return admin_required(status);
+    }
+    let Some(spec) = crate::admin_job_groups::runtime_task_specs()
+        .find(|spec| spec.task_type == request.task_type)
+    else {
+        return bad_request("unknown plan task type");
+    };
+    if !crate::admin_job_groups::task_type_is_triggerable(spec.task_type) {
+        return bad_request("this plan task does not support manual triggers");
+    }
+    let params =
+        match crate::admin_job_groups::validate_trigger_params(spec, request.params.as_ref()) {
+            Ok(params) => params,
+            Err(message) => return bad_request(&message),
+        };
+    let pool = &state.runtime.pool;
+    match enqueue_single_flight_plan_task(
+        pool,
+        spec.task_type,
+        "admin.plan_task_trigger",
+        json!({ "trigger": "admin.plan_task_trigger", "params": params }),
+    )
+    .await
+    {
+        Ok(task_id) => Json(json!({
+            "task_id": task_id,
+            "task_type": spec.task_type,
+            "status": "queued",
+        }))
+        .into_response(),
+        Err(error) => database_error("plan_task_trigger_enqueue", error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TriggerPlanTaskRequest {
+    pub(crate) task_type: String,
+    #[serde(default)]
+    pub(crate) params: Option<serde_json::Map<String, Value>>,
+}
+
+/// Insert one task row unless the same type is already queued or running.
+///
+/// Returns the existing task id when one is in flight, so an operator clicking
+/// twice advances nothing twice.
+async fn enqueue_single_flight_plan_task(
+    pool: &PgPool,
+    task_type: &str,
+    source: &str,
+    payload: Value,
+) -> Result<String, sqlx::Error> {
+    let inflight = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.job_tasks WHERE task_type = $1 AND status IN ('queued', 'running') ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(task_type)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(task_id) = inflight {
+        return Ok(task_id);
+    }
+    sqlx::query_scalar::<_, String>(
+        r#"
+        INSERT INTO public.job_tasks (
+          id, task_type, status, source, requested_by, payload_json, created_at, updated_at
+        )
+        SELECT $1, $2, 'queued', $3, $4, $5, $6, $6
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.job_tasks pending
+          WHERE pending.task_type = $2
+            AND pending.status IN ('queued', 'running')
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(task_type)
+    .bind(source)
+    .bind(Option::<String>::None)
+    .bind(payload.to_string())
+    .bind(Utc::now())
+    .fetch_optional(pool)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)
+}
+
 /// Queue one page of the polishing audience-variant repair sweep.
 ///
 /// Single-flight like the scheduled lane: while a `polish.backfill` task is
