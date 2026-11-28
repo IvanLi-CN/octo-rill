@@ -32,6 +32,7 @@
 - [`product.md`](./product.md)：产品语义、界面职责、权限与数据边界
 - [`architecture.md`](./architecture.md)：系统组成、运行边界、模块职责与排查入口
 - [`repository-governance.md`](./repository-governance.md)：GitHub 仓库保护、PR 门禁与质量规则事实源
+- [`operations/postgres-data-directory.md`](./operations/postgres-data-directory.md)：PostgreSQL 数据目录的所有权契约、静默故障形态与校验时机
 - 适合回答“项目现在怎么工作、从哪里改、谁是事实源”
 
 ### Agent memory / 长期工程记忆
