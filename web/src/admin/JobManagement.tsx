@@ -1198,6 +1198,8 @@ function taskTypeLabel(taskType: string) {
 			return "Webhook 对账";
 		case "release.reading_backfill":
 			return "阅读回填";
+		case "polish.backfill":
+			return "润色受众变体回填";
 		default:
 			return taskType;
 	}
@@ -1550,6 +1552,7 @@ const GENERAL_SCHEDULED_TASK_TYPES: Record<string, true> = {
 	"webhook.push.manage": true,
 	"retry.recent_failures": true,
 	"release.reading_backfill": true,
+	"polish.backfill": true,
 };
 const SCHEDULED_TASK_TYPES: Record<string, true> = {
 	...GENERAL_SCHEDULED_TASK_TYPES,
